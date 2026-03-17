@@ -1,0 +1,7 @@
+# OCSFS — Open Cluster Shared FileSystem
+# Kernel module build rules
+# SPDX-License-Identifier: GPL-2.0-only
+
+obj-$(CONFIG_OCSFS_FS) += ocsfs.o
+
+ocsfs-y := super.o inode.o dir.o file.o extent.o journal.o bitmap.o
