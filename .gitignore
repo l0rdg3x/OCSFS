@@ -1,0 +1,11 @@
+# Build artifacts
+*.o
+mkfs.ocsfs
+ocsfs-tool
+ocsfs-fuse
+ocsfs-defrag
+test_ocsfs
+
+# Test images
+/tmp/ocsfs_*.img
+*.img

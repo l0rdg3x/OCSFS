@@ -1,0 +1,75 @@
+.\" SPDX-License-Identifier: GPL-2.0-only
+.TH OCSFS\-DEFRAG 8 "March 2026" "ocsfs 0.1.0" "System Administration"
+.SH NAME
+ocsfs\-defrag \- online defragmentation daemon for OCSFS
+.SH SYNOPSIS
+.B ocsfs\-defrag
+[\fB\-b\fR \fIMB/s\fR]
+[\fB\-t\fR \fIthreshold\fR]
+[\fB\-n\fR]
+[\fB\-v\fR]
+[\fB\-d\fR]
+[\fB\-1\fR]
+.I mount\-point
+.SH DESCRIPTION
+.B ocsfs\-defrag
+scans a mounted OCSFS filesystem for fragmented files and
+defragments them by copying data to new contiguous locations.
+It uses the FIEMAP ioctl to detect fragmentation and the
+OCSFS allocator's preallocation hints to ensure new allocations
+are contiguous.
+.PP
+The daemon is bandwidth-limited to avoid impacting foreground
+VM I/O workloads. Only one instance runs per mount point,
+coordinated via a lock file.
+.SH OPTIONS
+.TP
+.BR \-b " " \fIMB/s\fR
+Bandwidth limit in megabytes per second (default: 50).
+.TP
+.BR \-t " " \fIthreshold\fR
+Minimum number of extents to consider a file fragmented (default: 4).
+.TP
+.BR \-n
+Dry run \- report fragmentation without defragmenting.
+.TP
+.BR \-v
+Verbose output \- print per-file defragmentation details.
+.TP
+.BR \-d
+Run as a background daemon.
+.TP
+.BR \-1
+Single pass \- scan once and exit (no continuous monitoring).
+.SH SIGNALS
+.TP
+.B SIGUSR1
+Pause defragmentation.
+.TP
+.B SIGUSR2
+Resume defragmentation.
+.TP
+.B SIGTERM
+Stop gracefully after current file.
+.SH SYSTEMD INTEGRATION
+A systemd template unit is provided:
+.PP
+.RS 4
+systemctl enable ocsfs\-defrag@mnt\-pve\-fc\\\\x2dshared.service
+.br
+systemctl start ocsfs\-defrag@mnt\-pve\-fc\\\\x2dshared.service
+.RE
+.PP
+Use
+.BR systemd\-escape (1)
+to convert mount paths:
+.PP
+.RS 4
+systemd\-escape \-p /mnt/pve/fc\-shared
+.RE
+.SH SEE ALSO
+.BR mkfs.ocsfs (8),
+.BR ocsfs\-tool (8),
+.BR mount.ocsfs (8)
+.SH AUTHORS
+OCSFS Project Contributors.

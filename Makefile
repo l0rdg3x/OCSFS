@@ -2,8 +2,10 @@
 # Build system
 #
 # Targets:
-#   all        Build everything
+#   all        Build everything (tools + test)
 #   tools      Build mkfs.ocsfs and ocsfs-tool
+#   fuse       Build ocsfs-fuse (requires libfuse3-dev)
+#   kmod       Build kernel module (requires linux-headers)
 #   test       Build and run tests
 #   clean      Remove build artifacts
 #
@@ -29,11 +31,27 @@ COMMON_SRCS = $(SRC_DIR)/crc32c.c \
 
 COMMON_OBJS = $(COMMON_SRCS:.c=.o)
 
+# New Phase 0 modules
+PHASE0_SRCS = $(SRC_DIR)/btree.c \
+              $(SRC_DIR)/inode.c \
+              $(SRC_DIR)/journal.c \
+              $(SRC_DIR)/dir.c
+
+PHASE0_OBJS = $(PHASE0_SRCS:.c=.o)
+
 # Tools
-MKFS_SRC = $(TOOL_DIR)/mkfs_ocsfs.c
-TOOL_SRC = $(TOOL_DIR)/ocsfs_tool.c
-MKFS_BIN = mkfs.ocsfs
-TOOL_BIN = ocsfs-tool
+MKFS_SRC   = $(TOOL_DIR)/mkfs_ocsfs.c
+TOOL_SRC   = $(TOOL_DIR)/ocsfs_tool.c
+DEFRAG_SRC = $(TOOL_DIR)/ocsfs_defrag.c
+MKFS_BIN   = mkfs.ocsfs
+TOOL_BIN   = ocsfs-tool
+DEFRAG_BIN = ocsfs-defrag
+
+# FUSE
+FUSE_SRC = $(SRC_DIR)/fuse_main.c
+FUSE_BIN = ocsfs-fuse
+FUSE_CFLAGS = $(shell pkg-config --cflags fuse3 2>/dev/null)
+FUSE_LDFLAGS = $(shell pkg-config --libs fuse3 2>/dev/null)
 
 # Tests
 TEST_SRC   = $(TEST_DIR)/test_ocsfs.c
@@ -41,11 +59,14 @@ TEST_BIN   = test_ocsfs
 
 # ─── Rules ──────────────────────────────────────────────────
 
-.PHONY: all tools test clean
+# Kernel module
+KMOD_DIR = kmod
+
+.PHONY: all tools fuse kmod test clean
 
 all: tools test
 
-tools: $(MKFS_BIN) $(TOOL_BIN)
+tools: $(MKFS_BIN) $(TOOL_BIN) $(DEFRAG_BIN)
 
 $(MKFS_BIN): $(MKFS_SRC) $(COMMON_OBJS)
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(LDFLAGS)
@@ -55,9 +76,22 @@ $(TOOL_BIN): $(TOOL_SRC) $(COMMON_OBJS)
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(LDFLAGS)
 	@echo "  Built: $@"
 
-$(TEST_BIN): $(TEST_SRC) $(COMMON_OBJS)
+$(DEFRAG_BIN): $(DEFRAG_SRC)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $< $(LDFLAGS)
+	@echo "  Built: $@"
+
+$(TEST_BIN): $(TEST_SRC) $(COMMON_OBJS) $(PHASE0_OBJS)
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(LDFLAGS)
 	@echo "  Built: $@"
+
+fuse: $(FUSE_BIN)
+
+$(FUSE_BIN): $(FUSE_SRC) $(COMMON_OBJS)
+	$(CC) $(CFLAGS) $(FUSE_CFLAGS) $(INCLUDES) -o $@ $^ $(LDFLAGS) $(FUSE_LDFLAGS)
+	@echo "  Built: $@"
+
+kmod:
+	$(MAKE) -C $(KMOD_DIR)
 
 %.o: %.c
 	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
@@ -71,8 +105,9 @@ test: $(TEST_BIN)
 	./$(TEST_BIN)
 
 clean:
-	rm -f $(COMMON_OBJS) $(MKFS_BIN) $(TOOL_BIN) $(TEST_BIN)
+	rm -f $(COMMON_OBJS) $(PHASE0_OBJS) $(MKFS_BIN) $(TOOL_BIN) $(DEFRAG_BIN) $(TEST_BIN) $(FUSE_BIN)
 	rm -f /tmp/ocsfs_test_*.img
+	-$(MAKE) -C $(KMOD_DIR) clean 2>/dev/null || true
 	@echo "  Cleaned."
 
 # ─── Development helpers ────────────────────────────────────
@@ -86,3 +121,11 @@ demo: tools
 	./$(TOOL_BIN) info /tmp/ocsfs_demo.img
 	./$(TOOL_BIN) df /tmp/ocsfs_demo.img
 	./$(TOOL_BIN) check /tmp/ocsfs_demo.img
+
+# Mount a test image with FUSE
+demo-fuse: fuse tools
+	@mkdir -p /tmp/ocsfs_mnt
+	dd if=/dev/zero of=/tmp/ocsfs_fuse.img bs=1M count=512 2>/dev/null
+	./$(MKFS_BIN) -L "fuse-test" -N 2 -J 4M -A 128M -f /tmp/ocsfs_fuse.img
+	./$(FUSE_BIN) /tmp/ocsfs_fuse.img /tmp/ocsfs_mnt -f -o allow_other &
+	@echo "Mounted at /tmp/ocsfs_mnt (PID $$!)"

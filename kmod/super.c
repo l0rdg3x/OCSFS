@@ -1,0 +1,503 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * OCSFS — super.c
+ * Superblock operations, module init/exit, mount/unmount.
+ *
+ * Phase 1: single-node operation (no cluster locking).
+ */
+
+#include "ocsfs.h"
+
+static struct kmem_cache *ocsfs_inode_cachep;
+
+/* ═══════════════════════════════════════════════════════════════
+ * INODE SLAB ALLOCATOR
+ * ═══════════════════════════════════════════════════════════════ */
+
+static struct inode *ocsfs_alloc_inode(struct super_block *sb)
+{
+	struct ocsfs_inode_info *oi;
+
+	oi = alloc_inode_sb(sb, ocsfs_inode_cachep, GFP_KERNEL);
+	if (!oi)
+		return NULL;
+
+	mutex_init(&oi->i_extent_lock);
+	oi->i_extent_count = 0;
+	oi->i_extent_tree_root = 0;
+	oi->i_flags = 0;
+	oi->i_ag = 0;
+	oi->i_disk_ino = 0;
+
+	return &oi->vfs_inode;
+}
+
+static void ocsfs_free_inode(struct inode *inode)
+{
+	kmem_cache_free(ocsfs_inode_cachep, OCSFS_I(inode));
+}
+
+static void ocsfs_inode_init_once(void *obj)
+{
+	struct ocsfs_inode_info *oi = obj;
+	inode_init_once(&oi->vfs_inode);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * SUPERBLOCK VALIDATION
+ * ═══════════════════════════════════════════════════════════════ */
+
+static int ocsfs_validate_super(struct ocsfs_disk_super *ds,
+				struct super_block *sb, int silent)
+{
+	u32 crc;
+
+	if (le32_to_cpu(ds->s_magic) != OCSFS_MAGIC) {
+		if (!silent)
+			pr_err("ocsfs: bad magic 0x%08x (expected 0x%08x)\n",
+			       le32_to_cpu(ds->s_magic), OCSFS_MAGIC);
+		return -EINVAL;
+	}
+
+	if (le16_to_cpu(ds->s_version_major) != OCSFS_VERSION_MAJOR) {
+		pr_err("ocsfs: unsupported version %u.%u\n",
+		       le16_to_cpu(ds->s_version_major),
+		       le16_to_cpu(ds->s_version_minor));
+		return -EINVAL;
+	}
+
+	/* Validate CRC32C (covers bytes 0..4091) */
+	crc = ocsfs_crc32c(~0U, ds, OCSFS_SUPERBLOCK_SIZE - 4);
+	if (crc != le32_to_cpu(ds->s_checksum)) {
+		pr_err("ocsfs: superblock checksum mismatch "
+		       "(computed 0x%08x, stored 0x%08x)\n",
+		       crc, le32_to_cpu(ds->s_checksum));
+		return -EINVAL;
+	}
+
+	if (le32_to_cpu(ds->s_block_size) != OCSFS_DEFAULT_BLOCK_SIZE) {
+		pr_err("ocsfs: unsupported block size %u (only 4096 supported)\n",
+		       le32_to_cpu(ds->s_block_size));
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * LOAD ALLOCATION GROUPS
+ * ═══════════════════════════════════════════════════════════════ */
+
+static int ocsfs_load_ags(struct super_block *sb)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	struct buffer_head *bh;
+	u32 i;
+	u64 ag_desc_block;
+
+	sbi->s_ags = kvmalloc_array(sbi->s_ag_count,
+				    sizeof(struct ocsfs_ag_info), GFP_KERNEL);
+	if (!sbi->s_ags)
+		return -ENOMEM;
+
+	for (i = 0; i < sbi->s_ag_count; i++) {
+		struct ocsfs_disk_ag *dag;
+		struct ocsfs_ag_info *ag = &sbi->s_ags[i];
+
+		ag_desc_block = ocsfs_byte_to_block(sbi,
+				sbi->s_ag_desc_off + (u64)i * sizeof(*dag));
+		bh = sb_bread(sb, ag_desc_block);
+		if (!bh) {
+			pr_err("ocsfs: failed to read AG %u descriptor\n", i);
+			kvfree(sbi->s_ags);
+			sbi->s_ags = NULL;
+			return -EIO;
+		}
+
+		dag = (struct ocsfs_disk_ag *)bh->b_data;
+
+		if (le32_to_cpu(dag->ag_magic) != OCSFS_AG_MAGIC) {
+			pr_err("ocsfs: AG %u bad magic\n", i);
+			brelse(bh);
+			kvfree(sbi->s_ags);
+			sbi->s_ags = NULL;
+			return -EINVAL;
+		}
+
+		ag->ag_no = i;
+		ag->block_start = le64_to_cpu(dag->ag_block_start);
+		ag->block_count = le64_to_cpu(dag->ag_block_count);
+		ag->free_blocks = le64_to_cpu(dag->ag_free_blocks);
+		ag->bitmap_off = le64_to_cpu(dag->ag_bitmap_off);
+		ag->bitmap_size = le64_to_cpu(dag->ag_bitmap_size);
+		ag->inode_table_off = le64_to_cpu(dag->ag_inode_table_off);
+		ag->inode_count = le64_to_cpu(dag->ag_inode_count);
+		ag->free_inodes = le64_to_cpu(dag->ag_free_inodes);
+		mutex_init(&ag->ag_lock);
+
+		brelse(bh);
+	}
+
+	return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * FILL SUPER — called during mount
+ * ═══════════════════════════════════════════════════════════════ */
+
+int ocsfs_fill_super(struct super_block *sb, void *data, int silent)
+{
+	struct ocsfs_sb_info *sbi;
+	struct ocsfs_disk_super *ds;
+	struct buffer_head *bh;
+	struct inode *root_inode;
+	int ret;
+
+	/* Set block size before first sb_bread */
+	if (!sb_set_blocksize(sb, OCSFS_DEFAULT_BLOCK_SIZE)) {
+		pr_err("ocsfs: unable to set block size %d\n",
+		       OCSFS_DEFAULT_BLOCK_SIZE);
+		return -EINVAL;
+	}
+
+	/* Read superblock from block 0 */
+	bh = sb_bread(sb, 0);
+	if (!bh) {
+		pr_err("ocsfs: unable to read superblock\n");
+		return -EIO;
+	}
+
+	ds = (struct ocsfs_disk_super *)bh->b_data;
+	ret = ocsfs_validate_super(ds, sb, silent);
+	if (ret) {
+		brelse(bh);
+		return ret;
+	}
+
+	/* Allocate in-memory superblock info */
+	sbi = kzalloc(sizeof(*sbi), GFP_KERNEL);
+	if (!sbi) {
+		brelse(bh);
+		return -ENOMEM;
+	}
+
+	sb->s_fs_info = sbi;
+	sbi->s_sbh = bh;
+	sbi->s_ds = ds;
+
+	/* Cache frequently-used fields */
+	sbi->s_block_size = le32_to_cpu(ds->s_block_size);
+	sbi->s_extent_size = le32_to_cpu(ds->s_extent_size);
+	sbi->s_total_blocks = le64_to_cpu(ds->s_total_blocks);
+	sbi->s_free_blocks = le64_to_cpu(ds->s_free_blocks);
+	sbi->s_ag_count = le32_to_cpu(ds->s_ag_count);
+	sbi->s_ag_size = le64_to_cpu(ds->s_ag_size);
+	sbi->s_max_nodes = le16_to_cpu(ds->s_max_nodes);
+	sbi->s_feature_flags = le64_to_cpu(ds->s_feature_flags);
+	sbi->s_data_off = le64_to_cpu(ds->s_data_off);
+	sbi->s_ag_desc_off = le64_to_cpu(ds->s_ag_desc_off);
+
+	init_rwsem(&sbi->s_global_lock);
+	spin_lock_init(&sbi->s_free_lock);
+
+	/* Set up super_block fields */
+	sb->s_magic = OCSFS_MAGIC;
+	sb->s_op = &ocsfs_sops;
+	sb->s_maxbytes = MAX_LFS_FILESIZE;
+	sb->s_time_gran = 1;  /* nanosecond timestamps */
+
+	/* Load allocation group descriptors */
+	ret = ocsfs_load_ags(sb);
+	if (ret)
+		goto fail;
+
+	/* Initialize journal */
+	ret = ocsfs_journal_init(sb);
+	if (ret)
+		goto fail_ags;
+
+	/* Replay journal if needed (crash recovery) */
+	ret = ocsfs_journal_replay(sb);
+	if (ret) {
+		pr_err("ocsfs: journal replay failed\n");
+		goto fail_journal;
+	}
+
+	/* Initialize clustering subsystem */
+	ret = ocsfs_cluster_init(sb);
+	if (ret) {
+		pr_err("ocsfs: cluster init failed\n");
+		goto fail_journal;
+	}
+
+	/* Read root inode */
+	root_inode = ocsfs_iget(sb, OCSFS_ROOT_INO);
+	if (IS_ERR(root_inode)) {
+		pr_err("ocsfs: failed to read root inode\n");
+		ret = PTR_ERR(root_inode);
+		goto fail_journal;
+	}
+
+	sb->s_root = d_make_root(root_inode);
+	if (!sb->s_root) {
+		ret = -ENOMEM;
+		goto fail_journal;
+	}
+
+	/* Update mount count and timestamp */
+	ds->s_mount_count = cpu_to_le64(
+		le64_to_cpu(ds->s_mount_count) + 1);
+	ds->s_last_mount_time = cpu_to_le64(
+		ktime_get_real_ns());
+
+	/* Recompute checksum after updates */
+	ds->s_checksum = cpu_to_le32(
+		ocsfs_crc32c(~0U, ds, OCSFS_SUPERBLOCK_SIZE - 4));
+	mark_buffer_dirty(bh);
+	sync_dirty_buffer(bh);
+
+	pr_info("ocsfs: mounted volume \"%.64s\" (%u AGs, %llu blocks free, "
+		"node slot %u%s)\n",
+		ds->s_label, sbi->s_ag_count, sbi->s_free_blocks,
+		sbi->s_node_slot,
+		sbi->s_clustered ? ", clustered" : "");
+
+	return 0;
+
+fail_journal:
+	ocsfs_cluster_exit(sb);
+	ocsfs_journal_exit(sb);
+fail_ags:
+	kvfree(sbi->s_ags);
+fail:
+	brelse(bh);
+	kfree(sbi);
+	sb->s_fs_info = NULL;
+	return ret;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * PUT SUPER — called during unmount
+ * ═══════════════════════════════════════════════════════════════ */
+
+void ocsfs_put_super(struct super_block *sb)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+
+	if (!sbi)
+		return;
+
+	ocsfs_cluster_exit(sb);
+	ocsfs_journal_exit(sb);
+	kvfree(sbi->s_ags);
+	brelse(sbi->s_sbh);
+	kfree(sbi);
+	sb->s_fs_info = NULL;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * STATFS
+ * ═══════════════════════════════════════════════════════════════ */
+
+int ocsfs_statfs(struct dentry *dentry, struct kstatfs *buf)
+{
+	struct super_block *sb = dentry->d_sb;
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	u64 free_inodes = 0;
+	u32 i;
+
+	buf->f_type = OCSFS_MAGIC;
+	buf->f_bsize = sbi->s_block_size;
+	buf->f_blocks = sbi->s_total_blocks;
+
+	/* Sum free blocks and inodes from all AGs */
+	for (i = 0; i < sbi->s_ag_count; i++) {
+		free_inodes += sbi->s_ags[i].free_inodes;
+	}
+
+	buf->f_bfree = sbi->s_free_blocks;
+	buf->f_bavail = sbi->s_free_blocks;
+	buf->f_files = sbi->s_total_blocks;     /* upper bound */
+	buf->f_ffree = free_inodes;
+	buf->f_namelen = OCSFS_MAX_NAME_LEN;
+	buf->f_frsize = sbi->s_block_size;
+
+	return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * SYNC FS
+ * ═══════════════════════════════════════════════════════════════ */
+
+int ocsfs_sync_fs(struct super_block *sb, int wait)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+
+	if (wait) {
+		down_write(&sbi->s_global_lock);
+		/* Flush superblock */
+		mark_buffer_dirty(sbi->s_sbh);
+		sync_dirty_buffer(sbi->s_sbh);
+		up_write(&sbi->s_global_lock);
+	}
+	return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * SUPER OPERATIONS TABLE
+ * ═══════════════════════════════════════════════════════════════ */
+
+const struct super_operations ocsfs_sops = {
+	.alloc_inode    = ocsfs_alloc_inode,
+	.free_inode     = ocsfs_free_inode,
+	.write_inode    = ocsfs_write_inode,
+	.evict_inode    = ocsfs_evict_inode,
+	.put_super      = ocsfs_put_super,
+	.statfs         = ocsfs_statfs,
+	.sync_fs        = ocsfs_sync_fs,
+};
+
+/* ═══════════════════════════════════════════════════════════════
+ * CLUSTER INIT / EXIT
+ *
+ * Initializes all Phase 2 clustering subsystems:
+ *   - Node slot management (claim a slot)
+ *   - SCSI PR registration
+ *   - Distributed lock manager
+ *   - Heartbeat thread
+ *   - Recovery work queue
+ *
+ * In single-node mode (max_nodes == 1 or mount option "nocluster"),
+ * clustering is disabled and these are no-ops.
+ * ═══════════════════════════════════════════════════════════════ */
+
+int ocsfs_cluster_init(struct super_block *sb)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	int ret;
+
+	/* Determine if clustering is enabled */
+	sbi->s_clustered = (sbi->s_max_nodes > 1);
+
+	if (!sbi->s_clustered) {
+		pr_info("ocsfs: single-node mode (max_nodes=1)\n");
+		sbi->s_node_slot = 0;
+		sbi->s_mount_gen = 1;
+		/* Still init DLM for consistent code paths */
+		ocsfs_dlm_init(sb);
+		ocsfs_recovery_init(sb);
+		return 0;
+	}
+
+	/* Initialize recovery subsystem first (needs to be ready) */
+	ret = ocsfs_recovery_init(sb);
+	if (ret)
+		return ret;
+
+	/* Initialize distributed lock manager */
+	ret = ocsfs_dlm_init(sb);
+	if (ret)
+		goto fail_recovery;
+
+	/* Claim a node slot + register PR key */
+	ret = ocsfs_node_init(sb);
+	if (ret)
+		goto fail_dlm;
+
+	/* Start heartbeat thread */
+	ret = ocsfs_heartbeat_start(sb);
+	if (ret)
+		goto fail_node;
+
+	pr_info("ocsfs: cluster mode active (slot %u, gen %u, "
+		"PR key 0x%016llx)\n",
+		sbi->s_node_slot, sbi->s_mount_gen, sbi->s_pr.pr_key);
+	return 0;
+
+fail_node:
+	ocsfs_node_exit(sb);
+fail_dlm:
+	ocsfs_dlm_exit(sb);
+fail_recovery:
+	ocsfs_recovery_exit(sb);
+	return ret;
+}
+
+void ocsfs_cluster_exit(struct super_block *sb)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+
+	if (sbi->s_clustered) {
+		ocsfs_heartbeat_stop(sb);
+		ocsfs_dlm_exit(sb);
+		ocsfs_node_exit(sb);
+	}
+	ocsfs_recovery_exit(sb);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * MOUNT / MODULE INIT
+ * ═══════════════════════════════════════════════════════════════ */
+
+static struct dentry *ocsfs_mount(struct file_system_type *fs_type,
+				  int flags, const char *dev_name,
+				  void *data)
+{
+	return mount_bdev(fs_type, flags, dev_name, data, ocsfs_fill_super);
+}
+
+static void ocsfs_kill_sb(struct super_block *sb)
+{
+	kill_block_super(sb);
+}
+
+static struct file_system_type ocsfs_fs_type = {
+	.owner          = THIS_MODULE,
+	.name           = "ocsfs",
+	.mount          = ocsfs_mount,
+	.kill_sb        = ocsfs_kill_sb,
+	.fs_flags       = FS_REQUIRES_DEV,
+};
+
+static int __init ocsfs_init(void)
+{
+	int ret;
+
+	ocsfs_inode_cachep = kmem_cache_create("ocsfs_inode_cache",
+					       sizeof(struct ocsfs_inode_info),
+					       0,
+					       SLAB_RECLAIM_ACCOUNT |
+					       SLAB_ACCOUNT,
+					       ocsfs_inode_init_once);
+	if (!ocsfs_inode_cachep)
+		return -ENOMEM;
+
+	ret = register_filesystem(&ocsfs_fs_type);
+	if (ret) {
+		kmem_cache_destroy(ocsfs_inode_cachep);
+		return ret;
+	}
+
+	pr_info("ocsfs: Open Cluster Shared FileSystem v%d.%d loaded\n",
+		OCSFS_VERSION_MAJOR, OCSFS_VERSION_MINOR);
+	return 0;
+}
+
+static void __exit ocsfs_exit(void)
+{
+	unregister_filesystem(&ocsfs_fs_type);
+
+	/* Wait for outstanding RCU callbacks before destroying cache */
+	rcu_barrier();
+	kmem_cache_destroy(ocsfs_inode_cachep);
+
+	pr_info("ocsfs: module unloaded\n");
+}
+
+module_init(ocsfs_init);
+module_exit(ocsfs_exit);
+
+MODULE_AUTHOR("OCSFS Project Contributors");
+MODULE_DESCRIPTION("OCSFS — Open Cluster Shared FileSystem");
+MODULE_LICENSE("GPL");
+MODULE_ALIAS_FS("ocsfs");
