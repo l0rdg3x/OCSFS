@@ -18,7 +18,8 @@
 
 #include "ocsfs.h"
 
-#define OCSFS_JOURNAL_NODE_SLOT  0  /* Phase 1: always node 0 */
+/* Default node slot for single-node mode */
+#define OCSFS_JOURNAL_NODE_SLOT  0
 
 /* ═══════════════════════════════════════════════════════════════
  * JOURNAL INIT / EXIT
@@ -462,4 +463,82 @@ int ocsfs_journal_replay(struct super_block *sb)
 			replayed);
 
 	return 0;
+}
+
+/*
+ * Replay a specific node's journal (Phase 2: recovery of failed node).
+ * Sets up a temporary ocsfs_journal for the target node's journal
+ * region and replays it.
+ */
+int ocsfs_journal_replay_node(struct super_block *sb, u16 node_slot)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	struct ocsfs_journal tmp_j;
+	struct ocsfs_disk_journal_hdr *jh;
+	struct buffer_head *bh;
+	u64 journal_off;
+	u32 journal_size;
+	int ret;
+
+	journal_size = le32_to_cpu(sbi->s_ds->s_journal_size);
+	journal_off = le64_to_cpu(sbi->s_ds->s_journal_off) +
+		      (u64)node_slot * journal_size;
+
+	memset(&tmp_j, 0, sizeof(tmp_j));
+	tmp_j.disk_off = journal_off;
+	tmp_j.size = journal_size;
+	mutex_init(&tmp_j.j_lock);
+
+	/* Read the target node's journal header */
+	bh = sb_bread(sb, journal_off / sbi->s_block_size);
+	if (!bh) {
+		pr_err("ocsfs: failed to read journal header for node %u\n",
+		       node_slot);
+		return -EIO;
+	}
+
+	jh = (struct ocsfs_disk_journal_hdr *)bh->b_data;
+
+	if (le32_to_cpu(jh->jh_magic) != OCSFS_JOURNAL_MAGIC) {
+		pr_info("ocsfs: node %u journal not initialized, skipping\n",
+			node_slot);
+		brelse(bh);
+		return 0;
+	}
+
+	tmp_j.head = le64_to_cpu(jh->jh_head);
+	tmp_j.tail = le64_to_cpu(jh->jh_tail);
+	tmp_j.sequence = le64_to_cpu(jh->jh_sequence);
+	tmp_j.j_header_bh = bh;
+
+	if (tmp_j.tail == tmp_j.head) {
+		pr_info("ocsfs: node %u journal is clean\n", node_slot);
+		brelse(bh);
+		return 0;
+	}
+
+	pr_info("ocsfs: replaying journal for node %u "
+		"(tail=%llu head=%llu)\n",
+		node_slot, tmp_j.tail, tmp_j.head);
+
+	/*
+	 * Temporarily swap in the target journal and replay it.
+	 * This reuses the same replay logic from ocsfs_journal_replay.
+	 */
+	{
+		struct ocsfs_journal saved = sbi->s_journal;
+		sbi->s_journal = tmp_j;
+		ret = ocsfs_journal_replay(sb);
+		sbi->s_journal = saved;
+	}
+
+	/* Reset the replayed journal to clean state */
+	jh->jh_head = jh->jh_tail;
+	jh->jh_checksum = cpu_to_le32(
+		ocsfs_crc32c(~0U, jh, sizeof(*jh) - sizeof(__le32)));
+	mark_buffer_dirty(bh);
+	sync_dirty_buffer(bh);
+	brelse(bh);
+
+	return ret;
 }

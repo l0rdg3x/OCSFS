@@ -223,6 +223,13 @@ int ocsfs_fill_super(struct super_block *sb, void *data, int silent)
 		goto fail_journal;
 	}
 
+	/* Initialize clustering subsystem */
+	ret = ocsfs_cluster_init(sb);
+	if (ret) {
+		pr_err("ocsfs: cluster init failed\n");
+		goto fail_journal;
+	}
+
 	/* Read root inode */
 	root_inode = ocsfs_iget(sb, OCSFS_ROOT_INO);
 	if (IS_ERR(root_inode)) {
@@ -249,12 +256,16 @@ int ocsfs_fill_super(struct super_block *sb, void *data, int silent)
 	mark_buffer_dirty(bh);
 	sync_dirty_buffer(bh);
 
-	pr_info("ocsfs: mounted volume \"%.64s\" (%u AGs, %llu blocks free)\n",
-		ds->s_label, sbi->s_ag_count, sbi->s_free_blocks);
+	pr_info("ocsfs: mounted volume \"%.64s\" (%u AGs, %llu blocks free, "
+		"node slot %u%s)\n",
+		ds->s_label, sbi->s_ag_count, sbi->s_free_blocks,
+		sbi->s_node_slot,
+		sbi->s_clustered ? ", clustered" : "");
 
 	return 0;
 
 fail_journal:
+	ocsfs_cluster_exit(sb);
 	ocsfs_journal_exit(sb);
 fail_ags:
 	kvfree(sbi->s_ags);
@@ -276,6 +287,7 @@ void ocsfs_put_super(struct super_block *sb)
 	if (!sbi)
 		return;
 
+	ocsfs_cluster_exit(sb);
 	ocsfs_journal_exit(sb);
 	kvfree(sbi->s_ags);
 	brelse(sbi->s_sbh);
@@ -344,6 +356,84 @@ const struct super_operations ocsfs_sops = {
 	.statfs         = ocsfs_statfs,
 	.sync_fs        = ocsfs_sync_fs,
 };
+
+/* ═══════════════════════════════════════════════════════════════
+ * CLUSTER INIT / EXIT
+ *
+ * Initializes all Phase 2 clustering subsystems:
+ *   - Node slot management (claim a slot)
+ *   - SCSI PR registration
+ *   - Distributed lock manager
+ *   - Heartbeat thread
+ *   - Recovery work queue
+ *
+ * In single-node mode (max_nodes == 1 or mount option "nocluster"),
+ * clustering is disabled and these are no-ops.
+ * ═══════════════════════════════════════════════════════════════ */
+
+int ocsfs_cluster_init(struct super_block *sb)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	int ret;
+
+	/* Determine if clustering is enabled */
+	sbi->s_clustered = (sbi->s_max_nodes > 1);
+
+	if (!sbi->s_clustered) {
+		pr_info("ocsfs: single-node mode (max_nodes=1)\n");
+		sbi->s_node_slot = 0;
+		sbi->s_mount_gen = 1;
+		/* Still init DLM for consistent code paths */
+		ocsfs_dlm_init(sb);
+		ocsfs_recovery_init(sb);
+		return 0;
+	}
+
+	/* Initialize recovery subsystem first (needs to be ready) */
+	ret = ocsfs_recovery_init(sb);
+	if (ret)
+		return ret;
+
+	/* Initialize distributed lock manager */
+	ret = ocsfs_dlm_init(sb);
+	if (ret)
+		goto fail_recovery;
+
+	/* Claim a node slot + register PR key */
+	ret = ocsfs_node_init(sb);
+	if (ret)
+		goto fail_dlm;
+
+	/* Start heartbeat thread */
+	ret = ocsfs_heartbeat_start(sb);
+	if (ret)
+		goto fail_node;
+
+	pr_info("ocsfs: cluster mode active (slot %u, gen %u, "
+		"PR key 0x%016llx)\n",
+		sbi->s_node_slot, sbi->s_mount_gen, sbi->s_pr.pr_key);
+	return 0;
+
+fail_node:
+	ocsfs_node_exit(sb);
+fail_dlm:
+	ocsfs_dlm_exit(sb);
+fail_recovery:
+	ocsfs_recovery_exit(sb);
+	return ret;
+}
+
+void ocsfs_cluster_exit(struct super_block *sb)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+
+	if (sbi->s_clustered) {
+		ocsfs_heartbeat_stop(sb);
+		ocsfs_dlm_exit(sb);
+		ocsfs_node_exit(sb);
+	}
+	ocsfs_recovery_exit(sb);
+}
 
 /* ═══════════════════════════════════════════════════════════════
  * MOUNT / MODULE INIT

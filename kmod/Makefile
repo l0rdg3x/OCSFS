@@ -13,7 +13,8 @@ PWD  := $(shell pwd)
 
 # When building out-of-tree, CONFIG_OCSFS_FS=m
 obj-m += ocsfs.o
-ocsfs-y := super.o inode.o dir.o file.o extent.o journal.o bitmap.o
+ocsfs-y := super.o inode.o dir.o file.o extent.o journal.o bitmap.o \
+           scsi_pr.o lock.o heartbeat.o node.o recovery.o
 
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules

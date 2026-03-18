@@ -21,7 +21,7 @@ to VMware's VMFS.
 - **Proxmox VE integration** — First-class storage plugin supporting all
   content types (images, ISO, templates, backups).
 
-## Current Status: Phase 1 — Kernel Module (single-node)
+## Current Status: Phase 2 — Multi-Node Clustering
 
 ### Phase 0 — Prototype (complete)
 
@@ -43,7 +43,7 @@ to VMware's VMFS.
 | `tools/ocsfs_tool.c` | Complete | Admin CLI (info, nodes, locks, df, check) |
 | `tests/test_ocsfs.c` | 36/36 pass | Comprehensive test suite (1770 assertions) |
 
-### Phase 1 — Kernel Module (in progress)
+### Phase 1 — Kernel Module (complete)
 
 | Component | Status | Description |
 |-----------|--------|-------------|
@@ -55,11 +55,33 @@ to VMware's VMFS.
 | `kmod/extent.c` | Complete | Inline extent manager (lookup, insert, truncate, merge) |
 | `kmod/journal.c` | Complete | WAL journal with crash recovery (replay on mount) |
 | `kmod/bitmap.c` | Complete | Block bitmap + inode number allocator per-AG |
-| `kmod/Kbuild` | Complete | In-tree kernel build rules |
-| `kmod/Makefile` | Complete | Out-of-tree module build |
-| `kmod/dkms.conf` | Complete | DKMS auto-install configuration |
 
 **Milestone:** Single-node read/write with crash recovery.
+
+### Phase 2 — Multi-Node Clustering (in progress)
+
+| Component | Status | Description |
+|-----------|--------|-------------|
+| `kmod/scsi_pr.c` | Complete | SCSI-3 Persistent Reservations (register, preempt, fencing) |
+| `kmod/lock.c` | Complete | On-disk distributed lock manager (CAS-based acquire/release) |
+| `kmod/heartbeat.c` | Complete | Storage-path heartbeat writer + failure detection kthread |
+| `kmod/node.c` | Complete | Node slot table management (claim, release, state machine) |
+| `kmod/recovery.c` | Complete | 5-phase crash recovery (elect, fence, replay, locks, cleanup) |
+
+**Milestone:** 2-node concurrent mount and I/O.
+
+#### Clustering Architecture
+
+- **On-disk locking:** All lock state in the 1 MB Lock Table on the shared LUN.
+  No external lock manager, no network dependency. Uses CAS-style versioned entries.
+- **Heartbeat:** Background kthread writes timestamp to shared LUN every 5s.
+  Detects failures after 15s (3 missed intervals). Tests actual I/O path, not network.
+- **SCSI-3 PR fencing:** Hardware-level fencing via PREEMPT AND ABORT.
+  SAN fabric rejects I/O from fenced node's HBA — eliminates zombie nodes.
+- **Recovery protocol:** Leader election (lowest slot), PR fencing, journal replay,
+  lock table scan, slot cleanup. Fully automated, no manual intervention.
+- **Graceful fallback:** Non-SCSI devices (loopback, files) skip PR commands
+  and operate in single-node mode.
 
 ## Building
 
@@ -160,13 +182,18 @@ ocsfs/
 │   └── fuse_main.c          # FUSE3 filesystem prototype
 ├── kmod/
 │   ├── ocsfs.h              # Internal kernel header
-│   ├── super.c              # Superblock, mount, module init
+│   ├── super.c              # Superblock, mount, module init, cluster init
 │   ├── inode.c              # VFS inode operations
 │   ├── dir.c                # VFS directory operations
 │   ├── file.c               # VFS file + address_space operations
 │   ├── extent.c             # Inline extent manager
 │   ├── journal.c            # WAL journaling + crash recovery
 │   ├── bitmap.c             # Block/inode bitmap allocator
+│   ├── scsi_pr.c            # SCSI-3 Persistent Reservations
+│   ├── lock.c               # On-disk distributed lock manager
+│   ├── heartbeat.c          # Storage-path heartbeat kthread
+│   ├── node.c               # Node slot table management
+│   ├── recovery.c           # 5-phase crash recovery protocol
 │   ├── Kbuild               # In-tree build rules
 │   ├── Makefile             # Out-of-tree build
 │   └── dkms.conf            # DKMS configuration
@@ -185,8 +212,8 @@ ocsfs/
 | Phase | Description | Status |
 |-------|-------------|--------|
 | Phase 0 | FUSE prototype — validate on-disk format | Complete |
-| Phase 1 | Kernel module — single-node read/write + crash recovery | **In progress** |
-| Phase 2 | Multi-node — distributed locking, heartbeat, recovery | Planned |
+| Phase 1 | Kernel module — single-node read/write + crash recovery | Complete |
+| Phase 2 | Multi-node — distributed locking, heartbeat, recovery | **In progress** |
 | Phase 3 | Performance — direct I/O, iomap, readahead, prealloc | Planned |
 | Phase 4 | Proxmox VE integration — storage plugin | Planned |
 | Phase 5 | Mainline kernel submission | Planned |

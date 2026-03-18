@@ -32,6 +32,13 @@
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/parser.h>
+#include <linux/kthread.h>
+#include <linux/delay.h>
+#include <linux/workqueue.h>
+#include <scsi/scsi.h>
+#include <scsi/scsi_device.h>
+#include <scsi/scsi_cmnd.h>
+#include <scsi/sg.h>
 
 /* ═══════════════════════════════════════════════════════════════
  * ON-DISK CONSTANTS (mirrored from userspace ocsfs.h)
@@ -116,6 +123,58 @@
 
 #define OCSFS_JBR_BEFORE        0x01
 #define OCSFS_JBR_AFTER         0x02
+
+/* Node slot states */
+#define OCSFS_NODE_FREE         0x00
+#define OCSFS_NODE_ACTIVE       0x01
+#define OCSFS_NODE_EVICTING     0x02
+#define OCSFS_NODE_DEAD         0xFF
+
+/* Lock modes */
+#define OCSFS_LOCK_NL           0   /* Null */
+#define OCSFS_LOCK_SH           1   /* Shared (read) */
+#define OCSFS_LOCK_EX           2   /* Exclusive (write) */
+#define OCSFS_LOCK_CW           3   /* Concurrent Write */
+
+/* Lock resource types */
+#define OCSFS_LOCKRES_INODE     1
+#define OCSFS_LOCKRES_AG        2
+#define OCSFS_LOCKRES_JOURNAL   3
+#define OCSFS_LOCKRES_RENAME    4
+#define OCSFS_LOCKRES_RECOVERY  5
+#define OCSFS_LOCKRES_SUPER     6
+
+/* Heartbeat constants */
+#define OCSFS_HB_INTERVAL_MS    5000   /* write every 5s */
+#define OCSFS_HB_TIMEOUT_MS     15000  /* 3 missed = dead */
+#define OCSFS_HB_CHECK_MS       2000   /* check peers every 2s */
+
+/* Lock acquisition retry */
+#define OCSFS_LOCK_RETRY_MIN_US 1000   /* 1 ms */
+#define OCSFS_LOCK_RETRY_MAX_US 100000 /* 100 ms */
+#define OCSFS_LOCK_MAX_RETRIES  50
+
+/* Recovery phases */
+#define OCSFS_RECOVERY_ELECT    1
+#define OCSFS_RECOVERY_FENCE    2
+#define OCSFS_RECOVERY_JOURNAL  3
+#define OCSFS_RECOVERY_LOCKS    4
+#define OCSFS_RECOVERY_CLEANUP  5
+
+/* SCSI PR service action codes */
+#define OCSFS_PR_REGISTER                0x00
+#define OCSFS_PR_RESERVE                 0x01
+#define OCSFS_PR_RELEASE                 0x02
+#define OCSFS_PR_CLEAR                   0x03
+#define OCSFS_PR_PREEMPT                 0x04
+#define OCSFS_PR_PREEMPT_AND_ABORT       0x05
+#define OCSFS_PR_REGISTER_AND_IGNORE     0x06
+
+/* SCSI PR types */
+#define OCSFS_PR_TYPE_WRITE_EXCL         0x01
+#define OCSFS_PR_TYPE_EXCL_ACCESS        0x03
+#define OCSFS_PR_TYPE_WRITE_EXCL_REG     0x05
+#define OCSFS_PR_TYPE_EXCL_ACCESS_REG    0x06
 
 /* ═══════════════════════════════════════════════════════════════
  * ON-DISK STRUCTURES (little-endian on disk)
@@ -239,6 +298,51 @@ struct ocsfs_disk_journal_bref {
 	__le32  jbr_checksum;
 } __packed;
 
+/* Node Slot — 256 bytes, up to 256 nodes */
+struct ocsfs_disk_node_slot {
+	__u8    ns_uuid[16];
+	__u8    ns_name[64];
+	__u8    ns_state;
+	__u8    ns_reserved1;
+	__le16  ns_slot_id;
+	__le32  ns_mount_gen;
+	__le64  ns_mount_time;
+	__le64  ns_last_heartbeat;
+	__le64  ns_pr_key;
+	__u8    ns_reserved2[140];
+	__le32  ns_checksum;
+} __packed;
+
+/* Heartbeat Entry — 1024 bytes per node */
+struct ocsfs_disk_heartbeat {
+	__le32  hb_magic;
+	__le16  hb_node_slot;
+	__le16  hb_state;
+	__le64  hb_timestamp;
+	__le64  hb_sequence;
+	__le32  hb_mount_gen;
+	__u8    hb_reserved[992];
+	__le32  hb_checksum;
+} __packed;
+
+/* Lock Table Entry — 256 bytes */
+struct ocsfs_disk_lock {
+	__le32  le_magic;
+	__le64  le_resource_id;
+	__le32  le_resource_type;
+	__le16  le_mode;
+	__le16  le_holder_slot;
+	__le32  le_holder_gen;
+	__le64  le_grant_time;
+	__le32  le_sh_holders;           /* bitmask: nodes 0-31 */
+	__u8    le_sh_holders_ext[32];   /* nodes 32-255 */
+	__u8    le_waiters[32];          /* waiting node bitmask */
+	__u8    le_waiter_modes[64];     /* 2 bits per waiter */
+	__le32  le_version;              /* CAS version */
+	__u8    le_reserved[84];
+	__le32  le_checksum;
+} __packed;
+
 /* ═══════════════════════════════════════════════════════════════
  * IN-MEMORY STRUCTURES
  * ═══════════════════════════════════════════════════════════════ */
@@ -292,6 +396,41 @@ struct ocsfs_txn_buf {
 	u64                     block_num;
 };
 
+/* In-memory lock resource — cached lock state */
+struct ocsfs_lock_res {
+	u64             lr_resource_id;
+	u32             lr_resource_type;
+	u16             lr_mode;         /* currently held mode */
+	u16             lr_slot;         /* lock table slot index */
+	struct mutex    lr_mutex;        /* local serialization */
+	struct list_head lr_list;        /* link in sb's active lock list */
+};
+
+/* Node info — in-memory representation of a peer node */
+struct ocsfs_node_info {
+	u16             ni_slot;
+	u8              ni_state;        /* OCSFS_NODE_* */
+	u32             ni_mount_gen;
+	u64             ni_pr_key;
+	u64             ni_last_hb;      /* last heartbeat timestamp we saw */
+	u64             ni_hb_sequence;
+	u8              ni_uuid[16];
+	char            ni_name[64];
+};
+
+/* Heartbeat thread state */
+struct ocsfs_heartbeat_info {
+	struct task_struct      *hb_thread;
+	bool                    hb_running;
+	u64                     hb_sequence;     /* our monotonic counter */
+};
+
+/* SCSI PR state */
+struct ocsfs_pr_info {
+	u64             pr_key;          /* our registration key */
+	bool            pr_registered;
+};
+
 /* Superblock in-memory info — stored in sb->s_fs_info */
 struct ocsfs_sb_info {
 	struct ocsfs_disk_super *s_ds;          /* raw superblock copy */
@@ -312,7 +451,7 @@ struct ocsfs_sb_info {
 	/* Allocation groups */
 	struct ocsfs_ag_info    *s_ags;         /* array [s_ag_count] */
 
-	/* Journal (single-node: node slot 0) */
+	/* Journal */
 	struct ocsfs_journal    s_journal;
 
 	/* Inode cache */
@@ -321,6 +460,35 @@ struct ocsfs_sb_info {
 	/* Locks */
 	struct rw_semaphore     s_global_lock;  /* global metadata lock */
 	spinlock_t              s_free_lock;    /* protects s_free_blocks */
+
+	/* === Phase 2: Clustering === */
+
+	/* This node's identity */
+	u16             s_node_slot;            /* our slot in node table */
+	u32             s_mount_gen;            /* our mount generation */
+	u8              s_node_uuid[16];        /* machine UUID */
+	char            s_node_name[64];        /* hostname */
+	bool            s_clustered;            /* multi-node mode active */
+
+	/* Node table */
+	struct ocsfs_node_info  s_nodes[OCSFS_MAX_NODES];
+	spinlock_t              s_node_lock;
+
+	/* Heartbeat */
+	struct ocsfs_heartbeat_info s_hb;
+
+	/* SCSI PR */
+	struct ocsfs_pr_info    s_pr;
+
+	/* Distributed lock manager */
+	struct list_head        s_lock_list;    /* active lock_res list */
+	spinlock_t              s_lock_list_lock;
+
+	/* Recovery */
+	struct work_struct      s_recovery_work;
+	u16                     s_recovery_target; /* slot being recovered */
+	bool                    s_recovery_in_progress;
+	struct mutex            s_recovery_lock;
 };
 
 /* Per-inode in-memory info — wraps struct inode */
@@ -470,5 +638,75 @@ int ocsfs_txn_add_bh(struct ocsfs_txn *txn, struct buffer_head *bh);
 int ocsfs_txn_commit(struct ocsfs_txn *txn);
 void ocsfs_txn_abort(struct ocsfs_txn *txn);
 int ocsfs_journal_replay(struct super_block *sb);
+int ocsfs_journal_replay_node(struct super_block *sb, u16 node_slot);
+
+/* scsi_pr.c — SCSI-3 Persistent Reservations */
+int ocsfs_pr_register(struct super_block *sb, u64 key);
+int ocsfs_pr_unregister(struct super_block *sb);
+int ocsfs_pr_reserve(struct super_block *sb, u8 type);
+int ocsfs_pr_release(struct super_block *sb, u8 type);
+int ocsfs_pr_preempt(struct super_block *sb, u64 victim_key, u8 type);
+int ocsfs_pr_preempt_abort(struct super_block *sb, u64 victim_key, u8 type);
+u64 ocsfs_pr_make_key(const u8 *uuid, u32 mount_gen);
+
+/* lock.c — Distributed on-disk lock manager */
+int ocsfs_dlm_init(struct super_block *sb);
+void ocsfs_dlm_exit(struct super_block *sb);
+struct ocsfs_lock_res *ocsfs_lock_alloc(struct super_block *sb,
+					u64 resource_id, u32 resource_type);
+void ocsfs_lock_free(struct ocsfs_lock_res *lr);
+int ocsfs_lock_acquire(struct super_block *sb, struct ocsfs_lock_res *lr,
+		       u16 mode);
+int ocsfs_lock_release(struct super_block *sb, struct ocsfs_lock_res *lr);
+int ocsfs_lock_downgrade(struct super_block *sb, struct ocsfs_lock_res *lr,
+			 u16 new_mode);
+int ocsfs_lock_recover_node(struct super_block *sb, u16 node_slot,
+			    u32 mount_gen);
+
+/* Resource ID hashing */
+static inline u64 ocsfs_lock_hash_inode(u64 ino)
+{
+	u64 h = 0xcbf29ce484222325ULL;
+	h ^= ino;
+	h *= 0x100000001b3ULL;
+	h ^= (ino >> 32);
+	h *= 0x100000001b3ULL;
+	return h;
+}
+
+static inline u64 ocsfs_lock_hash_ag(u32 ag_num)
+{
+	return ocsfs_lock_hash_inode((u64)ag_num | 0xA600000000000000ULL);
+}
+
+static inline u32 ocsfs_lock_table_slot(u64 resource_id)
+{
+	return (u32)(resource_id % OCSFS_LOCK_ENTRY_COUNT);
+}
+
+/* heartbeat.c — Storage-path heartbeat */
+int ocsfs_heartbeat_start(struct super_block *sb);
+void ocsfs_heartbeat_stop(struct super_block *sb);
+int ocsfs_heartbeat_write(struct super_block *sb);
+int ocsfs_heartbeat_check_peers(struct super_block *sb);
+bool ocsfs_node_is_alive(struct super_block *sb, u16 slot);
+
+/* node.c — Node slot table management */
+int ocsfs_node_init(struct super_block *sb);
+void ocsfs_node_exit(struct super_block *sb);
+int ocsfs_node_claim_slot(struct super_block *sb);
+int ocsfs_node_release_slot(struct super_block *sb);
+int ocsfs_node_read_table(struct super_block *sb);
+int ocsfs_node_mark_dead(struct super_block *sb, u16 slot);
+
+/* recovery.c — Multi-phase crash recovery */
+int ocsfs_recovery_init(struct super_block *sb);
+void ocsfs_recovery_exit(struct super_block *sb);
+void ocsfs_recovery_trigger(struct super_block *sb, u16 failed_slot);
+int ocsfs_recovery_run(struct super_block *sb, u16 failed_slot);
+
+/* cluster init/exit (called from super.c) */
+int ocsfs_cluster_init(struct super_block *sb);
+void ocsfs_cluster_exit(struct super_block *sb);
 
 #endif /* _OCSFS_KMOD_H */
