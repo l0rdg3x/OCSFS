@@ -622,6 +622,8 @@ int ocsfs_extent_insert(struct inode *inode, u64 logical, u64 physical,
 			u32 len, u16 flags);
 int ocsfs_extent_truncate(struct inode *inode, u64 from_block);
 int ocsfs_extent_count_blocks(struct inode *inode, u64 *count);
+int ocsfs_extent_convert_unwritten(struct inode *inode, u64 logical_block,
+				   u32 len);
 
 /* bitmap.c */
 int ocsfs_alloc_blocks(struct super_block *sb, u32 ag_hint, u32 count,
@@ -708,5 +710,27 @@ int ocsfs_recovery_run(struct super_block *sb, u16 failed_slot);
 /* cluster init/exit (called from super.c) */
 int ocsfs_cluster_init(struct super_block *sb);
 void ocsfs_cluster_exit(struct super_block *sb);
+
+/* === Phase 3: Performance Optimization === */
+
+/* iomap.c — iomap-based I/O */
+extern const struct iomap_ops ocsfs_iomap_ops;
+extern const struct iomap_ops ocsfs_dio_iomap_ops;
+extern const struct address_space_operations ocsfs_iomap_aops;
+ssize_t ocsfs_file_read_iter(struct kiocb *iocb, struct iov_iter *to);
+ssize_t ocsfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from);
+
+/* alloc.c — Smart block allocation with preallocation */
+int ocsfs_alloc_extent(struct inode *inode, u64 logical_block,
+		       u32 requested, u32 *allocated, u64 *phys_out,
+		       u16 flags);
+int ocsfs_prealloc_blocks(struct inode *inode, u64 offset, u64 len);
+
+/* thin.c — Thin provisioning, fallocate, DISCARD */
+long ocsfs_fallocate(struct file *file, int mode, loff_t offset, loff_t len);
+int ocsfs_punch_hole(struct inode *inode, loff_t offset, loff_t len);
+int ocsfs_zero_range(struct inode *inode, loff_t offset, loff_t len);
+int ocsfs_discard_blocks(struct super_block *sb, u64 block, u32 count);
+void ocsfs_thin_stats(struct inode *inode, u64 *written, u64 *unwritten);
 
 #endif /* _OCSFS_KMOD_H */

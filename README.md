@@ -21,7 +21,7 @@ to VMware's VMFS.
 - **Proxmox VE integration** — First-class storage plugin supporting all
   content types (images, ISO, templates, backups).
 
-## Current Status: Phase 2 — Multi-Node Clustering
+## Current Status: Phase 3 — Performance Optimization (complete)
 
 ### Phase 0 — Prototype (complete)
 
@@ -58,7 +58,7 @@ to VMware's VMFS.
 
 **Milestone:** Single-node read/write with crash recovery.
 
-### Phase 2 — Multi-Node Clustering (in progress)
+### Phase 2 — Multi-Node Clustering (complete)
 
 | Component | Status | Description |
 |-----------|--------|-------------|
@@ -82,6 +82,35 @@ to VMware's VMFS.
   lock table scan, slot cleanup. Fully automated, no manual intervention.
 - **Graceful fallback:** Non-SCSI devices (loopback, files) skip PR commands
   and operate in single-node mode.
+
+### Phase 3 — Performance Optimization (complete)
+
+| Component | Status | Description |
+|-----------|--------|-------------|
+| `kmod/iomap.c` | Complete | iomap-based I/O: direct I/O (O_DIRECT), buffered I/O, readahead |
+| `kmod/alloc.c` | Complete | Smart allocator: goal-oriented, preallocation, AG affinity |
+| `kmod/thin.c` | Complete | Thin provisioning: fallocate, punch hole, zero range, DISCARD |
+| `kmod/file.c` | Updated | iomap read/write iter, fallocate integration, O_DIRECT support |
+| `kmod/extent.c` | Updated | UNWRITTEN extent conversion (split on partial write) |
+| `kmod/ocsfs.h` | Updated | Phase 3 function declarations (iomap, alloc, thin) |
+
+**Milestone:** Direct I/O, thin provisioning, and preallocation for VM workloads.
+
+#### Performance Architecture
+
+- **iomap I/O path:** Modern Linux I/O framework (used by XFS, ext4, btrfs).
+  Maps file logical offsets to physical device offsets; VFS handles I/O submission.
+  Replaces buffer_head-based I/O for data files.
+- **Direct I/O (O_DIRECT):** Zero-copy between userspace and block device via
+  `iomap_dio_rw()`. Critical for VM disk image I/O (QEMU raw format).
+- **Extent preallocation:** Speculative multi-block allocation reduces fragmentation.
+  8-256 blocks per allocation, scaled by file size. Goal-oriented placement
+  keeps files physically contiguous.
+- **Thin provisioning:** UNWRITTEN extents for `fallocate()` preallocation.
+  `FALLOC_FL_PUNCH_HOLE` returns blocks to pool. `DISCARD` passthrough to
+  SAN/SSD for physical space reclaim.
+- **UNWRITTEN conversion:** 4-way split on partial write (head/middle/tail/full).
+  Reads from UNWRITTEN extents return zeroes without I/O.
 
 ## Building
 
@@ -185,10 +214,13 @@ ocsfs/
 │   ├── super.c              # Superblock, mount, module init, cluster init
 │   ├── inode.c              # VFS inode operations
 │   ├── dir.c                # VFS directory operations
-│   ├── file.c               # VFS file + address_space operations
-│   ├── extent.c             # Inline extent manager
+│   ├── file.c               # VFS file + address_space operations (iomap)
+│   ├── extent.c             # Inline extent manager + UNWRITTEN conversion
 │   ├── journal.c            # WAL journaling + crash recovery
 │   ├── bitmap.c             # Block/inode bitmap allocator
+│   ├── iomap.c              # iomap-based I/O (direct I/O, buffered, readahead)
+│   ├── alloc.c              # Smart allocator (prealloc, goal-oriented, AG affinity)
+│   ├── thin.c               # Thin provisioning (fallocate, punch hole, DISCARD)
 │   ├── scsi_pr.c            # SCSI-3 Persistent Reservations
 │   ├── lock.c               # On-disk distributed lock manager
 │   ├── heartbeat.c          # Storage-path heartbeat kthread
@@ -213,8 +245,8 @@ ocsfs/
 |-------|-------------|--------|
 | Phase 0 | FUSE prototype — validate on-disk format | Complete |
 | Phase 1 | Kernel module — single-node read/write + crash recovery | Complete |
-| Phase 2 | Multi-node — distributed locking, heartbeat, recovery | **In progress** |
-| Phase 3 | Performance — direct I/O, iomap, readahead, prealloc | Planned |
+| Phase 2 | Multi-node — distributed locking, heartbeat, recovery | Complete |
+| Phase 3 | Performance — direct I/O, iomap, readahead, prealloc | Complete |
 | Phase 4 | Proxmox VE integration — storage plugin | Planned |
 | Phase 5 | Mainline kernel submission | Planned |
 

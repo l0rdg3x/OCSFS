@@ -4,17 +4,24 @@
  * File operations and address_space operations.
  *
  * Phase 1: buffer_head based I/O via get_block callback.
- * Future: direct I/O, iomap, multipage write.
+ * Phase 3: iomap-based I/O for direct I/O and buffered I/O,
+ *           fallocate (prealloc, punch hole, zero range),
+ *           O_DIRECT via iomap_dio_rw.
+ *
+ * The buffer_head path is kept as a fallback. The iomap path
+ * (defined in iomap.c) is used for read_iter/write_iter and
+ * the iomap address_space_ops are set on regular files.
  */
 
 #include "ocsfs.h"
+#include <linux/iomap.h>
 
 /* ═══════════════════════════════════════════════════════════════
  * GET_BLOCK — maps logical file block → physical disk block
  *
  * This is the core callback used by the buffer_head layer.
- * For read: look up the extent map and return the mapping.
- * For write (create=1): allocate new blocks if needed.
+ * Retained for directory I/O and other non-data paths.
+ * Data file I/O uses iomap (see iomap.c).
  * ═══════════════════════════════════════════════════════════════ */
 
 static int ocsfs_get_block(struct inode *inode, sector_t iblock,
@@ -74,7 +81,10 @@ static int ocsfs_get_block(struct inode *inode, sector_t iblock,
 }
 
 /* ═══════════════════════════════════════════════════════════════
- * ADDRESS SPACE OPERATIONS
+ * ADDRESS SPACE OPERATIONS — buffer_head fallback
+ *
+ * Used for directories and as fallback if iomap is not available.
+ * Regular files use ocsfs_iomap_aops (see iomap.c).
  * ═══════════════════════════════════════════════════════════════ */
 
 static int ocsfs_read_folio(struct file *file, struct folio *folio)
@@ -132,11 +142,14 @@ const struct address_space_operations ocsfs_aops = {
 
 /* ═══════════════════════════════════════════════════════════════
  * FILE OPERATIONS
+ *
+ * Phase 3: read_iter/write_iter use iomap (defined in iomap.c)
+ * for data files. O_DIRECT is handled transparently by the iomap
+ * read/write iter implementations.
  * ═══════════════════════════════════════════════════════════════ */
 
 static int ocsfs_open(struct inode *inode, struct file *file)
 {
-	/* Nothing special for Phase 1 */
 	return generic_file_open(inode, file);
 }
 
@@ -164,10 +177,11 @@ static int ocsfs_fsync(struct file *file, loff_t start, loff_t end,
 
 const struct file_operations ocsfs_file_fops = {
 	.llseek         = generic_file_llseek,
-	.read_iter      = generic_file_read_iter,
-	.write_iter     = generic_file_write_iter,
+	.read_iter      = ocsfs_file_read_iter,   /* iomap-based (iomap.c) */
+	.write_iter     = ocsfs_file_write_iter,  /* iomap-based (iomap.c) */
 	.mmap           = generic_file_mmap,
 	.open           = ocsfs_open,
 	.fsync          = ocsfs_fsync,
+	.fallocate      = ocsfs_fallocate,        /* thin.c */
 	.splice_read    = filemap_splice_read,
 };

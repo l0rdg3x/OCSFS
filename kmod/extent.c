@@ -4,6 +4,7 @@
  * Inline extent management for the kernel module.
  *
  * Phase 1: only inline extents (up to OCSFS_INLINE_EXTENTS per inode).
+ * Phase 3: UNWRITTEN extent support (convert on write for thin provisioning).
  * Future: B+ tree overflow for files with many extents.
  *
  * Extents are kept sorted by logical_block. Adjacent extents are merged
@@ -170,6 +171,127 @@ int ocsfs_extent_truncate(struct inode *inode, u64 from_block)
 			inode->i_blocks -= (u64)freed *
 					   (sbi->s_block_size / 512);
 			e->length = keep;
+		}
+	}
+
+	mark_inode_dirty(inode);
+	return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * CONVERT UNWRITTEN → WRITTEN
+ *
+ * Phase 3: When a write lands on an UNWRITTEN (preallocated) extent,
+ * convert the affected range to WRITTEN. This may split an extent
+ * if only part of it is being written.
+ *
+ * Called from iomap_begin() when writing to UNWRITTEN extents.
+ * Caller must hold i_extent_lock.
+ * ═══════════════════════════════════════════════════════════════ */
+
+int ocsfs_extent_convert_unwritten(struct inode *inode, u64 logical_block,
+				   u32 len)
+{
+	struct ocsfs_inode_info *oi = OCSFS_I(inode);
+	u16 i;
+
+	for (i = 0; i < oi->i_extent_count; i++) {
+		struct ocsfs_extent *e = &oi->i_extents[i];
+		u64 ext_end = e->logical_block + e->length;
+
+		if (!(e->flags & OCSFS_EXT_UNWRITTEN))
+			continue;
+
+		/* Check if this extent overlaps the convert range */
+		if (logical_block >= ext_end ||
+		    logical_block + len <= e->logical_block)
+			continue;
+
+		/*
+		 * Case 1: Convert the entire extent.
+		 * The simple and common case — the write covers the
+		 * whole UNWRITTEN extent.
+		 */
+		if (logical_block <= e->logical_block &&
+		    logical_block + len >= ext_end) {
+			e->flags = OCSFS_EXT_WRITTEN;
+			mark_inode_dirty(inode);
+			continue;
+		}
+
+		/*
+		 * Case 2: Convert a prefix of the extent.
+		 * Split into [WRITTEN prefix] + [UNWRITTEN tail].
+		 */
+		if (logical_block <= e->logical_block &&
+		    logical_block + len < ext_end) {
+			u32 cvt_len = (u32)(logical_block + len -
+					    e->logical_block);
+			u64 tail_logical = e->logical_block + cvt_len;
+			u64 tail_physical = e->physical_block + cvt_len;
+			u32 tail_len = e->length - cvt_len;
+
+			/* Shrink current to converted prefix */
+			e->length = cvt_len;
+			e->flags = OCSFS_EXT_WRITTEN;
+
+			/* Insert the UNWRITTEN tail */
+			ocsfs_extent_insert(inode, tail_logical,
+					    tail_physical, tail_len,
+					    OCSFS_EXT_UNWRITTEN);
+			mark_inode_dirty(inode);
+			return 0;
+		}
+
+		/*
+		 * Case 3: Convert a suffix of the extent.
+		 * Split into [UNWRITTEN head] + [WRITTEN suffix].
+		 */
+		if (logical_block > e->logical_block &&
+		    logical_block + len >= ext_end) {
+			u32 head_len = (u32)(logical_block - e->logical_block);
+			u64 cvt_physical = e->physical_block + head_len;
+			u32 cvt_len = e->length - head_len;
+
+			/* Shrink current to UNWRITTEN head */
+			e->length = head_len;
+
+			/* Insert the WRITTEN suffix */
+			ocsfs_extent_insert(inode, logical_block,
+					    cvt_physical, cvt_len,
+					    OCSFS_EXT_WRITTEN);
+			mark_inode_dirty(inode);
+			continue;
+		}
+
+		/*
+		 * Case 4: Convert the middle (3-way split).
+		 * [UNWRITTEN head] + [WRITTEN middle] + [UNWRITTEN tail]
+		 */
+		{
+			u32 head_len = (u32)(logical_block - e->logical_block);
+			u32 cvt_len = len;
+			u32 tail_len = (u32)(ext_end - (logical_block + len));
+			u64 cvt_physical = e->physical_block + head_len;
+			u64 tail_logical = logical_block + len;
+			u64 tail_physical = e->physical_block + head_len +
+					    cvt_len;
+
+			/* Shrink current to UNWRITTEN head */
+			e->length = head_len;
+
+			/* Insert WRITTEN middle */
+			ocsfs_extent_insert(inode, logical_block,
+					    cvt_physical, cvt_len,
+					    OCSFS_EXT_WRITTEN);
+
+			/* Insert UNWRITTEN tail */
+			ocsfs_extent_insert(inode, tail_logical,
+					    tail_physical, tail_len,
+					    OCSFS_EXT_UNWRITTEN);
+
+			mark_inode_dirty(inode);
+			return 0;
 		}
 	}
 
