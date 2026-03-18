@@ -5,6 +5,7 @@
 #   all        Build everything (tools + test)
 #   tools      Build mkfs.ocsfs and ocsfs-tool
 #   fuse       Build ocsfs-fuse (requires libfuse3-dev)
+#   kmod       Build kernel module (requires linux-headers)
 #   test       Build and run tests
 #   clean      Remove build artifacts
 #
@@ -56,7 +57,10 @@ TEST_BIN   = test_ocsfs
 
 # ─── Rules ──────────────────────────────────────────────────
 
-.PHONY: all tools fuse test clean
+# Kernel module
+KMOD_DIR = kmod
+
+.PHONY: all tools fuse kmod test clean
 
 all: tools test
 
@@ -80,6 +84,9 @@ $(FUSE_BIN): $(FUSE_SRC) $(COMMON_OBJS)
 	$(CC) $(CFLAGS) $(FUSE_CFLAGS) $(INCLUDES) -o $@ $^ $(LDFLAGS) $(FUSE_LDFLAGS)
 	@echo "  Built: $@"
 
+kmod:
+	$(MAKE) -C $(KMOD_DIR)
+
 %.o: %.c
 	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
 
@@ -94,6 +101,7 @@ test: $(TEST_BIN)
 clean:
 	rm -f $(COMMON_OBJS) $(PHASE0_OBJS) $(MKFS_BIN) $(TOOL_BIN) $(TEST_BIN) $(FUSE_BIN)
 	rm -f /tmp/ocsfs_test_*.img
+	-$(MAKE) -C $(KMOD_DIR) clean 2>/dev/null || true
 	@echo "  Cleaned."
 
 # ─── Development helpers ────────────────────────────────────

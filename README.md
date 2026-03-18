@@ -21,21 +21,45 @@ to VMware's VMFS.
 - **Proxmox VE integration** — First-class storage plugin supporting all
   content types (images, ISO, templates, backups).
 
-## Current Status: Phase 0 — Prototype
+## Current Status: Phase 1 — Kernel Module (single-node)
 
-This is the initial codebase containing:
+### Phase 0 — Prototype (complete)
 
 | Component | Status | Description |
 |-----------|--------|-------------|
-| `include/ocsfs.h` | ✅ Complete | On-disk format specification (all structures) |
-| `src/crc32c.c` | ✅ Complete | CRC32C checksum (Castagnoli polynomial) |
-| `src/bitmap.c` | ✅ Complete | Block bitmap allocator with extent search |
-| `src/extent.c` | ✅ Complete | Extent map (insert, lookup, merge, punch hole) |
-| `src/lock.c` | ✅ Complete | On-disk lock manager (CAS protocol) |
-| `src/heartbeat.c` | ✅ Complete | Heartbeat writer/reader with failure detection |
-| `tools/mkfs_ocsfs.c` | ✅ Complete | Volume formatter |
-| `tools/ocsfs_tool.c` | ✅ Complete | Admin CLI (info, nodes, locks, df, check) |
-| `tests/test_ocsfs.c` | ✅ 24/24 pass | Comprehensive test suite |
+| `include/ocsfs.h` | Complete | On-disk format specification (all structures) |
+| `include/ocsfs_btree.h` | Complete | B+ tree header |
+| `src/crc32c.c` | Complete | CRC32C checksum (Castagnoli polynomial) |
+| `src/bitmap.c` | Complete | Block bitmap allocator with extent search |
+| `src/extent.c` | Complete | Extent map (insert, lookup, merge, punch hole) |
+| `src/lock.c` | Complete | On-disk lock manager (CAS protocol) |
+| `src/heartbeat.c` | Complete | Heartbeat writer/reader with failure detection |
+| `src/btree.c` | Complete | B+ tree (insert, search, delete, range scan) |
+| `src/inode.c` | Complete | Inode allocator (userspace prototype) |
+| `src/journal.c` | Complete | Journal / WAL (userspace prototype) |
+| `src/dir.c` | Complete | Directory operations (userspace prototype) |
+| `src/fuse_main.c` | Complete | FUSE3 filesystem (requires libfuse3-dev) |
+| `tools/mkfs_ocsfs.c` | Complete | Volume formatter |
+| `tools/ocsfs_tool.c` | Complete | Admin CLI (info, nodes, locks, df, check) |
+| `tests/test_ocsfs.c` | 36/36 pass | Comprehensive test suite (1770 assertions) |
+
+### Phase 1 — Kernel Module (in progress)
+
+| Component | Status | Description |
+|-----------|--------|-------------|
+| `kmod/ocsfs.h` | Complete | Internal kernel header (on-disk + in-memory structs) |
+| `kmod/super.c` | Complete | Module init/exit, mount/unmount, fill_super, statfs |
+| `kmod/inode.c` | Complete | Inode read/write, alloc/free, setattr/getattr |
+| `kmod/dir.c` | Complete | Directory ops (lookup, create, mkdir, rmdir, rename, readdir) |
+| `kmod/file.c` | Complete | File ops + address_space ops (buffer_head I/O) |
+| `kmod/extent.c` | Complete | Inline extent manager (lookup, insert, truncate, merge) |
+| `kmod/journal.c` | Complete | WAL journal with crash recovery (replay on mount) |
+| `kmod/bitmap.c` | Complete | Block bitmap + inode number allocator per-AG |
+| `kmod/Kbuild` | Complete | In-tree kernel build rules |
+| `kmod/Makefile` | Complete | Out-of-tree module build |
+| `kmod/dkms.conf` | Complete | DKMS auto-install configuration |
+
+**Milestone:** Single-node read/write with crash recovery.
 
 ## Building
 
@@ -43,11 +67,24 @@ This is the initial codebase containing:
 # Dependencies (Debian/Ubuntu/Proxmox)
 apt install build-essential uuid-dev
 
-# Build everything
+# Build userspace tools + tests
 make all
 
 # Run tests
 make test
+
+# Build FUSE prototype (requires libfuse3-dev)
+make fuse
+
+# Build kernel module (requires linux-headers-$(uname -r))
+make kmod
+# or directly:
+cd kmod && make
+
+# DKMS install
+sudo dkms add kmod/
+sudo dkms build ocsfs/0.1.0
+sudo dkms install ocsfs/0.1.0
 
 # Demo: create a 1 GiB test image and inspect it
 make demo
@@ -70,10 +107,30 @@ dd if=/dev/zero of=/tmp/test.img bs=1M count=2048
 ./ocsfs-tool locks /tmp/test.img
 ```
 
+### Kernel Module Usage (Phase 1)
+
+```bash
+# Load module
+sudo insmod kmod/ocsfs.ko
+
+# Mount (requires a formatted block device or loopback)
+sudo losetup /dev/loop0 /tmp/test.img
+sudo mount -t ocsfs /dev/loop0 /mnt/ocsfs
+
+# Use as a normal filesystem
+ls /mnt/ocsfs
+echo "hello" > /mnt/ocsfs/test.txt
+
+# Unmount
+sudo umount /mnt/ocsfs
+sudo losetup -d /dev/loop0
+sudo rmmod ocsfs
+```
+
 ## Architecture
 
-See `OCSFS_Technical_Architecture_v0.1.docx` for the full 14-chapter
-technical specification covering:
+See `OCSFS_Technical_Architecture_v0.1.md` for the full technical
+specification covering:
 
 - VMFS deep analysis and feature mapping
 - On-disk layout (superblock, AGs, inodes, extents)
@@ -88,21 +145,51 @@ technical specification covering:
 ```
 ocsfs/
 ├── include/
-│   └── ocsfs.h          # On-disk format (shared kernel/userspace header)
+│   ├── ocsfs.h              # On-disk format (shared kernel/userspace)
+│   └── ocsfs_btree.h        # B+ tree interface
 ├── src/
-│   ├── crc32c.c          # CRC32C implementation
-│   ├── bitmap.c          # Block bitmap allocator
-│   ├── extent.c          # Extent manager (lookup, insert, merge, remove)
-│   ├── lock.c            # On-disk distributed lock manager
-│   └── heartbeat.c       # Heartbeat subsystem
+│   ├── crc32c.c             # CRC32C implementation
+│   ├── bitmap.c             # Block bitmap allocator (userspace)
+│   ├── extent.c             # Extent manager (userspace)
+│   ├── lock.c               # On-disk distributed lock manager
+│   ├── heartbeat.c          # Heartbeat subsystem
+│   ├── btree.c              # B+ tree implementation
+│   ├── inode.c              # Inode allocator (userspace)
+│   ├── journal.c            # Journal / WAL (userspace)
+│   ├── dir.c                # Directory operations (userspace)
+│   └── fuse_main.c          # FUSE3 filesystem prototype
+├── kmod/
+│   ├── ocsfs.h              # Internal kernel header
+│   ├── super.c              # Superblock, mount, module init
+│   ├── inode.c              # VFS inode operations
+│   ├── dir.c                # VFS directory operations
+│   ├── file.c               # VFS file + address_space operations
+│   ├── extent.c             # Inline extent manager
+│   ├── journal.c            # WAL journaling + crash recovery
+│   ├── bitmap.c             # Block/inode bitmap allocator
+│   ├── Kbuild               # In-tree build rules
+│   ├── Makefile             # Out-of-tree build
+│   └── dkms.conf            # DKMS configuration
 ├── tools/
-│   ├── mkfs_ocsfs.c      # mkfs.ocsfs formatter
-│   └── ocsfs_tool.c      # ocsfs-tool admin CLI
+│   ├── mkfs_ocsfs.c         # mkfs.ocsfs formatter
+│   └── ocsfs_tool.c         # ocsfs-tool admin CLI
 ├── tests/
-│   └── test_ocsfs.c      # Test suite
+│   └── test_ocsfs.c         # Test suite (36 tests, 1770 assertions)
 ├── Makefile
+├── .gitignore
 └── README.md
 ```
+
+## Development Roadmap
+
+| Phase | Description | Status |
+|-------|-------------|--------|
+| Phase 0 | FUSE prototype — validate on-disk format | Complete |
+| Phase 1 | Kernel module — single-node read/write + crash recovery | **In progress** |
+| Phase 2 | Multi-node — distributed locking, heartbeat, recovery | Planned |
+| Phase 3 | Performance — direct I/O, iomap, readahead, prealloc | Planned |
+| Phase 4 | Proxmox VE integration — storage plugin | Planned |
+| Phase 5 | Mainline kernel submission | Planned |
 
 ## License
 
