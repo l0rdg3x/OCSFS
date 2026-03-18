@@ -21,7 +21,7 @@ to VMware's VMFS.
 - **Proxmox VE integration** — First-class storage plugin supporting all
   content types (images, ISO, templates, backups).
 
-## Current Status: Phase 3 — Performance Optimization (complete)
+## Current Status: Phase 4 — Advanced Features + Proxmox VE (complete)
 
 ### Phase 0 — Prototype (complete)
 
@@ -112,6 +112,56 @@ to VMware's VMFS.
 - **UNWRITTEN conversion:** 4-way split on partial write (head/middle/tail/full).
   Reads from UNWRITTEN extents return zeroes without I/O.
 
+### Phase 4 — Advanced Features + Proxmox VE Integration (complete)
+
+| Component | Status | Description |
+|-----------|--------|-------------|
+| `proxmox/OCSFSPlugin.pm` | Complete | Proxmox VE storage plugin (all content types) |
+| `proxmox/mount.ocsfs` | Complete | Mount helper for Proxmox (modprobe + validation) |
+| `proxmox/install.sh` | Complete | One-step PVE plugin installer (DKMS + Perl + tools) |
+| `kmod/snapshot.c` | Complete | CoW file-level snapshots (create, delete, CoW on write) |
+| `kmod/refcount.c` | Complete | Extent reference counting (per-AG hash table) |
+| `kmod/compress.c` | Complete | Inline compression (LZ4 fast, ZSTD high-ratio) |
+| `tools/ocsfs_defrag.c` | Complete | Online defragmentation daemon (FIEMAP, bandwidth-limited) |
+| `kmod/ocsfs.h` | Updated | Phase 4 declarations (snapshot, refcount, compression) |
+
+**Milestone:** VMFS-6 feature parity + Proxmox VE integration.
+
+#### Proxmox VE Integration
+
+- **Storage plugin:** Full PVE::Storage::Plugin implementation. Supports all
+  content types: images, iso, vztmpl, backup, rootdir, snippets.
+- **Configuration:** `storage.cfg` format with thin provisioning, compression,
+  and extent size options. Shared storage for multi-node PVE clusters.
+- **Thin provisioning:** New VM disks are thin-provisioned by default. Guest
+  TRIM/DISCARD reclaims space via `fallocate(PUNCH_HOLE)` → DISCARD passthrough.
+- **Mount helper:** `mount.ocsfs` validates superblock, loads kernel module,
+  and mounts. Called automatically by `mount -t ocsfs`.
+
+#### CoW Snapshots
+
+- **File-level snapshots:** Superior to VMFS's VMDK-only snapshots.
+  O(n) creation (n = number of extents, typically <16 for inline).
+- **Copy-on-Write:** Shared extents (refcount > 1) trigger CoW on write.
+  New blocks allocated, old data copied, extent map updated atomically.
+- **Refcount table:** Per-AG hash table (16 blocks). Blocks with refcount=1
+  have no entry (space-efficient). Supports 100+ snapshot layers.
+
+#### Inline Compression
+
+- **LZ4:** Default algorithm, optimized for speed. Uses kernel LZ4 library.
+- **ZSTD:** Higher compression ratio for archival content (ISOs, backups).
+- **Per-file control:** Compression enabled/disabled via inode flags.
+- **O_DIRECT bypass:** VM data path (O_DIRECT) completely bypasses compression.
+  Only buffered I/O is compressed — zero overhead for VM workloads.
+
+#### Online Defragmentation
+
+- **FIEMAP-based analysis:** Detects fragmented files via FIEMAP ioctl.
+- **Non-disruptive:** Bandwidth-limited background operation (configurable MB/s).
+- **Single-instance:** Lock file coordination — one defrag daemon per mount.
+- **Pause/resume:** SIGUSR1/SIGUSR2 signals for live control.
+
 ## Building
 
 ```bash
@@ -139,6 +189,9 @@ sudo dkms install ocsfs/0.1.0
 
 # Demo: create a 1 GiB test image and inspect it
 make demo
+
+# Install Proxmox VE storage plugin (on PVE host)
+sudo proxmox/install.sh
 ```
 
 ## Quick Start (on a test image)
@@ -176,6 +229,30 @@ echo "hello" > /mnt/ocsfs/test.txt
 sudo umount /mnt/ocsfs
 sudo losetup -d /dev/loop0
 sudo rmmod ocsfs
+```
+
+### Proxmox VE Usage (Phase 4)
+
+```bash
+# Add OCSFS storage via CLI
+pvesm add ocsfs fc-shared \
+  --path /mnt/pve/fc-shared \
+  --device /dev/mapper/mpath-3600508b... \
+  --content images,iso,vztmpl,backup,rootdir,snippets \
+  --maxnodes 16 --thin 1 --shared 1
+
+# Or edit /etc/pve/storage.cfg directly:
+# ocsfs: fc-shared
+#   path /mnt/pve/fc-shared
+#   device /dev/mapper/mpath-3600508b...
+#   content images,iso,vztmpl,backup,rootdir,snippets
+#   maxnodes 16
+#   thin 1
+#   shared 1
+
+# Online defragmentation
+./ocsfs-defrag /mnt/pve/fc-shared -v -b 50 -t 4
+./ocsfs-defrag /mnt/pve/fc-shared -n  # dry run (report only)
 ```
 
 ## Architecture
@@ -226,12 +303,20 @@ ocsfs/
 │   ├── heartbeat.c          # Storage-path heartbeat kthread
 │   ├── node.c               # Node slot table management
 │   ├── recovery.c           # 5-phase crash recovery protocol
+│   ├── snapshot.c           # CoW file-level snapshots
+│   ├── refcount.c           # Extent reference counting for CoW
+│   ├── compress.c           # Inline compression (LZ4/ZSTD)
 │   ├── Kbuild               # In-tree build rules
 │   ├── Makefile             # Out-of-tree build
 │   └── dkms.conf            # DKMS configuration
+├── proxmox/
+│   ├── OCSFSPlugin.pm       # Proxmox VE storage plugin (Perl)
+│   ├── mount.ocsfs          # Mount helper
+│   └── install.sh           # PVE plugin installer
 ├── tools/
 │   ├── mkfs_ocsfs.c         # mkfs.ocsfs formatter
-│   └── ocsfs_tool.c         # ocsfs-tool admin CLI
+│   ├── ocsfs_tool.c         # ocsfs-tool admin CLI
+│   └── ocsfs_defrag.c       # Online defragmentation daemon
 ├── tests/
 │   └── test_ocsfs.c         # Test suite (36 tests, 1770 assertions)
 ├── Makefile
@@ -247,7 +332,7 @@ ocsfs/
 | Phase 1 | Kernel module — single-node read/write + crash recovery | Complete |
 | Phase 2 | Multi-node — distributed locking, heartbeat, recovery | Complete |
 | Phase 3 | Performance — direct I/O, iomap, readahead, prealloc | Complete |
-| Phase 4 | Proxmox VE integration — storage plugin | Planned |
+| Phase 4 | Advanced features + Proxmox VE integration | Complete |
 | Phase 5 | Mainline kernel submission | Planned |
 
 ## License

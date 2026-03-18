@@ -733,4 +733,34 @@ int ocsfs_zero_range(struct inode *inode, loff_t offset, loff_t len);
 int ocsfs_discard_blocks(struct super_block *sb, u64 block, u32 count);
 void ocsfs_thin_stats(struct inode *inode, u64 *written, u64 *unwritten);
 
+/* === Phase 4: Advanced Features + Proxmox Integration === */
+
+/* snapshot.c — CoW file-level snapshots */
+int ocsfs_snapshot_create(struct inode *src, struct inode *dir,
+			  const struct qstr *name);
+int ocsfs_snapshot_delete(struct inode *snap);
+int ocsfs_cow_extent(struct inode *inode, u64 logical, u32 len);
+bool ocsfs_needs_cow(struct super_block *sb, u64 phys_block);
+
+/* refcount.c — Extent reference counting for CoW */
+int ocsfs_refcount_get(struct super_block *sb, u64 phys_block,
+		       u32 *refcount_out);
+int ocsfs_refcount_inc(struct super_block *sb, u64 phys_block, u32 len);
+int ocsfs_refcount_dec(struct super_block *sb, u64 phys_block, u32 len,
+		       bool *should_free);
+int ocsfs_refcount_init_ag(struct super_block *sb, u32 ag_no);
+
+/* compress.c — Inline LZ4/ZSTD compression */
+int ocsfs_compress_data(u8 algo, const void *src, unsigned int src_len,
+			void *dst, unsigned int *dst_len);
+int ocsfs_decompress_data(u8 algo, const void *src, unsigned int src_len,
+			  void *dst, unsigned int dst_len);
+int ocsfs_compress_extent_read(struct inode *inode,
+			       struct ocsfs_extent *ext,
+			       struct page **pages, unsigned int nr_pages);
+u8 ocsfs_get_compression_algo(struct inode *inode);
+int ocsfs_set_compression(struct inode *inode, u8 algo);
+void ocsfs_compress_stats(struct inode *inode, u64 *disk_size,
+			  u64 *logical_size);
+
 #endif /* _OCSFS_KMOD_H */

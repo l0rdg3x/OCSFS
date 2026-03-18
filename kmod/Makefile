@@ -15,7 +15,8 @@ PWD  := $(shell pwd)
 obj-m += ocsfs.o
 ocsfs-y := super.o inode.o dir.o file.o extent.o journal.o bitmap.o \
            scsi_pr.o lock.o heartbeat.o node.o recovery.o \
-           iomap.o alloc.o thin.o
+           iomap.o alloc.o thin.o \
+           snapshot.o refcount.o compress.o
 
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules

@@ -40,10 +40,12 @@ PHASE0_SRCS = $(SRC_DIR)/btree.c \
 PHASE0_OBJS = $(PHASE0_SRCS:.c=.o)
 
 # Tools
-MKFS_SRC = $(TOOL_DIR)/mkfs_ocsfs.c
-TOOL_SRC = $(TOOL_DIR)/ocsfs_tool.c
-MKFS_BIN = mkfs.ocsfs
-TOOL_BIN = ocsfs-tool
+MKFS_SRC   = $(TOOL_DIR)/mkfs_ocsfs.c
+TOOL_SRC   = $(TOOL_DIR)/ocsfs_tool.c
+DEFRAG_SRC = $(TOOL_DIR)/ocsfs_defrag.c
+MKFS_BIN   = mkfs.ocsfs
+TOOL_BIN   = ocsfs-tool
+DEFRAG_BIN = ocsfs-defrag
 
 # FUSE
 FUSE_SRC = $(SRC_DIR)/fuse_main.c
@@ -64,7 +66,7 @@ KMOD_DIR = kmod
 
 all: tools test
 
-tools: $(MKFS_BIN) $(TOOL_BIN)
+tools: $(MKFS_BIN) $(TOOL_BIN) $(DEFRAG_BIN)
 
 $(MKFS_BIN): $(MKFS_SRC) $(COMMON_OBJS)
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(LDFLAGS)
@@ -72,6 +74,10 @@ $(MKFS_BIN): $(MKFS_SRC) $(COMMON_OBJS)
 
 $(TOOL_BIN): $(TOOL_SRC) $(COMMON_OBJS)
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ $(LDFLAGS)
+	@echo "  Built: $@"
+
+$(DEFRAG_BIN): $(DEFRAG_SRC)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $< $(LDFLAGS)
 	@echo "  Built: $@"
 
 $(TEST_BIN): $(TEST_SRC) $(COMMON_OBJS) $(PHASE0_OBJS)
@@ -99,7 +105,7 @@ test: $(TEST_BIN)
 	./$(TEST_BIN)
 
 clean:
-	rm -f $(COMMON_OBJS) $(PHASE0_OBJS) $(MKFS_BIN) $(TOOL_BIN) $(TEST_BIN) $(FUSE_BIN)
+	rm -f $(COMMON_OBJS) $(PHASE0_OBJS) $(MKFS_BIN) $(TOOL_BIN) $(DEFRAG_BIN) $(TEST_BIN) $(FUSE_BIN)
 	rm -f /tmp/ocsfs_test_*.img
 	-$(MAKE) -C $(KMOD_DIR) clean 2>/dev/null || true
 	@echo "  Cleaned."
