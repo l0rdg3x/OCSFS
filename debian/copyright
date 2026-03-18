@@ -1,0 +1,28 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: ocsfs
+Source: https://github.com/ocsfs/ocsfs
+
+Files: *
+Copyright: 2026 OCSFS Project Contributors
+License: GPL-2.0-only
+
+Files: proxmox/*
+Copyright: 2026 OCSFS Project Contributors
+License: AGPL-3.0-or-later
+Comment: Proxmox VE plugin uses AGPL to match PVE licensing.
+
+License: GPL-2.0-only
+ This program is free software; you can redistribute it and/or modify
+ it under the terms of the GNU General Public License version 2 as
+ published by the Free Software Foundation.
+ .
+ On Debian systems, the full text of the GPL-2.0 is available at
+ /usr/share/common-licenses/GPL-2.
+
+License: AGPL-3.0-or-later
+ This program is free software: you can redistribute it and/or modify
+ it under the terms of the GNU Affero General Public License as
+ published by the Free Software Foundation, version 3 or later.
+ .
+ On Debian systems, the full text of the AGPL-3 is available at
+ /usr/share/common-licenses/AGPL-3.

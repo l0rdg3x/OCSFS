@@ -21,7 +21,7 @@ to VMware's VMFS.
 - **Proxmox VE integration** — First-class storage plugin supporting all
   content types (images, ISO, templates, backups).
 
-## Current Status: Phase 4 — Advanced Features + Proxmox VE (complete)
+## Current Status: All Phases Complete
 
 ### Phase 0 — Prototype (complete)
 
@@ -162,6 +162,29 @@ to VMware's VMFS.
 - **Single-instance:** Lock file coordination — one defrag daemon per mount.
 - **Pause/resume:** SIGUSR1/SIGUSR2 signals for live control.
 
+### Phase 5 — Production Readiness (complete)
+
+| Component | Status | Description |
+|-----------|--------|-------------|
+| `debian/` | Complete | Debian packaging (ocsfs-tools, ocsfs-dkms, ocsfs-proxmox) |
+| `conf/ocsfs-defrag@.service` | Complete | Systemd template unit for defrag daemon |
+| `conf/ocsfs-mount@.service` | Complete | Systemd template unit for auto-mount |
+| `conf/99-ocsfs.rules` | Complete | udev rules for SAN/multipath auto-detection |
+| `man/*.8` | Complete | Man pages for all 4 CLI tools |
+| `kmod/dkms.conf` | Updated | DKMS config with autoinstall for kernel upgrades |
+| `tests/xfstests-ocsfs.conf` | Complete | xfstests (fstests) integration config |
+
+**Milestone:** Production-ready out-of-tree deployment.
+
+#### Deployment Options
+
+- **Debian packages:** `dpkg-buildpackage` produces 3 .deb packages:
+  `ocsfs-tools` (CLI), `ocsfs-dkms` (kernel module), `ocsfs-proxmox` (PVE plugin).
+- **DKMS:** Kernel module auto-rebuilds on kernel upgrades.
+- **systemd:** Template units for mount and defrag. IO-limited, nice 19, memory-capped.
+- **udev:** Auto-symlinks for OCSFS devices in `/dev/disk/by-ocsfs/<label>`.
+  Multipath SAN tagging. UDISKS_IGNORE to prevent desktop automounting.
+
 ## Building
 
 ```bash
@@ -192,6 +215,12 @@ make demo
 
 # Install Proxmox VE storage plugin (on PVE host)
 sudo proxmox/install.sh
+
+# Build Debian packages
+dpkg-buildpackage -us -uc -b
+# Produces: ocsfs-tools_0.1.0-1_amd64.deb
+#           ocsfs-dkms_0.1.0-1_all.deb
+#           ocsfs-proxmox_0.1.0-1_all.deb
 ```
 
 ## Quick Start (on a test image)
@@ -318,7 +347,22 @@ ocsfs/
 │   ├── ocsfs_tool.c         # ocsfs-tool admin CLI
 │   └── ocsfs_defrag.c       # Online defragmentation daemon
 ├── tests/
-│   └── test_ocsfs.c         # Test suite (36 tests, 1770 assertions)
+│   ├── test_ocsfs.c         # Test suite (36 tests, 1770 assertions)
+│   └── xfstests-ocsfs.conf  # xfstests integration config
+├── conf/
+│   ├── ocsfs-defrag@.service # Systemd defrag template unit
+│   ├── ocsfs-mount@.service  # Systemd mount template unit
+│   └── 99-ocsfs.rules       # udev rules for SAN auto-detection
+├── man/
+│   ├── mkfs.ocsfs.8         # Man page: mkfs.ocsfs
+│   ├── ocsfs-tool.8         # Man page: ocsfs-tool
+│   ├── ocsfs-defrag.8       # Man page: ocsfs-defrag
+│   └── mount.ocsfs.8        # Man page: mount.ocsfs
+├── debian/
+│   ├── control              # Package definitions (tools, dkms, proxmox)
+│   ├── rules                # Build rules
+│   ├── changelog            # Package changelog
+│   └── copyright            # License info
 ├── Makefile
 ├── .gitignore
 └── README.md
@@ -333,7 +377,7 @@ ocsfs/
 | Phase 2 | Multi-node — distributed locking, heartbeat, recovery | Complete |
 | Phase 3 | Performance — direct I/O, iomap, readahead, prealloc | Complete |
 | Phase 4 | Advanced features + Proxmox VE integration | Complete |
-| Phase 5 | Mainline kernel submission | Planned |
+| Phase 5 | Production readiness — packaging, systemd, man pages | Complete |
 
 ## License
 

@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# 99-ocsfs.rules — udev rules for OCSFS
+#
+# Detects OCSFS-formatted block devices and creates symlinks.
+# Useful for Fibre Channel SAN environments with multipath.
+#
+# Install to /lib/udev/rules.d/99-ocsfs.rules or
+#            /etc/udev/rules.d/99-ocsfs.rules
+
+# Detect OCSFS superblock magic (0x4F435346 = 'OCSF' at offset 0)
+# and create a persistent symlink in /dev/disk/by-ocsfs/<label>
+SUBSYSTEM=="block", ENV{ID_FS_TYPE}=="ocsfs", \
+  SYMLINK+="disk/by-ocsfs/$env{ID_FS_LABEL}"
+
+# Tag multipath devices that contain OCSFS for easy identification
+SUBSYSTEM=="block", ENV{DM_UUID}=="mpath-*", ENV{ID_FS_TYPE}=="ocsfs", \
+  TAG+="ocsfs", ENV{OCSFS_DEVICE}="1"
+
+# Ensure SCSI persistent reservations are not disrupted by udev probing
+# Skip invasive probes on devices registered with SCSI PR
+SUBSYSTEM=="block", ENV{OCSFS_DEVICE}=="1", \
+  ENV{UDISKS_IGNORE}="1"

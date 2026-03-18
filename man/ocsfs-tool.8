@@ -1,0 +1,52 @@
+.\" SPDX-License-Identifier: GPL-2.0-only
+.TH OCSFS\-TOOL 8 "March 2026" "ocsfs 0.1.0" "System Administration"
+.SH NAME
+ocsfs\-tool \- inspect and manage OCSFS filesystems
+.SH SYNOPSIS
+.B ocsfs\-tool
+.I command
+.I device
+[\fIoptions\fR]
+.SH DESCRIPTION
+.B ocsfs\-tool
+is the administration CLI for OCSFS filesystems. It reads on-disk
+metadata directly from the block device (no mount required).
+.SH COMMANDS
+.TP
+.B info
+Display superblock information: UUID, label, version, geometry,
+feature flags, creation time, mount count.
+.TP
+.B df
+Display space usage: total, used, and free blocks per Allocation Group.
+Shows per-AG ownership for multi-node environments.
+.TP
+.B check
+Verify filesystem consistency: superblock CRC, AG headers, inode
+table integrity, bitmap consistency.
+.TP
+.B nodes
+List all node slots: slot ID, UUID, hostname, state (active/dead/free),
+last heartbeat timestamp, PR key.
+.TP
+.B locks
+Dump the lock table: active locks, holders, waiters, lock modes,
+and CAS versions.
+.SH EXAMPLES
+.RS 4
+ocsfs\-tool info /dev/mapper/mpath\-3600508b...
+.br
+ocsfs\-tool df /tmp/test.img
+.br
+ocsfs\-tool check /dev/sda1
+.br
+ocsfs\-tool nodes /dev/mapper/mpath\-3600508b...
+.br
+ocsfs\-tool locks /dev/mapper/mpath\-3600508b...
+.RE
+.SH SEE ALSO
+.BR mkfs.ocsfs (8),
+.BR mount.ocsfs (8),
+.BR ocsfs\-defrag (8)
+.SH AUTHORS
+OCSFS Project Contributors.

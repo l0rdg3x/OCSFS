@@ -1,0 +1,40 @@
+Source: ocsfs
+Section: admin
+Priority: optional
+Maintainer: OCSFS Project <ocsfs@example.org>
+Build-Depends: debhelper-compat (= 13), uuid-dev, dkms
+Standards-Version: 4.6.2
+Homepage: https://github.com/ocsfs/ocsfs
+
+Package: ocsfs-tools
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, uuid-runtime
+Recommends: ocsfs-dkms
+Description: OCSFS userspace tools
+ Open Cluster Shared FileSystem — userspace administration tools.
+ .
+ Includes:
+  * mkfs.ocsfs — format a block device with OCSFS
+  * ocsfs-tool — inspect and manage OCSFS volumes
+  * ocsfs-defrag — online defragmentation daemon
+  * mount.ocsfs — mount helper for mount(8)
+
+Package: ocsfs-dkms
+Architecture: all
+Depends: ${misc:Depends}, dkms, linux-headers-amd64 | linux-headers-generic | linux-headers-$(DEB_HOST_ARCH)
+Recommends: ocsfs-tools
+Description: OCSFS kernel module (DKMS)
+ Open Cluster Shared FileSystem — Linux kernel module built via DKMS.
+ .
+ Provides the ocsfs.ko kernel module for mounting OCSFS filesystems.
+ The module is automatically rebuilt when new kernel versions are installed.
+
+Package: ocsfs-proxmox
+Architecture: all
+Depends: ${misc:Depends}, ocsfs-tools, ocsfs-dkms, proxmox-ve | pve-manager
+Description: OCSFS Proxmox VE storage plugin
+ Open Cluster Shared FileSystem — Proxmox VE integration.
+ .
+ Provides the PVE::Storage::OCSFSPlugin storage backend, supporting
+ all PVE content types (images, ISO, templates, backups, containers,
+ snippets) on a single shared OCSFS datastore.
