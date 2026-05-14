@@ -61,6 +61,7 @@ int ocsfs_journal_init(struct super_block *sb)
 	}
 
 	j->j_header_bh = bh;
+	j->j_sb = sb;
 	return 0;
 }
 
@@ -202,7 +203,7 @@ int ocsfs_txn_add_bh(struct ocsfs_txn *txn, struct buffer_head *bh)
 	struct ocsfs_txn_buf *tb;
 	struct ocsfs_journal *j = txn->t_journal;
 	struct ocsfs_disk_journal_bref bref;
-	struct super_block *sb = bh->b_bdev->bd_super;
+	struct super_block *sb = txn->t_journal->j_sb;
 	int ret;
 
 	tb = kzalloc(sizeof(*tb), GFP_KERNEL);
@@ -246,8 +247,7 @@ int ocsfs_txn_commit(struct ocsfs_txn *txn)
 		return 0;
 	}
 
-	tb = list_first_entry(&txn->t_buffers, struct ocsfs_txn_buf, list);
-	sb = tb->bh->b_bdev->bd_super;
+	sb = j->j_sb;
 
 	/* Write COMMIT record */
 	memset(&jt, 0, sizeof(jt));

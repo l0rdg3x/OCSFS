@@ -13,6 +13,8 @@
  * and can be returned to the pool via punch_hole/DISCARD.
  */
 
+#include <linux/types.h>
+#include <linux/falloc.h>
 #include "ocsfs.h"
 
 /* ═══════════════════════════════════════════════════════════════

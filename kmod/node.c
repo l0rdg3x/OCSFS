@@ -10,6 +10,7 @@
  * Node states: FREE → ACTIVE → (EVICTING → DEAD) → FREE
  */
 
+#include <linux/utsname.h>
 #include "ocsfs.h"
 
 /* ═══════════════════════════════════════════════════════════════

@@ -71,7 +71,7 @@ struct inode *ocsfs_iget(struct super_block *sb, u64 ino)
 	inode = iget_locked(sb, ino);
 	if (!inode)
 		return ERR_PTR(-ENOMEM);
-	if (!(inode->i_state & I_NEW))
+	if (!(inode_state_read(inode) & I_NEW))
 		return inode;
 
 	oi = OCSFS_I(inode);
@@ -160,12 +160,15 @@ int ocsfs_write_inode(struct inode *inode, struct writeback_control *wbc)
 	di->i_size = cpu_to_le64(inode->i_size);
 	di->i_blocks = cpu_to_le64(inode->i_blocks /
 				   (sbi->s_block_size / 512));
-	di->i_atime = cpu_to_le64(
-		timespec64_to_ns(&inode_get_atime(inode)));
-	di->i_mtime = cpu_to_le64(
-		timespec64_to_ns(&inode_get_mtime(inode)));
-	di->i_ctime = cpu_to_le64(
-		timespec64_to_ns(&inode_get_ctime(inode)));
+	{
+		struct timespec64 ts;
+		ts = inode_get_atime(inode);
+		di->i_atime = cpu_to_le64(timespec64_to_ns(&ts));
+		ts = inode_get_mtime(inode);
+		di->i_mtime = cpu_to_le64(timespec64_to_ns(&ts));
+		ts = inode_get_ctime(inode);
+		di->i_ctime = cpu_to_le64(timespec64_to_ns(&ts));
+	}
 	di->i_flags = cpu_to_le32(oi->i_flags);
 	di->i_ag = cpu_to_le32(oi->i_ag);
 	di->i_extent_count = cpu_to_le16(oi->i_extent_count);

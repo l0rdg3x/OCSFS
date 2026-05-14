@@ -6,6 +6,7 @@
  * Phase 1: single-node operation (no cluster locking).
  */
 
+#include <linux/fs_context.h>
 #include "ocsfs.h"
 
 static struct kmem_cache *ocsfs_inode_cachep;
@@ -145,12 +146,13 @@ static int ocsfs_load_ags(struct super_block *sb)
  * FILL SUPER — called during mount
  * ═══════════════════════════════════════════════════════════════ */
 
-int ocsfs_fill_super(struct super_block *sb, void *data, int silent)
+int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
 	struct ocsfs_sb_info *sbi;
 	struct ocsfs_disk_super *ds;
 	struct buffer_head *bh;
 	struct inode *root_inode;
+	int silent = fc->sb_flags & SB_SILENT;
 	int ret;
 
 	/* Set block size before first sb_bread */
@@ -182,6 +184,7 @@ int ocsfs_fill_super(struct super_block *sb, void *data, int silent)
 	}
 
 	sb->s_fs_info = sbi;
+	sbi->s_sb = sb;
 	sbi->s_sbh = bh;
 	sbi->s_ds = ds;
 
@@ -439,11 +442,19 @@ void ocsfs_cluster_exit(struct super_block *sb)
  * MOUNT / MODULE INIT
  * ═══════════════════════════════════════════════════════════════ */
 
-static struct dentry *ocsfs_mount(struct file_system_type *fs_type,
-				  int flags, const char *dev_name,
-				  void *data)
+static int ocsfs_get_tree(struct fs_context *fc)
 {
-	return mount_bdev(fs_type, flags, dev_name, data, ocsfs_fill_super);
+	return get_tree_bdev(fc, ocsfs_fill_super);
+}
+
+static const struct fs_context_operations ocsfs_context_ops = {
+	.get_tree = ocsfs_get_tree,
+};
+
+static int ocsfs_init_fs_context(struct fs_context *fc)
+{
+	fc->ops = &ocsfs_context_ops;
+	return 0;
 }
 
 static void ocsfs_kill_sb(struct super_block *sb)
@@ -452,11 +463,11 @@ static void ocsfs_kill_sb(struct super_block *sb)
 }
 
 static struct file_system_type ocsfs_fs_type = {
-	.owner          = THIS_MODULE,
-	.name           = "ocsfs",
-	.mount          = ocsfs_mount,
-	.kill_sb        = ocsfs_kill_sb,
-	.fs_flags       = FS_REQUIRES_DEV,
+	.owner           = THIS_MODULE,
+	.name            = "ocsfs",
+	.init_fs_context = ocsfs_init_fs_context,
+	.kill_sb         = ocsfs_kill_sb,
+	.fs_flags        = FS_REQUIRES_DEV,
 };
 
 static int __init ocsfs_init(void)

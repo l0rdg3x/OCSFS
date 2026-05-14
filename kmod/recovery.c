@@ -180,7 +180,7 @@ static void ocsfs_recovery_work_fn(struct work_struct *work)
 {
 	struct ocsfs_sb_info *sbi =
 		container_of(work, struct ocsfs_sb_info, s_recovery_work);
-	struct super_block *sb = sbi->s_sbh->b_bdev->bd_super;
+	struct super_block *sb = sbi->s_sb;
 
 	ocsfs_recovery_run(sb, sbi->s_recovery_target);
 }

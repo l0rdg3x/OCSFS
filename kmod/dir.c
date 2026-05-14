@@ -364,15 +364,15 @@ static int ocsfs_create(struct mnt_idmap *idmap, struct inode *dir,
  * VFS MKDIR
  * ═══════════════════════════════════════════════════════════════ */
 
-static int ocsfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
-		       struct dentry *dentry, umode_t mode)
+static struct dentry *ocsfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+				  struct dentry *dentry, umode_t mode)
 {
 	struct inode *inode;
 	int ret;
 
 	inode = ocsfs_new_inode(dir, S_IFDIR | mode);
 	if (IS_ERR(inode))
-		return PTR_ERR(inode);
+		return ERR_CAST(inode);
 
 	/* Add . entry */
 	ret = ocsfs_add_dirent(inode,
@@ -400,12 +400,12 @@ static int ocsfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	inc_nlink(dir);
 	mark_inode_dirty(dir);
 	d_instantiate(dentry, inode);
-	return 0;
+	return NULL;
 
 fail:
 	clear_nlink(inode);
 	discard_new_inode(inode);
-	return ret;
+	return ERR_PTR(ret);
 }
 
 /* ═══════════════════════════════════════════════════════════════

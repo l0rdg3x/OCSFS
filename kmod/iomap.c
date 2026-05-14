@@ -186,7 +186,7 @@ ssize_t ocsfs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		return iomap_dio_rw(iocb, to, &ocsfs_dio_iomap_ops,
 				    NULL, 0, NULL, 0);
 
-	return iomap_file_buffered_read(iocb, to, &ocsfs_iomap_ops);
+	return filemap_read(iocb, to, 0);
 }
 
 ssize_t ocsfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
@@ -205,7 +205,7 @@ ssize_t ocsfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 				   NULL, 0, NULL, 0);
 	} else {
 		ret = iomap_file_buffered_write(iocb, from,
-						&ocsfs_iomap_ops);
+						&ocsfs_iomap_ops, NULL, NULL);
 		if (ret > 0)
 			iocb->ki_pos += ret;
 	}
@@ -227,38 +227,23 @@ out:
 
 static int ocsfs_iomap_read_folio(struct file *file, struct folio *folio)
 {
-	return iomap_read_folio(folio, &ocsfs_iomap_ops);
+	iomap_bio_read_folio(folio, &ocsfs_iomap_ops);
+	return 0;
 }
 
 static void ocsfs_iomap_readahead(struct readahead_control *rac)
 {
-	iomap_readahead(rac, &ocsfs_iomap_ops);
+	iomap_bio_readahead(rac, &ocsfs_iomap_ops);
 }
 
-static int ocsfs_iomap_writepages(struct address_space *mapping,
-				  struct writeback_control *wbc)
+static sector_t ocsfs_iomap_bmap(struct address_space *mapping, sector_t bno)
 {
-	return iomap_writepages(mapping, wbc, &ocsfs_iomap_ops);
-}
-
-/*
- * Map a page for buffered write (needed for page cache writes).
- * Falls back to iomap_file_buffered_write path.
- */
-static int ocsfs_iomap_write_begin(struct file *file,
-				   struct address_space *mapping,
-				   loff_t pos, unsigned len,
-				   struct page **pagep, void **fsdata)
-{
-	return iomap_write_begin(file_inode(file), pos, len,
-				 pagep, &ocsfs_iomap_ops);
+	return iomap_bmap(mapping, bno, &ocsfs_iomap_ops);
 }
 
 const struct address_space_operations ocsfs_iomap_aops = {
 	.dirty_folio    = iomap_dirty_folio,
 	.read_folio     = ocsfs_iomap_read_folio,
 	.readahead      = ocsfs_iomap_readahead,
-	.writepages     = ocsfs_iomap_writepages,
-	.direct_IO      = noop_direct_IO,  /* handled by iomap_dio_rw */
-	.bmap           = iomap_bmap,
+	.bmap           = ocsfs_iomap_bmap,
 };

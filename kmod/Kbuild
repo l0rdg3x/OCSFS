@@ -2,7 +2,7 @@
 # Kernel module build rules
 # SPDX-License-Identifier: GPL-2.0-only
 
-obj-$(CONFIG_OCSFS_FS) += ocsfs.o
+obj-m += ocsfs.o
 
 ocsfs-y := super.o inode.o dir.o file.o extent.o journal.o bitmap.o \
            scsi_pr.o lock.o heartbeat.o node.o recovery.o \

@@ -103,22 +103,22 @@ static int ocsfs_writepages(struct address_space *mapping,
 	return mpage_writepages(mapping, wbc, ocsfs_get_block);
 }
 
-static int ocsfs_write_begin(struct file *file,
+static int ocsfs_write_begin(const struct kiocb *iocb,
 			     struct address_space *mapping,
 			     loff_t pos, unsigned len,
-			     struct page **pagep, void **fsdata)
+			     struct folio **foliop, void **fsdata)
 {
-	return block_write_begin(mapping, pos, len, pagep, ocsfs_get_block);
+	return block_write_begin(mapping, pos, len, foliop, ocsfs_get_block);
 }
 
-static int ocsfs_write_end(struct file *file,
+static int ocsfs_write_end(const struct kiocb *iocb,
 			   struct address_space *mapping,
 			   loff_t pos, unsigned len, unsigned copied,
-			   struct page *page, void *fsdata)
+			   struct folio *folio, void *fsdata)
 {
 	int ret;
 
-	ret = generic_write_end(file, mapping, pos, len, copied, page, fsdata);
+	ret = generic_write_end(iocb, mapping, pos, len, copied, folio, fsdata);
 	if (ret > 0)
 		mark_inode_dirty(mapping->host);
 	return ret;
@@ -164,7 +164,7 @@ static int ocsfs_fsync(struct file *file, loff_t start, loff_t end,
 		return ret;
 
 	/* Flush inode metadata */
-	if (!datasync || inode->i_state & I_DIRTY_DATASYNC) {
+	if (!datasync || inode_state_read(inode) & I_DIRTY_DATASYNC) {
 		struct writeback_control wbc = {
 			.sync_mode = WB_SYNC_ALL,
 			.nr_to_write = 0,

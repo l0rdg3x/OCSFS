@@ -378,6 +378,7 @@ struct ocsfs_journal {
 	u64             sequence;       /* next txn ID */
 	struct mutex    j_lock;
 	struct buffer_head *j_header_bh;
+	struct super_block *j_sb;       /* owning superblock */
 };
 
 /* Active journal transaction */
@@ -433,6 +434,7 @@ struct ocsfs_pr_info {
 
 /* Superblock in-memory info — stored in sb->s_fs_info */
 struct ocsfs_sb_info {
+	struct super_block      *s_sb;          /* back-link to VFS superblock */
 	struct ocsfs_disk_super *s_ds;          /* raw superblock copy */
 	struct buffer_head      *s_sbh;         /* superblock buffer_head */
 
@@ -585,7 +587,7 @@ static inline u64 ocsfs_inode_disk_off(struct ocsfs_sb_info *sbi, u64 ino)
 
 /* super.c */
 extern const struct super_operations ocsfs_sops;
-int ocsfs_fill_super(struct super_block *sb, void *data, int silent);
+int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc);
 void ocsfs_put_super(struct super_block *sb);
 int ocsfs_statfs(struct dentry *dentry, struct kstatfs *buf);
 int ocsfs_sync_fs(struct super_block *sb, int wait);
