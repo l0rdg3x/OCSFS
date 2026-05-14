@@ -214,22 +214,25 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	if (ret)
 		goto fail;
 
-	/* Initialize journal */
-	ret = ocsfs_journal_init(sb);
-	if (ret)
-		goto fail_ags;
-
-	/* Replay journal if needed (crash recovery) */
-	ret = ocsfs_journal_replay(sb);
-	if (ret) {
-		pr_err("ocsfs: journal replay failed\n");
-		goto fail_journal;
-	}
-
-	/* Initialize clustering subsystem */
+	/*
+	 * Clustering init FIRST: claims a node slot, sets s_node_slot.
+	 * Journal init depends on s_node_slot to find our journal region.
+	 */
 	ret = ocsfs_cluster_init(sb);
 	if (ret) {
 		pr_err("ocsfs: cluster init failed\n");
+		goto fail_ags;
+	}
+
+	/* Initialize journal at our node slot's region */
+	ret = ocsfs_journal_init(sb);
+	if (ret)
+		goto fail_cluster;
+
+	/* Replay our journal (crash recovery for this node) */
+	ret = ocsfs_journal_replay(sb);
+	if (ret) {
+		pr_err("ocsfs: journal replay failed\n");
 		goto fail_journal;
 	}
 
@@ -268,8 +271,9 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	return 0;
 
 fail_journal:
-	ocsfs_cluster_exit(sb);
 	ocsfs_journal_exit(sb);
+fail_cluster:
+	ocsfs_cluster_exit(sb);
 fail_ags:
 	kvfree(sbi->s_ags);
 fail:
@@ -290,8 +294,8 @@ void ocsfs_put_super(struct super_block *sb)
 	if (!sbi)
 		return;
 
+	ocsfs_journal_exit(sb);   /* flush journal before releasing cluster slot */
 	ocsfs_cluster_exit(sb);
-	ocsfs_journal_exit(sb);
 	kvfree(sbi->s_ags);
 	brelse(sbi->s_sbh);
 	kfree(sbi);

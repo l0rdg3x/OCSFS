@@ -3,23 +3,15 @@
  * OCSFS — journal.c
  * Write-ahead logging (WAL) journal for crash recovery.
  *
- * Phase 1: single-node journal (slot 0).
+ * Each node has its own journal region at:
+ *   s_journal_off + (node_slot * s_journal_size)
  *
- * The journal is a circular log of metadata block before-images.
- * Transaction protocol:
- *   1. ocsfs_txn_begin()  — allocate a new transaction
- *   2. ocsfs_txn_add_bh() — journal a buffer_head (writes before-image)
- *   3. ocsfs_txn_commit() — write COMMIT record, flush journal
- *   4. Caller writes actual metadata blocks
- *
- * On mount, ocsfs_journal_replay() scans for uncommitted transactions
- * and replays before-images to restore consistency.
+ * Journal init must run AFTER cluster_init so that s_node_slot is known.
+ * Recovery of a failed node uses ocsfs_journal_replay_node() which opens
+ * the target node's journal at its offset directly.
  */
 
 #include "ocsfs.h"
-
-/* Default node slot for single-node mode */
-#define OCSFS_JOURNAL_NODE_SLOT  0
 
 /* ═══════════════════════════════════════════════════════════════
  * JOURNAL INIT / EXIT
@@ -32,11 +24,20 @@ int ocsfs_journal_init(struct super_block *sb)
 	struct ocsfs_disk_journal_hdr *jh;
 	struct buffer_head *bh;
 	u64 journal_off;
+	u32 journal_size;
 
-	/* Journal for node slot 0 starts at s_journal_off */
-	journal_off = le64_to_cpu(sbi->s_ds->s_journal_off);
+	/*
+	 * Each node has its own journal at:
+	 *   s_journal_off + (s_node_slot * s_journal_size)
+	 * cluster_init() must have run before us so s_node_slot is set.
+	 */
+	journal_size = le32_to_cpu(sbi->s_ds->s_journal_size);
+	journal_off = le64_to_cpu(sbi->s_ds->s_journal_off) +
+		      (u64)sbi->s_node_slot * journal_size;
+
 	j->disk_off = journal_off;
-	j->size = le32_to_cpu(sbi->s_ds->s_journal_size);
+	j->size = journal_size;
+	j->j_node_slot = sbi->s_node_slot;
 
 	mutex_init(&j->j_lock);
 
@@ -76,7 +77,7 @@ void ocsfs_journal_exit(struct super_block *sb)
 			(struct ocsfs_disk_journal_hdr *)j->j_header_bh->b_data;
 
 		jh->jh_magic = cpu_to_le32(OCSFS_JOURNAL_MAGIC);
-		jh->jh_node_slot = cpu_to_le16(OCSFS_JOURNAL_NODE_SLOT);
+		jh->jh_node_slot = cpu_to_le16(j->j_node_slot);
 		jh->jh_head = cpu_to_le64(j->head);
 		jh->jh_tail = cpu_to_le64(j->tail);
 		jh->jh_sequence = cpu_to_le64(j->sequence);
@@ -142,7 +143,7 @@ static int journal_sync(struct super_block *sb, struct ocsfs_journal *j)
 
 	jh = (struct ocsfs_disk_journal_hdr *)j->j_header_bh->b_data;
 	jh->jh_magic = cpu_to_le32(OCSFS_JOURNAL_MAGIC);
-	jh->jh_node_slot = cpu_to_le16(OCSFS_JOURNAL_NODE_SLOT);
+	jh->jh_node_slot = cpu_to_le16(j->j_node_slot);
 	jh->jh_head = cpu_to_le64(j->head);
 	jh->jh_tail = cpu_to_le64(j->tail);
 	jh->jh_sequence = cpu_to_le64(j->sequence);
@@ -183,7 +184,7 @@ struct ocsfs_txn *ocsfs_txn_begin(struct super_block *sb)
 	jt.jt_type = cpu_to_le32(OCSFS_JTYPE_BEGIN);
 	jt.jt_id = cpu_to_le64(txn->t_id);
 	jt.jt_timestamp = cpu_to_le64(ktime_get_real_ns());
-	jt.jt_node_slot = cpu_to_le16(OCSFS_JOURNAL_NODE_SLOT);
+	jt.jt_node_slot = cpu_to_le16(j->j_node_slot);
 	jt.jt_checksum = cpu_to_le32(
 		ocsfs_crc32c(~0U, &jt, sizeof(jt) - sizeof(__le32)));
 
@@ -254,7 +255,7 @@ int ocsfs_txn_commit(struct ocsfs_txn *txn)
 	jt.jt_type = cpu_to_le32(OCSFS_JTYPE_COMMIT);
 	jt.jt_id = cpu_to_le64(txn->t_id);
 	jt.jt_timestamp = cpu_to_le64(ktime_get_real_ns());
-	jt.jt_node_slot = cpu_to_le16(OCSFS_JOURNAL_NODE_SLOT);
+	jt.jt_node_slot = cpu_to_le16(j->j_node_slot);
 	jt.jt_block_count = cpu_to_le16(txn->t_nr_blocks);
 	jt.jt_checksum = cpu_to_le32(
 		ocsfs_crc32c(~0U, &jt, sizeof(jt) - sizeof(__le32)));

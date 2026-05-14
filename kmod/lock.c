@@ -50,7 +50,18 @@ static int lock_read_entry(struct super_block *sb, u32 slot,
 	return 0;
 }
 
-/* Write a lock entry to disk (CAS: check version first) */
+/*
+ * Write a lock entry to disk with version-based conflict detection.
+ *
+ * We record the version seen at read time, then before committing,
+ * force-invalidate the buffer and re-read from disk to check whether
+ * another node has written in the interim. If the version changed,
+ * return -EAGAIN so the caller retries.
+ *
+ * NOTE: This narrows the TOCTOU window but does not eliminate it — true
+ * atomicity requires SCSI Compare-And-Write (CAW). For production
+ * multi-node deployments on SCSI SANs, add CAW support via the sg layer.
+ */
 static int lock_write_entry(struct super_block *sb, u32 slot,
 			    struct ocsfs_disk_lock *entry,
 			    struct buffer_head *bh)
@@ -58,20 +69,51 @@ static int lock_write_entry(struct super_block *sb, u32 slot,
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	u64 off = OCSFS_LOCK_TABLE_OFF +
 		  (u64)slot * OCSFS_LOCK_ENTRY_SIZE;
+	u64 block = off / sbi->s_block_size;
 	u32 boff = off % sbi->s_block_size;
+	u32 expected_version = le32_to_cpu(entry->le_version);
+	struct buffer_head *bh_check;
+	struct ocsfs_disk_lock *check;
 
-	/* Increment version for CAS semantics */
-	entry->le_version = cpu_to_le32(
-		le32_to_cpu(entry->le_version) + 1);
+	/*
+	 * Force a fresh read from disk to detect concurrent writers.
+	 * Get the block, clear uptodate to bypass cache, re-read from device.
+	 */
+	bh_check = sb_getblk(sb, block);
+	if (!bh_check)
+		return -EIO;
+	clear_buffer_uptodate(bh_check);
+	if (bh_read(bh_check, 0) < 0) {
+		brelse(bh_check);
+		return -EIO;
+	}
 
-	/* Compute checksum */
+	check = (struct ocsfs_disk_lock *)(bh_check->b_data + boff);
+	if (le32_to_cpu(check->le_version) != expected_version) {
+		/* Another node wrote this entry between our read and now */
+		brelse(bh_check);
+		return -EAGAIN;
+	}
+	brelse(bh_check);
+
+	/* Version check passed — commit our update */
+	entry->le_version = cpu_to_le32(expected_version + 1);
 	entry->le_checksum = cpu_to_le32(
 		ocsfs_crc32c(~0U, entry,
 			     OCSFS_LOCK_ENTRY_SIZE - sizeof(__le32)));
 
-	memcpy(bh->b_data + boff, entry, sizeof(*entry));
-	mark_buffer_dirty(bh);
-	sync_dirty_buffer(bh);
+	/*
+	 * Re-read bh since we invalidated it above; we must write into
+	 * a valid buffer_head. Caller must brelse() the original bh.
+	 */
+	bh_check = sb_bread(sb, block);
+	if (!bh_check)
+		return -EIO;
+
+	memcpy(bh_check->b_data + boff, entry, sizeof(*entry));
+	mark_buffer_dirty(bh_check);
+	sync_dirty_buffer(bh_check);
+	brelse(bh_check);
 
 	return 0;
 }
@@ -305,6 +347,9 @@ retry:
 		ret = lock_write_entry(sb, lr->lr_slot, &dl, bh);
 		brelse(bh);
 
+		if (ret == -EAGAIN)
+			goto retry; /* concurrent write detected, re-read */
+
 		if (ret == 0)
 			lr->lr_mode = mode;
 
@@ -431,7 +476,6 @@ int ocsfs_lock_downgrade(struct super_block *sb, struct ocsfs_lock_res *lr,
 int ocsfs_lock_recover_node(struct super_block *sb, u16 node_slot,
 			    u32 mount_gen)
 {
-	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	struct ocsfs_disk_lock dl;
 	struct buffer_head *bh;
 	u32 i;

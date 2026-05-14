@@ -91,8 +91,6 @@ static struct ocsfs_ag_info *ocsfs_block_to_ag(struct ocsfs_sb_info *sbi,
 static u64 ocsfs_rc_table_block(struct ocsfs_sb_info *sbi,
 				struct ocsfs_ag_info *ag, u32 bucket)
 {
-	u64 bitmap_end = (ag->bitmap_off + ag->bitmap_size) /
-			 sbi->s_block_size;
 	u64 inode_table_blocks = (ag->inode_count * OCSFS_INODE_SIZE +
 				  sbi->s_block_size - 1) / sbi->s_block_size;
 	u64 rc_start = (ag->inode_table_off / sbi->s_block_size) +

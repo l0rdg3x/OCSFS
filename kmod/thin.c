@@ -205,7 +205,6 @@ int ocsfs_zero_range(struct inode *inode, loff_t offset, loff_t len)
 long ocsfs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 {
 	struct inode *inode = file_inode(file);
-	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
 	int ret = 0;
 
 	/* Check for unsupported mode combinations */

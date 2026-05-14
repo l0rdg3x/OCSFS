@@ -180,8 +180,6 @@ const struct iomap_ops ocsfs_dio_iomap_ops = {
 
 ssize_t ocsfs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
-	struct inode *inode = file_inode(iocb->ki_filp);
-
 	if (iocb->ki_flags & IOCB_DIRECT)
 		return iomap_dio_rw(iocb, to, &ocsfs_dio_iomap_ops,
 				    NULL, 0, NULL, 0);

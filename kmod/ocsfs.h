@@ -128,6 +128,7 @@
 #define OCSFS_NODE_FREE         0x00
 #define OCSFS_NODE_ACTIVE       0x01
 #define OCSFS_NODE_EVICTING     0x02
+#define OCSFS_NODE_SUSPECTED    0x03  /* heartbeat stale, not yet confirmed dead */
 #define OCSFS_NODE_DEAD         0xFF
 
 /* Lock modes */
@@ -146,7 +147,8 @@
 
 /* Heartbeat constants */
 #define OCSFS_HB_INTERVAL_MS    5000   /* write every 5s */
-#define OCSFS_HB_TIMEOUT_MS     15000  /* 3 missed = dead */
+#define OCSFS_HB_TIMEOUT_MS     15000  /* 3 missed → suspected */
+#define OCSFS_HB_CONFIRM_MS     10000  /* 2 more missed → confirmed dead */
 #define OCSFS_HB_CHECK_MS       2000   /* check peers every 2s */
 
 /* Lock acquisition retry */
@@ -376,6 +378,7 @@ struct ocsfs_journal {
 	u64             head;           /* write position */
 	u64             tail;           /* oldest live txn */
 	u64             sequence;       /* next txn ID */
+	u16             j_node_slot;    /* which node's journal this is */
 	struct mutex    j_lock;
 	struct buffer_head *j_header_bh;
 	struct super_block *j_sb;       /* owning superblock */
@@ -415,6 +418,7 @@ struct ocsfs_node_info {
 	u64             ni_pr_key;
 	u64             ni_last_hb;      /* last heartbeat timestamp we saw */
 	u64             ni_hb_sequence;
+	u64             ni_suspect_time; /* when we first suspected this node */
 	u8              ni_uuid[16];
 	char            ni_name[64];
 };

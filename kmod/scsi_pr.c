@@ -13,12 +13,18 @@
 #include "ocsfs.h"
 #include <linux/pr.h>
 
+/*
+ * Derive a unique, hard-to-predict PR key from the full 16-byte UUID
+ * and mount generation. Uses two independent CRC32C passes so that
+ * the upper and lower 32 bits are both UUID-dependent.
+ * Previous version used only 4 bytes of UUID, making keys guessable.
+ */
 u64 ocsfs_pr_make_key(const u8 *uuid, u32 mount_gen)
 {
-	u32 uuid_part;
+	u32 hi = crc32c(mount_gen,       uuid, 16);
+	u32 lo = crc32c(~hi ^ mount_gen, uuid, 16);
 
-	memcpy(&uuid_part, uuid, sizeof(uuid_part));
-	return ((u64)uuid_part << 32) | mount_gen;
+	return ((u64)hi << 32) | lo;
 }
 
 /* Map OCSFS SCSI-CDB type encoding to block-layer enum pr_type. */

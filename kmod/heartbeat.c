@@ -124,15 +124,41 @@ int ocsfs_heartbeat_check_peers(struct super_block *sb)
 		ni->ni_hb_sequence = le64_to_cpu(dhb.hb_sequence);
 		spin_unlock(&sbi->s_node_lock);
 
-		/* Check for timeout */
+		/* Two-stage detection: SUSPECTED → confirmed dead */
 		if (now - hb_ts > timeout_ns) {
-			pr_warn("ocsfs: node slot %u heartbeat stale "
-				"(last=%llu, now=%llu, delta=%llums)\n",
-				i, hb_ts, now,
-				(now - hb_ts) / 1000000ULL);
+			u64 confirm_ns = (u64)OCSFS_HB_CONFIRM_MS * 1000000ULL;
 
-			/* Trigger recovery for this node */
-			ocsfs_recovery_trigger(sb, i);
+			spin_lock(&sbi->s_node_lock);
+			if (ni->ni_state == OCSFS_NODE_ACTIVE) {
+				/* First time we notice staleness: mark suspected */
+				ni->ni_state = OCSFS_NODE_SUSPECTED;
+				ni->ni_suspect_time = now;
+				spin_unlock(&sbi->s_node_lock);
+				pr_warn("ocsfs: node slot %u heartbeat stale "
+					"(%llums), marking suspected\n",
+					i, (now - hb_ts) / 1000000ULL);
+			} else if (ni->ni_state == OCSFS_NODE_SUSPECTED &&
+				   (now - ni->ni_suspect_time) > confirm_ns) {
+				/* Still no heartbeat after confirm window — dead */
+				spin_unlock(&sbi->s_node_lock);
+				pr_warn("ocsfs: node slot %u confirmed dead "
+					"(suspected %llums ago), triggering recovery\n",
+					i,
+					(now - ni->ni_suspect_time) / 1000000ULL);
+				ocsfs_recovery_trigger(sb, i);
+			} else {
+				spin_unlock(&sbi->s_node_lock);
+			}
+		} else {
+			/* Heartbeat is fresh — clear suspected state if set */
+			spin_lock(&sbi->s_node_lock);
+			if (ni->ni_state == OCSFS_NODE_SUSPECTED) {
+				ni->ni_state = OCSFS_NODE_ACTIVE;
+				ni->ni_suspect_time = 0;
+				pr_info("ocsfs: node slot %u heartbeat recovered\n",
+					i);
+			}
+			spin_unlock(&sbi->s_node_lock);
 		}
 	}
 
@@ -155,8 +181,10 @@ bool ocsfs_node_is_alive(struct super_block *sb, u16 slot)
 
 	spin_lock(&sbi->s_node_lock);
 	ni = &sbi->s_nodes[slot];
-	alive = (ni->ni_state == OCSFS_NODE_ACTIVE &&
-		 (now - ni->ni_last_hb) < timeout_ns);
+	/* SUSPECTED is still considered alive until confirmed dead */
+	alive = ((ni->ni_state == OCSFS_NODE_ACTIVE ||
+		  ni->ni_state == OCSFS_NODE_SUSPECTED) &&
+		 (now - ni->ni_last_hb) < timeout_ns * 2);
 	spin_unlock(&sbi->s_node_lock);
 
 	return alive;

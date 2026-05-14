@@ -206,29 +206,6 @@ fill:
  * DEL DIRENT — remove a directory entry by name
  * ═══════════════════════════════════════════════════════════════ */
 
-struct del_ctx {
-	const struct qstr *name;
-	int found;
-};
-
-static int del_actor(struct ocsfs_disk_dirent *de, u64 block, u32 offset,
-		     void *priv)
-{
-	struct del_ctx *ctx = priv;
-
-	if (de->de_name_len != ctx->name->len)
-		return 0;
-	if (memcmp(de->de_name, ctx->name->name, ctx->name->len) != 0)
-		return 0;
-
-	/* Zero out the entry to mark it free */
-	de->de_name_len = 0;
-	de->de_ino = 0;
-	de->de_magic = 0;
-	ctx->found = 1;
-	return 1;
-}
-
 int ocsfs_del_dirent(struct inode *dir, const struct qstr *name)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(dir->i_sb);
@@ -520,7 +497,6 @@ static int ocsfs_readdir(struct file *file, struct dir_context *ctx)
 	struct ocsfs_sb_info *sbi = OCSFS_SB(dir->i_sb);
 	u64 dir_blocks = (dir->i_size + sbi->s_block_size - 1) /
 			 sbi->s_block_size;
-	u32 entries_per_block = sbi->s_block_size / OCSFS_DIRENT_SIZE;
 	u64 b;
 	u32 off;
 	loff_t pos = ctx->pos;
