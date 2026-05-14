@@ -1,5 +1,11 @@
 # Build artifacts
 *.o
+*.ko
+*.mod
+*.mod.c
+.*.cmd
+Module.symvers
+modules.order
 mkfs.ocsfs
 ocsfs-tool
 ocsfs-fuse
@@ -9,3 +15,9 @@ test_ocsfs
 # Test images
 /tmp/ocsfs_*.img
 *.img
+
+# Tooling config
+.claude/
+.claude-flow/
+.mcp.json
+CLAUDE.md
