@@ -77,7 +77,7 @@
 #define OCSFS_HEARTBEAT_TIMEOUT_MS  15000       /* 15 seconds */
 
 #define OCSFS_INODE_SIZE            512
-#define OCSFS_INLINE_EXTENTS        28          /* fits in 512-byte inode */
+#define OCSFS_INLINE_EXTENTS        16          /* 16 × 24 = 384 bytes, fits in 512-byte inode */
 #define OCSFS_MAX_NAME_LEN          255
 
 #define OCSFS_ROOT_INO              2           /* root directory inode */
@@ -301,19 +301,13 @@ struct ocsfs_inode {
     uint64_t    i_thin_allocated;   /* actual bytes written (thin prov.) */
     uint32_t    i_ag;               /* home allocation group */
     uint8_t     i_inline_extents[OCSFS_INLINE_EXTENTS * sizeof(struct ocsfs_extent)];
-    /* 28 * 24 = 672 — but we only have ~380 bytes left, recalculate... */
-    uint8_t     i_reserved[12];
+    /* 16 × 24 = 384 bytes; metadata = 92 bytes; checksum = 4; reserved = 32 → total 512 */
+    uint8_t     i_reserved[32];
     uint32_t    i_checksum;         /* CRC32C of bytes 0..507 */
 } __attribute__((packed));
 
-/*
- * Note: with the fields above we use:
- *   4+8+2+2+4+4+8+8+8+8+8+4+2+2+8+8+4 = 94 bytes for metadata
- *   512 - 94 - 4(checksum) - 12(reserved) = 402 bytes for inline extents
- *   402 / 24 = 16 inline extents (we redefine OCSFS_INLINE_EXTENTS_ACTUAL)
- */
-#undef OCSFS_INLINE_EXTENTS
-#define OCSFS_INLINE_EXTENTS    16  /* 16 × 24 = 384 bytes, fits in 512-byte inode */
+_Static_assert(sizeof(struct ocsfs_inode) == OCSFS_INODE_SIZE,
+               "inode must be exactly 512 bytes");
 
 /*
  * Allocation Group Descriptor — 4096 bytes.

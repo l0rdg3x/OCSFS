@@ -96,7 +96,7 @@ kmod:
 %.o: %.c
 	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
 
-test: $(TEST_BIN)
+test: tools $(TEST_BIN)
 	@echo ""
 	@echo "═══════════════════════════════════════════════"
 	@echo "  Running OCSFS test suite..."

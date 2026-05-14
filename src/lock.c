@@ -225,11 +225,16 @@ static uint64_t now_ns(void)
  * Returns 0 on success, -EAGAIN if non-blocking and conflicting,
  * -ETIMEDOUT if timed out, -EIO on I/O error.
  */
+/* Maximum slots to probe before giving up on a hash collision chain */
+#define OCSFS_MAX_PROBE_DEPTH   16
+
 int ocsfs_lock_acquire(struct ocsfs_lock_mgr *mgr,
                         uint64_t resource_id, uint32_t resource_type,
                         uint16_t mode, uint32_t timeout_ms)
 {
-    uint32_t slot = ocsfs_lock_slot(resource_id);
+    uint32_t base_slot = ocsfs_lock_slot(resource_id);
+    uint32_t slot = base_slot;
+    uint32_t probe_depth = 0;
     uint64_t deadline = (timeout_ms > 0) ? now_ns() + (uint64_t)timeout_ms * 1000000 : 0;
     uint32_t backoff_us = 1000; /* start at 1ms */
     int ret;
@@ -266,10 +271,9 @@ retry:
 
     /* Slot has a different resource — linear probe */
     if (le.le_resource_id != resource_id) {
-        /* TODO: implement linear probing chain.
-         * For now, use a secondary hash slot. */
-        slot = (slot + 1) % OCSFS_LOCK_ENTRY_COUNT;
-        /* In production, we'd probe up to MAX_PROBE_DEPTH slots */
+        if (++probe_depth > OCSFS_MAX_PROBE_DEPTH)
+            return -ENOSPC; /* lock table too congested */
+        slot = (base_slot + probe_depth) % OCSFS_LOCK_ENTRY_COUNT;
         goto retry;
     }
 
