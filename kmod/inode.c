@@ -34,6 +34,26 @@ static int ocsfs_read_disk_inode(struct super_block *sb, u64 ino,
 	return 0;
 }
 
+/*
+ * Force a fresh read of the block containing @ino's on-disk inode.
+ * Called before ocsfs_read_disk_inode() in clustered mode to bypass
+ * any stale buffer-cache entry that predates a remote write.
+ */
+static void ocsfs_inode_invalidate_cache(struct super_block *sb, u64 ino)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	u64 off   = ocsfs_inode_disk_off(sbi, ino);
+	u64 block = off / sbi->s_block_size;
+	struct buffer_head *bh;
+
+	bh = sb_getblk(sb, block);
+	if (!bh)
+		return;
+	clear_buffer_uptodate(bh);
+	bh_read(bh, 0);   /* re-read from block device */
+	brelse(bh);
+}
+
 /* Parse inline extents from the on-disk inode */
 static void ocsfs_parse_extents(struct ocsfs_inode_info *oi,
 				struct ocsfs_disk_inode *di)
@@ -63,6 +83,7 @@ static void ocsfs_parse_extents(struct ocsfs_inode_info *oi,
 
 struct inode *ocsfs_iget(struct super_block *sb, u64 ino)
 {
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	struct inode *inode;
 	struct ocsfs_inode_info *oi;
 	struct ocsfs_disk_inode di;
@@ -77,11 +98,34 @@ struct inode *ocsfs_iget(struct super_block *sb, u64 ino)
 	oi = OCSFS_I(inode);
 	oi->i_disk_ino = ino;
 
+	/* Initialise the per-inode DLM lock resource. */
+	ocsfs_lock_init(&oi->i_lock_res,
+			ocsfs_lock_hash_inode(ino), OCSFS_LOCKRES_INODE);
+
+	if (sbi->s_clustered) {
+		/*
+		 * Acquire shared lock before reading to ensure no other node
+		 * is mid-write on this inode, then force a fresh buffer-cache
+		 * read so we don't serve data written before we mounted.
+		 */
+		ret = ocsfs_lock_acquire(sb, &oi->i_lock_res, OCSFS_LOCK_SH);
+		if (ret) {
+			iget_failed(inode);
+			return ERR_PTR(ret);
+		}
+		ocsfs_inode_invalidate_cache(sb, ino);
+	}
+
 	ret = ocsfs_read_disk_inode(sb, ino, &di);
 	if (ret) {
+		if (sbi->s_clustered)
+			ocsfs_lock_release(sb, &oi->i_lock_res);
 		iget_failed(inode);
 		return ERR_PTR(ret);
 	}
+
+	if (sbi->s_clustered)
+		ocsfs_lock_release(sb, &oi->i_lock_res);
 
 	/* Fill VFS inode from disk data */
 	inode->i_mode = le16_to_cpu(di.i_mode);
@@ -139,14 +183,25 @@ int ocsfs_write_inode(struct inode *inode, struct writeback_control *wbc)
 	u64 off, block;
 	u32 boff;
 	u16 i;
+	int ret;
+
+	if (sbi->s_clustered) {
+		ret = ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
+					 OCSFS_LOCK_EX);
+		if (ret)
+			return ret;
+	}
 
 	off = ocsfs_inode_disk_off(sbi, oi->i_disk_ino);
 	block = off / sbi->s_block_size;
 	boff = off % sbi->s_block_size;
 
 	bh = sb_bread(inode->i_sb, block);
-	if (!bh)
+	if (!bh) {
+		if (sbi->s_clustered)
+			ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
 		return -EIO;
+	}
 
 	di = (struct ocsfs_disk_inode *)(bh->b_data + boff);
 
@@ -196,6 +251,9 @@ int ocsfs_write_inode(struct inode *inode, struct writeback_control *wbc)
 		sync_dirty_buffer(bh);
 	brelse(bh);
 
+	if (sbi->s_clustered)
+		ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
+
 	return 0;
 }
 
@@ -205,6 +263,7 @@ int ocsfs_write_inode(struct inode *inode, struct writeback_control *wbc)
 
 void ocsfs_evict_inode(struct inode *inode)
 {
+	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
 
 	truncate_inode_pages_final(&inode->i_data);
@@ -212,8 +271,24 @@ void ocsfs_evict_inode(struct inode *inode)
 
 	/* If nlink dropped to 0, free on-disk resources */
 	if (!inode->i_nlink && oi->i_disk_ino >= OCSFS_FIRST_USER_INO) {
+		/*
+		 * Need EX to free the inode on disk.  Acquire regardless of
+		 * whatever mode (if any) we may still hold; ocsfs_lock_acquire
+		 * is safe to call when lr_mode == NL.
+		 */
+		if (sbi->s_clustered)
+			ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
+					   OCSFS_LOCK_EX);
+
 		ocsfs_extent_truncate(inode, 0);
 		ocsfs_free_inode_num(inode->i_sb, oi->i_disk_ino);
+
+		if (sbi->s_clustered)
+			ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
+	} else if (sbi->s_clustered &&
+		   oi->i_lock_res.lr_mode != OCSFS_LOCK_NL) {
+		/* Release any lock left over from an error path in iget. */
+		ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
 	}
 }
 
@@ -251,6 +326,18 @@ struct inode *ocsfs_new_inode(struct inode *dir, umode_t mode)
 	oi->i_extent_tree_root = 0;
 	oi->i_flags = 0;
 
+	/* Initialise per-inode DLM lock and take EX during creation. */
+	ocsfs_lock_init(&oi->i_lock_res,
+			ocsfs_lock_hash_inode(ino), OCSFS_LOCKRES_INODE);
+	if (sbi->s_clustered) {
+		ret = ocsfs_lock_acquire(sb, &oi->i_lock_res, OCSFS_LOCK_EX);
+		if (ret) {
+			iput(inode);
+			ocsfs_free_inode_num(sb, ino);
+			return ERR_PTR(ret);
+		}
+	}
+
 	inode_init_owner(&nop_mnt_idmap, inode, dir, mode);
 	inode->i_ino = ino;
 	inode->i_blocks = 0;
@@ -272,6 +359,9 @@ struct inode *ocsfs_new_inode(struct inode *dir, umode_t mode)
 
 	insert_inode_hash(inode);
 	mark_inode_dirty(inode);
+
+	if (sbi->s_clustered)
+		ocsfs_lock_release(sb, &oi->i_lock_res);
 
 	return inode;
 }

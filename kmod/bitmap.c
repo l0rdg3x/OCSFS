@@ -28,9 +28,18 @@ static int ocsfs_ag_alloc_blocks(struct super_block *sb, u32 ag_no,
 	u64 b;
 	u32 found = 0;
 	u64 start_bit = 0;
+	int ret;
 
 	if (ag->free_blocks < count)
 		return -ENOSPC;
+
+	/* Cross-node serialisation: acquire EX on the AG before touching the
+	 * bitmap.  This prevents two nodes from allocating the same blocks. */
+	if (sbi->s_clustered) {
+		ret = ocsfs_lock_acquire(sb, &ag->ag_lock_res, OCSFS_LOCK_EX);
+		if (ret)
+			return ret;
+	}
 
 	mutex_lock(&ag->ag_lock);
 
@@ -52,8 +61,8 @@ static int ocsfs_ag_alloc_blocks(struct super_block *sb, u32 ag_no,
 
 		bh = sb_bread(sb, bm_block);
 		if (!bh) {
-			mutex_unlock(&ag->ag_lock);
-			return -EIO;
+			ret = -EIO;
+			goto out_unlock;
 		}
 
 		for (bit = 0; bit < bits_in_block; bit++) {
@@ -84,8 +93,8 @@ static int ocsfs_ag_alloc_blocks(struct super_block *sb, u32 ag_no,
 								(ag->bitmap_off / sbi->s_block_size) + mb);
 							if (!mbh) {
 								brelse(bh);
-								mutex_unlock(&ag->ag_lock);
-								return -EIO;
+								ret = -EIO;
+								goto out_unlock;
 							}
 						}
 
@@ -105,9 +114,8 @@ static int ocsfs_ag_alloc_blocks(struct super_block *sb, u32 ag_no,
 					spin_unlock(&sbi->s_free_lock);
 
 					*block_out = ag->block_start + start_bit;
-
-					mutex_unlock(&ag->ag_lock);
-					return 0;
+					ret = 0;
+					goto out_unlock;
 				}
 			} else {
 				/* Used bit — reset counter */
@@ -118,8 +126,13 @@ static int ocsfs_ag_alloc_blocks(struct super_block *sb, u32 ag_no,
 		brelse(bh);
 	}
 
+	ret = -ENOSPC;
+
+out_unlock:
 	mutex_unlock(&ag->ag_lock);
-	return -ENOSPC;
+	if (sbi->s_clustered)
+		ocsfs_lock_release(sb, &ag->ag_lock_res);
+	return ret;
 }
 
 int ocsfs_alloc_blocks(struct super_block *sb, u32 ag_hint, u32 count,
@@ -175,6 +188,10 @@ void ocsfs_free_blocks(struct super_block *sb, u64 block, u32 count)
 
 	local_block = block - ag->block_start;
 
+	/* Cross-node serialisation for bitmap modification */
+	if (sbi->s_clustered)
+		ocsfs_lock_acquire(sb, &ag->ag_lock_res, OCSFS_LOCK_EX);
+
 	mutex_lock(&ag->ag_lock);
 
 	for (i = 0; i < count; i++) {
@@ -200,6 +217,8 @@ void ocsfs_free_blocks(struct super_block *sb, u64 block, u32 count)
 	spin_unlock(&sbi->s_free_lock);
 
 	mutex_unlock(&ag->ag_lock);
+	if (sbi->s_clustered)
+		ocsfs_lock_release(sb, &ag->ag_lock_res);
 }
 
 /* ═══════════════════════════════════════════════════════════════

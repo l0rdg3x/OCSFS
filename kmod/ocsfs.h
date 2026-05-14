@@ -35,10 +35,7 @@
 #include <linux/kthread.h>
 #include <linux/delay.h>
 #include <linux/workqueue.h>
-#include <scsi/scsi.h>
-#include <scsi/scsi_device.h>
-#include <scsi/scsi_cmnd.h>
-#include <scsi/sg.h>
+#include <linux/timekeeping.h>
 
 /* ═══════════════════════════════════════════════════════════════
  * ON-DISK CONSTANTS (mirrored from userspace ocsfs.h)
@@ -155,6 +152,10 @@
 #define OCSFS_LOCK_RETRY_MIN_US 1000   /* 1 ms */
 #define OCSFS_LOCK_RETRY_MAX_US 100000 /* 100 ms */
 #define OCSFS_LOCK_MAX_RETRIES  50
+
+/* Lock caching — serve re-acquires from local cache for this window */
+#define OCSFS_LOCK_CACHE_MS     500ULL
+#define OCSFS_LOCK_CACHE_NS     (OCSFS_LOCK_CACHE_MS * 1000000ULL)
 
 /* Recovery phases */
 #define OCSFS_RECOVERY_ELECT    1
@@ -357,6 +358,19 @@ struct ocsfs_extent {
 	u16     flags;
 };
 
+/* In-memory lock resource — must be defined before ocsfs_ag_info and
+ * ocsfs_inode_info which embed it. */
+struct ocsfs_lock_res {
+	u64             lr_resource_id;
+	u32             lr_resource_type;
+	u16             lr_mode;         /* currently held mode */
+	u16             lr_slot;         /* lock table slot index */
+	bool            lr_cached;       /* recently acquired; skip slow path */
+	u64             lr_cache_expires; /* ktime_get_ns() expiry */
+	struct mutex    lr_mutex;        /* local serialization */
+	struct list_head lr_list;        /* link in sb's active lock list */
+};
+
 /* Per-AG in-memory state */
 struct ocsfs_ag_info {
 	u32             ag_no;
@@ -368,7 +382,8 @@ struct ocsfs_ag_info {
 	u64             inode_table_off;
 	u64             inode_count;
 	u64             free_inodes;
-	struct mutex    ag_lock;        /* protects bitmap + inode table */
+	struct mutex    ag_lock;        /* protects bitmap + inode table (local) */
+	struct ocsfs_lock_res ag_lock_res; /* cross-node DLM lock for this AG */
 };
 
 /* Journal in-memory state */
@@ -398,16 +413,6 @@ struct ocsfs_txn_buf {
 	struct list_head        list;
 	struct buffer_head      *bh;
 	u64                     block_num;
-};
-
-/* In-memory lock resource — cached lock state */
-struct ocsfs_lock_res {
-	u64             lr_resource_id;
-	u32             lr_resource_type;
-	u16             lr_mode;         /* currently held mode */
-	u16             lr_slot;         /* lock table slot index */
-	struct mutex    lr_mutex;        /* local serialization */
-	struct list_head lr_list;        /* link in sb's active lock list */
 };
 
 /* Node info — in-memory representation of a peer node */
@@ -506,6 +511,7 @@ struct ocsfs_inode_info {
 	struct ocsfs_extent     i_extents[OCSFS_INLINE_EXTENTS];
 	u64                     i_extent_tree_root;
 	struct mutex            i_extent_lock;
+	struct ocsfs_lock_res   i_lock_res;     /* cross-node DLM inode lock */
 	struct inode            vfs_inode;      /* must be last */
 };
 
@@ -660,6 +666,8 @@ u64 ocsfs_pr_make_key(const u8 *uuid, u32 mount_gen);
 /* lock.c — Distributed on-disk lock manager */
 int ocsfs_dlm_init(struct super_block *sb);
 void ocsfs_dlm_exit(struct super_block *sb);
+void ocsfs_lock_init(struct ocsfs_lock_res *lr, u64 resource_id,
+		     u32 resource_type);
 struct ocsfs_lock_res *ocsfs_lock_alloc(struct super_block *sb,
 					u64 resource_id, u32 resource_type);
 void ocsfs_lock_free(struct ocsfs_lock_res *lr);

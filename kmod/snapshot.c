@@ -48,7 +48,6 @@ int ocsfs_snapshot_create(struct inode *src, struct inode *dir,
 			  const struct qstr *name)
 {
 	struct super_block *sb = src->i_sb;
-	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	struct ocsfs_inode_info *src_oi = OCSFS_I(src);
 	struct ocsfs_inode_info *snap_oi;
 	struct inode *snap;

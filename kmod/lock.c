@@ -220,6 +220,26 @@ static bool has_waiters(struct ocsfs_disk_lock *dl)
  * LOCK RESOURCE ALLOCATION
  * ═══════════════════════════════════════════════════════════════ */
 
+/*
+ * ocsfs_lock_init() — initialise an embedded lock resource.
+ *
+ * Used for locks stored directly inside ocsfs_inode_info and
+ * ocsfs_ag_info (not heap-allocated).  Does NOT add to s_lock_list.
+ */
+void ocsfs_lock_init(struct ocsfs_lock_res *lr, u64 resource_id,
+		     u32 resource_type)
+{
+	memset(lr, 0, sizeof(*lr));
+	lr->lr_resource_id   = resource_id;
+	lr->lr_resource_type = resource_type;
+	lr->lr_mode          = OCSFS_LOCK_NL;
+	lr->lr_slot          = ocsfs_lock_table_slot(resource_id);
+	lr->lr_cached        = false;
+	lr->lr_cache_expires = 0;
+	mutex_init(&lr->lr_mutex);
+	INIT_LIST_HEAD(&lr->lr_list);
+}
+
 int ocsfs_dlm_init(struct super_block *sb)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
@@ -305,6 +325,22 @@ int ocsfs_lock_acquire(struct super_block *sb, struct ocsfs_lock_res *lr,
 
 	mutex_lock(&lr->lr_mutex);
 
+	/*
+	 * Cache fast-path: if we already hold a compatible or stronger lock
+	 * and the window hasn't expired, renew and return without disk I/O.
+	 * Safe because no other node can grab EX while we hold EX or SH.
+	 */
+	if (lr->lr_cached && lr->lr_cache_expires > ktime_get_ns()) {
+		bool compatible = (lr->lr_mode == OCSFS_LOCK_EX) ||
+				  (lr->lr_mode == mode);
+		if (compatible && mode != OCSFS_LOCK_NL) {
+			lr->lr_cache_expires = ktime_get_ns() + OCSFS_LOCK_CACHE_NS;
+			mutex_unlock(&lr->lr_mutex);
+			return 0;
+		}
+	}
+	lr->lr_cached = false;
+
 retry:
 	ret = lock_read_entry(sb, lr->lr_slot, &dl, &bh);
 	if (ret) {
@@ -350,8 +386,11 @@ retry:
 		if (ret == -EAGAIN)
 			goto retry; /* concurrent write detected, re-read */
 
-		if (ret == 0)
+		if (ret == 0) {
 			lr->lr_mode = mode;
+			lr->lr_cached = true;
+			lr->lr_cache_expires = ktime_get_ns() + OCSFS_LOCK_CACHE_NS;
+		}
 
 		mutex_unlock(&lr->lr_mutex);
 		return ret;
@@ -417,7 +456,9 @@ int ocsfs_lock_release(struct super_block *sb, struct ocsfs_lock_res *lr)
 	ret = lock_write_entry(sb, lr->lr_slot, &dl, bh);
 	brelse(bh);
 
-	lr->lr_mode = OCSFS_LOCK_NL;
+	lr->lr_mode          = OCSFS_LOCK_NL;
+	lr->lr_cached        = false;
+	lr->lr_cache_expires = 0;
 	mutex_unlock(&lr->lr_mutex);
 	return ret;
 }
@@ -462,8 +503,11 @@ int ocsfs_lock_downgrade(struct super_block *sb, struct ocsfs_lock_res *lr,
 	ret = lock_write_entry(sb, lr->lr_slot, &dl, bh);
 	brelse(bh);
 
-	if (ret == 0)
-		lr->lr_mode = new_mode;
+	if (ret == 0) {
+		lr->lr_mode          = new_mode;
+		lr->lr_cached        = false;
+		lr->lr_cache_expires = 0;
+	}
 
 	mutex_unlock(&lr->lr_mutex);
 	return ret;

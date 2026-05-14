@@ -24,6 +24,12 @@ static struct inode *ocsfs_alloc_inode(struct super_block *sb)
 		return NULL;
 
 	mutex_init(&oi->i_extent_lock);
+	/* Pre-init the embedded lock_res mutex so it is always safe to call
+	 * mutex_lock on it.  ocsfs_lock_init() will fully reinitialise it
+	 * before any actual lock operation. */
+	mutex_init(&oi->i_lock_res.lr_mutex);
+	INIT_LIST_HEAD(&oi->i_lock_res.lr_list);
+	oi->i_lock_res.lr_mode = OCSFS_LOCK_NL;
 	oi->i_extent_count = 0;
 	oi->i_extent_tree_root = 0;
 	oi->i_flags = 0;
@@ -135,6 +141,8 @@ static int ocsfs_load_ags(struct super_block *sb)
 		ag->inode_count = le64_to_cpu(dag->ag_inode_count);
 		ag->free_inodes = le64_to_cpu(dag->ag_free_inodes);
 		mutex_init(&ag->ag_lock);
+		ocsfs_lock_init(&ag->ag_lock_res,
+				ocsfs_lock_hash_ag(i), OCSFS_LOCKRES_AG);
 
 		brelse(bh);
 	}
