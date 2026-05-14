@@ -109,9 +109,18 @@ static int find_actor(struct ocsfs_disk_dirent *de, u64 block, u32 offset,
 
 u64 ocsfs_find_dirent(struct inode *dir, const struct qstr *name, u8 *ft_out)
 {
+	struct ocsfs_sb_info *sbi = OCSFS_SB(dir->i_sb);
+	struct ocsfs_inode_info *dir_oi = OCSFS_I(dir);
 	struct find_ctx ctx = { .name = name, .ino = 0, .ft = 0 };
 
+	if (sbi->s_clustered)
+		ocsfs_lock_acquire(dir->i_sb, &dir_oi->i_lock_res,
+				   OCSFS_LOCK_SH);
+
 	ocsfs_dir_foreach(dir, find_actor, &ctx);
+
+	if (sbi->s_clustered)
+		ocsfs_lock_release(dir->i_sb, &dir_oi->i_lock_res);
 
 	if (ft_out && ctx.ino)
 		*ft_out = ctx.ft;
@@ -126,11 +135,20 @@ int ocsfs_add_dirent(struct inode *dir, const struct qstr *name,
 		     u64 ino, u8 file_type)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(dir->i_sb);
+	struct ocsfs_inode_info *dir_oi = OCSFS_I(dir);
 	u64 dir_blocks = (dir->i_size + sbi->s_block_size - 1) /
 			 sbi->s_block_size;
-	struct buffer_head *bh;
+	struct buffer_head *bh = NULL;
 	u64 b;
-	u32 off;
+	u32 off = 0;
+	int ret = 0;
+
+	if (sbi->s_clustered) {
+		ret = ocsfs_lock_acquire(dir->i_sb, &dir_oi->i_lock_res,
+					 OCSFS_LOCK_EX);
+		if (ret)
+			return ret;
+	}
 
 	/* Scan for a free slot in existing blocks */
 	for (b = 0; b < dir_blocks; b++) {
@@ -151,30 +169,31 @@ int ocsfs_add_dirent(struct inode *dir, const struct qstr *name,
 			goto fill;
 		}
 		brelse(bh);
+		bh = NULL;
 	}
 
 	/* No free slot — allocate a new directory block */
 	{
 		u64 phys;
-		int ret;
 
-		ret = ocsfs_alloc_blocks(dir->i_sb,
-					 OCSFS_I(dir)->i_ag, 1, &phys);
+		ret = ocsfs_alloc_blocks(dir->i_sb, dir_oi->i_ag, 1, &phys);
 		if (ret)
-			return ret;
+			goto out;
 
 		ret = ocsfs_extent_insert(dir, dir_blocks, phys, 1,
 					  OCSFS_EXT_WRITTEN);
 		if (ret) {
 			ocsfs_free_blocks(dir->i_sb, phys, 1);
-			return ret;
+			goto out;
 		}
 
 		dir->i_size += sbi->s_block_size;
 
 		bh = sb_bread(dir->i_sb, phys);
-		if (!bh)
-			return -EIO;
+		if (!bh) {
+			ret = -EIO;
+			goto out;
+		}
 
 		memset(bh->b_data, 0, sbi->s_block_size);
 		off = 0;
@@ -195,11 +214,16 @@ fill:
 
 		mark_buffer_dirty(bh);
 		brelse(bh);
+		bh = NULL;
 	}
 
 	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
 	mark_inode_dirty(dir);
-	return 0;
+
+out:
+	if (sbi->s_clustered)
+		ocsfs_lock_release(dir->i_sb, &dir_oi->i_lock_res);
+	return ret;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -209,9 +233,18 @@ fill:
 int ocsfs_del_dirent(struct inode *dir, const struct qstr *name)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(dir->i_sb);
+	struct ocsfs_inode_info *dir_oi = OCSFS_I(dir);
 	u64 dir_blocks = (dir->i_size + sbi->s_block_size - 1) /
 			 sbi->s_block_size;
 	u64 b;
+	int ret;
+
+	if (sbi->s_clustered) {
+		ret = ocsfs_lock_acquire(dir->i_sb, &dir_oi->i_lock_res,
+					 OCSFS_LOCK_EX);
+		if (ret)
+			return ret;
+	}
 
 	/*
 	 * We can't use ocsfs_dir_foreach here because we need to modify
@@ -247,11 +280,15 @@ int ocsfs_del_dirent(struct inode *dir, const struct qstr *name)
 			inode_set_mtime_to_ts(dir,
 				inode_set_ctime_current(dir));
 			mark_inode_dirty(dir);
+			if (sbi->s_clustered)
+				ocsfs_lock_release(dir->i_sb, &dir_oi->i_lock_res);
 			return 0;
 		}
 		brelse(bh);
 	}
 
+	if (sbi->s_clustered)
+		ocsfs_lock_release(dir->i_sb, &dir_oi->i_lock_res);
 	return -ENOENT;
 }
 
