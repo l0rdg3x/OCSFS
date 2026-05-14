@@ -190,7 +190,23 @@ ssize_t ocsfs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 ssize_t ocsfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
+	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
+	struct ocsfs_inode_info *oi = OCSFS_I(inode);
 	ssize_t ret;
+
+	if (sbi->s_clustered) {
+		ret = ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
+					 OCSFS_LOCK_EX);
+		if (ret)
+			return ret;
+		/*
+		 * Invalidate the page cache so we start with clean pages.
+		 * Another node may have written to this file since our last
+		 * access; dropping stale pages prevents us from writing
+		 * outdated data or exposing stale reads post-write.
+		 */
+		invalidate_inode_pages2(inode->i_mapping);
+	}
 
 	inode_lock(inode);
 
@@ -215,6 +231,9 @@ out:
 		inode_set_mtime_to_ts(inode, inode_set_ctime_current(inode));
 		mark_inode_dirty(inode);
 	}
+
+	if (sbi->s_clustered)
+		ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
 
 	return ret;
 }
