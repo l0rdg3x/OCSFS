@@ -118,6 +118,56 @@ static int lock_write_entry(struct super_block *sb, u32 slot,
 	return 0;
 }
 
+/*
+ * ocsfs_lock_probe_slot() — find the actual on-disk slot for a resource.
+ *
+ * The primary slot is hash(resource_id) % ENTRY_COUNT, but collisions
+ * are possible.  We use open addressing (linear probe) to find a free
+ * slot or the existing slot that already holds this resource.
+ *
+ * Updates lr->lr_slot to the found slot so all subsequent operations
+ * (release, downgrade) hit the same disk entry.
+ *
+ * Called with lr->lr_mutex held.
+ * Returns 0 on success, -ENOSPC if OCSFS_LOCK_PROBE_MAX slots are all
+ * occupied by different resources (extremely unlikely with good hashing).
+ */
+static int ocsfs_lock_probe_slot(struct super_block *sb,
+				  struct ocsfs_lock_res *lr)
+{
+	u32 base = ocsfs_lock_table_slot(lr->lr_resource_id);
+	int i;
+
+	for (i = 0; i < OCSFS_LOCK_PROBE_MAX; i++) {
+		u32 slot = (base + i) % OCSFS_LOCK_ENTRY_COUNT;
+		struct ocsfs_disk_lock dl;
+		struct buffer_head *bh;
+		int ret;
+
+		ret = lock_read_entry(sb, slot, &dl, &bh);
+		if (ret)
+			return ret;
+		brelse(bh);
+
+		/* Free slot: claim it */
+		if (le32_to_cpu(dl.le_magic) != OCSFS_LOCK_MAGIC) {
+			lr->lr_slot = slot;
+			return 0;
+		}
+
+		/* Slot belongs to our resource: use it */
+		if (le64_to_cpu(dl.le_resource_id) == lr->lr_resource_id) {
+			lr->lr_slot = slot;
+			return 0;
+		}
+		/* Slot belongs to a different resource: probe next */
+	}
+
+	pr_warn("ocsfs: lock table full (probe_max=%d), resource 0x%llx\n",
+		OCSFS_LOCK_PROBE_MAX, lr->lr_resource_id);
+	return -ENOSPC;
+}
+
 /* ═══════════════════════════════════════════════════════════════
  * LOCK COMPATIBILITY
  * ═══════════════════════════════════════════════════════════════ */
@@ -341,6 +391,13 @@ int ocsfs_lock_acquire(struct super_block *sb, struct ocsfs_lock_res *lr,
 	}
 	lr->lr_cached = false;
 
+	/* Resolve collision: find/claim the actual on-disk slot. */
+	ret = ocsfs_lock_probe_slot(sb, lr);
+	if (ret) {
+		mutex_unlock(&lr->lr_mutex);
+		return ret;
+	}
+
 retry:
 	ret = lock_read_entry(sb, lr->lr_slot, &dl, &bh);
 	if (ret) {
@@ -348,16 +405,12 @@ retry:
 		return ret;
 	}
 
-	/* Check if entry is uninitialized or for a different resource */
-	if (le32_to_cpu(dl.le_magic) != OCSFS_LOCK_MAGIC ||
-	    le64_to_cpu(dl.le_resource_id) != lr->lr_resource_id) {
-		/* Initialize/claim this lock entry */
-		if (le32_to_cpu(dl.le_magic) != OCSFS_LOCK_MAGIC) {
-			memset(&dl, 0, sizeof(dl));
-			dl.le_magic = cpu_to_le32(OCSFS_LOCK_MAGIC);
-			dl.le_resource_id = cpu_to_le64(lr->lr_resource_id);
-			dl.le_resource_type = cpu_to_le32(lr->lr_resource_type);
-		}
+	/* Initialise the entry if we claimed a free slot. */
+	if (le32_to_cpu(dl.le_magic) != OCSFS_LOCK_MAGIC) {
+		memset(&dl, 0, sizeof(dl));
+		dl.le_magic = cpu_to_le32(OCSFS_LOCK_MAGIC);
+		dl.le_resource_id = cpu_to_le64(lr->lr_resource_id);
+		dl.le_resource_type = cpu_to_le32(lr->lr_resource_type);
 	}
 
 	u16 cur_mode = le16_to_cpu(dl.le_mode);

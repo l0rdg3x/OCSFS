@@ -153,6 +153,9 @@
 #define OCSFS_LOCK_RETRY_MAX_US 100000 /* 100 ms */
 #define OCSFS_LOCK_MAX_RETRIES  50
 
+/* Open-addressing probe limit to resolve slot collisions */
+#define OCSFS_LOCK_PROBE_MAX    16
+
 /* Lock caching — serve re-acquires from local cache for this window */
 #define OCSFS_LOCK_CACHE_MS     500ULL
 #define OCSFS_LOCK_CACHE_NS     (OCSFS_LOCK_CACHE_MS * 1000000ULL)
