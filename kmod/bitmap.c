@@ -245,6 +245,11 @@ int ocsfs_alloc_inode_num(struct super_block *sb, u32 ag_hint, u64 *ino_out)
 		if (ag->free_inodes == 0)
 			continue;
 
+		/* Serialise inode-slot claim across nodes (same AG lock as
+		 * block allocation — prevents duplicate inode numbers). */
+		if (sbi->s_clustered)
+			ocsfs_lock_acquire(sb, &ag->ag_lock_res, OCSFS_LOCK_EX);
+
 		mutex_lock(&ag->ag_lock);
 
 		for (i = (ag_no == 0 ? OCSFS_FIRST_USER_INO : 0);
@@ -274,6 +279,8 @@ int ocsfs_alloc_inode_num(struct super_block *sb, u32 ag_hint, u64 *ino_out)
 				*ino_out = ag_no * sbi->s_ag_size + i;
 
 				mutex_unlock(&ag->ag_lock);
+				if (sbi->s_clustered)
+					ocsfs_lock_release(sb, &ag->ag_lock_res);
 				return 0;
 			}
 
@@ -281,6 +288,8 @@ int ocsfs_alloc_inode_num(struct super_block *sb, u32 ag_hint, u64 *ino_out)
 		}
 
 		mutex_unlock(&ag->ag_lock);
+		if (sbi->s_clustered)
+			ocsfs_lock_release(sb, &ag->ag_lock_res);
 	}
 
 	return -ENOSPC;
@@ -308,6 +317,9 @@ void ocsfs_free_inode_num(struct super_block *sb, u64 ino)
 
 	ag = &sbi->s_ags[ag_no];
 
+	if (sbi->s_clustered)
+		ocsfs_lock_acquire(sb, &ag->ag_lock_res, OCSFS_LOCK_EX);
+
 	mutex_lock(&ag->ag_lock);
 
 	off = ag->inode_table_off + local * OCSFS_INODE_SIZE;
@@ -324,4 +336,6 @@ void ocsfs_free_inode_num(struct super_block *sb, u64 ino)
 
 	ag->free_inodes++;
 	mutex_unlock(&ag->ag_lock);
+	if (sbi->s_clustered)
+		ocsfs_lock_release(sb, &ag->ag_lock_res);
 }
