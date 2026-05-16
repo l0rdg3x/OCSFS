@@ -113,9 +113,11 @@ u64 ocsfs_find_dirent(struct inode *dir, const struct qstr *name, u8 *ft_out)
 	struct ocsfs_inode_info *dir_oi = OCSFS_I(dir);
 	struct find_ctx ctx = { .name = name, .ino = 0, .ft = 0 };
 
-	if (sbi->s_clustered)
-		ocsfs_lock_acquire(dir->i_sb, &dir_oi->i_lock_res,
-				   OCSFS_LOCK_SH);
+	if (sbi->s_clustered) {
+		if (ocsfs_lock_acquire(dir->i_sb, &dir_oi->i_lock_res,
+				       OCSFS_LOCK_SH))
+			return 0;
+	}
 
 	ocsfs_dir_foreach(dir, find_actor, &ctx);
 
@@ -131,8 +133,8 @@ u64 ocsfs_find_dirent(struct inode *dir, const struct qstr *name, u8 *ft_out)
  * ADD DIRENT — append a directory entry
  * ═══════════════════════════════════════════════════════════════ */
 
-int ocsfs_add_dirent(struct inode *dir, const struct qstr *name,
-		     u64 ino, u8 file_type)
+static int __ocsfs_add_dirent(struct inode *dir, const struct qstr *name,
+			      u64 ino, u8 file_type)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(dir->i_sb);
 	struct ocsfs_inode_info *dir_oi = OCSFS_I(dir);
@@ -142,13 +144,6 @@ int ocsfs_add_dirent(struct inode *dir, const struct qstr *name,
 	u64 b;
 	u32 off = 0;
 	int ret = 0;
-
-	if (sbi->s_clustered) {
-		ret = ocsfs_lock_acquire(dir->i_sb, &dir_oi->i_lock_res,
-					 OCSFS_LOCK_EX);
-		if (ret)
-			return ret;
-	}
 
 	/* Scan for a free slot in existing blocks */
 	for (b = 0; b < dir_blocks; b++) {
@@ -221,6 +216,25 @@ fill:
 	mark_inode_dirty(dir);
 
 out:
+	return ret;
+}
+
+int ocsfs_add_dirent(struct inode *dir, const struct qstr *name,
+		     u64 ino, u8 file_type)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(dir->i_sb);
+	struct ocsfs_inode_info *dir_oi = OCSFS_I(dir);
+	int ret;
+
+	if (sbi->s_clustered) {
+		ret = ocsfs_lock_acquire(dir->i_sb, &dir_oi->i_lock_res,
+					 OCSFS_LOCK_EX);
+		if (ret)
+			return ret;
+	}
+
+	ret = __ocsfs_add_dirent(dir, name, ino, file_type);
+
 	if (sbi->s_clustered)
 		ocsfs_lock_release(dir->i_sb, &dir_oi->i_lock_res);
 	return ret;
@@ -230,21 +244,12 @@ out:
  * DEL DIRENT — remove a directory entry by name
  * ═══════════════════════════════════════════════════════════════ */
 
-int ocsfs_del_dirent(struct inode *dir, const struct qstr *name)
+static int __ocsfs_del_dirent(struct inode *dir, const struct qstr *name)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(dir->i_sb);
-	struct ocsfs_inode_info *dir_oi = OCSFS_I(dir);
 	u64 dir_blocks = (dir->i_size + sbi->s_block_size - 1) /
 			 sbi->s_block_size;
 	u64 b;
-	int ret;
-
-	if (sbi->s_clustered) {
-		ret = ocsfs_lock_acquire(dir->i_sb, &dir_oi->i_lock_res,
-					 OCSFS_LOCK_EX);
-		if (ret)
-			return ret;
-	}
 
 	/*
 	 * We can't use ocsfs_dir_foreach here because we need to modify
@@ -280,16 +285,32 @@ int ocsfs_del_dirent(struct inode *dir, const struct qstr *name)
 			inode_set_mtime_to_ts(dir,
 				inode_set_ctime_current(dir));
 			mark_inode_dirty(dir);
-			if (sbi->s_clustered)
-				ocsfs_lock_release(dir->i_sb, &dir_oi->i_lock_res);
 			return 0;
 		}
 		brelse(bh);
 	}
 
+	return -ENOENT;
+}
+
+int ocsfs_del_dirent(struct inode *dir, const struct qstr *name)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(dir->i_sb);
+	struct ocsfs_inode_info *dir_oi = OCSFS_I(dir);
+	int ret;
+
+	if (sbi->s_clustered) {
+		ret = ocsfs_lock_acquire(dir->i_sb, &dir_oi->i_lock_res,
+					 OCSFS_LOCK_EX);
+		if (ret)
+			return ret;
+	}
+
+	ret = __ocsfs_del_dirent(dir, name);
+
 	if (sbi->s_clustered)
 		ocsfs_lock_release(dir->i_sb, &dir_oi->i_lock_res);
-	return -ENOENT;
+	return ret;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -316,12 +337,29 @@ static int empty_actor(struct ocsfs_disk_dirent *de, u64 block, u32 offset,
 	return 1;  /* stop — not empty */
 }
 
-int ocsfs_empty_dir(struct inode *dir)
+static int __ocsfs_empty_dir(struct inode *dir)
 {
 	struct empty_ctx ctx = { .count = 0 };
 
 	ocsfs_dir_foreach(dir, empty_actor, &ctx);
 	return ctx.count == 0;
+}
+
+int ocsfs_empty_dir(struct inode *dir)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(dir->i_sb);
+	struct ocsfs_inode_info *dir_oi = OCSFS_I(dir);
+	int ret;
+
+	if (sbi->s_clustered)
+		ocsfs_lock_acquire(dir->i_sb, &dir_oi->i_lock_res,
+				   OCSFS_LOCK_SH);
+
+	ret = __ocsfs_empty_dir(dir);
+
+	if (sbi->s_clustered)
+		ocsfs_lock_release(dir->i_sb, &dir_oi->i_lock_res);
+	return ret;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -471,6 +509,9 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 			struct inode *new_dir, struct dentry *new_dentry,
 			unsigned int flags)
 {
+	struct ocsfs_sb_info *sbi = OCSFS_SB(old_dir->i_sb);
+	struct ocsfs_inode_info *old_oi = OCSFS_I(old_dir);
+	struct ocsfs_inode_info *new_oi = OCSFS_I(new_dir);
 	struct inode *old_inode = d_inode(old_dentry);
 	struct inode *new_inode = d_inode(new_dentry);
 	int ret;
@@ -478,41 +519,86 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 	if (flags & ~RENAME_NOREPLACE)
 		return -EINVAL;
 
+	/*
+	 * Acquire EX DLM on both directories atomically, ordered by
+	 * on-disk inode number to prevent deadlock with a concurrent
+	 * rename in the opposite direction.
+	 */
+	if (sbi->s_clustered) {
+		struct ocsfs_inode_info *first = old_oi, *second = new_oi;
+
+		if (old_dir != new_dir &&
+		    new_oi->i_disk_ino < old_oi->i_disk_ino) {
+			first  = new_oi;
+			second = old_oi;
+		}
+
+		ret = ocsfs_lock_acquire(old_dir->i_sb, &first->i_lock_res,
+					 OCSFS_LOCK_EX);
+		if (ret)
+			return ret;
+
+		if (old_dir != new_dir) {
+			ret = ocsfs_lock_acquire(old_dir->i_sb,
+						 &second->i_lock_res,
+						 OCSFS_LOCK_EX);
+			if (ret) {
+				ocsfs_lock_release(old_dir->i_sb,
+						   &first->i_lock_res);
+				return ret;
+			}
+		}
+	}
+
 	/* If target exists, remove it first */
 	if (new_inode) {
 		if (S_ISDIR(new_inode->i_mode)) {
-			if (!ocsfs_empty_dir(new_inode))
-				return -ENOTEMPTY;
-			ocsfs_del_dirent(new_dir, &new_dentry->d_name);
+			if (!__ocsfs_empty_dir(new_inode)) {
+				ret = -ENOTEMPTY;
+				goto out_unlock;
+			}
+			__ocsfs_del_dirent(new_dir, &new_dentry->d_name);
 			clear_nlink(new_inode);
 			drop_nlink(new_dir);
 		} else {
-			ocsfs_del_dirent(new_dir, &new_dentry->d_name);
+			__ocsfs_del_dirent(new_dir, &new_dentry->d_name);
 			inode_dec_link_count(new_inode);
 		}
 		mark_inode_dirty(new_inode);
 	}
 
 	/* Remove from old location */
-	ret = ocsfs_del_dirent(old_dir, &old_dentry->d_name);
+	ret = __ocsfs_del_dirent(old_dir, &old_dentry->d_name);
 	if (ret)
-		return ret;
+		goto out_unlock;
 
 	/* Add to new location */
-	ret = ocsfs_add_dirent(new_dir, &new_dentry->d_name,
-			       OCSFS_I(old_inode)->i_disk_ino,
-			       ocsfs_mode_to_ft(old_inode->i_mode));
+	ret = __ocsfs_add_dirent(new_dir, &new_dentry->d_name,
+				 OCSFS_I(old_inode)->i_disk_ino,
+				 ocsfs_mode_to_ft(old_inode->i_mode));
 	if (ret)
-		return ret;
+		goto out_unlock;
 
 	/* Update .. in moved directory */
 	if (S_ISDIR(old_inode->i_mode) && old_dir != new_dir) {
+		struct ocsfs_inode_info *moved_oi = OCSFS_I(old_inode);
 		struct qstr dotdot = QSTR_INIT("..", 2);
 
-		ocsfs_del_dirent(old_inode, &dotdot);
-		ocsfs_add_dirent(old_inode, &dotdot,
-				 OCSFS_I(new_dir)->i_disk_ino,
-				 OCSFS_FT_DIR);
+		if (sbi->s_clustered) {
+			ret = ocsfs_lock_acquire(old_dir->i_sb,
+						 &moved_oi->i_lock_res,
+						 OCSFS_LOCK_EX);
+			if (ret)
+				goto out_unlock;
+		}
+
+		__ocsfs_del_dirent(old_inode, &dotdot);
+		__ocsfs_add_dirent(old_inode, &dotdot,
+				   new_oi->i_disk_ino, OCSFS_FT_DIR);
+
+		if (sbi->s_clustered)
+			ocsfs_lock_release(old_dir->i_sb, &moved_oi->i_lock_res);
+
 		drop_nlink(old_dir);
 		inc_nlink(new_dir);
 		mark_inode_dirty(old_dir);
@@ -521,7 +607,15 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 
 	inode_set_ctime_current(old_inode);
 	mark_inode_dirty(old_inode);
-	return 0;
+	ret = 0;
+
+out_unlock:
+	if (sbi->s_clustered) {
+		if (old_dir != new_dir)
+			ocsfs_lock_release(old_dir->i_sb, &new_oi->i_lock_res);
+		ocsfs_lock_release(old_dir->i_sb, &old_oi->i_lock_res);
+	}
+	return ret;
 }
 
 /* ═══════════════════════════════════════════════════════════════

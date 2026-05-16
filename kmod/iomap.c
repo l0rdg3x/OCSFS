@@ -180,11 +180,29 @@ const struct iomap_ops ocsfs_dio_iomap_ops = {
 
 ssize_t ocsfs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
-	if (iocb->ki_flags & IOCB_DIRECT)
-		return iomap_dio_rw(iocb, to, &ocsfs_dio_iomap_ops,
-				    NULL, 0, NULL, 0);
+	struct inode *inode = file_inode(iocb->ki_filp);
+	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
+	struct ocsfs_inode_info *oi = OCSFS_I(inode);
+	ssize_t ret;
 
-	return filemap_read(iocb, to, 0);
+	if (sbi->s_clustered) {
+		ret = ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
+					 OCSFS_LOCK_SH);
+		if (ret)
+			return ret;
+		invalidate_inode_pages2(inode->i_mapping);
+	}
+
+	if (iocb->ki_flags & IOCB_DIRECT)
+		ret = iomap_dio_rw(iocb, to, &ocsfs_dio_iomap_ops,
+				   NULL, 0, NULL, 0);
+	else
+		ret = filemap_read(iocb, to, 0);
+
+	if (sbi->s_clustered)
+		ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
+
+	return ret;
 }
 
 ssize_t ocsfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
