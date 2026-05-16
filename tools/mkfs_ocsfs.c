@@ -51,7 +51,7 @@ static struct mkfs_config {
     .extent_size  = OCSFS_DEFAULT_EXTENT_SIZE,
     .ag_size      = OCSFS_DEFAULT_AG_SIZE / OCSFS_DEFAULT_BLOCK_SIZE,
     .journal_size = OCSFS_DEFAULT_JOURNAL_SIZE,
-    .features     = OCSFS_FEAT_THIN_PROV, /* thin provisioning on by default */
+    .features     = OCSFS_FEAT_THIN_PROV,
 };
 
 /* ─── Utility ───────────────────────────────────────────────── */
@@ -189,13 +189,11 @@ static void format_device(int fd, uint64_t dev_size)
         exit(1);
     }
 
-    /* Recalculate data_start with correct ag_count */
     uint64_t ag_desc_off = ocsfs_ag_desc_offset(cfg.max_nodes, cfg.journal_size);
     data_start = ag_desc_off + (uint64_t)ag_count * sizeof(struct ocsfs_ag_desc);
     /* Align to block boundary */
     data_start = (data_start + cfg.block_size - 1) & ~((uint64_t)cfg.block_size - 1);
 
-    /* Recalculate AG count with final data_start */
     data_space = dev_size - data_start;
     ag_count = (uint32_t)(data_space / ag_size_bytes);
     if (ag_count < 1) {
@@ -233,11 +231,11 @@ static void format_device(int fd, uint64_t dev_size)
     }
 
     /* ── Step 1: Zero metadata regions ── */
-    printf("  [1/6] Zeroing metadata regions...\n");
+    printf("  [1/4] Zeroing metadata regions...\n");
     zero_region(fd, 0, data_start);
 
     /* ── Step 2: Write superblock ── */
-    printf("  [2/6] Writing superblock...\n");
+    printf("  [2/4] Writing superblock...\n");
     struct ocsfs_superblock sb;
     memset(&sb, 0, sizeof(sb));
     sb.s_magic = OCSFS_MAGIC;
@@ -268,16 +266,8 @@ static void format_device(int fd, uint64_t dev_size)
     write_at(fd, OCSFS_SUPERBLOCK_OFFSET, &sb, sizeof(sb));
     write_at(fd, OCSFS_SUPERBLOCK_MIRROR, &sb, sizeof(sb));
 
-    /* ── Step 3: Initialize node slots ── */
-    printf("  [3/6] Initializing node slot table...\n");
-    /* Already zeroed — FREE state is 0x00. No work needed. */
-
-    /* ── Step 4: Initialize lock table ── */
-    printf("  [4/6] Initializing lock table...\n");
-    /* Already zeroed — NL mode is 0. No work needed. */
-
-    /* ── Step 5: Initialize journals ── */
-    printf("  [5/6] Initializing per-node journals...\n");
+    /* ── Step 3: Initialize journals ── */
+    printf("  [3/4] Initializing per-node journals...\n");
     for (uint16_t n = 0; n < cfg.max_nodes; n++) {
         uint64_t joff = sb.s_journal_off + (uint64_t)n * cfg.journal_size;
         struct ocsfs_journal_header jh;
@@ -292,18 +282,12 @@ static void format_device(int fd, uint64_t dev_size)
         write_at(fd, joff, &jh, sizeof(jh));
     }
 
-    /* ── Step 6: Initialize Allocation Groups ── */
-    printf("  [6/6] Initializing %u allocation groups...\n", ag_count);
+    /* ── Step 4: Initialize Allocation Groups ── */
+    printf("  [4/4] Initializing %u allocation groups...\n", ag_count);
     for (uint32_t ag = 0; ag < ag_count; ag++) {
         uint64_t ag_data_start = data_start + (uint64_t)ag * ag_size_bytes;
         uint64_t ag_data_blocks = ag_blocks;
 
-        /* AG internal layout:
-         *   Block 0:      AG descriptor (4 KB)
-         *   Block 1..B:   Block bitmap
-         *   Block B+1..I: Inode table
-         *   Block I+1..:  Data blocks
-         */
         uint64_t bitmap_blocks = (ag_data_blocks + cfg.block_size * 8 - 1) /
                                  (cfg.block_size * 8);
         uint64_t inodes_per_ag = ag_data_blocks / 64; /* 1 inode per 64 blocks heuristic */
@@ -378,9 +362,6 @@ static void format_device(int fd, uint64_t dev_size)
             write_at(fd, ino_off, &root_ino, sizeof(root_ino));
         }
 
-        if (cfg.verbose && (ag % 100 == 0 || ag == ag_count - 1)) {
-            printf("    AG %u/%u initialized\n", ag + 1, ag_count);
-        }
     }
 
     /* ── Done ── */
@@ -405,6 +386,7 @@ static void format_device(int fd, uint64_t dev_size)
     if (cfg.features & OCSFS_FEAT_COMPRESSION) printf(" compress");
     if (cfg.features & OCSFS_FEAT_ENCRYPTION) printf(" encrypt");
     if (cfg.features & OCSFS_FEAT_SNAPSHOTS) printf(" snapshots");
+    if (cfg.features & OCSFS_FEAT_AUTH) printf(" auth");
     printf("\n");
 }
 
@@ -422,6 +404,7 @@ static void usage(void)
         "  -E <extent_sz>  Extent size (default 1M, e.g., 1M, 4M)\n"
         "  -A <ag_size>    Allocation Group size (default 1G)\n"
         "  -J <jnl_size>   Per-node journal size (default 32M)\n"
+        "  -K              Enable cluster auth (requires cluster_secret= at mount)\n"
         "  -T              Enable thin provisioning (default: on)\n"
         "  -f              Force (skip confirmation prompt)\n"
         "  -v              Verbose output\n"
@@ -434,7 +417,7 @@ static void usage(void)
 int main(int argc, char *argv[])
 {
     int opt;
-    while ((opt = getopt(argc, argv, "L:N:b:E:A:J:Tfvh")) != -1) {
+    while ((opt = getopt(argc, argv, "L:N:b:E:A:J:KTfvh")) != -1) {
         switch (opt) {
         case 'L':
             snprintf(cfg.label, OCSFS_MAX_LABEL, "%s", optarg);
@@ -453,6 +436,9 @@ int main(int argc, char *argv[])
             break;
         case 'J':
             cfg.journal_size = (uint32_t)parse_size(optarg);
+            break;
+        case 'K':
+            cfg.features |= OCSFS_FEAT_AUTH;
             break;
         case 'T':
             cfg.features |= OCSFS_FEAT_THIN_PROV;
@@ -478,10 +464,8 @@ int main(int argc, char *argv[])
     printf("mkfs.ocsfs %d.%d — Open Cluster Shared FileSystem\n\n",
            OCSFS_VERSION_MAJOR, OCSFS_VERSION_MINOR);
 
-    /* Open device */
     int fd = open(cfg.device_path, O_RDWR);
     if (fd < 0) {
-        /* Try creating as a regular file (for testing) */
         fd = open(cfg.device_path, O_RDWR | O_CREAT, 0644);
         if (fd < 0) {
             fprintf(stderr, "mkfs.ocsfs: cannot open %s: %s\n",

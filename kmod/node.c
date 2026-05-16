@@ -52,6 +52,11 @@ int ocsfs_node_read_table(struct super_block *sb)
 		memcpy(ni->ni_uuid, dns->ns_uuid, 16);
 		memcpy(ni->ni_name, dns->ns_name, 64);
 
+		/* Verify cluster secret for active peer nodes */
+		if (ni->ni_state == OCSFS_NODE_ACTIVE &&
+		    ocsfs_node_verify_auth(sb, dns) < 0)
+			ni->ni_state = OCSFS_NODE_SUSPECTED;
+
 		brelse(bh);
 	}
 
@@ -89,6 +94,15 @@ static int ocsfs_node_write_slot(struct super_block *sb, u16 slot)
 	dns->ns_last_heartbeat = cpu_to_le64(ni->ni_last_hb);
 	dns->ns_pr_key = cpu_to_le64(ni->ni_pr_key);
 
+	if (sbi->s_auth_required) {
+		__le32 tok = cpu_to_le32(ocsfs_crc32c(0, sbi->s_cluster_secret, 32));
+		memcpy(dns->ns_auth_token, &tok, sizeof(tok));
+		memset(dns->ns_auth_token + sizeof(tok), 0,
+		       sizeof(dns->ns_auth_token) - sizeof(tok));
+	} else {
+		memset(dns->ns_auth_token, 0, sizeof(dns->ns_auth_token));
+	}
+
 	/* Compute checksum */
 	dns->ns_checksum = cpu_to_le32(
 		ocsfs_crc32c(~0U, dns,
@@ -98,6 +112,31 @@ static int ocsfs_node_write_slot(struct super_block *sb, u16 slot)
 	sync_dirty_buffer(bh);
 	brelse(bh);
 
+	return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * AUTH VERIFICATION — compare a slot's token against our secret
+ * Protects against stray nodes joining the wrong cluster.
+ * Token is CRC32C(secret,32) stored as LE32 in ns_auth_token[0..3].
+ * ═══════════════════════════════════════════════════════════════ */
+
+int ocsfs_node_verify_auth(struct super_block *sb,
+			    const struct ocsfs_disk_node_slot *dns)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	__le32 expected, got;
+
+	if (!sbi->s_auth_required)
+		return 0;
+
+	expected = cpu_to_le32(ocsfs_crc32c(0, sbi->s_cluster_secret, 32));
+	memcpy(&got, dns->ns_auth_token, sizeof(got));
+	if (got != expected) {
+		pr_warn("ocsfs: node slot %u auth mismatch — wrong cluster secret?\n",
+			le16_to_cpu(dns->ns_slot_id));
+		return -EACCES;
+	}
 	return 0;
 }
 
@@ -248,4 +287,69 @@ void ocsfs_node_exit(struct super_block *sb)
 {
 	ocsfs_pr_unregister(sb);
 	ocsfs_node_release_slot(sb);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * CLUSTER INIT / EXIT — bring up / tear down all Phase 2 subsystems
+ * ═══════════════════════════════════════════════════════════════ */
+
+int ocsfs_cluster_init(struct super_block *sb)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	int ret;
+
+	sbi->s_clustered = (sbi->s_max_nodes > 1);
+
+	if (!sbi->s_clustered) {
+		pr_info("ocsfs: single-node mode (max_nodes=1)\n");
+		sbi->s_node_slot = 0;
+		sbi->s_mount_gen = 1;
+		ocsfs_dlm_init(sb);
+		ocsfs_recovery_init(sb);
+		return 0;
+	}
+
+	if (sbi->s_auth_required)
+		pr_info("ocsfs: cluster auth enabled\n");
+
+	ret = ocsfs_recovery_init(sb);
+	if (ret)
+		return ret;
+
+	ret = ocsfs_dlm_init(sb);
+	if (ret)
+		goto fail_recovery;
+
+	ret = ocsfs_node_init(sb);
+	if (ret)
+		goto fail_dlm;
+
+	ret = ocsfs_heartbeat_start(sb);
+	if (ret)
+		goto fail_node;
+
+	pr_info("ocsfs: cluster mode active (slot %u, gen %u, "
+		"PR key 0x%016llx)\n",
+		sbi->s_node_slot, sbi->s_mount_gen, sbi->s_pr.pr_key);
+	return 0;
+
+fail_node:
+	ocsfs_node_exit(sb);
+fail_dlm:
+	ocsfs_dlm_exit(sb);
+fail_recovery:
+	ocsfs_recovery_exit(sb);
+	return ret;
+}
+
+void ocsfs_cluster_exit(struct super_block *sb)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+
+	if (sbi->s_clustered) {
+		ocsfs_heartbeat_stop(sb);
+		ocsfs_dlm_exit(sb);
+		ocsfs_node_exit(sb);
+	}
+	ocsfs_recovery_exit(sb);
 }

@@ -7,13 +7,17 @@
  */
 
 #include <linux/fs_context.h>
+#include <linux/fs_parser.h>
 #include "ocsfs.h"
 
 static struct kmem_cache *ocsfs_inode_cachep;
 
-/* ═══════════════════════════════════════════════════════════════
- * INODE SLAB ALLOCATOR
- * ═══════════════════════════════════════════════════════════════ */
+struct ocsfs_fs_context {
+	u8   fc_secret[32];
+	bool fc_has_secret;
+};
+
+/* ─── Inode slab ─────────────────────────────────────────────── */
 
 static struct inode *ocsfs_alloc_inode(struct super_block *sb)
 {
@@ -24,9 +28,6 @@ static struct inode *ocsfs_alloc_inode(struct super_block *sb)
 		return NULL;
 
 	mutex_init(&oi->i_extent_lock);
-	/* Pre-init the embedded lock_res mutex so it is always safe to call
-	 * mutex_lock on it.  ocsfs_lock_init() will fully reinitialise it
-	 * before any actual lock operation. */
 	mutex_init(&oi->i_lock_res.lr_mutex);
 	INIT_LIST_HEAD(&oi->i_lock_res.lr_list);
 	oi->i_lock_res.lr_mode = OCSFS_LOCK_NL;
@@ -50,9 +51,7 @@ static void ocsfs_inode_init_once(void *obj)
 	inode_init_once(&oi->vfs_inode);
 }
 
-/* ═══════════════════════════════════════════════════════════════
- * SUPERBLOCK VALIDATION
- * ═══════════════════════════════════════════════════════════════ */
+/* ─── Superblock validation ──────────────────────────────────── */
 
 static int ocsfs_validate_super(struct ocsfs_disk_super *ds,
 				struct super_block *sb, int silent)
@@ -196,6 +195,16 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sbi->s_sbh = bh;
 	sbi->s_ds = ds;
 
+	/* Apply cluster_secret mount option */
+	if (fc->fs_private) {
+		struct ocsfs_fs_context *ctx = fc->fs_private;
+
+		if (ctx->fc_has_secret) {
+			memcpy(sbi->s_cluster_secret, ctx->fc_secret, 32);
+			sbi->s_auth_required = true;
+		}
+	}
+
 	/* Cache frequently-used fields */
 	sbi->s_block_size = le32_to_cpu(ds->s_block_size);
 	sbi->s_extent_size = le32_to_cpu(ds->s_extent_size);
@@ -207,6 +216,13 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sbi->s_feature_flags = le64_to_cpu(ds->s_feature_flags);
 	sbi->s_data_off = le64_to_cpu(ds->s_data_off);
 	sbi->s_ag_desc_off = le64_to_cpu(ds->s_ag_desc_off);
+
+	/* Enforce: auth feature requires cluster_secret= mount option */
+	if ((sbi->s_feature_flags & OCSFS_FEAT_AUTH) && !sbi->s_auth_required) {
+		pr_err("ocsfs: volume requires cluster_secret= mount option\n");
+		ret = -EACCES;
+		goto fail;
+	}
 
 	init_rwsem(&sbi->s_global_lock);
 	spin_lock_init(&sbi->s_free_lock);
@@ -310,9 +326,7 @@ void ocsfs_put_super(struct super_block *sb)
 	sb->s_fs_info = NULL;
 }
 
-/* ═══════════════════════════════════════════════════════════════
- * STATFS
- * ═══════════════════════════════════════════════════════════════ */
+/* ─── statfs ─────────────────────────────────────────────────── */
 
 int ocsfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 {
@@ -325,7 +339,6 @@ int ocsfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	buf->f_bsize = sbi->s_block_size;
 	buf->f_blocks = sbi->s_total_blocks;
 
-	/* Sum free blocks and inodes from all AGs */
 	for (i = 0; i < sbi->s_ag_count; i++) {
 		free_inodes += sbi->s_ags[i].free_inodes;
 	}
@@ -340,9 +353,7 @@ int ocsfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	return 0;
 }
 
-/* ═══════════════════════════════════════════════════════════════
- * SYNC FS
- * ═══════════════════════════════════════════════════════════════ */
+/* ─── sync_fs ────────────────────────────────────────────────── */
 
 int ocsfs_sync_fs(struct super_block *sb, int wait)
 {
@@ -350,7 +361,6 @@ int ocsfs_sync_fs(struct super_block *sb, int wait)
 
 	if (wait) {
 		down_write(&sbi->s_global_lock);
-		/* Flush superblock */
 		mark_buffer_dirty(sbi->s_sbh);
 		sync_dirty_buffer(sbi->s_sbh);
 		up_write(&sbi->s_global_lock);
@@ -358,9 +368,7 @@ int ocsfs_sync_fs(struct super_block *sb, int wait)
 	return 0;
 }
 
-/* ═══════════════════════════════════════════════════════════════
- * SUPER OPERATIONS TABLE
- * ═══════════════════════════════════════════════════════════════ */
+/* ─── super_operations ───────────────────────────────────────── */
 
 const struct super_operations ocsfs_sops = {
 	.alloc_inode    = ocsfs_alloc_inode,
@@ -373,86 +381,43 @@ const struct super_operations ocsfs_sops = {
 };
 
 /* ═══════════════════════════════════════════════════════════════
- * CLUSTER INIT / EXIT
- *
- * Initializes all Phase 2 clustering subsystems:
- *   - Node slot management (claim a slot)
- *   - SCSI PR registration
- *   - Distributed lock manager
- *   - Heartbeat thread
- *   - Recovery work queue
- *
- * In single-node mode (max_nodes == 1 or mount option "nocluster"),
- * clustering is disabled and these are no-ops.
- * ═══════════════════════════════════════════════════════════════ */
-
-int ocsfs_cluster_init(struct super_block *sb)
-{
-	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
-	int ret;
-
-	/* Determine if clustering is enabled */
-	sbi->s_clustered = (sbi->s_max_nodes > 1);
-
-	if (!sbi->s_clustered) {
-		pr_info("ocsfs: single-node mode (max_nodes=1)\n");
-		sbi->s_node_slot = 0;
-		sbi->s_mount_gen = 1;
-		/* Still init DLM for consistent code paths */
-		ocsfs_dlm_init(sb);
-		ocsfs_recovery_init(sb);
-		return 0;
-	}
-
-	/* Initialize recovery subsystem first (needs to be ready) */
-	ret = ocsfs_recovery_init(sb);
-	if (ret)
-		return ret;
-
-	/* Initialize distributed lock manager */
-	ret = ocsfs_dlm_init(sb);
-	if (ret)
-		goto fail_recovery;
-
-	/* Claim a node slot + register PR key */
-	ret = ocsfs_node_init(sb);
-	if (ret)
-		goto fail_dlm;
-
-	/* Start heartbeat thread */
-	ret = ocsfs_heartbeat_start(sb);
-	if (ret)
-		goto fail_node;
-
-	pr_info("ocsfs: cluster mode active (slot %u, gen %u, "
-		"PR key 0x%016llx)\n",
-		sbi->s_node_slot, sbi->s_mount_gen, sbi->s_pr.pr_key);
-	return 0;
-
-fail_node:
-	ocsfs_node_exit(sb);
-fail_dlm:
-	ocsfs_dlm_exit(sb);
-fail_recovery:
-	ocsfs_recovery_exit(sb);
-	return ret;
-}
-
-void ocsfs_cluster_exit(struct super_block *sb)
-{
-	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
-
-	if (sbi->s_clustered) {
-		ocsfs_heartbeat_stop(sb);
-		ocsfs_dlm_exit(sb);
-		ocsfs_node_exit(sb);
-	}
-	ocsfs_recovery_exit(sb);
-}
-
-/* ═══════════════════════════════════════════════════════════════
  * MOUNT / MODULE INIT
  * ═══════════════════════════════════════════════════════════════ */
+
+static int ocsfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
+{
+	struct ocsfs_fs_context *ctx = fc->fs_private;
+	const char *hex;
+	size_t len;
+	int i;
+
+	if (strcmp(param->key, "cluster_secret") != 0)
+		return -ENOPARAM;
+
+	hex = param->string;
+	len = strlen(hex);
+	if (len != 64) {
+		pr_err("ocsfs: cluster_secret must be 64 hex chars (32 bytes)\n");
+		return -EINVAL;
+	}
+	for (i = 0; i < 32; i++) {
+		unsigned int byte;
+
+		if (sscanf(hex + i * 2, "%2x", &byte) != 1) {
+			pr_err("ocsfs: cluster_secret: invalid hex at position %d\n",
+			       i * 2);
+			return -EINVAL;
+		}
+		ctx->fc_secret[i] = (u8)byte;
+	}
+	ctx->fc_has_secret = true;
+	return 0;
+}
+
+static void ocsfs_free_fc(struct fs_context *fc)
+{
+	kfree(fc->fs_private);
+}
 
 static int ocsfs_get_tree(struct fs_context *fc)
 {
@@ -460,11 +425,19 @@ static int ocsfs_get_tree(struct fs_context *fc)
 }
 
 static const struct fs_context_operations ocsfs_context_ops = {
-	.get_tree = ocsfs_get_tree,
+	.parse_param = ocsfs_parse_param,
+	.get_tree    = ocsfs_get_tree,
+	.free        = ocsfs_free_fc,
 };
 
 static int ocsfs_init_fs_context(struct fs_context *fc)
 {
+	struct ocsfs_fs_context *ctx;
+
+	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	if (!ctx)
+		return -ENOMEM;
+	fc->fs_private = ctx;
 	fc->ops = &ocsfs_context_ops;
 	return 0;
 }
@@ -509,8 +482,6 @@ static int __init ocsfs_init(void)
 static void __exit ocsfs_exit(void)
 {
 	unregister_filesystem(&ocsfs_fs_type);
-
-	/* Wait for outstanding RCU callbacks before destroying cache */
 	rcu_barrier();
 	kmem_cache_destroy(ocsfs_inode_cachep);
 

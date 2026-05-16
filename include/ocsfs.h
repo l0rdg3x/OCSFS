@@ -93,6 +93,7 @@
 #define OCSFS_FEAT_SNAPSHOTS    (1ULL << 3)
 #define OCSFS_FEAT_DEDUP        (1ULL << 4)
 #define OCSFS_FEAT_MULTI_LUN    (1ULL << 5)
+#define OCSFS_FEAT_AUTH         (1ULL << 6)
 
 /* ═══════════════════════════════════════════════════════════════
  * NODE SLOT STATES

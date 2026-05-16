@@ -89,6 +89,7 @@
 #define OCSFS_FEAT_SNAPSHOTS    (1ULL << 3)
 #define OCSFS_FEAT_DEDUP        (1ULL << 4)
 #define OCSFS_FEAT_MULTI_LUN    (1ULL << 5)
+#define OCSFS_FEAT_AUTH         (1ULL << 6)  /* cluster membership auth */
 
 /* Inode flags */
 #define OCSFS_IFLAG_THIN        0x0001
@@ -315,7 +316,8 @@ struct ocsfs_disk_node_slot {
 	__le64  ns_mount_time;
 	__le64  ns_last_heartbeat;
 	__le64  ns_pr_key;
-	__u8    ns_reserved2[140];
+	__u8    ns_auth_token[32];  /* crc32c(secret,32) LE; 0 if no auth */
+	__u8    ns_reserved2[108];
 	__le32  ns_checksum;
 } __packed;
 
@@ -503,6 +505,10 @@ struct ocsfs_sb_info {
 	u16                     s_recovery_target; /* slot being recovered */
 	bool                    s_recovery_in_progress;
 	struct mutex            s_recovery_lock;
+
+	/* Cluster auth */
+	u8              s_cluster_secret[32];   /* raw secret from mount option */
+	bool            s_auth_required;        /* OCSFS_FEAT_AUTH or secret given */
 };
 
 /* Per-inode in-memory info — wraps struct inode */
@@ -717,6 +723,8 @@ int ocsfs_node_claim_slot(struct super_block *sb);
 int ocsfs_node_release_slot(struct super_block *sb);
 int ocsfs_node_read_table(struct super_block *sb);
 int ocsfs_node_mark_dead(struct super_block *sb, u16 slot);
+int ocsfs_node_verify_auth(struct super_block *sb,
+			    const struct ocsfs_disk_node_slot *slot);
 
 /* recovery.c — Multi-phase crash recovery */
 int ocsfs_recovery_init(struct super_block *sb);
