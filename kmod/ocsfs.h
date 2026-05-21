@@ -234,9 +234,12 @@ struct ocsfs_disk_inode {
 	__le64  i_thin_allocated;
 	__le32  i_ag;
 	__u8    i_inline_extents[OCSFS_INLINE_EXTENTS * 24];
-	__u8    i_reserved[12];
+	__u8    i_reserved[32];
 	__le32  i_checksum;
 } __packed;
+
+static_assert(sizeof(struct ocsfs_disk_inode) == OCSFS_INODE_SIZE,
+	      "ocsfs_disk_inode must be exactly 512 bytes — fix i_reserved[]");
 
 struct ocsfs_disk_extent {
 	__le64  e_logical_block;
@@ -502,13 +505,16 @@ struct ocsfs_sb_info {
 
 	/* Recovery */
 	struct work_struct      s_recovery_work;
-	u16                     s_recovery_target; /* slot being recovered */
+	DECLARE_BITMAP(s_recovery_pending, OCSFS_MAX_NODES); /* one bit per failed slot */
 	bool                    s_recovery_in_progress;
 	struct mutex            s_recovery_lock;
 
 	/* Cluster auth */
 	u8              s_cluster_secret[32];   /* raw secret from mount option */
 	bool            s_auth_required;        /* OCSFS_FEAT_AUTH or secret given */
+
+	/* SCSI Compare-And-Write capability (probed at mount time) */
+	bool            s_caw_supported;
 };
 
 /* Per-inode in-memory info — wraps struct inode */
@@ -663,7 +669,7 @@ void ocsfs_txn_abort(struct ocsfs_txn *txn);
 int ocsfs_journal_replay(struct super_block *sb);
 int ocsfs_journal_replay_node(struct super_block *sb, u16 node_slot);
 
-/* scsi_pr.c — SCSI-3 Persistent Reservations */
+/* scsi_pr.c — SCSI-3 Persistent Reservations + Compare-And-Write */
 int ocsfs_pr_register(struct super_block *sb, u64 key);
 int ocsfs_pr_unregister(struct super_block *sb);
 int ocsfs_pr_reserve(struct super_block *sb, u8 type);
@@ -671,8 +677,15 @@ int ocsfs_pr_release(struct super_block *sb, u8 type);
 int ocsfs_pr_preempt(struct super_block *sb, u64 victim_key, u8 type);
 int ocsfs_pr_preempt_abort(struct super_block *sb, u64 victim_key, u8 type);
 u64 ocsfs_pr_make_key(const u8 *uuid, u32 mount_gen);
+/* CAW — atomic lock-table write via SCSI Compare-And-Write (opcode 0x89) */
+void ocsfs_build_caw_cdb(u8 cdb[16], u64 lba);
+bool ocsfs_scsi_caw_probe(struct super_block *sb);
+int  ocsfs_scsi_caw(struct super_block *sb, u64 lba,
+		    const void *expected, const void *new_data,
+		    unsigned int lbs);
 
 /* lock.c — Distributed on-disk lock manager */
+bool lock_modes_compatible(u16 held, u16 requested);
 int ocsfs_dlm_init(struct super_block *sb);
 void ocsfs_dlm_exit(struct super_block *sb);
 void ocsfs_lock_init(struct ocsfs_lock_res *lr, u64 resource_id,

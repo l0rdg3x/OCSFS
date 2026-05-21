@@ -15,6 +15,9 @@
  * Only the elected leader performs recovery. Other nodes wait.
  * The SCSI PR fencing ensures the failed node cannot write even if
  * it is still running (zombie/partitioned).
+ *
+ * Multiple concurrent failures are handled via s_recovery_pending bitmask:
+ * each failed slot sets its bit; the work function drains them in order.
  */
 
 #include "ocsfs.h"
@@ -63,14 +66,7 @@ int ocsfs_recovery_run(struct super_block *sb, u16 failed_slot)
 
 	mutex_lock(&sbi->s_recovery_lock);
 
-	if (sbi->s_recovery_in_progress) {
-		mutex_unlock(&sbi->s_recovery_lock);
-		pr_info("ocsfs: recovery already in progress, skipping\n");
-		return 0;
-	}
-
 	sbi->s_recovery_in_progress = true;
-	sbi->s_recovery_target = failed_slot;
 
 	pr_warn("ocsfs: ═══ RECOVERY START for node slot %u ═══\n",
 		failed_slot);
@@ -173,7 +169,11 @@ int ocsfs_recovery_run(struct super_block *sb, u16 failed_slot)
 }
 
 /* ═══════════════════════════════════════════════════════════════
- * RECOVERY WORK — scheduled from heartbeat failure detection
+ * RECOVERY WORK — drains s_recovery_pending bitmask
+ *
+ * Processes all pending failed slots in slot-number order.
+ * New failures arriving while the work runs are picked up by
+ * the while loop on the next iteration without losing any event.
  * ═══════════════════════════════════════════════════════════════ */
 
 static void ocsfs_recovery_work_fn(struct work_struct *work)
@@ -181,20 +181,26 @@ static void ocsfs_recovery_work_fn(struct work_struct *work)
 	struct ocsfs_sb_info *sbi =
 		container_of(work, struct ocsfs_sb_info, s_recovery_work);
 	struct super_block *sb = sbi->s_sb;
+	unsigned int slot;
 
-	ocsfs_recovery_run(sb, sbi->s_recovery_target);
+	while ((slot = find_first_bit(sbi->s_recovery_pending,
+				      OCSFS_MAX_NODES)) < OCSFS_MAX_NODES) {
+		/*
+		 * Clear the bit before running recovery so that a new
+		 * failure on the same slot arriving during recovery is
+		 * not silently dropped — it will set the bit again and
+		 * the loop will process it.
+		 */
+		clear_bit(slot, sbi->s_recovery_pending);
+		ocsfs_recovery_run(sb, (u16)slot);
+	}
 }
 
 void ocsfs_recovery_trigger(struct super_block *sb, u16 failed_slot)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 
-	if (sbi->s_recovery_in_progress) {
-		pr_debug("ocsfs: recovery already in progress, not re-triggering\n");
-		return;
-	}
-
-	sbi->s_recovery_target = failed_slot;
+	set_bit(failed_slot, sbi->s_recovery_pending);
 	schedule_work(&sbi->s_recovery_work);
 }
 
@@ -208,6 +214,7 @@ int ocsfs_recovery_init(struct super_block *sb)
 
 	mutex_init(&sbi->s_recovery_lock);
 	sbi->s_recovery_in_progress = false;
+	bitmap_zero(sbi->s_recovery_pending, OCSFS_MAX_NODES);
 	INIT_WORK(&sbi->s_recovery_work, ocsfs_recovery_work_fn);
 
 	return 0;

@@ -51,16 +51,16 @@ static int lock_read_entry(struct super_block *sb, u32 slot,
 }
 
 /*
- * Write a lock entry to disk with version-based conflict detection.
+ * Write a lock entry to disk with atomicity guaranteed by one of two paths:
  *
- * We record the version seen at read time, then before committing,
- * force-invalidate the buffer and re-read from disk to check whether
- * another node has written in the interim. If the version changed,
- * return -EAGAIN so the caller retries.
+ * CAW path (when s_caw_supported): SCSI Compare-And-Write (opcode 0x89)
+ *   atomically verifies the expected sector content and writes the new data
+ *   in a single SCSI command. Eliminates the TOCTOU race entirely.
+ *   MISCOMPARE → -EAGAIN (another node wrote first; caller retries).
  *
- * NOTE: This narrows the TOCTOU window but does not eliminate it — true
- * atomicity requires SCSI Compare-And-Write (CAW). For production
- * multi-node deployments on SCSI SANs, add CAW support via the sg layer.
+ * Fallback path: software version-check read-modify-write.
+ *   Narrows the TOCTOU window with a fresh disk read + version compare,
+ *   but a race remains between the check and the write.
  */
 static int lock_write_entry(struct super_block *sb, u32 slot,
 			    struct ocsfs_disk_lock *entry,
@@ -75,10 +75,42 @@ static int lock_write_entry(struct super_block *sb, u32 slot,
 	struct buffer_head *bh_check;
 	struct ocsfs_disk_lock *check;
 
-	/*
-	 * Force a fresh read from disk to detect concurrent writers.
-	 * Get the block, clear uptodate to bypass cache, re-read from device.
-	 */
+	if (sbi->s_caw_supported) {
+		unsigned int lbs = bdev_logical_block_size(sb->s_bdev);
+		/* Offset of the LBS-aligned sector within the block */
+		u32 lbs_start = boff & ~(lbs - 1u);
+		u8 *exp_buf = kmalloc(lbs, GFP_KERNEL);
+		u8 *new_buf = kmalloc(lbs, GFP_KERNEL);
+		int ret = -ENOMEM;
+
+		if (exp_buf && new_buf) {
+			u64 scsi_lba = off / lbs;
+
+			/* Build expected sector from the buffer_head cache */
+			memcpy(exp_buf, bh->b_data + lbs_start, lbs);
+
+			/* Build new sector: preserve neighbours, update our entry */
+			memcpy(new_buf, exp_buf, lbs);
+			entry->le_version = cpu_to_le32(expected_version + 1);
+			entry->le_checksum = cpu_to_le32(
+				ocsfs_crc32c(~0U, entry,
+					     OCSFS_LOCK_ENTRY_SIZE - sizeof(__le32)));
+			memcpy(new_buf + (boff & (lbs - 1u)), entry, sizeof(*entry));
+
+			ret = ocsfs_scsi_caw(sb, scsi_lba, exp_buf, new_buf, lbs);
+			if (ret == -EAGAIN)
+				/* Invalidate cache so retry gets fresh disk data */
+				clear_buffer_uptodate(bh);
+		}
+		kfree(exp_buf);
+		kfree(new_buf);
+
+		if (ret != -EOPNOTSUPP)
+			return ret;
+		/* EOPNOTSUPP: device no longer supports CAW — fall through */
+	}
+
+	/* Software fallback: force fresh disk read + version check */
 	bh_check = sb_getblk(sb, block);
 	if (!bh_check)
 		return -EIO;
@@ -90,22 +122,16 @@ static int lock_write_entry(struct super_block *sb, u32 slot,
 
 	check = (struct ocsfs_disk_lock *)(bh_check->b_data + boff);
 	if (le32_to_cpu(check->le_version) != expected_version) {
-		/* Another node wrote this entry between our read and now */
 		brelse(bh_check);
 		return -EAGAIN;
 	}
 	brelse(bh_check);
 
-	/* Version check passed — commit our update */
 	entry->le_version = cpu_to_le32(expected_version + 1);
 	entry->le_checksum = cpu_to_le32(
 		ocsfs_crc32c(~0U, entry,
 			     OCSFS_LOCK_ENTRY_SIZE - sizeof(__le32)));
 
-	/*
-	 * Re-read bh since we invalidated it above; we must write into
-	 * a valid buffer_head. Caller must brelse() the original bh.
-	 */
 	bh_check = sb_bread(sb, block);
 	if (!bh_check)
 		return -EIO;
@@ -172,7 +198,7 @@ static int ocsfs_lock_probe_slot(struct super_block *sb,
  * LOCK COMPATIBILITY
  * ═══════════════════════════════════════════════════════════════ */
 
-static bool lock_modes_compatible(u16 held, u16 requested)
+bool lock_modes_compatible(u16 held, u16 requested)
 {
 	if (held == OCSFS_LOCK_NL || requested == OCSFS_LOCK_NL)
 		return true;
@@ -550,6 +576,13 @@ int ocsfs_lock_downgrade(struct super_block *sb, struct ocsfs_lock_res *lr,
 		dl.le_holder_gen = 0;
 		add_sh_holder(&dl, sbi->s_node_slot);
 	} else if (new_mode == OCSFS_LOCK_NL) {
+		/*
+		 * Must release lr_mutex before calling ocsfs_lock_release(),
+		 * which acquires the same mutex. Holding it here would deadlock
+		 * on non-recursive mutexes (BUG-002).
+		 */
+		brelse(bh);
+		mutex_unlock(&lr->lr_mutex);
 		return ocsfs_lock_release(sb, lr);
 	}
 

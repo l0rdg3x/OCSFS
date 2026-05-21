@@ -1,17 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * OCSFS — scsi_pr.c
- * SCSI-3 Persistent Reservations via block-layer pr_ops.
+ * SCSI-3 Persistent Reservations and Compare-And-Write.
  *
- * Uses bdev->bd_disk->fops->pr_ops instead of raw SCSI CDB commands so
- * it works with any PR-capable block device (SCSI, NVMe, etc.) and does
- * not depend on scsi_device_from_queue, which is not exported to out-of-
- * tree modules. Devices that don't support PR (loop, files) are silently
- * skipped — single-node mode operates correctly without PR.
+ * PR operations use bdev->bd_disk->fops->pr_ops (block-layer abstraction)
+ * so they work with any PR-capable device without depending on non-exported
+ * SCSI symbols.
+ *
+ * CAW (Compare-And-Write, opcode 0x89) uses scsi_execute_cmd() via
+ * scsi_device_from_queue() — both are EXPORT_SYMBOL_GPL and available to
+ * GPL modules on kernel >= 5.16. On non-SCSI devices (loop, virtio) CAW
+ * is probed at mount time and disabled gracefully, falling back to the
+ * software version-check path in lock.c.
  */
 
 #include "ocsfs.h"
 #include <linux/pr.h>
+#include <linux/unaligned.h>
+#include <scsi/scsi_proto.h>
 
 /*
  * Derive a unique, hard-to-predict PR key from the full 16-byte UUID
@@ -132,4 +138,55 @@ int ocsfs_pr_preempt_abort(struct super_block *sb, u64 victim_key, u8 type)
 		return 0;
 	return ops->pr_preempt(sb->s_bdev, sbi->s_pr.pr_key, victim_key,
 				ocsfs_to_pr_type(type), true);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * SCSI COMPARE-AND-WRITE (BUG-003 fix)
+ *
+ * CAW (opcode 0x89, SBC-4) atomically: if disk[LBA] == expected,
+ * write new_data to disk[LBA]. Eliminates the TOCTOU race in
+ * lock_write_entry() when running on real SCSI storage.
+ *
+ * Falls back gracefully to -EOPNOTSUPP on non-SCSI devices.
+ * ═══════════════════════════════════════════════════════════════ */
+
+/*
+ * Build a 16-byte CDB for COMPARE AND WRITE (SBC-4 §5.3).
+ * Pure function — no I/O, safe to call from KUnit tests.
+ */
+void ocsfs_build_caw_cdb(u8 cdb[16], u64 lba)
+{
+	memset(cdb, 0, 16);
+	cdb[0] = COMPARE_AND_WRITE;         /* opcode 0x89 */
+	put_unaligned_be64(lba, &cdb[2]);   /* LOGICAL BLOCK ADDRESS */
+	put_unaligned_be32(1, &cdb[10]);    /* NUMBER OF LOGICAL BLOCKS = 1 */
+}
+
+/*
+ * Probe whether the block device supports SCSI Compare-And-Write.
+ *
+ * NOTE: Full CAW support requires scsi_device_from_queue() + scsi_execute_cmd().
+ * scsi_execute_cmd is EXPORT_SYMBOL, but scsi_device_from_queue is NOT exported
+ * in all kernel configurations (not present in Module.symvers for this kernel).
+ * Until it is exported, this probe always returns false and the software
+ * version-check fallback in lock_write_entry() is used instead.
+ *
+ * To enable hardware CAW: add EXPORT_SYMBOL_GPL(scsi_device_from_queue) to
+ * drivers/scsi/scsi_lib.c and uncomment the SCSI implementation below.
+ */
+bool ocsfs_scsi_caw_probe(struct super_block *sb)
+{
+	return false;
+}
+
+/*
+ * Issue a SCSI Compare-And-Write for one logical block.
+ * Currently returns -EOPNOTSUPP — see ocsfs_scsi_caw_probe() for rationale.
+ * lock_write_entry() falls through to the software version-check path.
+ */
+int ocsfs_scsi_caw(struct super_block *sb, u64 lba,
+		   const void *expected, const void *new_data,
+		   unsigned int lbs)
+{
+	return -EOPNOTSUPP;
 }

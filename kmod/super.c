@@ -248,6 +248,10 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		goto fail_ags;
 	}
 
+	sbi->s_caw_supported = ocsfs_scsi_caw_probe(sb);
+	if (sbi->s_caw_supported)
+		pr_info("ocsfs: SCSI CAW supported — atomic lock writes enabled\n");
+
 	/* Initialize journal at our node slot's region */
 	ret = ocsfs_journal_init(sb);
 	if (ret)
