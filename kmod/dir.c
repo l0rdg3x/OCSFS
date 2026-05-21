@@ -228,8 +228,6 @@ fill:
 		u64 phys = 0;
 		u32 phys_off = off;
 
-		oi->i_dirent_count++;
-
 		/* Resolve physical block for the slot we just filled */
 		if (ocsfs_extent_lookup(dir, b, &ext_tmp) == 0 &&
 		    ext_tmp.physical_block)
@@ -240,9 +238,12 @@ fill:
 		else if (ocsfs_dir_btree_should_build(dir))
 			ocsfs_dir_btree_migrate(dir);
 	}
+	ret = ocsfs_txn_commit(txn);
+	if (ret)
+		goto out;
+	OCSFS_I(dir)->i_dirent_count++;
 	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
 	mark_inode_dirty(dir);
-	ret = ocsfs_txn_commit(txn);
 out:
 	return ret;
 }
