@@ -16,6 +16,7 @@
 
 #include <kunit/test.h>
 #include "ocsfs.h"
+#include "ocsfs_btree.h"
 
 /* ─── helpers ─────────────────────────────────────────────────── */
 
@@ -204,6 +205,139 @@ static void test_recovery_pending_find_order(struct kunit *test)
 			(unsigned int)OCSFS_MAX_NODES);
 }
 
+/* ─── in-memory block store for B+ tree tests ─────────────────── */
+
+#define MEM_BT_BLOCKS 32
+#define MEM_BT_BSIZE  512
+
+struct mem_bt_store {
+	u8  data[MEM_BT_BLOCKS][MEM_BT_BSIZE];
+	int next;
+};
+
+static int mem_bt_read(void *ctx, u64 blk, void *buf, u32 sz)
+{
+	struct mem_bt_store *s = ctx;
+	if (blk >= MEM_BT_BLOCKS || sz > MEM_BT_BSIZE)
+		return -EINVAL;
+	memcpy(buf, s->data[blk], sz);
+	return 0;
+}
+
+static int mem_bt_write(void *ctx, u64 blk, const void *buf, u32 sz)
+{
+	struct mem_bt_store *s = ctx;
+	if (blk >= MEM_BT_BLOCKS || sz > MEM_BT_BSIZE)
+		return -EINVAL;
+	memcpy(s->data[blk], buf, sz);
+	return 0;
+}
+
+static int mem_bt_alloc(void *ctx, u64 *out)
+{
+	struct mem_bt_store *s = ctx;
+	if (s->next >= MEM_BT_BLOCKS)
+		return -ENOSPC;
+	*out = s->next++;
+	return 0;
+}
+
+static int mem_bt_free(void *ctx, u64 blk) { (void)ctx; (void)blk; return 0; }
+
+/* ─── ocsfs_btree_search_le ───────────────────────────────────── */
+
+static void test_btree_search_le_exact_hit(struct kunit *test)
+{
+	struct mem_bt_store *s = kzalloc(sizeof(*s), GFP_KERNEL);
+	struct ocsfs_btree bt;
+	u64 out_key, out_val;
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(test, s);
+	KUNIT_ASSERT_EQ(test, ocsfs_btree_create(&bt, MEM_BT_BSIZE,
+		mem_bt_read, mem_bt_write, mem_bt_alloc, mem_bt_free, s), 0);
+	KUNIT_ASSERT_EQ(test, ocsfs_btree_insert(&bt, 10, 100), 0);
+	KUNIT_ASSERT_EQ(test, ocsfs_btree_insert(&bt, 20, 200), 0);
+	KUNIT_ASSERT_EQ(test, ocsfs_btree_insert(&bt, 30, 300), 0);
+
+	ret = ocsfs_btree_search_le(&bt, 20, &out_key, &out_val);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, out_key, 20ULL);
+	KUNIT_EXPECT_EQ(test, out_val, 200ULL);
+	kfree(s);
+}
+
+static void test_btree_search_le_floor(struct kunit *test)
+{
+	struct mem_bt_store *s = kzalloc(sizeof(*s), GFP_KERNEL);
+	struct ocsfs_btree bt;
+	u64 out_key, out_val;
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(test, s);
+	KUNIT_ASSERT_EQ(test, ocsfs_btree_create(&bt, MEM_BT_BSIZE,
+		mem_bt_read, mem_bt_write, mem_bt_alloc, mem_bt_free, s), 0);
+	KUNIT_ASSERT_EQ(test, ocsfs_btree_insert(&bt, 10, 100), 0);
+	KUNIT_ASSERT_EQ(test, ocsfs_btree_insert(&bt, 30, 300), 0);
+
+	ret = ocsfs_btree_search_le(&bt, 20, &out_key, &out_val);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, out_key, 10ULL);
+	KUNIT_EXPECT_EQ(test, out_val, 100ULL);
+	kfree(s);
+}
+
+static void test_btree_search_le_no_floor(struct kunit *test)
+{
+	struct mem_bt_store *s = kzalloc(sizeof(*s), GFP_KERNEL);
+	struct ocsfs_btree bt;
+	u64 out_key, out_val;
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(test, s);
+	KUNIT_ASSERT_EQ(test, ocsfs_btree_create(&bt, MEM_BT_BSIZE,
+		mem_bt_read, mem_bt_write, mem_bt_alloc, mem_bt_free, s), 0);
+	KUNIT_ASSERT_EQ(test, ocsfs_btree_insert(&bt, 10, 100), 0);
+
+	ret = ocsfs_btree_search_le(&bt, 5, &out_key, &out_val);
+	KUNIT_EXPECT_EQ(test, ret, -ENOENT);
+	kfree(s);
+}
+
+/* ─── dir B+ tree build threshold ────────────────────────────── */
+
+static void test_dir_btree_no_build_below_threshold(struct kunit *test)
+{
+	u32 count = OCSFS_DIR_BTREE_THRESHOLD - 1;
+	u64 root = 0;
+
+	KUNIT_EXPECT_FALSE(test, count >= OCSFS_DIR_BTREE_THRESHOLD && !root);
+}
+
+static void test_dir_btree_build_at_threshold(struct kunit *test)
+{
+	u32 count = OCSFS_DIR_BTREE_THRESHOLD;
+	u64 root = 0;
+
+	KUNIT_EXPECT_TRUE(test, count >= OCSFS_DIR_BTREE_THRESHOLD && !root);
+}
+
+static void test_dir_btree_no_build_when_root_set(struct kunit *test)
+{
+	u32 count = OCSFS_DIR_BTREE_THRESHOLD + 10;
+	u64 root = 0x1234ULL;
+
+	KUNIT_EXPECT_FALSE(test, count >= OCSFS_DIR_BTREE_THRESHOLD && !root);
+}
+
+static void test_dir_btree_build_above_threshold(struct kunit *test)
+{
+	u32 count = OCSFS_DIR_BTREE_THRESHOLD + 100;
+	u64 root = 0;
+
+	KUNIT_EXPECT_TRUE(test, count >= OCSFS_DIR_BTREE_THRESHOLD && !root);
+}
+
 /* ─── test suite registration ─────────────────────────────────── */
 
 static struct kunit_case ocsfs_lock_test_cases[] = {
@@ -220,6 +354,13 @@ static struct kunit_case ocsfs_lock_test_cases[] = {
 	KUNIT_CASE(test_recovery_pending_two_slots),
 	KUNIT_CASE(test_recovery_pending_clear_one),
 	KUNIT_CASE(test_recovery_pending_find_order),
+	KUNIT_CASE(test_btree_search_le_exact_hit),
+	KUNIT_CASE(test_btree_search_le_floor),
+	KUNIT_CASE(test_btree_search_le_no_floor),
+	KUNIT_CASE(test_dir_btree_no_build_below_threshold),
+	KUNIT_CASE(test_dir_btree_build_at_threshold),
+	KUNIT_CASE(test_dir_btree_no_build_when_root_set),
+	KUNIT_CASE(test_dir_btree_build_above_threshold),
 	{},
 };
 

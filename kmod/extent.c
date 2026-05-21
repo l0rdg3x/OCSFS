@@ -27,6 +27,9 @@ int ocsfs_extent_lookup(struct inode *inode, u64 logical_block,
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
 	u16 i;
 
+	if (oi->i_extent_tree_root)
+		return ocsfs_extent_btree_lookup(inode, logical_block, ext_out);
+
 	for (i = 0; i < oi->i_extent_count; i++) {
 		struct ocsfs_extent *e = &oi->i_extents[i];
 
@@ -56,6 +59,10 @@ int ocsfs_extent_insert(struct inode *inode, u64 logical, u64 physical,
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
 	u16 i, pos;
 
+	if (oi->i_extent_tree_root)
+		return ocsfs_extent_btree_insert(inode, logical, physical,
+						 len, flags);
+
 	/* Try to merge with an existing extent */
 	for (i = 0; i < oi->i_extent_count; i++) {
 		struct ocsfs_extent *e = &oi->i_extents[i];
@@ -82,9 +89,12 @@ int ocsfs_extent_insert(struct inode *inode, u64 logical, u64 physical,
 
 	/* No merge possible — insert a new extent */
 	if (oi->i_extent_count >= OCSFS_INLINE_EXTENTS) {
-		pr_warn("ocsfs: inode %llu: too many extents (%u)\n",
-			oi->i_disk_ino, oi->i_extent_count);
-		return -ENOSPC;
+		int mret = ocsfs_extent_btree_migrate(inode);
+
+		if (mret)
+			return mret;
+		return ocsfs_extent_btree_insert(inode, logical, physical,
+						 len, flags);
 	}
 
 	/* Find insertion position (keep sorted by logical_block) */
@@ -149,6 +159,9 @@ int ocsfs_extent_truncate(struct inode *inode, u64 from_block)
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
 	struct super_block *sb = inode->i_sb;
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+
+	if (oi->i_extent_tree_root)
+		return ocsfs_extent_btree_truncate(inode, from_block);
 	int i;
 
 	for (i = oi->i_extent_count - 1; i >= 0; i--) {
@@ -194,6 +207,10 @@ int ocsfs_extent_convert_unwritten(struct inode *inode, u64 logical_block,
 {
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
 	u16 i;
+
+	if (oi->i_extent_tree_root)
+		return ocsfs_extent_btree_convert_unwritten(inode,
+							    logical_block, len);
 
 	for (i = 0; i < oi->i_extent_count; i++) {
 		struct ocsfs_extent *e = &oi->i_extents[i];
@@ -308,6 +325,9 @@ int ocsfs_extent_count_blocks(struct inode *inode, u64 *count)
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
 	u64 total = 0;
 	u16 i;
+
+	if (oi->i_extent_tree_root)
+		return ocsfs_extent_btree_count(inode, count);
 
 	for (i = 0; i < oi->i_extent_count; i++)
 		total += oi->i_extents[i].length;

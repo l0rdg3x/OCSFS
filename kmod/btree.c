@@ -349,6 +349,55 @@ out:
 	return ret;
 }
 
+/* ── search_le — floor search: largest key ≤ target ── */
+
+int ocsfs_btree_search_le(struct ocsfs_btree *bt, u64 key,
+			  u64 *out_key, u64 *out_value)
+{
+	struct ocsfs_btree_node_hdr *hdr;
+	struct ocsfs_btree_entry *entries;
+	void *buf;
+	int lo, hi, best, n, ret;
+
+	buf = kzalloc(bt->block_size, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	ret = ocsfs_btree_find_leaf(bt, key, buf, NULL, NULL, 0);
+	if (ret < 0)
+		goto out;
+
+	hdr     = node_hdr(buf);
+	entries = leaf_entries(buf);
+	n       = le16_to_cpu(hdr->bn_count);
+
+	lo = 0; hi = n - 1; best = -1;
+	while (lo <= hi) {
+		int mid = lo + (hi - lo) / 2;
+
+		if (le64_to_cpu(entries[mid].key) <= key) {
+			best = mid;
+			lo = mid + 1;
+		} else {
+			hi = mid - 1;
+		}
+	}
+
+	if (best >= 0) {
+		if (out_key)
+			*out_key = le64_to_cpu(entries[best].key);
+		if (out_value)
+			*out_value = le64_to_cpu(entries[best].value);
+		ret = 0;
+	} else {
+		ret = -ENOENT;
+	}
+
+out:
+	kfree(buf);
+	return ret;
+}
+
 /* ── range scan ── */
 
 int ocsfs_btree_range_scan(struct ocsfs_btree *bt, u64 start_key, u64 end_key,

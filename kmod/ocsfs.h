@@ -78,6 +78,7 @@
 #define OCSFS_INODE_SIZE            512
 #define OCSFS_INLINE_EXTENTS        16
 #define OCSFS_MAX_NAME_LEN          255
+#define OCSFS_DIR_BTREE_THRESHOLD   64u  /* entries before building dir index */
 #define OCSFS_DIRENT_SIZE           sizeof(struct ocsfs_disk_dirent)
 
 #define OCSFS_ROOT_INO              2
@@ -680,6 +681,17 @@ int ocsfs_extent_truncate(struct inode *inode, u64 from_block);
 int ocsfs_extent_count_blocks(struct inode *inode, u64 *count);
 int ocsfs_extent_convert_unwritten(struct inode *inode, u64 logical_block,
 				   u32 len);
+
+/* extent_btree.c */
+int ocsfs_extent_btree_lookup(struct inode *inode, u64 logical,
+			      struct ocsfs_extent *out);
+int ocsfs_extent_btree_insert(struct inode *inode, u64 logical, u64 physical,
+			      u32 len, u16 flags);
+int ocsfs_extent_btree_migrate(struct inode *inode);
+int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block);
+int ocsfs_extent_btree_convert_unwritten(struct inode *inode, u64 logical,
+					 u32 len);
+int ocsfs_extent_btree_count(struct inode *inode, u64 *count);
 
 /* bitmap.c */
 int ocsfs_alloc_blocks(struct super_block *sb, u32 ag_hint, u32 count,

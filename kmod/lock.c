@@ -1,13 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * OCSFS — lock.c
- * On-disk distributed lock manager.
- *
- * All lock state lives in the 1 MB Lock Table region on the shared LUN.
- * Lock operations use buffer_head reads + writes with CAS-style versioning.
- * On real SCSI hardware, Compare-And-Write (CAW) provides atomicity;
- * for the initial implementation we use read-modify-write with version
- * checks and retry on conflict.
+ * Lock acquire, release, downgrade, and node recovery.
+ * I/O helpers, bitmask helpers, and resource allocation are in lock_io.c.
  *
  * Lock compatibility matrix:
  *   NL + anything = compatible
@@ -18,363 +13,7 @@
  */
 
 #include "ocsfs.h"
-
-/* ═══════════════════════════════════════════════════════════════
- * LOCK TABLE I/O
- * ═══════════════════════════════════════════════════════════════ */
-
-/* Read a lock entry from disk */
-static int lock_read_entry(struct super_block *sb, u32 slot,
-			   struct ocsfs_disk_lock *out,
-			   struct buffer_head **bh_out)
-{
-	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
-	u64 off = OCSFS_LOCK_TABLE_OFF +
-		  (u64)slot * OCSFS_LOCK_ENTRY_SIZE;
-	u64 block = off / sbi->s_block_size;
-	u32 boff = off % sbi->s_block_size;
-	struct buffer_head *bh;
-
-	bh = sb_bread(sb, block);
-	if (!bh)
-		return -EIO;
-
-	memcpy(out, bh->b_data + boff, sizeof(*out));
-
-	if (bh_out) {
-		*bh_out = bh;
-	} else {
-		brelse(bh);
-	}
-
-	return 0;
-}
-
-/*
- * Write a lock entry to disk with atomicity guaranteed by one of two paths:
- *
- * CAW path (when s_caw_supported): SCSI Compare-And-Write (opcode 0x89)
- *   atomically verifies the expected sector content and writes the new data
- *   in a single SCSI command. Eliminates the TOCTOU race entirely.
- *   MISCOMPARE → -EAGAIN (another node wrote first; caller retries).
- *
- * Fallback path: software version-check read-modify-write.
- *   Narrows the TOCTOU window with a fresh disk read + version compare,
- *   but a race remains between the check and the write.
- */
-static int lock_write_entry(struct super_block *sb, u32 slot,
-			    struct ocsfs_disk_lock *entry,
-			    struct buffer_head *bh)
-{
-	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
-	u64 off = OCSFS_LOCK_TABLE_OFF +
-		  (u64)slot * OCSFS_LOCK_ENTRY_SIZE;
-	u64 block = off / sbi->s_block_size;
-	u32 boff = off % sbi->s_block_size;
-	u32 expected_version = le32_to_cpu(entry->le_version);
-	struct buffer_head *bh_check;
-	struct ocsfs_disk_lock *check;
-
-	if (sbi->s_caw_supported) {
-		unsigned int lbs = bdev_logical_block_size(sb->s_bdev);
-		u32 lbs_start;
-		u8 *exp_buf, *new_buf;
-		u64 scsi_lba;
-		int ret = -ENOMEM;
-
-		/* VULN-003: lbs must not exceed the filesystem block size;
-		 * otherwise lbs_start + lbs overruns the buffer_head data. */
-		if (lbs == 0 || lbs > sbi->s_block_size || !is_power_of_2(lbs))
-			goto software_fallback;
-
-		lbs_start = boff & ~(lbs - 1u);
-		exp_buf   = kmalloc(lbs, GFP_KERNEL);
-		new_buf   = kmalloc(lbs, GFP_KERNEL);
-
-		if (exp_buf && new_buf) {
-			scsi_lba = off / lbs;
-			memcpy(exp_buf, bh->b_data + lbs_start, lbs);
-			memcpy(new_buf, exp_buf, lbs);
-			entry->le_version = cpu_to_le32(expected_version + 1);
-			entry->le_checksum = cpu_to_le32(
-				ocsfs_crc32c(~0U, entry,
-					     OCSFS_LOCK_ENTRY_SIZE - sizeof(__le32)));
-			memcpy(new_buf + (boff & (lbs - 1u)), entry, sizeof(*entry));
-
-			ret = ocsfs_scsi_caw(sb, scsi_lba, exp_buf, new_buf, lbs);
-			if (ret == -EAGAIN)
-				clear_buffer_uptodate(bh);
-		}
-		kfree(exp_buf);
-		kfree(new_buf);
-
-		if (ret != -EOPNOTSUPP)
-			return ret;
-	}
-
-software_fallback:
-	/* Software fallback: force fresh disk read + version check */
-	bh_check = sb_getblk(sb, block);
-	if (!bh_check)
-		return -EIO;
-	clear_buffer_uptodate(bh_check);
-	if (bh_read(bh_check, 0) < 0) {
-		brelse(bh_check);
-		return -EIO;
-	}
-
-	check = (struct ocsfs_disk_lock *)(bh_check->b_data + boff);
-	if (le32_to_cpu(check->le_version) != expected_version) {
-		brelse(bh_check);
-		return -EAGAIN;
-	}
-	brelse(bh_check);
-
-	entry->le_version = cpu_to_le32(expected_version + 1);
-	entry->le_checksum = cpu_to_le32(
-		ocsfs_crc32c(~0U, entry,
-			     OCSFS_LOCK_ENTRY_SIZE - sizeof(__le32)));
-
-	bh_check = sb_bread(sb, block);
-	if (!bh_check)
-		return -EIO;
-
-	memcpy(bh_check->b_data + boff, entry, sizeof(*entry));
-	mark_buffer_dirty(bh_check);
-	sync_dirty_buffer(bh_check);
-	brelse(bh_check);
-
-	return 0;
-}
-
-/*
- * ocsfs_lock_probe_slot() — find the actual on-disk slot for a resource.
- *
- * The primary slot is hash(resource_id) % ENTRY_COUNT, but collisions
- * are possible.  We use open addressing (linear probe) to find a free
- * slot or the existing slot that already holds this resource.
- *
- * Updates lr->lr_slot to the found slot so all subsequent operations
- * (release, downgrade) hit the same disk entry.
- *
- * Called with lr->lr_mutex held.
- * Returns 0 on success, -ENOSPC if OCSFS_LOCK_PROBE_MAX slots are all
- * occupied by different resources (extremely unlikely with good hashing).
- */
-static int ocsfs_lock_probe_slot(struct super_block *sb,
-				  struct ocsfs_lock_res *lr)
-{
-	u32 base = ocsfs_lock_table_slot(lr->lr_resource_id);
-	int i;
-
-	for (i = 0; i < OCSFS_LOCK_PROBE_MAX; i++) {
-		u32 slot = (base + i) % OCSFS_LOCK_ENTRY_COUNT;
-		struct ocsfs_disk_lock dl;
-		struct buffer_head *bh;
-		int ret;
-
-		ret = lock_read_entry(sb, slot, &dl, &bh);
-		if (ret)
-			return ret;
-		brelse(bh);
-
-		/* Free slot: claim it */
-		if (le32_to_cpu(dl.le_magic) != OCSFS_LOCK_MAGIC) {
-			lr->lr_slot = slot;
-			return 0;
-		}
-
-		/* Slot belongs to our resource: use it */
-		if (le64_to_cpu(dl.le_resource_id) == lr->lr_resource_id) {
-			lr->lr_slot = slot;
-			return 0;
-		}
-		/* Slot belongs to a different resource: probe next */
-	}
-
-	pr_warn("ocsfs: lock table full (probe_max=%d), resource 0x%llx\n",
-		OCSFS_LOCK_PROBE_MAX, lr->lr_resource_id);
-	return -ENOSPC;
-}
-
-/* ═══════════════════════════════════════════════════════════════
- * LOCK COMPATIBILITY
- * ═══════════════════════════════════════════════════════════════ */
-
-bool lock_modes_compatible(u16 held, u16 requested)
-{
-	if (held == OCSFS_LOCK_NL || requested == OCSFS_LOCK_NL)
-		return true;
-	if (held == OCSFS_LOCK_SH && requested == OCSFS_LOCK_SH)
-		return true;
-	if (held == OCSFS_LOCK_CW && requested == OCSFS_LOCK_CW)
-		return true;
-	return false;
-}
-
-/* Set a bit in the waiter bitmask */
-static void set_waiter_bit(struct ocsfs_disk_lock *dl, u16 slot)
-{
-	u32 byte = slot / 8;
-	u32 bit = slot % 8;
-
-	if (byte < sizeof(dl->le_waiters))
-		dl->le_waiters[byte] |= (1 << bit);
-}
-
-/* Clear a bit in the waiter bitmask */
-static void clear_waiter_bit(struct ocsfs_disk_lock *dl, u16 slot)
-{
-	u32 byte = slot / 8;
-	u32 bit = slot % 8;
-
-	if (byte < sizeof(dl->le_waiters))
-		dl->le_waiters[byte] &= ~(1 << bit);
-}
-
-/* Check if a node is in the SH holders bitmask */
-static bool is_sh_holder(struct ocsfs_disk_lock *dl, u16 slot)
-{
-	if (slot < 32)
-		return !!(le32_to_cpu(dl->le_sh_holders) & (1 << slot));
-	if (slot - 32 < sizeof(dl->le_sh_holders_ext) * 8)
-		return !!(dl->le_sh_holders_ext[(slot - 32) / 8] &
-			  (1 << ((slot - 32) % 8)));
-	return false;
-}
-
-/* Add this node to SH holders */
-static void add_sh_holder(struct ocsfs_disk_lock *dl, u16 slot)
-{
-	if (slot < 32) {
-		u32 mask = le32_to_cpu(dl->le_sh_holders);
-		mask |= (1 << slot);
-		dl->le_sh_holders = cpu_to_le32(mask);
-	} else if (slot - 32 < sizeof(dl->le_sh_holders_ext) * 8) {
-		dl->le_sh_holders_ext[(slot - 32) / 8] |=
-			(1 << ((slot - 32) % 8));
-	}
-}
-
-/* Remove this node from SH holders */
-static void remove_sh_holder(struct ocsfs_disk_lock *dl, u16 slot)
-{
-	if (slot < 32) {
-		u32 mask = le32_to_cpu(dl->le_sh_holders);
-		mask &= ~(1 << slot);
-		dl->le_sh_holders = cpu_to_le32(mask);
-	} else if (slot - 32 < sizeof(dl->le_sh_holders_ext) * 8) {
-		dl->le_sh_holders_ext[(slot - 32) / 8] &=
-			~(1 << ((slot - 32) % 8));
-	}
-}
-
-/* Check if any SH holders remain */
-static bool has_sh_holders(struct ocsfs_disk_lock *dl)
-{
-	int i;
-
-	if (le32_to_cpu(dl->le_sh_holders) != 0)
-		return true;
-	for (i = 0; i < sizeof(dl->le_sh_holders_ext); i++) {
-		if (dl->le_sh_holders_ext[i] != 0)
-			return true;
-	}
-	return false;
-}
-
-/* Check if any waiters exist */
-static bool has_waiters(struct ocsfs_disk_lock *dl)
-{
-	int i;
-
-	for (i = 0; i < sizeof(dl->le_waiters); i++) {
-		if (dl->le_waiters[i] != 0)
-			return true;
-	}
-	return false;
-}
-
-/* ═══════════════════════════════════════════════════════════════
- * LOCK RESOURCE ALLOCATION
- * ═══════════════════════════════════════════════════════════════ */
-
-/*
- * ocsfs_lock_init() — initialise an embedded lock resource.
- *
- * Used for locks stored directly inside ocsfs_inode_info and
- * ocsfs_ag_info (not heap-allocated).  Does NOT add to s_lock_list.
- */
-void ocsfs_lock_init(struct ocsfs_lock_res *lr, u64 resource_id,
-		     u32 resource_type)
-{
-	memset(lr, 0, sizeof(*lr));
-	lr->lr_resource_id   = resource_id;
-	lr->lr_resource_type = resource_type;
-	lr->lr_mode          = OCSFS_LOCK_NL;
-	lr->lr_slot          = ocsfs_lock_table_slot(resource_id);
-	lr->lr_cached        = false;
-	lr->lr_cache_expires = 0;
-	mutex_init(&lr->lr_mutex);
-	INIT_LIST_HEAD(&lr->lr_list);
-}
-
-int ocsfs_dlm_init(struct super_block *sb)
-{
-	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
-
-	INIT_LIST_HEAD(&sbi->s_lock_list);
-	spin_lock_init(&sbi->s_lock_list_lock);
-	return 0;
-}
-
-void ocsfs_dlm_exit(struct super_block *sb)
-{
-	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
-	struct ocsfs_lock_res *lr, *tmp;
-
-	/* Release all held locks */
-	spin_lock(&sbi->s_lock_list_lock);
-	list_for_each_entry_safe(lr, tmp, &sbi->s_lock_list, lr_list) {
-		if (lr->lr_mode != OCSFS_LOCK_NL) {
-			spin_unlock(&sbi->s_lock_list_lock);
-			ocsfs_lock_release(sb, lr);
-			spin_lock(&sbi->s_lock_list_lock);
-		}
-		list_del(&lr->lr_list);
-		kfree(lr);
-	}
-	spin_unlock(&sbi->s_lock_list_lock);
-}
-
-struct ocsfs_lock_res *ocsfs_lock_alloc(struct super_block *sb,
-					u64 resource_id, u32 resource_type)
-{
-	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
-	struct ocsfs_lock_res *lr;
-
-	lr = kzalloc(sizeof(*lr), GFP_KERNEL);
-	if (!lr)
-		return ERR_PTR(-ENOMEM);
-
-	lr->lr_resource_id = resource_id;
-	lr->lr_resource_type = resource_type;
-	lr->lr_mode = OCSFS_LOCK_NL;
-	lr->lr_slot = ocsfs_lock_table_slot(resource_id);
-	mutex_init(&lr->lr_mutex);
-
-	spin_lock(&sbi->s_lock_list_lock);
-	list_add(&lr->lr_list, &sbi->s_lock_list);
-	spin_unlock(&sbi->s_lock_list_lock);
-
-	return lr;
-}
-
-void ocsfs_lock_free(struct ocsfs_lock_res *lr)
-{
-	/* Caller must release lock first */
-	kfree(lr);
-}
+#include "lock_internal.h"
 
 /* ═══════════════════════════════════════════════════════════════
  * LOCK ACQUIRE
@@ -397,7 +36,6 @@ int ocsfs_lock_acquire(struct super_block *sb, struct ocsfs_lock_res *lr,
 	u32 delay_us = OCSFS_LOCK_RETRY_MIN_US;
 
 	if (!sbi->s_clustered) {
-		/* Single-node mode: no on-disk locking needed */
 		lr->lr_mode = mode;
 		return 0;
 	}
@@ -406,8 +44,7 @@ int ocsfs_lock_acquire(struct super_block *sb, struct ocsfs_lock_res *lr,
 
 	/*
 	 * Cache fast-path: if we already hold a compatible or stronger lock
-	 * and the window hasn't expired, renew and return without disk I/O.
-	 * Safe because no other node can grab EX while we hold EX or SH.
+	 * and the window hasn't expired, renew without disk I/O.
 	 */
 	if (lr->lr_cached && lr->lr_cache_expires > ktime_get_ns()) {
 		bool compatible = (lr->lr_mode == OCSFS_LOCK_EX) ||
@@ -420,8 +57,7 @@ int ocsfs_lock_acquire(struct super_block *sb, struct ocsfs_lock_res *lr,
 	}
 	lr->lr_cached = false;
 
-	/* Resolve collision: find/claim the actual on-disk slot. */
-	ret = ocsfs_lock_probe_slot(sb, lr);
+	ret = lock_probe_slot(sb, lr);
 	if (ret) {
 		mutex_unlock(&lr->lr_mutex);
 		return ret;
@@ -434,23 +70,20 @@ retry:
 		return ret;
 	}
 
-	/* Initialise the entry if we claimed a free slot. */
 	if (le32_to_cpu(dl.le_magic) != OCSFS_LOCK_MAGIC) {
 		memset(&dl, 0, sizeof(dl));
-		dl.le_magic = cpu_to_le32(OCSFS_LOCK_MAGIC);
-		dl.le_resource_id = cpu_to_le64(lr->lr_resource_id);
+		dl.le_magic         = cpu_to_le32(OCSFS_LOCK_MAGIC);
+		dl.le_resource_id   = cpu_to_le64(lr->lr_resource_id);
 		dl.le_resource_type = cpu_to_le32(lr->lr_resource_type);
 	}
 
 	u16 cur_mode = le16_to_cpu(dl.le_mode);
 
-	/* Check compatibility */
 	if (cur_mode == OCSFS_LOCK_NL || lock_modes_compatible(cur_mode, mode)) {
-		/* Grant the lock */
 		if (mode == OCSFS_LOCK_EX) {
-			dl.le_mode = cpu_to_le16(OCSFS_LOCK_EX);
+			dl.le_mode        = cpu_to_le16(OCSFS_LOCK_EX);
 			dl.le_holder_slot = cpu_to_le16(sbi->s_node_slot);
-			dl.le_holder_gen = cpu_to_le32(sbi->s_mount_gen);
+			dl.le_holder_gen  = cpu_to_le32(sbi->s_mount_gen);
 		} else if (mode == OCSFS_LOCK_SH) {
 			dl.le_mode = cpu_to_le16(OCSFS_LOCK_SH);
 			add_sh_holder(&dl, sbi->s_node_slot);
@@ -466,11 +99,11 @@ retry:
 		brelse(bh);
 
 		if (ret == -EAGAIN)
-			goto retry; /* concurrent write detected, re-read */
+			goto retry;
 
 		if (ret == 0) {
-			lr->lr_mode = mode;
-			lr->lr_cached = true;
+			lr->lr_mode          = mode;
+			lr->lr_cached        = true;
 			lr->lr_cache_expires = ktime_get_ns() + OCSFS_LOCK_CACHE_NS;
 		}
 
@@ -478,7 +111,6 @@ retry:
 		return ret;
 	}
 
-	/* Conflict — set waiter bit and retry */
 	set_waiter_bit(&dl, sbi->s_node_slot);
 	lock_write_entry(sb, lr->lr_slot, &dl, bh);
 	brelse(bh);
@@ -492,7 +124,6 @@ retry:
 		return -ETIMEDOUT;
 	}
 
-	/* Exponential backoff */
 	usleep_range(delay_us, delay_us * 2);
 	delay_us = min_t(u32, delay_us * 2, OCSFS_LOCK_RETRY_MAX_US);
 	goto retry;
@@ -523,9 +154,8 @@ int ocsfs_lock_release(struct super_block *sb, struct ocsfs_lock_res *lr)
 	}
 
 	if (lr->lr_mode == OCSFS_LOCK_EX) {
-		/* Clear exclusive holder */
 		dl.le_holder_slot = 0;
-		dl.le_holder_gen = 0;
+		dl.le_holder_gen  = 0;
 		if (!has_sh_holders(&dl) && !has_waiters(&dl))
 			dl.le_mode = cpu_to_le16(OCSFS_LOCK_NL);
 	} else if (lr->lr_mode == OCSFS_LOCK_SH ||
@@ -563,7 +193,7 @@ int ocsfs_lock_downgrade(struct super_block *sb, struct ocsfs_lock_res *lr,
 	}
 
 	if (new_mode >= lr->lr_mode)
-		return -EINVAL;  /* not a downgrade */
+		return -EINVAL;
 
 	mutex_lock(&lr->lr_mutex);
 
@@ -574,15 +204,15 @@ int ocsfs_lock_downgrade(struct super_block *sb, struct ocsfs_lock_res *lr,
 	}
 
 	if (lr->lr_mode == OCSFS_LOCK_EX && new_mode == OCSFS_LOCK_SH) {
-		dl.le_mode = cpu_to_le16(OCSFS_LOCK_SH);
+		dl.le_mode        = cpu_to_le16(OCSFS_LOCK_SH);
 		dl.le_holder_slot = 0;
-		dl.le_holder_gen = 0;
+		dl.le_holder_gen  = 0;
 		add_sh_holder(&dl, sbi->s_node_slot);
 	} else if (new_mode == OCSFS_LOCK_NL) {
 		/*
 		 * Must release lr_mutex before calling ocsfs_lock_release(),
-		 * which acquires the same mutex. Holding it here would deadlock
-		 * on non-recursive mutexes (BUG-002).
+		 * which acquires the same mutex — would deadlock on non-recursive
+		 * mutexes (BUG-002 fix).
 		 */
 		brelse(bh);
 		mutex_unlock(&lr->lr_mutex);
@@ -630,19 +260,17 @@ int ocsfs_lock_recover_node(struct super_block *sb, u16 node_slot,
 
 		bool modified = false;
 
-		/* Check EX holder */
 		if (le16_to_cpu(dl.le_mode) == OCSFS_LOCK_EX &&
 		    le16_to_cpu(dl.le_holder_slot) == node_slot &&
 		    le32_to_cpu(dl.le_holder_gen) == mount_gen) {
 			dl.le_holder_slot = 0;
-			dl.le_holder_gen = 0;
+			dl.le_holder_gen  = 0;
 			if (!has_sh_holders(&dl))
 				dl.le_mode = cpu_to_le16(OCSFS_LOCK_NL);
 			modified = true;
 			recovered++;
 		}
 
-		/* Check SH holders */
 		if (is_sh_holder(&dl, node_slot)) {
 			remove_sh_holder(&dl, node_slot);
 			if (!has_sh_holders(&dl) &&
@@ -652,7 +280,6 @@ int ocsfs_lock_recover_node(struct super_block *sb, u16 node_slot,
 			recovered++;
 		}
 
-		/* Clear waiter bit */
 		clear_waiter_bit(&dl, node_slot);
 
 		if (modified)

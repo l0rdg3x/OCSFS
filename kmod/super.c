@@ -494,7 +494,6 @@ static void __exit ocsfs_exit(void)
 
 module_init(ocsfs_init);
 module_exit(ocsfs_exit);
-
 MODULE_AUTHOR("OCSFS Project Contributors");
 MODULE_DESCRIPTION("OCSFS — Open Cluster Shared FileSystem");
 MODULE_LICENSE("GPL");

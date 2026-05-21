@@ -118,6 +118,8 @@ int ocsfs_btree_open(struct ocsfs_btree *bt, u64 root_block, u32 block_size,
 		     ocsfs_btree_alloc_fn, ocsfs_btree_free_fn, void *ctx);
 
 int ocsfs_btree_search(struct ocsfs_btree *bt, u64 key, u64 *out_value);
+int ocsfs_btree_search_le(struct ocsfs_btree *bt, u64 key,
+			  u64 *out_key, u64 *out_value);
 int ocsfs_btree_insert(struct ocsfs_btree *bt, u64 key, u64 value);
 int ocsfs_btree_delete(struct ocsfs_btree *bt, u64 key);
 

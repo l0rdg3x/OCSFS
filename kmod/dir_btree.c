@@ -17,7 +17,6 @@
 #include "ocsfs.h"
 #include "ocsfs_btree.h"
 
-#define OCSFS_DIR_BTREE_THRESHOLD  64u   /* entries before building the index */
 
 /* Encode block+offset into the 64-bit btree value */
 static inline u64 dir_encode_val(u64 block, u32 offset)
@@ -187,6 +186,7 @@ int ocsfs_dir_btree_insert(struct inode *dir, const struct qstr *name,
 	struct ocsfs_btree bt;
 	struct dir_btree_ctx dc;
 	u64 hash;
+	int ret;
 
 	if (!oi->i_dir_btree_root)
 		return -ENOENT;
@@ -195,7 +195,10 @@ int ocsfs_dir_btree_insert(struct inode *dir, const struct qstr *name,
 		return -EIO;
 
 	hash = dir_name_hash(name->name, name->len);
-	return ocsfs_btree_insert(&bt, hash, dir_encode_val(phys_block, offset));
+	ret = ocsfs_btree_insert(&bt, hash, dir_encode_val(phys_block, offset));
+	if (!ret)
+		oi->i_dir_btree_root = bt.root_block;
+	return ret;
 }
 
 /* Remove a name from the B+ tree index */
@@ -205,6 +208,7 @@ int ocsfs_dir_btree_delete(struct inode *dir, const struct qstr *name)
 	struct ocsfs_btree bt;
 	struct dir_btree_ctx dc;
 	u64 hash;
+	int ret;
 
 	if (!oi->i_dir_btree_root)
 		return 0;
@@ -213,7 +217,10 @@ int ocsfs_dir_btree_delete(struct inode *dir, const struct qstr *name)
 		return -EIO;
 
 	hash = dir_name_hash(name->name, name->len);
-	return ocsfs_btree_delete(&bt, hash);
+	ret = ocsfs_btree_delete(&bt, hash);
+	if (!ret)
+		oi->i_dir_btree_root = bt.root_block;
+	return ret;
 }
 
 /*
@@ -264,8 +271,15 @@ int ocsfs_dir_btree_migrate(struct inode *dir)
 
 			hash = dir_name_hash((char *)de->de_name,
 					     de->de_name_len);
-			ocsfs_btree_insert(&bt, hash,
-					   dir_encode_val(phys, off));
+			ret = ocsfs_btree_insert(&bt, hash,
+						 dir_encode_val(phys, off));
+			if (ret) {
+				brelse(bh);
+				pr_err("ocsfs: dir btree migrate failed: %d\n",
+				       ret);
+				return ret;
+			}
+			oi->i_dir_btree_root = bt.root_block;
 		}
 		brelse(bh);
 	}
