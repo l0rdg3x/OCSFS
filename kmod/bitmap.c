@@ -20,7 +20,8 @@
  * ═══════════════════════════════════════════════════════════════ */
 
 static int ocsfs_ag_alloc_blocks(struct super_block *sb, u32 ag_no,
-				 u32 count, u64 *block_out)
+				 u32 count, u64 *block_out,
+				 struct ocsfs_txn *txn)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	struct ocsfs_ag_info *ag = &sbi->s_ags[ag_no];
@@ -98,6 +99,16 @@ static int ocsfs_ag_alloc_blocks(struct super_block *sb, u32 ag_no,
 							}
 						}
 
+						if (txn) {
+							ret = ocsfs_txn_add_bh(txn, mbh);
+							if (ret) {
+								if (mb != b)
+									brelse(mbh);
+								brelse(bh);
+								goto out_unlock;
+							}
+						}
+
 						((u8 *)mbh->b_data)[mbit / 8] |=
 							(1 << (mbit % 8));
 						mark_buffer_dirty(mbh);
@@ -139,26 +150,36 @@ int ocsfs_alloc_blocks(struct super_block *sb, u32 ag_hint, u32 count,
 		       u64 *block_out)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	struct ocsfs_txn *txn;
 	u32 i;
 	int ret;
 
+	txn = ocsfs_txn_begin(sb);
+	if (IS_ERR(txn))
+		return PTR_ERR(txn);
+
 	/* Try preferred AG first */
 	if (ag_hint < sbi->s_ag_count) {
-		ret = ocsfs_ag_alloc_blocks(sb, ag_hint, count, block_out);
+		ret = ocsfs_ag_alloc_blocks(sb, ag_hint, count, block_out, txn);
 		if (ret == 0)
-			return 0;
+			goto commit;
 	}
 
 	/* Fall back to any AG with space */
 	for (i = 0; i < sbi->s_ag_count; i++) {
 		if (i == ag_hint)
 			continue;
-		ret = ocsfs_ag_alloc_blocks(sb, i, count, block_out);
+		ret = ocsfs_ag_alloc_blocks(sb, i, count, block_out, txn);
 		if (ret == 0)
-			return 0;
+			goto commit;
 	}
 
-	return -ENOSPC;
+	ret = -ENOSPC;
+	ocsfs_txn_abort(txn);
+	return ret;
+
+commit:
+	return ocsfs_txn_commit(txn);
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -266,8 +287,14 @@ void ocsfs_free_blocks(struct super_block *sb, u64 block, u32 count)
 int ocsfs_alloc_inode_num(struct super_block *sb, u32 ag_hint, u64 *ino_out)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	struct ocsfs_txn *txn;
 	u32 ag_no;
 	u32 try;
+
+	/* Open txn before any AG lock (ordering: j_lock → ag_lock). */
+	txn = ocsfs_txn_begin(sb);
+	if (IS_ERR(txn))
+		return PTR_ERR(txn);
 
 	for (try = 0; try < sbi->s_ag_count; try++) {
 		struct ocsfs_ag_info *ag;
@@ -279,8 +306,6 @@ int ocsfs_alloc_inode_num(struct super_block *sb, u32 ag_hint, u64 *ino_out)
 		if (ag->free_inodes == 0)
 			continue;
 
-		/* Serialise inode-slot claim across nodes (same AG lock as
-		 * block allocation — prevents duplicate inode numbers). */
 		if (sbi->s_clustered)
 			ocsfs_lock_acquire(sb, &ag->ag_lock_res, OCSFS_LOCK_EX);
 
@@ -301,24 +326,29 @@ int ocsfs_alloc_inode_num(struct super_block *sb, u32 ag_hint, u64 *ino_out)
 			di = (struct ocsfs_disk_inode *)(bh->b_data + boff);
 
 			if (le32_to_cpu(di->i_magic) != OCSFS_INODE_MAGIC) {
-				/* Free slot — claim it */
-				memset(di, 0, OCSFS_INODE_SIZE);
-				di->i_magic = cpu_to_le32(OCSFS_INODE_MAGIC);
-				di->i_ino = cpu_to_le64(
-					ag_no * sbi->s_ag_size + i);
-				mark_buffer_dirty(bh);
+				int tr = ocsfs_txn_add_bh(txn, bh);
+
+				if (!tr) {
+					memset(di, 0, OCSFS_INODE_SIZE);
+					di->i_magic = cpu_to_le32(OCSFS_INODE_MAGIC);
+					di->i_ino = cpu_to_le64(
+						ag_no * sbi->s_ag_size + i);
+					mark_buffer_dirty(bh);
+					brelse(bh);
+
+					ag->free_inodes--;
+					*ino_out = ag_no * sbi->s_ag_size + i;
+
+					mutex_unlock(&ag->ag_lock);
+					if (sbi->s_clustered)
+						ocsfs_lock_release(sb, &ag->ag_lock_res);
+					return ocsfs_txn_commit(txn);
+				}
+
 				brelse(bh);
-
-				ag->free_inodes--;
-				*ino_out = ag_no * sbi->s_ag_size + i;
-
-				mutex_unlock(&ag->ag_lock);
-				if (sbi->s_clustered)
-					ocsfs_lock_release(sb, &ag->ag_lock_res);
-				return 0;
+			} else {
+				brelse(bh);
 			}
-
-			brelse(bh);
 		}
 
 		mutex_unlock(&ag->ag_lock);
@@ -326,6 +356,7 @@ int ocsfs_alloc_inode_num(struct super_block *sb, u32 ag_hint, u64 *ino_out)
 			ocsfs_lock_release(sb, &ag->ag_lock_res);
 	}
 
+	ocsfs_txn_abort(txn);
 	return -ENOSPC;
 }
 
@@ -343,9 +374,17 @@ void ocsfs_free_inode_num(struct super_block *sb, u64 ino)
 	u32 boff;
 	struct buffer_head *bh;
 	struct ocsfs_disk_inode *di;
+	struct ocsfs_txn *txn;
 
 	if (ag_no >= sbi->s_ag_count) {
 		pr_warn("ocsfs: free_inode_num: ino %llu out of range\n", ino);
+		return;
+	}
+
+	/* Open txn before AG lock (ordering: j_lock → ag_lock). */
+	txn = ocsfs_txn_begin(sb);
+	if (IS_ERR(txn)) {
+		pr_err("ocsfs: free_inode_num: txn_begin failed\n");
 		return;
 	}
 
@@ -362,9 +401,11 @@ void ocsfs_free_inode_num(struct super_block *sb, u64 ino)
 
 	bh = sb_bread(sb, block);
 	if (bh) {
-		di = (struct ocsfs_disk_inode *)(bh->b_data + boff);
-		memset(di, 0, OCSFS_INODE_SIZE);  /* magic = 0 → free */
-		mark_buffer_dirty(bh);
+		if (ocsfs_txn_add_bh(txn, bh) == 0) {
+			di = (struct ocsfs_disk_inode *)(bh->b_data + boff);
+			memset(di, 0, OCSFS_INODE_SIZE);
+			mark_buffer_dirty(bh);
+		}
 		brelse(bh);
 	}
 
@@ -372,4 +413,5 @@ void ocsfs_free_inode_num(struct super_block *sb, u64 ino)
 	mutex_unlock(&ag->ag_lock);
 	if (sbi->s_clustered)
 		ocsfs_lock_release(sb, &ag->ag_lock_res);
+	ocsfs_txn_commit(txn);
 }

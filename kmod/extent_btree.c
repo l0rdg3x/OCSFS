@@ -205,6 +205,7 @@ int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block)
 	struct ocsfs_btree bt;
 	struct ext_btree_ctx ec;
 	struct ext_trunc_ctx tc;
+	struct ocsfs_txn *txn;
 	u64 key, val;
 	u32 i;
 	int ret;
@@ -212,6 +213,10 @@ int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block)
 	ret = ext_btree_open(inode, &bt, &ec);
 	if (ret)
 		return ret;
+
+	txn = ocsfs_txn_begin(sb);
+	if (IS_ERR(txn))
+		return PTR_ERR(txn);
 
 	/* Shrink any extent that straddles from_block */
 	if (from_block > 0 &&
@@ -222,7 +227,10 @@ int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block)
 			u32 keep  = (u32)(from_block - key);
 			u32 freed = elen - keep;
 
-			ocsfs_free_blocks(sb, ext_phys(val) + keep, freed);
+			ret = ocsfs_free_blocks_txn(txn,
+						    ext_phys(val) + keep, freed);
+			if (ret)
+				goto abort;
 			inode->i_blocks -= (u64)freed * (sbi->s_block_size / 512);
 			ocsfs_btree_delete(&bt, key);
 			ocsfs_btree_insert(&bt, key,
@@ -241,7 +249,11 @@ int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block)
 			u64 v;
 
 			if (!ocsfs_btree_search(&bt, tc.keys[i], &v)) {
-				ocsfs_free_blocks(sb, ext_phys(v), ext_len(v));
+				ret = ocsfs_free_blocks_txn(txn,
+							    ext_phys(v),
+							    ext_len(v));
+				if (ret)
+					goto abort;
 				inode->i_blocks -= (u64)ext_len(v) *
 						   (sbi->s_block_size / 512);
 				ocsfs_btree_delete(&bt, tc.keys[i]);
@@ -251,7 +263,11 @@ int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block)
 	} while (tc.count > 0);
 
 	mark_inode_dirty(inode);
-	return 0;
+	return ocsfs_txn_commit(txn);
+
+abort:
+	ocsfs_txn_abort(txn);
+	return ret;
 }
 
 /* ── convert unwritten ── */
