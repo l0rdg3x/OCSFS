@@ -62,19 +62,67 @@ static int ocsfs_unlink(struct inode *dir, struct dentry *dentry)
 
 static int ocsfs_rmdir(struct inode *dir, struct dentry *dentry)
 {
+	struct ocsfs_sb_info *sbi = OCSFS_SB(dir->i_sb);
+	struct ocsfs_inode_info *dir_oi  = OCSFS_I(dir);
 	struct inode *inode = d_inode(dentry);
+	struct ocsfs_inode_info *child_oi = OCSFS_I(inode);
+	int ret;
 
-	if (!ocsfs_empty_dir(inode))
-		return -ENOTEMPTY;
+	/*
+	 * Acquire EX on both dir and child ordered by on-disk ino to prevent
+	 * deadlock with a concurrent cross-dir rename of the same inodes.
+	 */
+	if (sbi->s_clustered) {
+		struct ocsfs_inode_info *first  = dir_oi;
+		struct ocsfs_inode_info *second = child_oi;
 
-	ocsfs_del_dirent(dir, &dentry->d_name);
+		if (child_oi->i_disk_ino < dir_oi->i_disk_ino) {
+			first  = child_oi;
+			second = dir_oi;
+		}
+
+		ret = ocsfs_lock_acquire(dir->i_sb, &first->i_lock_res,
+					 OCSFS_LOCK_EX);
+		if (ret)
+			return ret;
+
+		ret = ocsfs_lock_acquire(dir->i_sb, &second->i_lock_res,
+					 OCSFS_LOCK_EX);
+		if (ret) {
+			ocsfs_lock_release(dir->i_sb, &first->i_lock_res);
+			return ret;
+		}
+	}
+
+	if (!__ocsfs_empty_dir(inode)) {
+		ret = -ENOTEMPTY;
+		goto out_unlock;
+	}
+
+	ret = __ocsfs_del_dirent(dir, &dentry->d_name);
+	if (ret)
+		goto out_unlock;
+
 	clear_nlink(inode);
 	mark_inode_dirty(inode);
 
 	drop_nlink(dir);
 	mark_inode_dirty(dir);
+	ret = 0;
 
-	return 0;
+out_unlock:
+	if (sbi->s_clustered) {
+		struct ocsfs_inode_info *first  = dir_oi;
+		struct ocsfs_inode_info *second = child_oi;
+
+		if (child_oi->i_disk_ino < dir_oi->i_disk_ino) {
+			first  = child_oi;
+			second = dir_oi;
+		}
+		ocsfs_lock_release(dir->i_sb, &second->i_lock_res);
+		ocsfs_lock_release(dir->i_sb, &first->i_lock_res);
+	}
+	return ret;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -173,6 +221,9 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 		__ocsfs_add_dirent(old_inode, &dotdot,
 				   new_oi->i_disk_ino, OCSFS_FT_DIR);
 
+		inode_set_ctime_current(old_inode);
+		mark_inode_dirty(old_inode);
+
 		if (sbi->s_clustered)
 			ocsfs_lock_release(old_dir->i_sb, &moved_oi->i_lock_res);
 
@@ -180,10 +231,10 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 		inc_nlink(new_dir);
 		mark_inode_dirty(old_dir);
 		mark_inode_dirty(new_dir);
+	} else {
+		inode_set_ctime_current(old_inode);
+		mark_inode_dirty(old_inode);
 	}
-
-	inode_set_ctime_current(old_inode);
-	mark_inode_dirty(old_inode);
 	ret = 0;
 
 out_unlock:

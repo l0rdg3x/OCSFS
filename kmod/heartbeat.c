@@ -41,7 +41,8 @@ int ocsfs_heartbeat_write(struct super_block *sb)
 	dhb->hb_node_slot = cpu_to_le16(sbi->s_node_slot);
 	dhb->hb_state = cpu_to_le16(OCSFS_NODE_ACTIVE);
 	dhb->hb_timestamp = cpu_to_le64(ktime_get_real_ns());
-	dhb->hb_sequence = cpu_to_le64(++sbi->s_hb.hb_sequence);
+	dhb->hb_sequence = cpu_to_le64(
+		atomic64_inc_return(&sbi->s_hb.hb_sequence));
 	dhb->hb_mount_gen = cpu_to_le32(sbi->s_mount_gen);
 	dhb->hb_checksum = cpu_to_le32(
 		ocsfs_crc32c(~0U, dhb,
@@ -243,7 +244,7 @@ int ocsfs_heartbeat_start(struct super_block *sb)
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	int ret;
 
-	sbi->s_hb.hb_sequence = 0;
+	atomic64_set(&sbi->s_hb.hb_sequence, 0);
 
 	/* Write initial heartbeat */
 	ret = ocsfs_heartbeat_write(sb);

@@ -165,15 +165,22 @@ int ocsfs_alloc_blocks(struct super_block *sb, u32 ag_hint, u32 count,
  * BLOCK FREE
  * ═══════════════════════════════════════════════════════════════ */
 
-void ocsfs_free_blocks(struct super_block *sb, u64 block, u32 count)
+/*
+ * Journalized free: logs before-images of bitmap blocks into @txn BEFORE
+ * clearing bits, so crash recovery can restore them if the txn never commits.
+ * Caller must have an open transaction; AG DLM EX + ag_lock are acquired here.
+ */
+int ocsfs_free_blocks_txn(struct ocsfs_txn *txn, u64 block, u32 count)
 {
+	struct ocsfs_journal *j = txn->t_journal;
+	struct super_block *sb = j->j_sb;
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	u32 ag_no;
 	struct ocsfs_ag_info *ag;
 	u64 local_block;
 	u32 i;
+	int ret = 0;
 
-	/* Determine which AG this block belongs to */
 	for (ag_no = 0; ag_no < sbi->s_ag_count; ag_no++) {
 		ag = &sbi->s_ags[ag_no];
 		if (block >= ag->block_start &&
@@ -182,15 +189,17 @@ void ocsfs_free_blocks(struct super_block *sb, u64 block, u32 count)
 	}
 
 	if (ag_no >= sbi->s_ag_count) {
-		pr_warn("ocsfs: free_blocks: block %llu not in any AG\n", block);
-		return;
+		pr_warn("ocsfs: free_blocks_txn: block %llu not in any AG\n", block);
+		return -EINVAL;
 	}
 
 	local_block = block - ag->block_start;
 
-	/* Cross-node serialisation for bitmap modification */
-	if (sbi->s_clustered)
-		ocsfs_lock_acquire(sb, &ag->ag_lock_res, OCSFS_LOCK_EX);
+	if (sbi->s_clustered) {
+		ret = ocsfs_lock_acquire(sb, &ag->ag_lock_res, OCSFS_LOCK_EX);
+		if (ret)
+			return ret;
+	}
 
 	mutex_lock(&ag->ag_lock);
 
@@ -202,8 +211,16 @@ void ocsfs_free_blocks(struct super_block *sb, u64 block, u32 count)
 
 		bh = sb_bread(sb,
 			      (ag->bitmap_off / sbi->s_block_size) + bm_block_idx);
-		if (!bh)
-			continue;
+		if (!bh) {
+			ret = -EIO;
+			goto out_unlock;
+		}
+
+		ret = ocsfs_txn_add_bh(txn, bh);
+		if (ret) {
+			brelse(bh);
+			goto out_unlock;
+		}
 
 		((u8 *)bh->b_data)[bm_bit / 8] &= ~(1 << (bm_bit % 8));
 		mark_buffer_dirty(bh);
@@ -211,14 +228,31 @@ void ocsfs_free_blocks(struct super_block *sb, u64 block, u32 count)
 	}
 
 	ag->free_blocks += count;
-
 	spin_lock(&sbi->s_free_lock);
 	sbi->s_free_blocks += count;
 	spin_unlock(&sbi->s_free_lock);
 
+out_unlock:
 	mutex_unlock(&ag->ag_lock);
 	if (sbi->s_clustered)
 		ocsfs_lock_release(sb, &ag->ag_lock_res);
+	return ret;
+}
+
+void ocsfs_free_blocks(struct super_block *sb, u64 block, u32 count)
+{
+	struct ocsfs_txn *txn = ocsfs_txn_begin(sb);
+
+	if (IS_ERR(txn)) {
+		pr_err("ocsfs: free_blocks: failed to open txn (%ld)\n",
+		       PTR_ERR(txn));
+		return;
+	}
+
+	if (ocsfs_free_blocks_txn(txn, block, count))
+		ocsfs_txn_abort(txn);
+	else
+		ocsfs_txn_commit(txn);
 }
 
 /* ═══════════════════════════════════════════════════════════════

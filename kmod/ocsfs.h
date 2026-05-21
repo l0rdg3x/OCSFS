@@ -444,7 +444,7 @@ struct ocsfs_node_info {
 struct ocsfs_heartbeat_info {
 	struct task_struct      *hb_thread;
 	bool                    hb_running;
-	u64                     hb_sequence;     /* our monotonic counter */
+	atomic64_t              hb_sequence;     /* our monotonic counter */
 };
 
 /* SCSI PR state */
@@ -696,6 +696,7 @@ int ocsfs_extent_btree_count(struct inode *inode, u64 *count);
 /* bitmap.c */
 int ocsfs_alloc_blocks(struct super_block *sb, u32 ag_hint, u32 count,
 		       u64 *block_out);
+int  ocsfs_free_blocks_txn(struct ocsfs_txn *txn, u64 block, u32 count);
 void ocsfs_free_blocks(struct super_block *sb, u64 block, u32 count);
 int ocsfs_alloc_inode_num(struct super_block *sb, u32 ag_hint, u64 *ino_out);
 void ocsfs_free_inode_num(struct super_block *sb, u64 ino);

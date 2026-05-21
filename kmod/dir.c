@@ -148,6 +148,7 @@ int __ocsfs_add_dirent(struct inode *dir, const struct qstr *name,
 	u64 dir_blocks = (dir->i_size + sbi->s_block_size - 1) /
 			 sbi->s_block_size;
 	struct buffer_head *bh = NULL;
+	struct ocsfs_txn *txn;
 	u64 b;
 	u32 off = 0;
 	int ret = 0;
@@ -196,12 +197,14 @@ int __ocsfs_add_dirent(struct inode *dir, const struct qstr *name,
 			ret = -EIO;
 			goto out;
 		}
-
 		memset(bh->b_data, 0, sbi->s_block_size);
 		off = 0;
 	}
-
 fill:
+	txn = ocsfs_txn_begin(dir->i_sb);
+	if (IS_ERR(txn)) { brelse(bh); ret = PTR_ERR(txn); goto out; }
+	ret = ocsfs_txn_add_bh(txn, bh);
+	if (ret) { ocsfs_txn_abort(txn); brelse(bh); goto out; }
 	{
 		struct ocsfs_disk_dirent *de =
 			(struct ocsfs_disk_dirent *)(bh->b_data + off);
@@ -218,7 +221,6 @@ fill:
 		brelse(bh);
 		bh = NULL;
 	}
-
 	/* B+ tree index: insert or trigger migration on threshold */
 	{
 		struct ocsfs_inode_info *oi = OCSFS_I(dir);
@@ -238,10 +240,9 @@ fill:
 		else if (ocsfs_dir_btree_should_build(dir))
 			ocsfs_dir_btree_migrate(dir);
 	}
-
 	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
 	mark_inode_dirty(dir);
-
+	ret = ocsfs_txn_commit(txn);
 out:
 	return ret;
 }
@@ -302,16 +303,24 @@ int __ocsfs_del_dirent(struct inode *dir, const struct qstr *name)
 			if (memcmp(de->de_name, name->name, name->len) != 0)
 				continue;
 
-			/* Found — zero it */
-			de->de_name_len = 0;
-			de->de_ino = 0;
-			de->de_magic = 0;
-			mark_buffer_dirty(bh);
-			brelse(bh);
-
+			/* Found — journal before zeroing */
+			{
+				struct ocsfs_txn *txn;
+				int tr;
+				txn = ocsfs_txn_begin(dir->i_sb);
+				if (IS_ERR(txn)) { brelse(bh); return PTR_ERR(txn); }
+				tr = ocsfs_txn_add_bh(txn, bh);
+				if (tr) { ocsfs_txn_abort(txn); brelse(bh); return tr; }
+				de->de_name_len = 0;
+				de->de_ino = 0;
+				de->de_magic = 0;
+				mark_buffer_dirty(bh);
+				brelse(bh);
+				tr = ocsfs_txn_commit(txn);
+				if (tr) return tr;
+			}
 			OCSFS_I(dir)->i_dirent_count--;
 			ocsfs_dir_btree_delete(dir, name);
-
 			inode_set_mtime_to_ts(dir,
 				inode_set_ctime_current(dir));
 			mark_inode_dirty(dir);
@@ -319,7 +328,6 @@ int __ocsfs_del_dirent(struct inode *dir, const struct qstr *name)
 		}
 		brelse(bh);
 	}
-
 	return -ENOENT;
 }
 

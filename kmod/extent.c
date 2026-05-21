@@ -159,28 +159,36 @@ int ocsfs_extent_truncate(struct inode *inode, u64 from_block)
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
 	struct super_block *sb = inode->i_sb;
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	struct ocsfs_txn *txn;
+	int i, ret;
 
 	if (oi->i_extent_tree_root)
 		return ocsfs_extent_btree_truncate(inode, from_block);
-	int i;
+
+	txn = ocsfs_txn_begin(sb);
+	if (IS_ERR(txn))
+		return PTR_ERR(txn);
 
 	for (i = oi->i_extent_count - 1; i >= 0; i--) {
 		struct ocsfs_extent *e = &oi->i_extents[i];
 
 		if (e->logical_block >= from_block) {
-			/* Entire extent is beyond truncation point — free it */
-			ocsfs_free_blocks(sb, e->physical_block, e->length);
+			ret = ocsfs_free_blocks_txn(txn, e->physical_block,
+						    e->length);
+			if (ret)
+				goto abort;
 			inode->i_blocks -= (u64)e->length *
 					   (sbi->s_block_size / 512);
 			oi->i_extent_count--;
 		} else if (e->logical_block + e->length > from_block) {
-			/* Extent partially overlaps — shrink it */
 			u32 keep = (u32)(from_block - e->logical_block);
 			u32 freed = e->length - keep;
 
-			ocsfs_free_blocks(sb,
-					  e->physical_block + keep,
-					  freed);
+			ret = ocsfs_free_blocks_txn(txn,
+						    e->physical_block + keep,
+						    freed);
+			if (ret)
+				goto abort;
 			inode->i_blocks -= (u64)freed *
 					   (sbi->s_block_size / 512);
 			e->length = keep;
@@ -188,7 +196,11 @@ int ocsfs_extent_truncate(struct inode *inode, u64 from_block)
 	}
 
 	mark_inode_dirty(inode);
-	return 0;
+	return ocsfs_txn_commit(txn);
+
+abort:
+	ocsfs_txn_abort(txn);
+	return ret;
 }
 
 /* ═══════════════════════════════════════════════════════════════
