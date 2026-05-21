@@ -12,7 +12,9 @@
 
 static int ocsfs_unlink(struct inode *dir, struct dentry *dentry)
 {
+	struct ocsfs_sb_info *sbi = OCSFS_SB(dir->i_sb);
 	struct inode *inode = d_inode(dentry);
+	struct ocsfs_inode_info *oi = OCSFS_I(inode);
 	int ret;
 
 	ret = ocsfs_del_dirent(dir, &dentry->d_name);
@@ -21,6 +23,35 @@ static int ocsfs_unlink(struct inode *dir, struct dentry *dentry)
 
 	inode_dec_link_count(inode);
 	inode_set_ctime_current(inode);
+
+	/*
+	 * If this was the last link, free data extents now — not deferred to
+	 * evict_inode — so every cluster node returns the blocks to the
+	 * allocator.  Other nodes never call evict_inode for this inode.
+	 *
+	 * On EX lock failure degrade gracefully: the file is already
+	 * unreachable from the namespace; evict_inode will free blocks
+	 * locally when this node's last reference drops.
+	 */
+	if (inode->i_nlink == 0 && oi->i_disk_ino >= OCSFS_FIRST_USER_INO) {
+		int trunc_ret = 0;
+
+		if (sbi->s_clustered)
+			trunc_ret = ocsfs_lock_acquire(inode->i_sb,
+						       &oi->i_lock_res,
+						       OCSFS_LOCK_EX);
+
+		if (!trunc_ret) {
+			mutex_lock(&oi->i_extent_lock);
+			ocsfs_extent_truncate(inode, 0);
+			mutex_unlock(&oi->i_extent_lock);
+			i_size_write(inode, 0);
+
+			if (sbi->s_clustered)
+				ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
+		}
+	}
+
 	mark_inode_dirty(inode);
 	return 0;
 }

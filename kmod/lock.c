@@ -43,19 +43,16 @@ int ocsfs_lock_acquire(struct super_block *sb, struct ocsfs_lock_res *lr,
 	mutex_lock(&lr->lr_mutex);
 
 	/*
-	 * Cache fast-path: if we already hold a compatible or stronger lock
-	 * and the window hasn't expired, renew without disk I/O.
+	 * NOTE: the cache fast-path was removed because it allowed a remote
+	 * node that had preempted/recovered our holder slot to be ignored
+	 * for up to OCSFS_LOCK_CACHE_NS, violating cross-node coherence.
+	 * Every acquire now goes through the on-disk lock table.
+	 *
+	 * The correct optimization is an epoch counter bumped by
+	 * ocsfs_lock_recover_node() and checked here — NOT a wall-clock TTL.
 	 */
-	if (lr->lr_cached && lr->lr_cache_expires > ktime_get_ns()) {
-		bool compatible = (lr->lr_mode == OCSFS_LOCK_EX) ||
-				  (lr->lr_mode == mode);
-		if (compatible && mode != OCSFS_LOCK_NL) {
-			lr->lr_cache_expires = ktime_get_ns() + OCSFS_LOCK_CACHE_NS;
-			mutex_unlock(&lr->lr_mutex);
-			return 0;
-		}
-	}
-	lr->lr_cached = false;
+	lr->lr_cached        = false;
+	lr->lr_cache_expires = 0;
 
 	ret = lock_probe_slot(sb, lr);
 	if (ret) {
@@ -103,8 +100,9 @@ retry:
 
 		if (ret == 0) {
 			lr->lr_mode          = mode;
-			lr->lr_cached        = true;
-			lr->lr_cache_expires = ktime_get_ns() + OCSFS_LOCK_CACHE_NS;
+			/* No caching — see comment at top of ocsfs_lock_acquire(). */
+			lr->lr_cached        = false;
+			lr->lr_cache_expires = 0;
 		}
 
 		mutex_unlock(&lr->lr_mutex);

@@ -66,79 +66,111 @@ int ocsfs_journal_replay(struct super_block *sb)
 	scan_pos = j->tail;
 
 	while (scan_pos < j->head) {
+		u32 type;
+		u64 tid;
+		bool committed = false;
+		u64 ahead;
+
 		ret = journal_read(sb, j, scan_pos, &jt, sizeof(jt));
 		if (ret)
 			return ret;
 
-		u32 type = le32_to_cpu(jt.jt_type);
+		type = le32_to_cpu(jt.jt_type);
 
-		if (type == OCSFS_JTYPE_BEGIN) {
-			u64 ahead = scan_pos + sizeof(jt);
-			bool committed = false;
-			u64 tid = le64_to_cpu(jt.jt_id);
-
-			/* Scan forward to find a matching COMMIT */
-			while (ahead < j->head) {
-				struct ocsfs_disk_journal_txn jt2;
-
-				ret = journal_read(sb, j, ahead, &jt2, sizeof(jt2));
-				if (ret)
-					break;
-
-				if (le32_to_cpu(jt2.jt_type) == OCSFS_JTYPE_COMMIT &&
-				    le64_to_cpu(jt2.jt_id) == tid) {
-					committed = true;
-					break;
-				}
-
-				ahead += sizeof(jt2);
-				if (le16_to_cpu(jt2.jt_block_count) > 0)
-					ahead += le32_to_cpu(jt2.jt_data_len);
-			}
-
-			if (!committed) {
-				u64 replay_pos = scan_pos + sizeof(jt);
-
-				while (replay_pos < j->head) {
-					struct ocsfs_disk_journal_bref bref;
-
-					ret = journal_read(sb, j, replay_pos,
-							   &bref, sizeof(bref));
-					if (ret)
-						break;
-
-					if (!(le32_to_cpu(bref.jbr_flags) &
-					      OCSFS_JBR_BEFORE))
-						break;
-
-					replay_pos += sizeof(bref);
-					{
-						u64 blk = le64_to_cpu(bref.jbr_block_num);
-						struct buffer_head *bh = sb_bread(sb, blk);
-
-						if (bh) {
-							if (!journal_read(sb, j, replay_pos,
-									  bh->b_data,
-									  bh->b_size)) {
-								mark_buffer_dirty(bh);
-								sync_dirty_buffer(bh);
-								replayed++;
-							}
-							brelse(bh);
-						}
-					}
-					replay_pos += sbi->s_block_size;
-				}
-
-				pr_info("ocsfs: rolled back txn %llu (%d blocks)\n",
-					tid, replayed);
-			}
+		if (type != OCSFS_JTYPE_BEGIN) {
+			/* Stray or corrupted record — skip one header */
+			scan_pos += sizeof(jt);
+			continue;
 		}
 
-		scan_pos += sizeof(jt);
+		tid = le64_to_cpu(jt.jt_id);
+
+		/*
+		 * Forward-scan for the matching COMMIT.  Payload between BEGIN
+		 * and COMMIT is a sequence of fixed-stride (bref + block) units,
+		 * so we probe at each stride offset.  Stop if we hit the next
+		 * BEGIN (this txn never committed) or fall off j->head.
+		 */
+		ahead = scan_pos + sizeof(jt);
+		while (ahead + sizeof(jt) <= j->head) {
+			struct ocsfs_disk_journal_txn jt2;
+
+			ret = journal_read(sb, j, ahead, &jt2, sizeof(jt2));
+			if (ret)
+				break;
+
+			if (le32_to_cpu(jt2.jt_type) == OCSFS_JTYPE_COMMIT &&
+			    le64_to_cpu(jt2.jt_id) == tid) {
+				committed = true;
+				break;
+			}
+			if (le32_to_cpu(jt2.jt_type) == OCSFS_JTYPE_BEGIN) {
+				/* Next txn started — current never committed */
+				break;
+			}
+
+			ahead += sizeof(struct ocsfs_disk_journal_bref) +
+				 sbi->s_block_size;
+		}
+
+		if (!committed) {
+			u64 replay_pos = scan_pos + sizeof(jt);
+			int this_replayed = 0;
+			u64 stride = sizeof(struct ocsfs_disk_journal_bref) +
+				     sbi->s_block_size;
+
+			while (replay_pos + stride <= j->head) {
+				struct ocsfs_disk_journal_bref bref;
+				u64 blk;
+				struct buffer_head *bh;
+
+				ret = journal_read(sb, j, replay_pos,
+						   &bref, sizeof(bref));
+				if (ret)
+					break;
+				if (!(le32_to_cpu(bref.jbr_flags) &
+				      OCSFS_JBR_BEFORE))
+					break;
+
+				replay_pos += sizeof(bref);
+				blk = le64_to_cpu(bref.jbr_block_num);
+				bh  = sb_bread(sb, blk);
+				if (bh) {
+					if (!journal_read(sb, j, replay_pos,
+							  bh->b_data,
+							  bh->b_size)) {
+						mark_buffer_dirty(bh);
+						sync_dirty_buffer(bh);
+						this_replayed++;
+						replayed++;
+					}
+					brelse(bh);
+				}
+				replay_pos += sbi->s_block_size;
+			}
+
+			pr_info("ocsfs: rolled back txn %llu (%d blocks)\n",
+				tid, this_replayed);
+			scan_pos = replay_pos;
+		} else {
+			/* Skip BEGIN + payload + COMMIT */
+			scan_pos = ahead + sizeof(jt);
+		}
 	}
 
 	j->tail = j->head;
+
+	/* Persist the updated tail so replay is not re-run on next mount. */
+	if (j->j_header_bh) {
+		struct ocsfs_disk_journal_hdr *jh =
+			(struct ocsfs_disk_journal_hdr *)j->j_header_bh->b_data;
+		jh->jh_head     = cpu_to_le64(j->head);
+		jh->jh_tail     = cpu_to_le64(j->tail);
+		jh->jh_checksum = cpu_to_le32(
+			ocsfs_crc32c(~0U, jh, sizeof(*jh) - sizeof(__le32)));
+		mark_buffer_dirty(j->j_header_bh);
+		sync_dirty_buffer(j->j_header_bh);
+	}
 
 	if (replayed > 0)
 		pr_info("ocsfs: journal replay complete (%d blocks restored)\n",

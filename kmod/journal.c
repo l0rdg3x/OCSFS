@@ -169,11 +169,13 @@ struct ocsfs_txn *ocsfs_txn_begin(struct super_block *sb)
 	INIT_LIST_HEAD(&txn->t_buffers);
 
 	memset(&jt, 0, sizeof(jt));
-	jt.jt_type      = cpu_to_le32(OCSFS_JTYPE_BEGIN);
-	jt.jt_id        = cpu_to_le64(txn->t_id);
-	jt.jt_timestamp = cpu_to_le64(ktime_get_real_ns());
-	jt.jt_node_slot = cpu_to_le16(j->j_node_slot);
-	jt.jt_checksum  = cpu_to_le32(
+	jt.jt_type        = cpu_to_le32(OCSFS_JTYPE_BEGIN);
+	jt.jt_id          = cpu_to_le64(txn->t_id);
+	jt.jt_timestamp   = cpu_to_le64(ktime_get_real_ns());
+	jt.jt_node_slot   = cpu_to_le16(j->j_node_slot);
+	jt.jt_block_count = 0;   /* BEGIN carries no payload */
+	jt.jt_data_len    = 0;
+	jt.jt_checksum    = cpu_to_le32(
 		ocsfs_crc32c(~0U, &jt, sizeof(jt) - sizeof(__le32)));
 
 	ret = journal_write(sb, j, &jt, sizeof(jt));
@@ -223,6 +225,7 @@ int ocsfs_txn_commit(struct ocsfs_txn *txn)
 	struct ocsfs_disk_journal_txn jt;
 	struct ocsfs_txn_buf *tb, *tmp;
 	struct super_block *sb;
+	u32 data_len;
 	int ret;
 
 	if (list_empty(&txn->t_buffers)) {
@@ -233,12 +236,24 @@ int ocsfs_txn_commit(struct ocsfs_txn *txn)
 
 	sb = j->j_sb;
 
+	/*
+	 * jt_data_len encodes the total byte size of the (bref + block)
+	 * payload that was written between the BEGIN and this COMMIT.
+	 * journal_replay uses it to skip committed transactions during
+	 * forward scan.  Each ocsfs_txn_add_bh call emits exactly one
+	 * (bref + block) unit of fixed stride.
+	 */
+	data_len = (u32)txn->t_nr_blocks *
+		   (u32)(sizeof(struct ocsfs_disk_journal_bref) +
+			 sb->s_blocksize);
+
 	memset(&jt, 0, sizeof(jt));
 	jt.jt_type        = cpu_to_le32(OCSFS_JTYPE_COMMIT);
 	jt.jt_id          = cpu_to_le64(txn->t_id);
 	jt.jt_timestamp   = cpu_to_le64(ktime_get_real_ns());
 	jt.jt_node_slot   = cpu_to_le16(j->j_node_slot);
 	jt.jt_block_count = cpu_to_le16(txn->t_nr_blocks);
+	jt.jt_data_len    = cpu_to_le32(data_len);
 	jt.jt_checksum    = cpu_to_le32(
 		ocsfs_crc32c(~0U, &jt, sizeof(jt) - sizeof(__le32)));
 
