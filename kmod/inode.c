@@ -149,6 +149,9 @@ struct inode *ocsfs_iget(struct super_block *sb, u64 ino)
 
 	ocsfs_parse_extents(oi, &di);
 
+	oi->i_dir_btree_root = le64_to_cpu(di.i_dir_btree_root);
+	oi->i_dirent_count   = le32_to_cpu(di.i_dirent_count);
+
 	/* Set up operations based on file type */
 	if (S_ISREG(inode->i_mode)) {
 		inode->i_op = &ocsfs_file_inode_ops;
@@ -229,6 +232,8 @@ int ocsfs_write_inode(struct inode *inode, struct writeback_control *wbc)
 	di->i_extent_count = cpu_to_le16(oi->i_extent_count);
 	di->i_extent_max = cpu_to_le16(OCSFS_INLINE_EXTENTS);
 	di->i_extent_tree_root = cpu_to_le64(oi->i_extent_tree_root);
+	di->i_dir_btree_root = cpu_to_le64(oi->i_dir_btree_root);
+	di->i_dirent_count   = cpu_to_le32(oi->i_dirent_count);
 
 	/* Write inline extents */
 	for (i = 0; i < oi->i_extent_count && i < OCSFS_INLINE_EXTENTS; i++) {
@@ -325,6 +330,8 @@ struct inode *ocsfs_new_inode(struct inode *dir, umode_t mode)
 	oi->i_extent_count = 0;
 	oi->i_extent_tree_root = 0;
 	oi->i_flags = 0;
+	oi->i_dir_btree_root = 0;
+	oi->i_dirent_count   = 0;
 
 	/* Initialise per-inode DLM lock and take EX during creation. */
 	ocsfs_lock_init(&oi->i_lock_res,

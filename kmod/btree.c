@@ -10,9 +10,72 @@
 
 /* ── node I/O wrappers ── */
 
+/*
+ * Validate magic, checksum, and count bounds of a node read from disk.
+ * Rejects corrupted or maliciously crafted blocks before any array access.
+ * VULN-001/VULN-002: without this, bn_count > leaf_order causes heap OOB.
+ */
+static int verify_node(const struct ocsfs_btree *bt, const void *buf)
+{
+	const struct ocsfs_btree_node_hdr *hdr = node_hdr((void *)buf);
+	u32 expected_magic, stored_csum, computed_csum;
+	u16 count, max_count;
+	void *tmp;
+
+	/* magic check */
+	if (le16_to_cpu(hdr->bn_level) == 0)
+		expected_magic = OCSFS_BTREE_LEAF_MAGIC;
+	else
+		expected_magic = OCSFS_BTREE_INTERNAL_MAGIC;
+
+	if (le32_to_cpu(hdr->bn_magic) != expected_magic) {
+		pr_err_ratelimited("ocsfs: btree: bad magic %08x (expected %08x) "
+				   "at block %llu\n",
+				   le32_to_cpu(hdr->bn_magic), expected_magic,
+				   le64_to_cpu(hdr->bn_block_num));
+		return -EIO;
+	}
+
+	/* checksum check — requires a writable copy to zero the field */
+	tmp = kmemdup(buf, bt->block_size, GFP_KERNEL);
+	if (!tmp)
+		return -ENOMEM;
+	stored_csum = le32_to_cpu(node_hdr(tmp)->bn_checksum);
+	node_hdr(tmp)->bn_checksum = 0;
+	computed_csum = ocsfs_crc32c(0, tmp, bt->block_size);
+	kfree(tmp);
+
+	if (stored_csum != computed_csum) {
+		pr_err_ratelimited("ocsfs: btree: checksum mismatch at block %llu "
+				   "(stored %08x computed %08x)\n",
+				   le64_to_cpu(hdr->bn_block_num),
+				   stored_csum, computed_csum);
+		return -EIO;
+	}
+
+	/* count bounds — prevents OOB access in search/insert/delete */
+	count = le16_to_cpu(hdr->bn_count);
+	max_count = (le16_to_cpu(hdr->bn_level) == 0)
+		    ? (u16)bt->leaf_order : (u16)bt->internal_order;
+
+	if (count > max_count) {
+		pr_err_ratelimited("ocsfs: btree: bn_count %u > max %u "
+				   "at block %llu\n",
+				   count, max_count,
+				   le64_to_cpu(hdr->bn_block_num));
+		return -EIO;
+	}
+
+	return 0;
+}
+
 static int read_node(struct ocsfs_btree *bt, u64 block, void *buf)
 {
-	return bt->read_block(bt->io_ctx, block, buf, bt->block_size);
+	int ret = bt->read_block(bt->io_ctx, block, buf, bt->block_size);
+
+	if (ret < 0)
+		return ret;
+	return verify_node(bt, buf);
 }
 
 static int write_node(struct ocsfs_btree *bt, u64 block, const void *buf)
@@ -62,6 +125,24 @@ void ocsfs_btree_init_internal(void *buf, u32 bsz, u64 block_num, u16 level)
 
 /* ── create / open ── */
 
+/* VULN-004: block_size must be a power-of-2 in [512, 65536]; callers
+ * derive it from the superblock which is validated at mount time, but
+ * btree_create/open are also callable from tests — guard here too. */
+static int btree_validate_block_size(u32 block_size)
+{
+	if (block_size < 512 || block_size > 65536 || !is_power_of_2(block_size)) {
+		pr_err("ocsfs: btree: invalid block_size %u\n", block_size);
+		return -EINVAL;
+	}
+	/* A leaf node must fit at least 2 entries, else the tree cannot split */
+	if (ocsfs_btree_leaf_order(block_size) < 2) {
+		pr_err("ocsfs: btree: block_size %u too small for B+ tree\n",
+		       block_size);
+		return -EINVAL;
+	}
+	return 0;
+}
+
 int ocsfs_btree_create(struct ocsfs_btree *bt, u32 block_size,
 		       ocsfs_btree_read_fn read_fn,
 		       ocsfs_btree_write_fn write_fn,
@@ -72,6 +153,10 @@ int ocsfs_btree_create(struct ocsfs_btree *bt, u32 block_size,
 	u64 root;
 	void *buf;
 	int ret;
+
+	ret = btree_validate_block_size(block_size);
+	if (ret)
+		return ret;
 
 	memset(bt, 0, sizeof(*bt));
 	bt->block_size     = block_size;
@@ -118,6 +203,10 @@ int ocsfs_btree_open(struct ocsfs_btree *bt, u64 root_block, u32 block_size,
 {
 	void *buf, *cur;
 	int ret;
+
+	ret = btree_validate_block_size(block_size);
+	if (ret)
+		return ret;
 
 	memset(bt, 0, sizeof(*bt));
 	bt->root_block     = root_block;

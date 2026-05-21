@@ -77,19 +77,23 @@ static int lock_write_entry(struct super_block *sb, u32 slot,
 
 	if (sbi->s_caw_supported) {
 		unsigned int lbs = bdev_logical_block_size(sb->s_bdev);
-		/* Offset of the LBS-aligned sector within the block */
-		u32 lbs_start = boff & ~(lbs - 1u);
-		u8 *exp_buf = kmalloc(lbs, GFP_KERNEL);
-		u8 *new_buf = kmalloc(lbs, GFP_KERNEL);
+		u32 lbs_start;
+		u8 *exp_buf, *new_buf;
+		u64 scsi_lba;
 		int ret = -ENOMEM;
 
+		/* VULN-003: lbs must not exceed the filesystem block size;
+		 * otherwise lbs_start + lbs overruns the buffer_head data. */
+		if (lbs == 0 || lbs > sbi->s_block_size || !is_power_of_2(lbs))
+			goto software_fallback;
+
+		lbs_start = boff & ~(lbs - 1u);
+		exp_buf   = kmalloc(lbs, GFP_KERNEL);
+		new_buf   = kmalloc(lbs, GFP_KERNEL);
+
 		if (exp_buf && new_buf) {
-			u64 scsi_lba = off / lbs;
-
-			/* Build expected sector from the buffer_head cache */
+			scsi_lba = off / lbs;
 			memcpy(exp_buf, bh->b_data + lbs_start, lbs);
-
-			/* Build new sector: preserve neighbours, update our entry */
 			memcpy(new_buf, exp_buf, lbs);
 			entry->le_version = cpu_to_le32(expected_version + 1);
 			entry->le_checksum = cpu_to_le32(
@@ -99,7 +103,6 @@ static int lock_write_entry(struct super_block *sb, u32 slot,
 
 			ret = ocsfs_scsi_caw(sb, scsi_lba, exp_buf, new_buf, lbs);
 			if (ret == -EAGAIN)
-				/* Invalidate cache so retry gets fresh disk data */
 				clear_buffer_uptodate(bh);
 		}
 		kfree(exp_buf);
@@ -107,9 +110,9 @@ static int lock_write_entry(struct super_block *sb, u32 slot,
 
 		if (ret != -EOPNOTSUPP)
 			return ret;
-		/* EOPNOTSUPP: device no longer supports CAW — fall through */
 	}
 
+software_fallback:
 	/* Software fallback: force fresh disk read + version check */
 	bh_check = sb_getblk(sb, block);
 	if (!bh_check)

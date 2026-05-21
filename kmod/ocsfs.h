@@ -78,6 +78,7 @@
 #define OCSFS_INODE_SIZE            512
 #define OCSFS_INLINE_EXTENTS        16
 #define OCSFS_MAX_NAME_LEN          255
+#define OCSFS_DIRENT_SIZE           sizeof(struct ocsfs_disk_dirent)
 
 #define OCSFS_ROOT_INO              2
 #define OCSFS_FIRST_USER_INO        64
@@ -234,7 +235,9 @@ struct ocsfs_disk_inode {
 	__le64  i_thin_allocated;
 	__le32  i_ag;
 	__u8    i_inline_extents[OCSFS_INLINE_EXTENTS * 24];
-	__u8    i_reserved[32];
+	__le64  i_dir_btree_root;   /* dir B+ tree root block, 0 = flat list */
+	__le32  i_dirent_count;     /* number of directory entries */
+	__u8    i_reserved[20];     /* was [32], reduced by 12 bytes */
 	__le32  i_checksum;
 } __packed;
 
@@ -527,6 +530,9 @@ struct ocsfs_inode_info {
 	u64                     i_extent_tree_root;
 	struct mutex            i_extent_lock;
 	struct ocsfs_lock_res   i_lock_res;     /* cross-node DLM inode lock */
+	/* directory B+ tree index */
+	u64                     i_dir_btree_root; /* 0 = flat-list dir */
+	u32                     i_dirent_count;   /* live entry count */
 	struct inode            vfs_inode;      /* must be last */
 };
 
@@ -619,7 +625,6 @@ int ocsfs_sync_fs(struct super_block *sb, int wait);
 
 /* inode.c */
 extern const struct inode_operations ocsfs_file_inode_ops;
-extern const struct inode_operations ocsfs_dir_inode_ops;
 extern const struct inode_operations ocsfs_special_inode_ops;
 struct inode *ocsfs_iget(struct super_block *sb, u64 ino);
 int ocsfs_write_inode(struct inode *inode, struct writeback_control *wbc);
@@ -631,12 +636,36 @@ int ocsfs_getattr(struct mnt_idmap *idmap, const struct path *path,
 		  struct kstat *stat, u32 request_mask, unsigned int flags);
 
 /* dir.c */
-extern const struct file_operations ocsfs_dir_fops;
 int ocsfs_add_dirent(struct inode *dir, const struct qstr *name,
 		     u64 ino, u8 file_type);
 int ocsfs_del_dirent(struct inode *dir, const struct qstr *name);
 u64 ocsfs_find_dirent(struct inode *dir, const struct qstr *name, u8 *ft_out);
 int ocsfs_empty_dir(struct inode *dir);
+/* dir.c internal — used by dir_rename.c */
+struct buffer_head *ocsfs_dir_bread(struct inode *dir, u64 logical_block);
+int __ocsfs_add_dirent(struct inode *dir, const struct qstr *name,
+		       u64 ino, u8 file_type);
+int __ocsfs_del_dirent(struct inode *dir, const struct qstr *name);
+int __ocsfs_empty_dir(struct inode *dir);
+struct dentry *ocsfs_lookup(struct inode *dir, struct dentry *dentry,
+			    unsigned int flags);
+int ocsfs_create(struct mnt_idmap *idmap, struct inode *dir,
+		 struct dentry *dentry, umode_t mode, bool excl);
+struct dentry *ocsfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+			   struct dentry *dentry, umode_t mode);
+
+/* dir_rename.c */
+extern const struct inode_operations ocsfs_dir_inode_ops;
+extern const struct file_operations ocsfs_dir_fops;
+
+/* dir_btree.c */
+u64  ocsfs_dir_btree_lookup(struct inode *dir, const struct qstr *name,
+			    u8 *ft_out);
+int  ocsfs_dir_btree_insert(struct inode *dir, const struct qstr *name,
+			    u64 phys_block, u32 offset);
+int  ocsfs_dir_btree_delete(struct inode *dir, const struct qstr *name);
+int  ocsfs_dir_btree_migrate(struct inode *dir);
+bool ocsfs_dir_btree_should_build(struct inode *dir);
 
 /* file.c */
 extern const struct file_operations ocsfs_file_fops;
