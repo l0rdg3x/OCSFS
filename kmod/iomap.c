@@ -16,6 +16,13 @@
 #include "ocsfs.h"
 #include <linux/iomap.h>
 
+/*
+ * Minimum blocks to pre-allocate per iomap_begin write call.
+ * Reduces per-txn overhead for VM workloads with many small writes.
+ * Staged fallback: prealloc → write size → single block.
+ */
+#define OCSFS_MIN_PREALLOC_BLOCKS  8
+
 /* ═══════════════════════════════════════════════════════════════
  * IOMAP BEGIN / END CALLBACKS
  *
@@ -93,19 +100,28 @@ static int ocsfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 	{
 		u64 phys;
 		u32 alloc_blocks;
-		u32 hint_blocks;
+		u32 write_blocks, try_blocks;
 
-		/* Try to allocate a multi-block extent for write efficiency */
-		hint_blocks = (length + sbi->s_block_size - 1) /
-			      sbi->s_block_size;
-		hint_blocks = max_t(u32, hint_blocks, 1);
+		/*
+		 * Staged fallback: try OCSFS_MIN_PREALLOC_BLOCKS first to
+		 * amortize txn overhead across many small writes (e.g. VM I/O).
+		 * If pre-alloc fails, retry with the exact write size, then
+		 * with a single block as last resort.
+		 */
+		write_blocks = max_t(u32,
+			(length + sbi->s_block_size - 1) / sbi->s_block_size,
+			1);
+		try_blocks = max_t(u32, write_blocks, OCSFS_MIN_PREALLOC_BLOCKS);
 
-		/* Attempt multi-block allocation, fall back to single */
 		ret = ocsfs_alloc_blocks(inode->i_sb, oi->i_ag,
-					 hint_blocks, &phys);
-		if (ret && hint_blocks > 1) {
-			/* Fall back to single block */
-			hint_blocks = 1;
+					 try_blocks, &phys);
+		if (ret && try_blocks > write_blocks) {
+			try_blocks = write_blocks;
+			ret = ocsfs_alloc_blocks(inode->i_sb, oi->i_ag,
+						 try_blocks, &phys);
+		}
+		if (ret && try_blocks > 1) {
+			try_blocks = 1;
 			ret = ocsfs_alloc_blocks(inode->i_sb, oi->i_ag,
 						 1, &phys);
 		}
@@ -114,7 +130,7 @@ static int ocsfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 			return ret;
 		}
 
-		alloc_blocks = hint_blocks;
+		alloc_blocks = try_blocks;
 
 		ret = ocsfs_extent_insert(inode, logical_block, phys,
 					  alloc_blocks, OCSFS_EXT_WRITTEN);

@@ -127,33 +127,48 @@ static int journal_replay_j(struct super_block *sb, struct ocsfs_journal *j)
 			u64 stride = sizeof(struct ocsfs_disk_journal_bref) +
 				     sbi->s_block_size;
 
+			/*
+			 * Consume all bref+block pairs (BEFORE and AFTER).
+			 * A crash between AFTER-write and COMMIT leaves AFTER
+			 * images in the journal without a COMMIT record.  We
+			 * must skip those images to stay aligned; only BEFORE
+			 * images are applied (rollback).
+			 */
 			while (replay_pos + stride <= j->head) {
 				struct ocsfs_disk_journal_bref bref;
-				u64 blk;
-				struct buffer_head *bh;
+				u32 flags;
 
 				ret = journal_read(sb, j, replay_pos,
 						   &bref, sizeof(bref));
 				if (ret)
 					break;
-				if (!(le32_to_cpu(bref.jbr_flags) &
-				      OCSFS_JBR_BEFORE))
+
+				flags = le32_to_cpu(bref.jbr_flags);
+
+				/* Stop at anything that is not a bref */
+				if (!(flags & (OCSFS_JBR_BEFORE | OCSFS_JBR_AFTER)))
 					break;
 
 				replay_pos += sizeof(bref);
-				blk = le64_to_cpu(bref.jbr_block_num);
-				bh  = sb_bread(sb, blk);
-				if (bh) {
-					if (!journal_read(sb, j, replay_pos,
-							  bh->b_data,
-							  bh->b_size)) {
-						mark_buffer_dirty(bh);
-						sync_dirty_buffer(bh);
-						this_replayed++;
-						replayed++;
+
+				if (flags & OCSFS_JBR_BEFORE) {
+					u64 blk = le64_to_cpu(bref.jbr_block_num);
+					struct buffer_head *bh = sb_bread(sb, blk);
+
+					if (bh) {
+						if (!journal_read(sb, j, replay_pos,
+								  bh->b_data,
+								  bh->b_size)) {
+							mark_buffer_dirty(bh);
+							sync_dirty_buffer(bh);
+							this_replayed++;
+							replayed++;
+						}
+						brelse(bh);
 					}
-					brelse(bh);
 				}
+				/* AFTER images in an uncommitted txn are skipped */
+
 				replay_pos += sbi->s_block_size;
 			}
 
