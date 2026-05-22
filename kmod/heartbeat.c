@@ -66,9 +66,20 @@ static int heartbeat_read(struct super_block *sb, u16 slot,
 	u64 block = off / sbi->s_block_size;
 	u32 boff = off % sbi->s_block_size;
 
-	bh = sb_bread(sb, block);
+	/*
+	 * Always force a fresh read from the block device — never return a
+	 * cached copy.  Another node's heartbeat writer may have updated the
+	 * disk since we last read it.  A stale buffer-cache entry would make
+	 * a live node look dead and trigger false-positive recovery.
+	 */
+	bh = sb_getblk(sb, block);
 	if (!bh)
 		return -EIO;
+	clear_buffer_uptodate(bh);
+	if (bh_read(bh, 0) < 0) {
+		brelse(bh);
+		return -EIO;
+	}
 
 	memcpy(out, bh->b_data + boff, sizeof(*out));
 	brelse(bh);
