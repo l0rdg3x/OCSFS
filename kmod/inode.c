@@ -448,7 +448,7 @@ int ocsfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 
 	if (attr->ia_valid & ATTR_SIZE) {
 		if (attr->ia_size < inode->i_size) {
-			/* Truncate: free extents beyond new size */
+			/* Truncate: free extents, update i_size, flush before EX release */
 			struct ocsfs_inode_info *oi = OCSFS_I(inode);
 			u64 from_block = (attr->ia_size +
 				OCSFS_SB(inode->i_sb)->s_block_size - 1) /
@@ -460,8 +460,18 @@ int ocsfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			mutex_lock(&oi->i_extent_lock);
 			ocsfs_extent_truncate(inode, from_block);
 			mutex_unlock(&oi->i_extent_lock);
-			if (sbi->s_clustered)
+			truncate_setsize(inode, attr->ia_size);
+			setattr_copy(idmap, inode, attr);
+			mark_inode_dirty(inode);
+			if (sbi->s_clustered) {
+				int fr = ocsfs_flush_inode_locked(inode, true);
+				if (fr)
+					pr_warn_ratelimited(
+						"ocsfs: setattr truncate flush failed (%d)\n",
+						fr);
 				ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
+			}
+			return 0;
 		}
 		truncate_setsize(inode, attr->ia_size);
 	}
