@@ -189,16 +189,9 @@ struct inode *ocsfs_iget(struct super_block *sb, u64 ino)
  * WRITE INODE TO DISK
  * ═══════════════════════════════════════════════════════════════ */
 
-/*
- * Write the inode to disk. Caller must already hold DLM EX (or be in
- * single-node mode). Does NOT acquire or release any DLM lock.
- *
- * @force_sync: call sync_dirty_buffer() — required when the caller is
- * about to release EX and must guarantee the inode is durable on the
- * block device before another node can read it.
- *
- * Lock ordering: DLM EX (held by caller) → j_lock (acquired here).
- */
+/* Write inode to disk — caller holds DLM EX (or single-node mode).
+ * force_sync=true: sync before returning (required before EX release).
+ * Lock ordering: DLM EX (caller) → j_lock (acquired here). */
 int ocsfs_flush_inode_locked(struct inode *inode, bool force_sync)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
