@@ -44,8 +44,37 @@ static int ocsfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 		/* Found an existing extent */
 		u64 offset_in_ext = logical_block - ext.logical_block;
 		u64 remaining_blocks = ext.length - offset_in_ext;
-		loff_t mapped_len = (loff_t)remaining_blocks * sbi->s_block_size;
+		loff_t mapped_len;
 
+		/*
+		 * CoW: if writing to a shared extent (refcount > 1 from a
+		 * snapshot), copy the blocks before mapping them for write.
+		 * Caller (ocsfs_file_write_iter) holds DLM EX; we hold
+		 * i_extent_lock — satisfies ocsfs_cow_extent's contract.
+		 * Re-lookup after CoW since the extent map changed.
+		 */
+		if ((flags & IOMAP_WRITE) &&
+		    !(ext.flags & OCSFS_EXT_UNWRITTEN) &&
+		    ocsfs_needs_cow(inode->i_sb, ext.physical_block)) {
+			u32 cow_blocks = min_t(u32, (u32)remaining_blocks,
+				(u32)((length + sbi->s_block_size - 1) /
+				      sbi->s_block_size));
+
+			ret = ocsfs_cow_extent(inode, logical_block, cow_blocks);
+			if (ret) {
+				mutex_unlock(&oi->i_extent_lock);
+				return ret;
+			}
+			ret = ocsfs_extent_lookup(inode, logical_block, &ext);
+			if (ret || ext.physical_block == 0) {
+				mutex_unlock(&oi->i_extent_lock);
+				return ret ? ret : -EIO;
+			}
+			offset_in_ext    = logical_block - ext.logical_block;
+			remaining_blocks = ext.length - offset_in_ext;
+		}
+
+		mapped_len = (loff_t)remaining_blocks * sbi->s_block_size;
 		iomap->addr = (ext.physical_block + offset_in_ext) *
 			      (u64)sbi->s_block_size;
 		iomap->length = min_t(loff_t, length, mapped_len);
@@ -274,6 +303,21 @@ out:
 		 */
 		if (ret > 0 && !(iocb->ki_flags & IOCB_DIRECT))
 			filemap_write_and_wait(inode->i_mapping);
+
+		/*
+		 * Flush inode metadata (i_size, mtime, updated extent map from
+		 * any CoW that occurred) before releasing EX.  Another node's
+		 * ocsfs_iget reads the inode from disk after acquiring SH; if
+		 * the updated extent map is not on disk yet it will see stale
+		 * block mappings and silently read wrong data.
+		 */
+		if (ret > 0) {
+			int fr = ocsfs_flush_inode_locked(inode, true);
+			if (fr)
+				pr_warn_ratelimited(
+					"ocsfs: write_iter inode flush failed (%d)\n",
+					fr);
+		}
 
 		ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
 	}
