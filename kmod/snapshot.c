@@ -48,6 +48,7 @@ int ocsfs_snapshot_create(struct inode *src, struct inode *dir,
 			  const struct qstr *name)
 {
 	struct super_block *sb = src->i_sb;
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	struct ocsfs_inode_info *src_oi = OCSFS_I(src);
 	struct ocsfs_inode_info *snap_oi;
 	struct inode *snap;
@@ -69,6 +70,26 @@ int ocsfs_snapshot_create(struct inode *src, struct inode *dir,
 	i_size_write(snap, i_size_read(src));
 	snap->i_blocks = src->i_blocks;
 	snap_oi->i_flags = src_oi->i_flags;
+
+	/*
+	 * Clustered mode: acquire DLM EX on src to serialize refcount
+	 * operations and guarantee we read a coherent extent map.
+	 * Acquire EX on snap so we can flush it before ocsfs_add_dirent
+	 * makes it visible to other nodes. Lock src first (older inode).
+	 */
+	if (sbi->s_clustered) {
+		ret = ocsfs_lock_acquire(sb, &src_oi->i_lock_res, OCSFS_LOCK_EX);
+		if (ret) {
+			iput(snap);
+			return ret;
+		}
+		ret = ocsfs_lock_acquire(sb, &snap_oi->i_lock_res, OCSFS_LOCK_EX);
+		if (ret) {
+			ocsfs_lock_release(sb, &src_oi->i_lock_res);
+			iput(snap);
+			return ret;
+		}
+	}
 
 	/* Lock both inodes for extent manipulation */
 	mutex_lock(&src_oi->i_extent_lock);
@@ -104,6 +125,10 @@ int ocsfs_snapshot_create(struct inode *src, struct inode *dir,
 
 			mutex_unlock(&snap_oi->i_extent_lock);
 			mutex_unlock(&src_oi->i_extent_lock);
+			if (sbi->s_clustered) {
+				ocsfs_lock_release(sb, &snap_oi->i_lock_res);
+				ocsfs_lock_release(sb, &src_oi->i_lock_res);
+			}
 			iput(snap);
 			return ret;
 		}
@@ -112,9 +137,20 @@ int ocsfs_snapshot_create(struct inode *src, struct inode *dir,
 	mutex_unlock(&snap_oi->i_extent_lock);
 	mutex_unlock(&src_oi->i_extent_lock);
 
-	/* Mark both inodes dirty */
-	mark_inode_dirty(src);
-	mark_inode_dirty(snap);
+	/* Flush to disk before EX release; single-node: async dirty is fine */
+	if (sbi->s_clustered) {
+		int fr = ocsfs_flush_inode_locked(snap, true);
+		if (fr)
+			pr_warn_ratelimited("ocsfs: snapshot_create snap flush failed (%d)\n", fr);
+		ocsfs_lock_release(sb, &snap_oi->i_lock_res);
+		fr = ocsfs_flush_inode_locked(src, true);
+		if (fr)
+			pr_warn_ratelimited("ocsfs: snapshot_create src flush failed (%d)\n", fr);
+		ocsfs_lock_release(sb, &src_oi->i_lock_res);
+	} else {
+		mark_inode_dirty(src);
+		mark_inode_dirty(snap);
+	}
 
 	/* Add directory entry for the snapshot */
 	ret = ocsfs_add_dirent(dir, name, snap_oi->i_disk_ino,
@@ -143,6 +179,12 @@ int ocsfs_snapshot_delete(struct inode *snap)
 	bool should_free;
 	u16 i;
 	int ret;
+
+	if (sbi->s_clustered) {
+		ret = ocsfs_lock_acquire(sb, &oi->i_lock_res, OCSFS_LOCK_EX);
+		if (ret)
+			return ret;
+	}
 
 	mutex_lock(&oi->i_extent_lock);
 
@@ -174,6 +216,14 @@ int ocsfs_snapshot_delete(struct inode *snap)
 	mark_inode_dirty(snap);
 
 	mutex_unlock(&oi->i_extent_lock);
+
+	if (sbi->s_clustered) {
+		int fr = ocsfs_flush_inode_locked(snap, true);
+		if (fr)
+			pr_warn_ratelimited("ocsfs: snapshot_delete flush failed (%d)\n", fr);
+		ocsfs_lock_release(sb, &oi->i_lock_res);
+	}
+
 	return 0;
 }
 
@@ -191,8 +241,9 @@ int ocsfs_snapshot_delete(struct inode *snap)
  * @logical:  starting logical block of the write
  * @len:      number of blocks to CoW
  *
- * Returns 0 on success, the new physical block in the extent map.
- * Caller must hold i_extent_lock.
+ * Returns 0 on success; updates extent map in place.
+ * Caller must hold i_extent_lock (and DLM EX in clustered mode).
+ * Caller must call ocsfs_flush_inode_locked() before releasing DLM EX.
  */
 int ocsfs_cow_extent(struct inode *inode, u64 logical, u32 len)
 {
