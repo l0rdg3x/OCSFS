@@ -67,6 +67,18 @@ out_unlock:
 		struct ocsfs_inode_info *first  = d_oi;
 		struct ocsfs_inode_info *second = oi;
 
+		/* Flush both inodes while EX is still held — cluster coherency */
+		if (ret == 0) {
+			int fr = ocsfs_flush_inode_locked(dir, true);
+			if (fr)
+				pr_warn_ratelimited(
+					"ocsfs: unlink dir flush failed (%d)\n", fr);
+			fr = ocsfs_flush_inode_locked(inode, true);
+			if (fr)
+				pr_warn_ratelimited(
+					"ocsfs: unlink inode flush failed (%d)\n", fr);
+		}
+
 		if (oi->i_disk_ino < d_oi->i_disk_ino) {
 			first  = oi;
 			second = d_oi;
@@ -135,6 +147,17 @@ out_unlock:
 	if (sbi->s_clustered) {
 		struct ocsfs_inode_info *first  = dir_oi;
 		struct ocsfs_inode_info *second = child_oi;
+
+		if (ret == 0) {
+			int fr = ocsfs_flush_inode_locked(dir, true);
+			if (fr)
+				pr_warn_ratelimited(
+					"ocsfs: rmdir dir flush failed (%d)\n", fr);
+			fr = ocsfs_flush_inode_locked(inode, true);
+			if (fr)
+				pr_warn_ratelimited(
+					"ocsfs: rmdir inode flush failed (%d)\n", fr);
+		}
 
 		if (child_oi->i_disk_ino < dir_oi->i_disk_ino) {
 			first  = child_oi;
@@ -295,8 +318,13 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 		inode_set_ctime_current(old_inode);
 		mark_inode_dirty(old_inode);
 
-		if (sbi->s_clustered)
+		if (sbi->s_clustered) {
+			int fr = ocsfs_flush_inode_locked(old_inode, true);
+			if (fr)
+				pr_warn_ratelimited(
+					"ocsfs: rename dotdot flush failed (%d)\n", fr);
 			ocsfs_lock_release(old_dir->i_sb, &moved_oi->i_lock_res);
+		}
 
 		if (ret)
 			goto out_unlock;
@@ -313,6 +341,19 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 
 out_unlock:
 	if (sbi->s_clustered) {
+		if (ret == 0) {
+			int fr = ocsfs_flush_inode_locked(old_dir, true);
+			if (fr)
+				pr_warn_ratelimited(
+					"ocsfs: rename old_dir flush failed (%d)\n", fr);
+			if (old_dir != new_dir) {
+				fr = ocsfs_flush_inode_locked(new_dir, true);
+				if (fr)
+					pr_warn_ratelimited(
+						"ocsfs: rename new_dir flush failed (%d)\n",
+						fr);
+			}
+		}
 		if (old_dir != new_dir)
 			ocsfs_lock_release(old_dir->i_sb, &new_oi->i_lock_res);
 		ocsfs_lock_release(old_dir->i_sb, &old_oi->i_lock_res);
