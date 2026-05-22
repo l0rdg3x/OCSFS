@@ -301,6 +301,12 @@ int ocsfs_txn_add_bh(struct ocsfs_txn *txn, struct buffer_head *bh)
 	if (!tb)
 		return -ENOMEM;
 
+	tb->after_buf = kmalloc(bh->b_size, GFP_KERNEL);
+	if (!tb->after_buf) {
+		kfree(tb);
+		return -ENOMEM;
+	}
+
 	tb->bh        = bh;
 	tb->block_num = bh->b_blocknr;
 	get_bh(bh);
@@ -344,16 +350,25 @@ int ocsfs_txn_commit(struct ocsfs_txn *txn)
 	list_for_each_entry(tb, &txn->t_buffers, list) {
 		struct ocsfs_disk_journal_bref abref;
 
+		/*
+		 * Snapshot the block under lock_buffer to avoid a torn read if
+		 * kernel writeback is running concurrently. The shadow copy is
+		 * what we store in the journal as the AFTER-image.
+		 */
+		lock_buffer(tb->bh);
+		memcpy(tb->after_buf, tb->bh->b_data, tb->bh->b_size);
+		unlock_buffer(tb->bh);
+
 		memset(&abref, 0, sizeof(abref));
 		abref.jbr_block_num = cpu_to_le64(tb->bh->b_blocknr);
 		abref.jbr_flags     = cpu_to_le32(OCSFS_JBR_AFTER);
 		abref.jbr_checksum  = cpu_to_le32(
-			ocsfs_crc32c(~0U, tb->bh->b_data, tb->bh->b_size));
+			ocsfs_crc32c(~0U, tb->after_buf, tb->bh->b_size));
 
 		ret = journal_write(sb, j, &abref, sizeof(abref));
 		if (ret)
 			goto out;
-		ret = journal_write(sb, j, tb->bh->b_data, tb->bh->b_size);
+		ret = journal_write(sb, j, tb->after_buf, tb->bh->b_size);
 		if (ret)
 			goto out;
 	}
@@ -400,6 +415,7 @@ out:
 	list_for_each_entry_safe(tb, tmp, &txn->t_buffers, list) {
 		list_del(&tb->list);
 		brelse(tb->bh);
+		kfree(tb->after_buf);
 		kfree(tb);
 	}
 
@@ -417,6 +433,7 @@ void ocsfs_txn_abort(struct ocsfs_txn *txn)
 	list_for_each_entry_safe(tb, tmp, &txn->t_buffers, list) {
 		list_del(&tb->list);
 		brelse(tb->bh);
+		kfree(tb->after_buf);
 		kfree(tb);
 	}
 

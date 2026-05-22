@@ -427,6 +427,7 @@ struct ocsfs_txn_buf {
 	struct list_head        list;
 	struct buffer_head      *bh;
 	u64                     block_num;
+	u8                      *after_buf;     /* shadow copy for AFTER-image */
 };
 
 /* Node info — in-memory representation of a peer node */
