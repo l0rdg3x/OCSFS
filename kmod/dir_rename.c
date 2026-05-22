@@ -12,48 +12,69 @@
 
 static int ocsfs_unlink(struct inode *dir, struct dentry *dentry)
 {
-	struct ocsfs_sb_info *sbi = OCSFS_SB(dir->i_sb);
-	struct inode *inode = d_inode(dentry);
-	struct ocsfs_inode_info *oi = OCSFS_I(inode);
+	struct ocsfs_sb_info *sbi     = OCSFS_SB(dir->i_sb);
+	struct inode *inode           = d_inode(dentry);
+	struct ocsfs_inode_info *oi   = OCSFS_I(inode);
+	struct ocsfs_inode_info *d_oi = OCSFS_I(dir);
 	int ret;
 
-	ret = ocsfs_del_dirent(dir, &dentry->d_name);
+	/*
+	 * Acquire EX on both dir and child ordered by on-disk ino —
+	 * same ordering as ocsfs_rmdir — to prevent ABBA deadlocks.
+	 * With both locks held from the start, the nlink==0 truncation
+	 * path below reuses the already-held child lock.
+	 */
+	if (sbi->s_clustered) {
+		struct ocsfs_inode_info *first  = d_oi;
+		struct ocsfs_inode_info *second = oi;
+
+		if (oi->i_disk_ino < d_oi->i_disk_ino) {
+			first  = oi;
+			second = d_oi;
+		}
+
+		ret = ocsfs_lock_acquire(dir->i_sb, &first->i_lock_res,
+					 OCSFS_LOCK_EX);
+		if (ret)
+			return ret;
+
+		ret = ocsfs_lock_acquire(dir->i_sb, &second->i_lock_res,
+					 OCSFS_LOCK_EX);
+		if (ret) {
+			ocsfs_lock_release(dir->i_sb, &first->i_lock_res);
+			return ret;
+		}
+	}
+
+	ret = __ocsfs_del_dirent(dir, &dentry->d_name);
 	if (ret)
-		return ret;
+		goto out_unlock;
 
 	inode_dec_link_count(inode);
 	inode_set_ctime_current(inode);
 
-	/*
-	 * If this was the last link, free data extents now — not deferred to
-	 * evict_inode — so every cluster node returns the blocks to the
-	 * allocator.  Other nodes never call evict_inode for this inode.
-	 *
-	 * On EX lock failure degrade gracefully: the file is already
-	 * unreachable from the namespace; evict_inode will free blocks
-	 * locally when this node's last reference drops.
-	 */
 	if (inode->i_nlink == 0 && oi->i_disk_ino >= OCSFS_FIRST_USER_INO) {
-		int trunc_ret = 0;
-
-		if (sbi->s_clustered)
-			trunc_ret = ocsfs_lock_acquire(inode->i_sb,
-						       &oi->i_lock_res,
-						       OCSFS_LOCK_EX);
-
-		if (!trunc_ret) {
-			mutex_lock(&oi->i_extent_lock);
-			ocsfs_extent_truncate(inode, 0);
-			mutex_unlock(&oi->i_extent_lock);
-			i_size_write(inode, 0);
-
-			if (sbi->s_clustered)
-				ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
-		}
+		mutex_lock(&oi->i_extent_lock);
+		ocsfs_extent_truncate(inode, 0);
+		mutex_unlock(&oi->i_extent_lock);
+		i_size_write(inode, 0);
 	}
 
 	mark_inode_dirty(inode);
-	return 0;
+
+out_unlock:
+	if (sbi->s_clustered) {
+		struct ocsfs_inode_info *first  = d_oi;
+		struct ocsfs_inode_info *second = oi;
+
+		if (oi->i_disk_ino < d_oi->i_disk_ino) {
+			first  = oi;
+			second = d_oi;
+		}
+		ocsfs_lock_release(dir->i_sb, &second->i_lock_res);
+		ocsfs_lock_release(dir->i_sb, &first->i_lock_res);
+	}
+	return ret;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -129,6 +150,53 @@ out_unlock:
  * VFS RENAME
  * ═══════════════════════════════════════════════════════════════ */
 
+/*
+ * Update the ".." entry of a moved directory in a single journaled txn.
+ * Safer than del+add (avoids the window where ".." is missing entirely).
+ */
+static int ocsfs_rename_update_dotdot(struct inode *inode, u64 new_parent_ino)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
+	u64 dir_blocks = (inode->i_size + sbi->s_block_size - 1) /
+			 sbi->s_block_size;
+	u64 b;
+
+	for (b = 0; b < dir_blocks; b++) {
+		struct buffer_head *bh;
+		u32 off;
+
+		bh = ocsfs_dir_bread(inode, b);
+		if (!bh)
+			continue;
+
+		for (off = 0; off + OCSFS_DIRENT_SIZE <= sbi->s_block_size;
+		     off += OCSFS_DIRENT_SIZE) {
+			struct ocsfs_disk_dirent *de =
+				(struct ocsfs_disk_dirent *)(bh->b_data + off);
+
+			if (le32_to_cpu(de->de_magic) != OCSFS_DIRENT_MAGIC ||
+			    de->de_name_len != 2 ||
+			    de->de_name[0] != '.' || de->de_name[1] != '.')
+				continue;
+
+			{
+				struct ocsfs_txn *txn = ocsfs_txn_begin(inode->i_sb);
+				int tr;
+
+				if (IS_ERR(txn)) { brelse(bh); return PTR_ERR(txn); }
+				tr = ocsfs_txn_add_bh(txn, bh);
+				if (tr) { ocsfs_txn_abort(txn); brelse(bh); return tr; }
+				de->de_ino = cpu_to_le64(new_parent_ino);
+				mark_buffer_dirty(bh);
+				brelse(bh);
+				return ocsfs_txn_commit(txn);
+			}
+		}
+		brelse(bh);
+	}
+	return -ENOENT;
+}
+
 static int ocsfs_rename(struct mnt_idmap *idmap,
 			struct inode *old_dir, struct dentry *old_dentry,
 			struct inode *new_dir, struct dentry *new_dentry,
@@ -175,39 +243,45 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 		}
 	}
 
-	/* If target exists, remove it first */
+	/* Remove target if it exists */
 	if (new_inode) {
 		if (S_ISDIR(new_inode->i_mode)) {
 			if (!__ocsfs_empty_dir(new_inode)) {
 				ret = -ENOTEMPTY;
 				goto out_unlock;
 			}
-			__ocsfs_del_dirent(new_dir, &new_dentry->d_name);
+			ret = __ocsfs_del_dirent(new_dir, &new_dentry->d_name);
+			if (ret)
+				goto out_unlock;
 			clear_nlink(new_inode);
 			drop_nlink(new_dir);
 		} else {
-			__ocsfs_del_dirent(new_dir, &new_dentry->d_name);
+			ret = __ocsfs_del_dirent(new_dir, &new_dentry->d_name);
+			if (ret)
+				goto out_unlock;
 			inode_dec_link_count(new_inode);
 		}
 		mark_inode_dirty(new_inode);
 	}
 
-	/* Remove from old location */
-	ret = __ocsfs_del_dirent(old_dir, &old_dentry->d_name);
-	if (ret)
-		goto out_unlock;
-
-	/* Add to new location */
+	/*
+	 * Add to new location BEFORE removing from old.  On crash between
+	 * these two commits the file appears in both dirs (fsck fixes the
+	 * link count) rather than disappearing from the namespace entirely.
+	 */
 	ret = __ocsfs_add_dirent(new_dir, &new_dentry->d_name,
 				 OCSFS_I(old_inode)->i_disk_ino,
 				 ocsfs_mode_to_ft(old_inode->i_mode));
 	if (ret)
 		goto out_unlock;
 
-	/* Update .. in moved directory */
+	ret = __ocsfs_del_dirent(old_dir, &old_dentry->d_name);
+	if (ret)
+		goto out_unlock;
+
+	/* Update ".." in moved directory — single in-place txn */
 	if (S_ISDIR(old_inode->i_mode) && old_dir != new_dir) {
 		struct ocsfs_inode_info *moved_oi = OCSFS_I(old_inode);
-		struct qstr dotdot = QSTR_INIT("..", 2);
 
 		if (sbi->s_clustered) {
 			ret = ocsfs_lock_acquire(old_dir->i_sb,
@@ -217,15 +291,15 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 				goto out_unlock;
 		}
 
-		__ocsfs_del_dirent(old_inode, &dotdot);
-		__ocsfs_add_dirent(old_inode, &dotdot,
-				   new_oi->i_disk_ino, OCSFS_FT_DIR);
-
+		ret = ocsfs_rename_update_dotdot(old_inode, new_oi->i_disk_ino);
 		inode_set_ctime_current(old_inode);
 		mark_inode_dirty(old_inode);
 
 		if (sbi->s_clustered)
 			ocsfs_lock_release(old_dir->i_sb, &moved_oi->i_lock_res);
+
+		if (ret)
+			goto out_unlock;
 
 		drop_nlink(old_dir);
 		inc_nlink(new_dir);
