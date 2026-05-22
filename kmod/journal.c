@@ -98,6 +98,21 @@ static int journal_write(struct super_block *sb, struct ocsfs_journal *j,
 	const u8 *src = data;
 	u64 journal_start    = sizeof(struct ocsfs_disk_journal_hdr);
 	u64 journal_data_size = j->size - journal_start;
+	u64 used;
+	u64 available;
+
+	/*
+	 * Journal overflow protection: refuse the write if it would wrap
+	 * over the uncommitted tail.  head/tail are monotonically increasing
+	 * logical offsets, so (head - tail) is the in-flight payload size.
+	 */
+	used      = j->head - j->tail;
+	available = (used > journal_data_size) ? 0 : journal_data_size - used;
+	if (len > available) {
+		pr_err("ocsfs: journal full (head=%llu tail=%llu len=%zu avail=%llu)\n",
+		       j->head, j->tail, len, available);
+		return -ENOSPC;
+	}
 
 	while (len > 0) {
 		struct buffer_head *bh;
@@ -113,8 +128,64 @@ static int journal_write(struct super_block *sb, struct ocsfs_journal *j,
 
 		memcpy(bh->b_data + boff, src, chunk);
 		mark_buffer_dirty(bh);
-		sync_dirty_buffer(bh);
+		/*
+		 * Do NOT sync_dirty_buffer here: a single commit can produce
+		 * dozens of journal_write calls.  Sync is amortized in
+		 * ocsfs_txn_commit() via blkdev_issue_flush() before COMMIT.
+		 */
 		brelse(bh);
+
+		src      += chunk;
+		len      -= chunk;
+		j->head  += chunk;
+	}
+
+	return 0;
+}
+
+/*
+ * Variant of journal_write that synchronously flushes the underlying bh.
+ * Used ONLY for the COMMIT record: every preceding journal_write is async,
+ * blkdev_issue_flush() guarantees those reach the platter, then this
+ * synchronous write makes the COMMIT durable atomically.
+ */
+static int journal_write_sync(struct super_block *sb, struct ocsfs_journal *j,
+			      const void *data, size_t len)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	const u8 *src = data;
+	u64 journal_start    = sizeof(struct ocsfs_disk_journal_hdr);
+	u64 journal_data_size = j->size - journal_start;
+	u64 used;
+	u64 available;
+	int ret = 0;
+
+	used      = j->head - j->tail;
+	available = (used > journal_data_size) ? 0 : journal_data_size - used;
+	if (len > available) {
+		pr_err("ocsfs: journal full on commit (used=%llu len=%zu)\n",
+		       used, len);
+		return -ENOSPC;
+	}
+
+	while (len > 0) {
+		struct buffer_head *bh;
+		u64 pos   = journal_start + (j->head - journal_start) %
+			    journal_data_size;
+		u64 block = (j->disk_off + pos) / sbi->s_block_size;
+		u32 boff  = (j->disk_off + pos) % sbi->s_block_size;
+		u32 chunk = min_t(u32, len, sbi->s_block_size - boff);
+
+		bh = sb_bread(sb, block);
+		if (!bh)
+			return -EIO;
+
+		memcpy(bh->b_data + boff, src, chunk);
+		mark_buffer_dirty(bh);
+		ret = sync_dirty_buffer(bh);
+		brelse(bh);
+		if (ret)
+			return ret;
 
 		src      += chunk;
 		len      -= chunk;
@@ -155,6 +226,10 @@ struct ocsfs_txn *ocsfs_txn_begin(struct super_block *sb)
 	struct ocsfs_journal *j = &sbi->s_journal;
 	struct ocsfs_txn *txn;
 	struct ocsfs_disk_journal_txn jt;
+	u64 journal_start;
+	u64 journal_data_size;
+	u64 used;
+	u64 min_space;
 	int ret;
 
 	txn = kzalloc(sizeof(*txn), GFP_KERNEL);
@@ -162,6 +237,25 @@ struct ocsfs_txn *ocsfs_txn_begin(struct super_block *sb)
 		return ERR_PTR(-ENOMEM);
 
 	mutex_lock(&j->j_lock);
+
+	/*
+	 * Refuse to start a txn that cannot possibly fit at least BEGIN +
+	 * one bref + one block + COMMIT.  Prevents partial writes from
+	 * tripping ENOSPC inside add_bh/commit and leaving torn records.
+	 */
+	journal_start     = sizeof(struct ocsfs_disk_journal_hdr);
+	journal_data_size = j->size - journal_start;
+	used              = j->head - j->tail;
+	min_space = (u64)sizeof(struct ocsfs_disk_journal_txn) * 2 +
+		    (u64)sizeof(struct ocsfs_disk_journal_bref) * 2 +
+		    (u64)sb->s_blocksize * 2;
+	if (used + min_space > journal_data_size) {
+		mutex_unlock(&j->j_lock);
+		kfree(txn);
+		pr_err("ocsfs: txn_begin refused (journal near-full, used=%llu)\n",
+		       used);
+		return ERR_PTR(-ENOSPC);
+	}
 
 	txn->t_journal  = j;
 	txn->t_id       = j->sequence++;
@@ -282,7 +376,17 @@ int ocsfs_txn_commit(struct ocsfs_txn *txn)
 	jt.jt_checksum    = cpu_to_le32(
 		ocsfs_crc32c(~0U, &jt, sizeof(jt) - sizeof(__le32)));
 
-	ret = journal_write(sb, j, &jt, sizeof(jt));
+	/*
+	 * Barrier: ensure all BEFORE+AFTER payload (written async above)
+	 * reaches the platter BEFORE the COMMIT record becomes durable.
+	 * One flush amortizes dozens of journal_write calls.
+	 */
+	ret = blkdev_issue_flush(sb->s_bdev);
+	if (ret)
+		goto out;
+
+	/* Synchronous write of the COMMIT record itself. */
+	ret = journal_write_sync(sb, j, &jt, sizeof(jt));
 	if (ret)
 		goto out;
 
