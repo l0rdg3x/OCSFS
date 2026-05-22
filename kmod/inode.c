@@ -34,11 +34,6 @@ static int ocsfs_read_disk_inode(struct super_block *sb, u64 ino,
 	return 0;
 }
 
-/*
- * Force a fresh read of the block containing @ino's on-disk inode.
- * Called before ocsfs_read_disk_inode() in clustered mode to bypass
- * any stale buffer-cache entry that predates a remote write.
- */
 static void ocsfs_inode_invalidate_cache(struct super_block *sb, u64 ino)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
@@ -103,11 +98,6 @@ struct inode *ocsfs_iget(struct super_block *sb, u64 ino)
 			ocsfs_lock_hash_inode(ino), OCSFS_LOCKRES_INODE);
 
 	if (sbi->s_clustered) {
-		/*
-		 * Acquire shared lock before reading to ensure no other node
-		 * is mid-write on this inode, then force a fresh buffer-cache
-		 * read so we don't serve data written before we mounted.
-		 */
 		ret = ocsfs_lock_acquire(sb, &oi->i_lock_res, OCSFS_LOCK_SH);
 		if (ret) {
 			iget_failed(inode);
@@ -124,14 +114,8 @@ struct inode *ocsfs_iget(struct super_block *sb, u64 ino)
 		return ERR_PTR(ret);
 	}
 
-	/*
-	 * Keep SH lock held across the entire VFS population below.
-	 * Releasing earlier would let a remote EX holder delete/rename
-	 * this inode while we are still writing its fields, producing a
-	 * torn view in the dcache.  Released just before unlock_new_inode.
-	 */
-
-	/* Fill VFS inode from disk data — still holding SH lock */
+	/* Keep SH held across VFS population; released before unlock_new_inode. */
+	/* Fill VFS inode from disk data */
 	inode->i_mode = le16_to_cpu(di.i_mode);
 	set_nlink(inode, le16_to_cpu(di.i_nlink));
 	i_uid_write(inode, le32_to_cpu(di.i_uid));
@@ -183,6 +167,30 @@ struct inode *ocsfs_iget(struct super_block *sb, u64 ino)
 
 	unlock_new_inode(inode);
 	return inode;
+}
+
+/* Re-read inode metadata from disk. Caller holds DLM SH. */
+int ocsfs_inode_refresh(struct inode *inode)
+{
+	struct ocsfs_inode_info *oi = OCSFS_I(inode);
+	struct ocsfs_sb_info *sbi   = OCSFS_SB(inode->i_sb);
+	struct ocsfs_disk_inode di;
+	int ret;
+
+	ocsfs_inode_invalidate_cache(inode->i_sb, oi->i_disk_ino);
+	ret = ocsfs_read_disk_inode(inode->i_sb, oi->i_disk_ino, &di);
+	if (ret)
+		return ret;
+	mutex_lock(&oi->i_extent_lock);
+	inode->i_size   = le64_to_cpu(di.i_size);
+	inode->i_blocks = le64_to_cpu(di.i_blocks) * (sbi->s_block_size / 512);
+	inode_set_mtime_to_ts(inode, ns_to_timespec64(le64_to_cpu(di.i_mtime)));
+	inode_set_ctime_to_ts(inode, ns_to_timespec64(le64_to_cpu(di.i_ctime)));
+	oi->i_flags            = le32_to_cpu(di.i_flags);
+	oi->i_extent_tree_root = le64_to_cpu(di.i_extent_tree_root);
+	ocsfs_parse_extents(oi, &di);
+	mutex_unlock(&oi->i_extent_lock);
+	return 0;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -406,13 +414,6 @@ struct inode *ocsfs_new_inode(struct inode *dir, umode_t mode)
 	mark_inode_dirty(inode);
 
 	if (sbi->s_clustered) {
-		/*
-		 * Write the new inode to disk before releasing EX.  ocsfs_add_dirent
-		 * will flush the parent dir while holding its own EX, making the
-		 * new name visible to other nodes.  If we haven't written the inode
-		 * first, a remote iget immediately after that dir flush would call
-		 * ocsfs_inode_invalidate_cache and read garbage from the inode slot.
-		 */
 		int fr = ocsfs_flush_inode_locked(inode, true);
 
 		if (fr)

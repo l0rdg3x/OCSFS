@@ -630,6 +630,7 @@ extern const struct inode_operations ocsfs_file_inode_ops;
 extern const struct inode_operations ocsfs_special_inode_ops;
 struct inode *ocsfs_iget(struct super_block *sb, u64 ino);
 int ocsfs_flush_inode_locked(struct inode *inode, bool force_sync);
+int ocsfs_inode_refresh(struct inode *inode);
 int ocsfs_write_inode(struct inode *inode, struct writeback_control *wbc);
 void ocsfs_evict_inode(struct inode *inode);
 struct inode *ocsfs_new_inode(struct inode *dir, umode_t mode);
