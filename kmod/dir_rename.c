@@ -18,12 +18,7 @@ static int ocsfs_unlink(struct inode *dir, struct dentry *dentry)
 	struct ocsfs_inode_info *d_oi = OCSFS_I(dir);
 	int ret;
 
-	/*
-	 * Acquire EX on both dir and child ordered by on-disk ino —
-	 * same ordering as ocsfs_rmdir — to prevent ABBA deadlocks.
-	 * With both locks held from the start, the nlink==0 truncation
-	 * path below reuses the already-held child lock.
-	 */
+	/* Acquire EX on dir and child by ino order — prevents ABBA deadlock. */
 	if (sbi->s_clustered) {
 		struct ocsfs_inode_info *first  = d_oi;
 		struct ocsfs_inode_info *second = oi;
@@ -32,12 +27,10 @@ static int ocsfs_unlink(struct inode *dir, struct dentry *dentry)
 			first  = oi;
 			second = d_oi;
 		}
-
 		ret = ocsfs_lock_acquire(dir->i_sb, &first->i_lock_res,
 					 OCSFS_LOCK_EX);
 		if (ret)
 			return ret;
-
 		ret = ocsfs_lock_acquire(dir->i_sb, &second->i_lock_res,
 					 OCSFS_LOCK_EX);
 		if (ret) {
@@ -101,10 +94,7 @@ static int ocsfs_rmdir(struct inode *dir, struct dentry *dentry)
 	struct ocsfs_inode_info *child_oi = OCSFS_I(inode);
 	int ret;
 
-	/*
-	 * Acquire EX on both dir and child ordered by on-disk ino to prevent
-	 * deadlock with a concurrent cross-dir rename of the same inodes.
-	 */
+	/* Acquire EX on dir and child by ino order — prevents ABBA deadlock. */
 	if (sbi->s_clustered) {
 		struct ocsfs_inode_info *first  = dir_oi;
 		struct ocsfs_inode_info *second = child_oi;
@@ -113,12 +103,10 @@ static int ocsfs_rmdir(struct inode *dir, struct dentry *dentry)
 			first  = child_oi;
 			second = dir_oi;
 		}
-
 		ret = ocsfs_lock_acquire(dir->i_sb, &first->i_lock_res,
 					 OCSFS_LOCK_EX);
 		if (ret)
 			return ret;
-
 		ret = ocsfs_lock_acquire(dir->i_sb, &second->i_lock_res,
 					 OCSFS_LOCK_EX);
 		if (ret) {
@@ -230,37 +218,51 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 	struct ocsfs_inode_info *new_oi = OCSFS_I(new_dir);
 	struct inode *old_inode = d_inode(old_dentry);
 	struct inode *new_inode = d_inode(new_dentry);
+	/* Sorted DLM EX set: old_dir, new_dir, new_inode, old_inode(dotdot) */
+	struct ocsfs_inode_info *lock_arr[4];
+	int n_locks = 0;
 	int ret;
+	int i;
 
 	if (flags & ~RENAME_NOREPLACE)
 		return -EINVAL;
 
-	/*
-	 * Acquire EX DLM on both directories atomically, ordered by
-	 * on-disk inode number to prevent deadlock with a concurrent
-	 * rename in the opposite direction.
-	 */
 	if (sbi->s_clustered) {
-		struct ocsfs_inode_info *first = old_oi, *second = new_oi;
+		int j;
+		struct ocsfs_inode_info *key;
 
-		if (old_dir != new_dir &&
-		    new_oi->i_disk_ino < old_oi->i_disk_ino) {
-			first  = new_oi;
-			second = old_oi;
+		lock_arr[n_locks++] = old_oi;
+		if (old_dir != new_dir)
+			lock_arr[n_locks++] = new_oi;
+		if (new_inode) {
+			struct ocsfs_inode_info *ni = OCSFS_I(new_inode);
+			if (ni != old_oi && ni != new_oi)
+				lock_arr[n_locks++] = ni;
+		}
+		if (S_ISDIR(old_inode->i_mode) && old_dir != new_dir) {
+			struct ocsfs_inode_info *mi = OCSFS_I(old_inode);
+			if (mi != old_oi && mi != new_oi)
+				lock_arr[n_locks++] = mi;
 		}
 
-		ret = ocsfs_lock_acquire(old_dir->i_sb, &first->i_lock_res,
-					 OCSFS_LOCK_EX);
-		if (ret)
-			return ret;
+		/* Insertion sort by i_disk_ino — at most 4 elements */
+		for (i = 1; i < n_locks; i++) {
+			key = lock_arr[i];
+			for (j = i - 1;
+			     j >= 0 && lock_arr[j]->i_disk_ino > key->i_disk_ino;
+			     j--)
+				lock_arr[j + 1] = lock_arr[j];
+			lock_arr[j + 1] = key;
+		}
 
-		if (old_dir != new_dir) {
+		for (i = 0; i < n_locks; i++) {
 			ret = ocsfs_lock_acquire(old_dir->i_sb,
-						 &second->i_lock_res,
+						 &lock_arr[i]->i_lock_res,
 						 OCSFS_LOCK_EX);
 			if (ret) {
-				ocsfs_lock_release(old_dir->i_sb,
-						   &first->i_lock_res);
+				while (--i >= 0)
+					ocsfs_lock_release(old_dir->i_sb,
+							   &lock_arr[i]->i_lock_res);
 				return ret;
 			}
 		}
@@ -304,31 +306,11 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 
 	/* Update ".." in moved directory — single in-place txn */
 	if (S_ISDIR(old_inode->i_mode) && old_dir != new_dir) {
-		struct ocsfs_inode_info *moved_oi = OCSFS_I(old_inode);
-
-		if (sbi->s_clustered) {
-			ret = ocsfs_lock_acquire(old_dir->i_sb,
-						 &moved_oi->i_lock_res,
-						 OCSFS_LOCK_EX);
-			if (ret)
-				goto out_unlock;
-		}
-
 		ret = ocsfs_rename_update_dotdot(old_inode, new_oi->i_disk_ino);
 		inode_set_ctime_current(old_inode);
 		mark_inode_dirty(old_inode);
-
-		if (sbi->s_clustered) {
-			int fr = ocsfs_flush_inode_locked(old_inode, true);
-			if (fr)
-				pr_warn_ratelimited(
-					"ocsfs: rename dotdot flush failed (%d)\n", fr);
-			ocsfs_lock_release(old_dir->i_sb, &moved_oi->i_lock_res);
-		}
-
 		if (ret)
 			goto out_unlock;
-
 		drop_nlink(old_dir);
 		inc_nlink(new_dir);
 		mark_inode_dirty(old_dir);
@@ -342,7 +324,23 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 out_unlock:
 	if (sbi->s_clustered) {
 		if (ret == 0) {
-			int fr = ocsfs_flush_inode_locked(old_dir, true);
+			int fr;
+
+			if (new_inode) {
+				fr = ocsfs_flush_inode_locked(new_inode, true);
+				if (fr)
+					pr_warn_ratelimited(
+						"ocsfs: rename new_inode flush failed (%d)\n",
+						fr);
+			}
+			if (S_ISDIR(old_inode->i_mode) && old_dir != new_dir) {
+				fr = ocsfs_flush_inode_locked(old_inode, true);
+				if (fr)
+					pr_warn_ratelimited(
+						"ocsfs: rename dotdot flush failed (%d)\n",
+						fr);
+			}
+			fr = ocsfs_flush_inode_locked(old_dir, true);
 			if (fr)
 				pr_warn_ratelimited(
 					"ocsfs: rename old_dir flush failed (%d)\n", fr);
@@ -354,9 +352,9 @@ out_unlock:
 						fr);
 			}
 		}
-		if (old_dir != new_dir)
-			ocsfs_lock_release(old_dir->i_sb, &new_oi->i_lock_res);
-		ocsfs_lock_release(old_dir->i_sb, &old_oi->i_lock_res);
+		for (i = n_locks - 1; i >= 0; i--)
+			ocsfs_lock_release(old_dir->i_sb,
+					   &lock_arr[i]->i_lock_res);
 	}
 	return ret;
 }
