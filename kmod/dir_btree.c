@@ -269,10 +269,19 @@ int ocsfs_dir_btree_delete(struct inode *dir, const struct qstr *name)
 }
 
 /*
+ * Maximum btree inserts per journal transaction during migrate.
+ * Limits j_lock hold time: large dirs no longer stall all other writers.
+ * Each partial commit persists the btree root in the inode, so a crash
+ * mid-migrate leaves a valid partial index; missing entries fall back to
+ * the linear scan until the directory is re-opened.
+ */
+#define OCSFS_MIGRATE_CHUNK  64
+
+/*
  * Build the B+ tree index by scanning the flat dirent list.
  * Called when i_dirent_count first crosses OCSFS_DIR_BTREE_THRESHOLD.
- * The entire migration is atomic: on failure the txn rolls back all
- * btree-node and bitmap changes.
+ * Uses chunked transactions (OCSFS_MIGRATE_CHUNK inserts per txn) to
+ * bound j_lock hold time without sacrificing crash recoverability.
  */
 int ocsfs_dir_btree_migrate(struct inode *dir)
 {
@@ -282,7 +291,7 @@ int ocsfs_dir_btree_migrate(struct inode *dir)
 	struct dir_btree_ctx dc;
 	struct ocsfs_txn *txn;
 	u64 dir_blocks, b;
-	int ret;
+	int ret, chunk = 0;
 
 	txn = ocsfs_txn_begin(dir->i_sb);
 	if (IS_ERR(txn))
@@ -332,6 +341,22 @@ int ocsfs_dir_btree_migrate(struct inode *dir)
 				pr_err("ocsfs: dir btree migrate failed: %d\n",
 				       ret);
 				goto abort;
+			}
+
+			if (++chunk >= OCSFS_MIGRATE_CHUNK) {
+				/* Commit partial batch, persist root */
+				ret = ocsfs_txn_commit(txn);
+				if (ret) { brelse(bh); return ret; }
+				oi->i_dir_btree_root = bt.root_block;
+				mark_inode_dirty(dir);
+
+				txn = ocsfs_txn_begin(dir->i_sb);
+				if (IS_ERR(txn)) {
+					brelse(bh);
+					return PTR_ERR(txn);
+				}
+				dc.txn = txn;
+				chunk  = 0;
 			}
 		}
 		brelse(bh);
