@@ -373,6 +373,69 @@ static int ocsfs_readdir(struct file *file, struct dir_context *ctx)
 }
 
 /* ═══════════════════════════════════════════════════════════════
+ * VFS CREATE AND MKDIR
+ * ═══════════════════════════════════════════════════════════════ */
+
+int ocsfs_create(struct mnt_idmap *idmap, struct inode *dir,
+		 struct dentry *dentry, umode_t mode, bool excl)
+{
+	struct inode *inode;
+	int ret;
+
+	inode = ocsfs_new_inode(dir, mode);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
+
+	ret = ocsfs_add_dirent(dir, &dentry->d_name,
+			       OCSFS_I(inode)->i_disk_ino,
+			       ocsfs_mode_to_ft(mode));
+	if (ret) {
+		inode_dec_link_count(inode);
+		discard_new_inode(inode);
+		return ret;
+	}
+
+	d_instantiate(dentry, inode);
+	return 0;
+}
+
+struct dentry *ocsfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+			   struct dentry *dentry, umode_t mode)
+{
+	struct inode *inode;
+	int ret;
+
+	inode = ocsfs_new_inode(dir, S_IFDIR | mode);
+	if (IS_ERR(inode))
+		return ERR_CAST(inode);
+
+	ret = ocsfs_add_dirent(inode, &(struct qstr)QSTR_INIT(".", 1),
+			       OCSFS_I(inode)->i_disk_ino, OCSFS_FT_DIR);
+	if (ret)
+		goto fail;
+
+	ret = ocsfs_add_dirent(inode, &(struct qstr)QSTR_INIT("..", 2),
+			       OCSFS_I(dir)->i_disk_ino, OCSFS_FT_DIR);
+	if (ret)
+		goto fail;
+
+	ret = ocsfs_add_dirent(dir, &dentry->d_name,
+			       OCSFS_I(inode)->i_disk_ino, OCSFS_FT_DIR);
+	if (ret)
+		goto fail;
+
+	inc_nlink(dir);
+	mark_inode_dirty(dir);
+	d_instantiate(dentry, inode);
+	return NULL;
+
+fail:
+	clear_nlink(inode);
+	discard_new_inode(inode);
+	return ERR_PTR(ret);
+}
+
+/* ═══════════════════════════════════════════════════════════════
  * OPERATIONS TABLES
  * ═══════════════════════════════════════════════════════════════ */
 

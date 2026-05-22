@@ -189,11 +189,21 @@ struct inode *ocsfs_iget(struct super_block *sb, u64 ino)
  * WRITE INODE TO DISK
  * ═══════════════════════════════════════════════════════════════ */
 
-int ocsfs_write_inode(struct inode *inode, struct writeback_control *wbc)
+/*
+ * Write the inode to disk. Caller must already hold DLM EX (or be in
+ * single-node mode). Does NOT acquire or release any DLM lock.
+ *
+ * @force_sync: call sync_dirty_buffer() — required when the caller is
+ * about to release EX and must guarantee the inode is durable on the
+ * block device before another node can read it.
+ *
+ * Lock ordering: DLM EX (held by caller) → j_lock (acquired here).
+ */
+int ocsfs_flush_inode_locked(struct inode *inode, bool force_sync)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
-	struct ocsfs_txn *txn = NULL;
+	struct ocsfs_txn *txn;
 	struct buffer_head *bh;
 	struct ocsfs_disk_inode *di;
 	u64 off, block;
@@ -201,33 +211,13 @@ int ocsfs_write_inode(struct inode *inode, struct writeback_control *wbc)
 	u16 i;
 	int ret;
 
-	if (sbi->s_clustered) {
-		ret = ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
-					 OCSFS_LOCK_EX);
-		if (ret)
-			return ret;
-	}
-
-	/*
-	 * Wrap the inode buffer in a journal transaction so a crash between
-	 * mark_buffer_dirty() and the disk write leaves a recoverable WAL
-	 * record.  ocsfs_txn_begin grabs j_lock, serializing journal writers.
-	 * We always journal — even in single-node mode — for crash recovery.
-	 *
-	 * Lock ordering: i_lock_res (DLM EX) → j_lock (mutex). Consistent
-	 * with all other call sites.
-	 */
 	txn = ocsfs_txn_begin(inode->i_sb);
-	if (IS_ERR(txn)) {
-		ret = PTR_ERR(txn);
-		if (sbi->s_clustered)
-			ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
-		return ret;
-	}
+	if (IS_ERR(txn))
+		return PTR_ERR(txn);
 
-	off = ocsfs_inode_disk_off(sbi, oi->i_disk_ino);
+	off   = ocsfs_inode_disk_off(sbi, oi->i_disk_ino);
 	block = off / sbi->s_block_size;
-	boff = off % sbi->s_block_size;
+	boff  = off % sbi->s_block_size;
 
 	bh = sb_bread(inode->i_sb, block);
 	if (!bh) {
@@ -235,7 +225,6 @@ int ocsfs_write_inode(struct inode *inode, struct writeback_control *wbc)
 		goto out_abort;
 	}
 
-	/* Snapshot BEFORE image before mutating the buffer. */
 	ret = ocsfs_txn_add_bh(txn, bh);
 	if (ret) {
 		brelse(bh);
@@ -244,15 +233,15 @@ int ocsfs_write_inode(struct inode *inode, struct writeback_control *wbc)
 
 	di = (struct ocsfs_disk_inode *)(bh->b_data + boff);
 
-	di->i_magic = cpu_to_le32(OCSFS_INODE_MAGIC);
-	di->i_ino = cpu_to_le64(oi->i_disk_ino);
-	di->i_mode = cpu_to_le16(inode->i_mode);
-	di->i_nlink = cpu_to_le16(inode->i_nlink);
-	di->i_uid = cpu_to_le32(i_uid_read(inode));
-	di->i_gid = cpu_to_le32(i_gid_read(inode));
-	di->i_size = cpu_to_le64(inode->i_size);
-	di->i_blocks = cpu_to_le64(inode->i_blocks /
-				   (sbi->s_block_size / 512));
+	di->i_magic            = cpu_to_le32(OCSFS_INODE_MAGIC);
+	di->i_ino              = cpu_to_le64(oi->i_disk_ino);
+	di->i_mode             = cpu_to_le16(inode->i_mode);
+	di->i_nlink            = cpu_to_le16(inode->i_nlink);
+	di->i_uid              = cpu_to_le32(i_uid_read(inode));
+	di->i_gid              = cpu_to_le32(i_gid_read(inode));
+	di->i_size             = cpu_to_le64(inode->i_size);
+	di->i_blocks           = cpu_to_le64(inode->i_blocks /
+					     (sbi->s_block_size / 512));
 	{
 		struct timespec64 ts;
 		ts = inode_get_atime(inode);
@@ -262,46 +251,55 @@ int ocsfs_write_inode(struct inode *inode, struct writeback_control *wbc)
 		ts = inode_get_ctime(inode);
 		di->i_ctime = cpu_to_le64(timespec64_to_ns(&ts));
 	}
-	di->i_flags = cpu_to_le32(oi->i_flags);
-	di->i_ag = cpu_to_le32(oi->i_ag);
-	di->i_extent_count = cpu_to_le16(oi->i_extent_count);
-	di->i_extent_max = cpu_to_le16(OCSFS_INLINE_EXTENTS);
+	di->i_flags            = cpu_to_le32(oi->i_flags);
+	di->i_ag               = cpu_to_le32(oi->i_ag);
+	di->i_extent_count     = cpu_to_le16(oi->i_extent_count);
+	di->i_extent_max       = cpu_to_le16(OCSFS_INLINE_EXTENTS);
 	di->i_extent_tree_root = cpu_to_le64(oi->i_extent_tree_root);
-	di->i_dir_btree_root = cpu_to_le64(oi->i_dir_btree_root);
-	di->i_dirent_count   = cpu_to_le32(oi->i_dirent_count);
+	di->i_dir_btree_root   = cpu_to_le64(oi->i_dir_btree_root);
+	di->i_dirent_count     = cpu_to_le32(oi->i_dirent_count);
 
 	for (i = 0; i < oi->i_extent_count && i < OCSFS_INLINE_EXTENTS; i++) {
 		struct ocsfs_disk_extent *de =
 			(struct ocsfs_disk_extent *)
 			(di->i_inline_extents + i * sizeof(*de));
-		de->e_logical_block = cpu_to_le64(oi->i_extents[i].logical_block);
+		de->e_logical_block  = cpu_to_le64(oi->i_extents[i].logical_block);
 		de->e_physical_block = cpu_to_le64(oi->i_extents[i].physical_block);
-		de->e_length = cpu_to_le32(oi->i_extents[i].length);
-		de->e_flags = cpu_to_le16(oi->i_extents[i].flags);
-		de->e_checksum = 0;
+		de->e_length         = cpu_to_le32(oi->i_extents[i].length);
+		de->e_flags          = cpu_to_le16(oi->i_extents[i].flags);
+		de->e_checksum       = 0;
 	}
 
 	di->i_checksum = cpu_to_le32(
 		ocsfs_crc32c(~0U, di, OCSFS_INODE_SIZE - 4));
 
 	mark_buffer_dirty(bh);
-	if (wbc->sync_mode == WB_SYNC_ALL)
+	if (force_sync)
 		sync_dirty_buffer(bh);
 	brelse(bh);
 
-	/*
-	 * Commit writes the COMMIT marker and syncs the journal header
-	 * (durability point), then releases j_lock and frees txn.
-	 */
-	ret = ocsfs_txn_commit(txn);
-	txn = NULL;
-
-	if (sbi->s_clustered)
-		ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
-	return ret;
+	return ocsfs_txn_commit(txn);
 
 out_abort:
 	ocsfs_txn_abort(txn);
+	return ret;
+}
+
+int ocsfs_write_inode(struct inode *inode, struct writeback_control *wbc)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
+	struct ocsfs_inode_info *oi = OCSFS_I(inode);
+	int ret;
+
+	if (sbi->s_clustered) {
+		ret = ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
+					 OCSFS_LOCK_EX);
+		if (ret)
+			return ret;
+	}
+
+	ret = ocsfs_flush_inode_locked(inode, wbc->sync_mode == WB_SYNC_ALL);
+
 	if (sbi->s_clustered)
 		ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
 	return ret;
