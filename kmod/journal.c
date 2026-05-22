@@ -113,6 +113,7 @@ static int journal_write(struct super_block *sb, struct ocsfs_journal *j,
 
 		memcpy(bh->b_data + boff, src, chunk);
 		mark_buffer_dirty(bh);
+		sync_dirty_buffer(bh);
 		brelse(bh);
 
 		src      += chunk;
@@ -196,6 +197,12 @@ int ocsfs_txn_add_bh(struct ocsfs_txn *txn, struct buffer_head *bh)
 	struct super_block *sb = j->j_sb;
 	int ret;
 
+	/* Idempotent: skip if this block is already journaled in this txn */
+	list_for_each_entry(tb, &txn->t_buffers, list) {
+		if (tb->block_num == bh->b_blocknr)
+			return 0;
+	}
+
 	tb = kzalloc(sizeof(*tb), GFP_KERNEL);
 	if (!tb)
 		return -ENOMEM;
@@ -237,13 +244,31 @@ int ocsfs_txn_commit(struct ocsfs_txn *txn)
 	sb = j->j_sb;
 
 	/*
-	 * jt_data_len encodes the total byte size of the (bref + block)
-	 * payload that was written between the BEGIN and this COMMIT.
-	 * journal_replay uses it to skip committed transactions during
-	 * forward scan.  Each ocsfs_txn_add_bh call emits exactly one
-	 * (bref + block) unit of fixed stride.
+	 * Write AFTER-images before COMMIT so redo-replay can recover
+	 * committed data that was lost before kernel writeback.
 	 */
-	data_len = (u32)txn->t_nr_blocks *
+	list_for_each_entry(tb, &txn->t_buffers, list) {
+		struct ocsfs_disk_journal_bref abref;
+
+		memset(&abref, 0, sizeof(abref));
+		abref.jbr_block_num = cpu_to_le64(tb->bh->b_blocknr);
+		abref.jbr_flags     = cpu_to_le32(OCSFS_JBR_AFTER);
+		abref.jbr_checksum  = cpu_to_le32(
+			ocsfs_crc32c(~0U, tb->bh->b_data, tb->bh->b_size));
+
+		ret = journal_write(sb, j, &abref, sizeof(abref));
+		if (ret)
+			goto out;
+		ret = journal_write(sb, j, tb->bh->b_data, tb->bh->b_size);
+		if (ret)
+			goto out;
+	}
+
+	/*
+	 * data_len: BEFORE-images (from add_bh) + AFTER-images (written above).
+	 * Each bh contributes 2 * (bref + block) to the payload.
+	 */
+	data_len = (u32)txn->t_nr_blocks * 2 *
 		   (u32)(sizeof(struct ocsfs_disk_journal_bref) +
 			 sb->s_blocksize);
 

@@ -696,6 +696,8 @@ int ocsfs_extent_btree_count(struct inode *inode, u64 *count);
 /* bitmap.c */
 int ocsfs_alloc_blocks(struct super_block *sb, u32 ag_hint, u32 count,
 		       u64 *block_out);
+int ocsfs_alloc_blocks_txn(struct ocsfs_txn *txn, struct super_block *sb,
+			    u32 ag_hint, u32 count, u64 *block_out);
 int  ocsfs_free_blocks_txn(struct ocsfs_txn *txn, u64 block, u32 count);
 void ocsfs_free_blocks(struct super_block *sb, u64 block, u32 count);
 int ocsfs_alloc_inode_num(struct super_block *sb, u32 ag_hint, u64 *ino_out);

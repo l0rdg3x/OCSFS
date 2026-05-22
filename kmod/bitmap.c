@@ -182,6 +182,34 @@ commit:
 	return ocsfs_txn_commit(txn);
 }
 
+/*
+ * Allocate blocks within an existing transaction (no txn_begin/commit).
+ * Use when the caller already holds an open txn and cannot re-enter j_lock.
+ */
+int ocsfs_alloc_blocks_txn(struct ocsfs_txn *txn, struct super_block *sb,
+			    u32 ag_hint, u32 count, u64 *block_out)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	u32 i;
+	int ret;
+
+	if (ag_hint < sbi->s_ag_count) {
+		ret = ocsfs_ag_alloc_blocks(sb, ag_hint, count, block_out, txn);
+		if (ret == 0)
+			return 0;
+	}
+
+	for (i = 0; i < sbi->s_ag_count; i++) {
+		if (i == ag_hint)
+			continue;
+		ret = ocsfs_ag_alloc_blocks(sb, i, count, block_out, txn);
+		if (ret == 0)
+			return 0;
+	}
+
+	return -ENOSPC;
+}
+
 /* ═══════════════════════════════════════════════════════════════
  * BLOCK FREE
  * ═══════════════════════════════════════════════════════════════ */

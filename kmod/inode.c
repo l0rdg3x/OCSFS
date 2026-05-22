@@ -330,7 +330,9 @@ void ocsfs_evict_inode(struct inode *inode)
 			ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
 					   OCSFS_LOCK_EX);
 
+		mutex_lock(&oi->i_extent_lock);
 		ocsfs_extent_truncate(inode, 0);
+		mutex_unlock(&oi->i_extent_lock);
 		ocsfs_free_inode_num(inode->i_sb, oi->i_disk_ino);
 
 		if (sbi->s_clustered)
@@ -426,6 +428,7 @@ int ocsfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		  struct iattr *attr)
 {
 	struct inode *inode = d_inode(dentry);
+	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
 	int ret;
 
 	ret = setattr_prepare(idmap, dentry, attr);
@@ -435,10 +438,19 @@ int ocsfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	if (attr->ia_valid & ATTR_SIZE) {
 		if (attr->ia_size < inode->i_size) {
 			/* Truncate: free extents beyond new size */
+			struct ocsfs_inode_info *oi = OCSFS_I(inode);
 			u64 from_block = (attr->ia_size +
 				OCSFS_SB(inode->i_sb)->s_block_size - 1) /
 				OCSFS_SB(inode->i_sb)->s_block_size;
+
+			if (sbi->s_clustered)
+				ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
+						   OCSFS_LOCK_EX);
+			mutex_lock(&oi->i_extent_lock);
 			ocsfs_extent_truncate(inode, from_block);
+			mutex_unlock(&oi->i_extent_lock);
+			if (sbi->s_clustered)
+				ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
 		}
 		truncate_setsize(inode, attr->ia_size);
 	}

@@ -149,8 +149,9 @@ int __ocsfs_add_dirent(struct inode *dir, const struct qstr *name,
 			 sbi->s_block_size;
 	struct buffer_head *bh = NULL;
 	struct ocsfs_txn *txn;
-	u64 b;
-	u32 off = 0;
+	u64 phys_for_btree = 0;
+	u32 phys_off_for_btree = 0;
+	u64 b; u32 off = 0;
 	int ret = 0;
 
 	/* Scan for a free slot in existing blocks */
@@ -221,22 +222,14 @@ fill:
 		brelse(bh);
 		bh = NULL;
 	}
-	/* B+ tree index: insert or trigger migration on threshold */
 	{
-		struct ocsfs_inode_info *oi = OCSFS_I(dir);
 		struct ocsfs_extent ext_tmp;
-		u64 phys = 0;
-		u32 phys_off = off;
 
-		/* Resolve physical block for the slot we just filled */
+		phys_off_for_btree = off;
 		if (ocsfs_extent_lookup(dir, b, &ext_tmp) == 0 &&
 		    ext_tmp.physical_block)
-			phys = ext_tmp.physical_block + (b - ext_tmp.logical_block);
-
-		if (oi->i_dir_btree_root && phys)
-			ocsfs_dir_btree_insert(dir, name, phys, phys_off);
-		else if (ocsfs_dir_btree_should_build(dir))
-			ocsfs_dir_btree_migrate(dir);
+			phys_for_btree = ext_tmp.physical_block +
+					 (b - ext_tmp.logical_block);
 	}
 	ret = ocsfs_txn_commit(txn);
 	if (ret)
@@ -244,6 +237,12 @@ fill:
 	OCSFS_I(dir)->i_dirent_count++;
 	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
 	mark_inode_dirty(dir);
+	/* B+ tree index: separate txn, avoids j_lock re-entry */
+	if (dir_oi->i_dir_btree_root && phys_for_btree)
+		ocsfs_dir_btree_insert(dir, name, phys_for_btree,
+				       phys_off_for_btree);
+	else if (ocsfs_dir_btree_should_build(dir))
+		ocsfs_dir_btree_migrate(dir);
 out:
 	return ret;
 }

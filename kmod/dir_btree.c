@@ -12,6 +12,9 @@
  * 64-bit keys. On a hash match, the caller always verifies the actual name.
  * If the name doesn't match, ocsfs_dir_btree_lookup returns 0 and the caller
  * falls back to the flat linear scan.
+ *
+ * Write operations (insert, delete, migrate) open a WAL transaction so that
+ * btree node writes and block alloc/free are atomic with respect to crashes.
  */
 
 #include "ocsfs.h"
@@ -43,6 +46,7 @@ static u64 dir_name_hash(const char *name, unsigned int len)
 
 struct dir_btree_ctx {
 	struct super_block *sb;
+	struct ocsfs_txn   *txn;  /* NULL for read-only operations */
 };
 
 static int dir_btree_read(void *ctx, u64 block, void *buf, u32 size)
@@ -57,13 +61,28 @@ static int dir_btree_read(void *ctx, u64 block, void *buf, u32 size)
 	return 0;
 }
 
+/*
+ * Journal before-image then overwrite: makes btree node writes atomic.
+ * sb_bread is used (not sb_getblk) to capture the real before-image.
+ */
 static int dir_btree_write(void *ctx, u64 block, const void *buf, u32 size)
 {
 	struct dir_btree_ctx *dc = ctx;
-	struct buffer_head *bh   = sb_getblk(dc->sb, block);
+	struct buffer_head *bh;
+	int ret;
 
+	bh = sb_bread(dc->sb, block);
 	if (!bh)
 		return -EIO;
+
+	if (dc->txn) {
+		ret = ocsfs_txn_add_bh(dc->txn, bh);
+		if (ret) {
+			brelse(bh);
+			return ret;
+		}
+	}
+
 	lock_buffer(bh);
 	memcpy(bh->b_data, buf, size);
 	set_buffer_uptodate(bh);
@@ -77,7 +96,12 @@ static int dir_btree_alloc(void *ctx, u64 *out_block)
 {
 	struct dir_btree_ctx *dc = ctx;
 	u64 block;
-	int ret = ocsfs_alloc_blocks(dc->sb, 0, 1, &block);
+	int ret;
+
+	if (dc->txn)
+		ret = ocsfs_alloc_blocks_txn(dc->txn, dc->sb, 0, 1, &block);
+	else
+		ret = ocsfs_alloc_blocks(dc->sb, 0, 1, &block);
 
 	if (!ret)
 		*out_block = block;
@@ -88,20 +112,16 @@ static int dir_btree_free(void *ctx, u64 block)
 {
 	struct dir_btree_ctx *dc = ctx;
 
+	if (dc->txn)
+		return ocsfs_free_blocks_txn(dc->txn, block, 1);
 	ocsfs_free_blocks(dc->sb, block, 1);
 	return 0;
-}
-
-static void dir_fill_btree_ctx(struct dir_btree_ctx *dc,
-				struct super_block *sb)
-{
-	dc->sb = sb;
 }
 
 /* ── open existing btree for a directory ── */
 
 static int dir_btree_open(struct inode *dir, struct ocsfs_btree *bt,
-			  struct dir_btree_ctx *dc)
+			  struct dir_btree_ctx *dc, struct ocsfs_txn *txn)
 {
 	struct ocsfs_sb_info *sbi    = OCSFS_SB(dir->i_sb);
 	struct ocsfs_inode_info *oi  = OCSFS_I(dir);
@@ -109,7 +129,8 @@ static int dir_btree_open(struct inode *dir, struct ocsfs_btree *bt,
 	if (!oi->i_dir_btree_root)
 		return -ENOENT;
 
-	dir_fill_btree_ctx(dc, dir->i_sb);
+	dc->sb  = dir->i_sb;
+	dc->txn = txn;
 	return ocsfs_btree_open(bt, oi->i_dir_btree_root, sbi->s_block_size,
 				dir_btree_read, dir_btree_write,
 				dir_btree_alloc, dir_btree_free, dc);
@@ -138,7 +159,7 @@ u64 ocsfs_dir_btree_lookup(struct inode *dir, const struct qstr *name,
 	if (!oi->i_dir_btree_root)
 		return 0;
 
-	ret = dir_btree_open(dir, &bt, &dc);
+	ret = dir_btree_open(dir, &bt, &dc, NULL);
 	if (ret)
 		return 0;
 
@@ -185,19 +206,31 @@ int ocsfs_dir_btree_insert(struct inode *dir, const struct qstr *name,
 	struct ocsfs_inode_info *oi = OCSFS_I(dir);
 	struct ocsfs_btree bt;
 	struct dir_btree_ctx dc;
+	struct ocsfs_txn *txn;
 	u64 hash;
 	int ret;
 
 	if (!oi->i_dir_btree_root)
 		return -ENOENT;
 
-	if (dir_btree_open(dir, &bt, &dc))
+	txn = ocsfs_txn_begin(dir->i_sb);
+	if (IS_ERR(txn))
+		return PTR_ERR(txn);
+
+	if (dir_btree_open(dir, &bt, &dc, txn)) {
+		ocsfs_txn_abort(txn);
 		return -EIO;
+	}
 
 	hash = dir_name_hash(name->name, name->len);
 	ret = ocsfs_btree_insert(&bt, hash, dir_encode_val(phys_block, offset));
 	if (!ret)
 		oi->i_dir_btree_root = bt.root_block;
+
+	if (ret)
+		ocsfs_txn_abort(txn);
+	else
+		ret = ocsfs_txn_commit(txn);
 	return ret;
 }
 
@@ -207,25 +240,39 @@ int ocsfs_dir_btree_delete(struct inode *dir, const struct qstr *name)
 	struct ocsfs_inode_info *oi = OCSFS_I(dir);
 	struct ocsfs_btree bt;
 	struct dir_btree_ctx dc;
+	struct ocsfs_txn *txn;
 	u64 hash;
 	int ret;
 
 	if (!oi->i_dir_btree_root)
 		return 0;
 
-	if (dir_btree_open(dir, &bt, &dc))
+	txn = ocsfs_txn_begin(dir->i_sb);
+	if (IS_ERR(txn))
+		return PTR_ERR(txn);
+
+	if (dir_btree_open(dir, &bt, &dc, txn)) {
+		ocsfs_txn_abort(txn);
 		return -EIO;
+	}
 
 	hash = dir_name_hash(name->name, name->len);
 	ret = ocsfs_btree_delete(&bt, hash);
 	if (!ret)
 		oi->i_dir_btree_root = bt.root_block;
+
+	if (ret)
+		ocsfs_txn_abort(txn);
+	else
+		ret = ocsfs_txn_commit(txn);
 	return ret;
 }
 
 /*
  * Build the B+ tree index by scanning the flat dirent list.
  * Called when i_dirent_count first crosses OCSFS_DIR_BTREE_THRESHOLD.
+ * The entire migration is atomic: on failure the txn rolls back all
+ * btree-node and bitmap changes.
  */
 int ocsfs_dir_btree_migrate(struct inode *dir)
 {
@@ -233,15 +280,22 @@ int ocsfs_dir_btree_migrate(struct inode *dir)
 	struct ocsfs_inode_info *oi  = OCSFS_I(dir);
 	struct ocsfs_btree bt;
 	struct dir_btree_ctx dc;
+	struct ocsfs_txn *txn;
 	u64 dir_blocks, b;
 	int ret;
 
-	dir_fill_btree_ctx(&dc, dir->i_sb);
+	txn = ocsfs_txn_begin(dir->i_sb);
+	if (IS_ERR(txn))
+		return PTR_ERR(txn);
+
+	dc.sb  = dir->i_sb;
+	dc.txn = txn;
+
 	ret = ocsfs_btree_create(&bt, sbi->s_block_size,
 				 dir_btree_read, dir_btree_write,
 				 dir_btree_alloc, dir_btree_free, &dc);
 	if (ret)
-		return ret;
+		goto abort;
 
 	dir_blocks = (dir->i_size + sbi->s_block_size - 1) / sbi->s_block_size;
 
@@ -277,16 +331,22 @@ int ocsfs_dir_btree_migrate(struct inode *dir)
 				brelse(bh);
 				pr_err("ocsfs: dir btree migrate failed: %d\n",
 				       ret);
-				return ret;
+				goto abort;
 			}
-			oi->i_dir_btree_root = bt.root_block;
 		}
 		brelse(bh);
 	}
 
+	ret = ocsfs_txn_commit(txn);
+	if (ret)
+		return ret;
 	oi->i_dir_btree_root = bt.root_block;
 	mark_inode_dirty(dir);
 	return 0;
+
+abort:
+	ocsfs_txn_abort(txn);
+	return ret;
 }
 
 bool ocsfs_dir_btree_should_build(struct inode *dir)

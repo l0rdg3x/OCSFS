@@ -262,8 +262,10 @@ int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block)
 		}
 	} while (tc.count > 0);
 
-	mark_inode_dirty(inode);
-	return ocsfs_txn_commit(txn);
+	ret = ocsfs_txn_commit(txn);
+	if (!ret)
+		mark_inode_dirty(inode);
+	return ret;
 
 abort:
 	ocsfs_txn_abort(txn);

@@ -101,8 +101,12 @@ int ocsfs_journal_replay(struct super_block *sb)
 
 			if (le32_to_cpu(jt2.jt_type) == OCSFS_JTYPE_COMMIT &&
 			    le64_to_cpu(jt2.jt_id) == tid) {
-				committed = true;
-				break;
+				u32 crc = ocsfs_crc32c(~0U, &jt2,
+					sizeof(jt2) - sizeof(__le32));
+				if (le32_to_cpu(jt2.jt_checksum) == crc) {
+					committed = true;
+					break;
+				}
 			}
 			if (le32_to_cpu(jt2.jt_type) == OCSFS_JTYPE_BEGIN) {
 				/* Next txn started — current never committed */
@@ -153,7 +157,46 @@ int ocsfs_journal_replay(struct super_block *sb)
 				tid, this_replayed);
 			scan_pos = replay_pos;
 		} else {
-			/* Skip BEGIN + payload + COMMIT */
+			/* Redo: apply AFTER-images so committed data survives crash */
+			u64 replay_pos = scan_pos + sizeof(jt);
+			u64 stride = sizeof(struct ocsfs_disk_journal_bref) +
+				     sbi->s_block_size;
+			int this_replayed = 0;
+
+			while (replay_pos + stride <= ahead) {
+				struct ocsfs_disk_journal_bref bref;
+				u32 flags;
+
+				ret = journal_read(sb, j, replay_pos,
+						   &bref, sizeof(bref));
+				if (ret)
+					break;
+
+				flags = le32_to_cpu(bref.jbr_flags);
+				replay_pos += sizeof(bref);
+
+				if (flags & OCSFS_JBR_AFTER) {
+					u64 blk = le64_to_cpu(bref.jbr_block_num);
+					struct buffer_head *bh = sb_bread(sb, blk);
+
+					if (bh) {
+						if (!journal_read(sb, j, replay_pos,
+								  bh->b_data,
+								  bh->b_size)) {
+							mark_buffer_dirty(bh);
+							sync_dirty_buffer(bh);
+							this_replayed++;
+							replayed++;
+						}
+						brelse(bh);
+					}
+				}
+				replay_pos += sbi->s_block_size;
+			}
+
+			if (this_replayed > 0)
+				pr_info("ocsfs: redo txn %llu (%d blocks)\n",
+					tid, this_replayed);
 			scan_pos = ahead + sizeof(jt);
 		}
 	}
