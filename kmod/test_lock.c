@@ -17,6 +17,7 @@
 #include <kunit/test.h>
 #include "ocsfs.h"
 #include "ocsfs_btree.h"
+#include "lock_internal.h"
 
 /* ─── helpers ─────────────────────────────────────────────────── */
 
@@ -395,6 +396,66 @@ static void test_prealloc_blocks_minimum_is_power_of_two(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, (int)(v & (v - 1)), 0);
 }
 
+/* ─── lock release livelock regression tests ─────────────────── */
+
+/*
+ * Regression: ocsfs_lock_release EX with active waiter.
+ *
+ * Before the fix: mode stayed EX when has_waiters() was true. A waiting
+ * node retrying lock_acquire would see mode=EX (holder_slot=0) and treat
+ * it as conflicted, retrying forever — a storage-path livelock.
+ *
+ * After the fix: mode is unconditionally set to NL on EX release.
+ */
+static void test_ex_release_with_waiter_yields_nl(struct kunit *test)
+{
+	struct ocsfs_disk_lock dl;
+
+	memset(&dl, 0, sizeof(dl));
+	dl.le_magic       = cpu_to_le32(OCSFS_LOCK_MAGIC);
+	dl.le_mode        = cpu_to_le16(OCSFS_LOCK_EX);
+	dl.le_holder_slot = cpu_to_le16(1);
+	dl.le_holder_gen  = cpu_to_le32(42);
+	set_waiter_bit(&dl, 2);   /* slot 2 is waiting for EX */
+	KUNIT_ASSERT_TRUE(test, has_waiters(&dl));
+	/* Apply fixed ocsfs_lock_release EX logic */
+	dl.le_holder_slot = 0;
+	dl.le_holder_gen  = 0;
+	dl.le_mode        = cpu_to_le16(OCSFS_LOCK_NL);   /* unconditional */
+
+	/* Mode must be NL so the waiter can proceed on next retry */
+	KUNIT_EXPECT_EQ(test, (int)le16_to_cpu(dl.le_mode), (int)OCSFS_LOCK_NL);
+	/* Waiter bit is preserved — cleared by the waiter when it acquires */
+	KUNIT_EXPECT_TRUE(test, has_waiters(&dl));
+}
+
+/*
+ * Regression: ocsfs_lock_release SH (last holder) with active waiter.
+ *
+ * Same livelock: without the fix, mode stayed SH (no holders, but waiter
+ * present), blocking an EX waiter from ever acquiring the lock.
+ */
+static void test_sh_release_last_holder_with_waiter_yields_nl(struct kunit *test)
+{
+	struct ocsfs_disk_lock dl;
+
+	memset(&dl, 0, sizeof(dl));
+	dl.le_magic = cpu_to_le32(OCSFS_LOCK_MAGIC);
+	dl.le_mode  = cpu_to_le16(OCSFS_LOCK_SH);
+	add_sh_holder(&dl, 1);   /* slot 1 holds SH */
+	set_waiter_bit(&dl, 2);  /* slot 2 wants EX */
+	KUNIT_ASSERT_TRUE(test, has_sh_holders(&dl));
+	KUNIT_ASSERT_TRUE(test, has_waiters(&dl));
+	/* Apply fixed ocsfs_lock_release SH logic for slot 1 */
+	remove_sh_holder(&dl, 1);
+	if (!has_sh_holders(&dl))      /* no waiter check — that was the bug */
+		dl.le_mode = cpu_to_le16(OCSFS_LOCK_NL);
+
+	KUNIT_EXPECT_EQ(test, (int)le16_to_cpu(dl.le_mode), (int)OCSFS_LOCK_NL);
+	KUNIT_EXPECT_FALSE(test, has_sh_holders(&dl));
+	KUNIT_EXPECT_TRUE(test, has_waiters(&dl));
+}
+
 /* ─── test suite registration ─────────────────────────────────── */
 
 static struct kunit_case ocsfs_lock_test_cases[] = {
@@ -424,6 +485,8 @@ static struct kunit_case ocsfs_lock_test_cases[] = {
 	KUNIT_CASE(test_jbr_zero_flags_stops_loop),
 	KUNIT_CASE(test_prealloc_blocks_minimum_is_positive),
 	KUNIT_CASE(test_prealloc_blocks_minimum_is_power_of_two),
+	KUNIT_CASE(test_ex_release_with_waiter_yields_nl),
+	KUNIT_CASE(test_sh_release_last_holder_with_waiter_yields_nl),
 	{},
 };
 

@@ -154,12 +154,17 @@ int ocsfs_lock_release(struct super_block *sb, struct ocsfs_lock_res *lr)
 	if (lr->lr_mode == OCSFS_LOCK_EX) {
 		dl.le_holder_slot = 0;
 		dl.le_holder_gen  = 0;
-		if (!has_sh_holders(&dl) && !has_waiters(&dl))
-			dl.le_mode = cpu_to_le16(OCSFS_LOCK_NL);
+		/*
+		 * Always reset to NL after EX release. Waiter bits indicate
+		 * demand but do not hold the lock — leaving mode=EX with no
+		 * holder would cause all waiters to livelock: each retry sees
+		 * mode=EX (no holder) and treats it as conflicted.
+		 */
+		dl.le_mode = cpu_to_le16(OCSFS_LOCK_NL);
 	} else if (lr->lr_mode == OCSFS_LOCK_SH ||
 		   lr->lr_mode == OCSFS_LOCK_CW) {
 		remove_sh_holder(&dl, sbi->s_node_slot);
-		if (!has_sh_holders(&dl) && !has_waiters(&dl))
+		if (!has_sh_holders(&dl))
 			dl.le_mode = cpu_to_le16(OCSFS_LOCK_NL);
 	}
 
