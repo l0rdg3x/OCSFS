@@ -261,8 +261,22 @@ out:
 		mark_inode_dirty(inode);
 	}
 
-	if (sbi->s_clustered)
+	if (sbi->s_clustered) {
+		/*
+		 * Flush dirty pages to the block device BEFORE releasing EX.
+		 * Without this, another node that acquires SH immediately after
+		 * our release would call invalidate_inode_pages2 and then read
+		 * from the block device, seeing the pre-write data because our
+		 * pages haven't been written back yet.
+		 *
+		 * Buffered writes only: direct I/O already bypasses the page
+		 * cache and writes synchronously to the block device.
+		 */
+		if (ret > 0 && !(iocb->ki_flags & IOCB_DIRECT))
+			filemap_write_and_wait(inode->i_mapping);
+
 		ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
+	}
 
 	return ret;
 }
