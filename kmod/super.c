@@ -264,7 +264,7 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		goto fail_journal;
 	}
 
-	/* Read root inode */
+	ocsfs_orphan_scan(sb);
 	root_inode = ocsfs_iget(sb, OCSFS_ROOT_INO);
 	if (IS_ERR(root_inode)) {
 		pr_err("ocsfs: failed to read root inode\n");

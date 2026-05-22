@@ -375,7 +375,7 @@ struct inode *ocsfs_new_inode(struct inode *dir, umode_t mode)
 	oi->i_ag = ocsfs_ino_to_ag(sbi, ino);
 	oi->i_extent_count = 0;
 	oi->i_extent_tree_root = 0;
-	oi->i_flags = 0;
+	oi->i_flags = OCSFS_IFLAG_ORPHAN;
 	oi->i_dir_btree_root = 0;
 	oi->i_dirent_count   = 0;
 

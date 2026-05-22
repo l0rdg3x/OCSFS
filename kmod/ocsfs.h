@@ -100,6 +100,7 @@
 #define OCSFS_IFLAG_ENCRYPTED   0x0004
 #define OCSFS_IFLAG_IMMUTABLE   0x0008
 #define OCSFS_IFLAG_APPEND      0x0010
+#define OCSFS_IFLAG_ORPHAN      0x0020  /* set at create, cleared after dirent commit */
 
 /* Extent flags */
 #define OCSFS_EXT_WRITTEN       0x0000
@@ -631,6 +632,7 @@ extern const struct inode_operations ocsfs_special_inode_ops;
 struct inode *ocsfs_iget(struct super_block *sb, u64 ino);
 int ocsfs_flush_inode_locked(struct inode *inode, bool force_sync);
 int ocsfs_inode_refresh(struct inode *inode);
+int ocsfs_orphan_scan(struct super_block *sb);
 int ocsfs_write_inode(struct inode *inode, struct writeback_control *wbc);
 void ocsfs_evict_inode(struct inode *inode);
 struct inode *ocsfs_new_inode(struct inode *dir, umode_t mode);

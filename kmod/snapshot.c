@@ -162,6 +162,8 @@ int ocsfs_snapshot_create(struct inode *src, struct inode *dir,
 		return ret;
 	}
 
+	snap_oi->i_flags &= ~OCSFS_IFLAG_ORPHAN;
+	mark_inode_dirty(snap);
 	iput(snap);
 	return 0;
 }

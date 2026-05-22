@@ -433,7 +433,8 @@ int ocsfs_create(struct mnt_idmap *idmap, struct inode *dir,
 		discard_new_inode(inode);
 		return ret;
 	}
-
+	OCSFS_I(inode)->i_flags &= ~OCSFS_IFLAG_ORPHAN;
+	mark_inode_dirty(inode);
 	d_instantiate(dentry, inode);
 	return 0;
 }
@@ -462,7 +463,8 @@ struct dentry *ocsfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 			       OCSFS_I(inode)->i_disk_ino, OCSFS_FT_DIR);
 	if (ret)
 		goto fail;
-
+	OCSFS_I(inode)->i_flags &= ~OCSFS_IFLAG_ORPHAN;
+	mark_inode_dirty(inode);
 	inc_nlink(dir);
 	mark_inode_dirty(dir);
 	d_instantiate(dentry, inode);

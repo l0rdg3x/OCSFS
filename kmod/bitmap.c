@@ -443,3 +443,55 @@ void ocsfs_free_inode_num(struct super_block *sb, u64 ino)
 		ocsfs_lock_release(sb, &ag->ag_lock_res);
 	ocsfs_txn_commit(txn);
 }
+
+/* Scan all AGs for orphan inodes (OCSFS_IFLAG_ORPHAN) and log warnings. */
+int ocsfs_orphan_scan(struct super_block *sb)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	int total = 0;
+	u32 ag_no;
+
+	for (ag_no = 0; ag_no < sbi->s_ag_count; ag_no++) {
+		struct ocsfs_ag_info *ag = &sbi->s_ags[ag_no];
+		u64 i;
+
+		mutex_lock(&ag->ag_lock);
+
+		for (i = (ag_no == 0 ? OCSFS_FIRST_USER_INO : 0);
+		     i < ag->inode_count; i++) {
+			struct buffer_head *bh;
+			u64 off   = ag->inode_table_off + i * OCSFS_INODE_SIZE;
+			u64 block = off / sbi->s_block_size;
+			u32 boff  = off % sbi->s_block_size;
+			struct ocsfs_disk_inode *di;
+
+			bh = sb_bread(sb, block);
+			if (!bh)
+				continue;
+
+			di = (struct ocsfs_disk_inode *)(bh->b_data + boff);
+
+			if (le32_to_cpu(di->i_magic) == OCSFS_INODE_MAGIC &&
+			    (le32_to_cpu(di->i_flags) & OCSFS_IFLAG_ORPHAN)) {
+				u64 ino = (u64)ag_no * sbi->s_ag_size + i;
+
+				pr_warn("ocsfs: orphan inode %llu "
+					"(mode=%04o size=%llu) — run fsck\n",
+					ino,
+					le16_to_cpu(di->i_mode),
+					le64_to_cpu(di->i_size));
+				total++;
+			}
+
+			brelse(bh);
+		}
+
+		mutex_unlock(&ag->ag_lock);
+	}
+
+	if (total)
+		pr_warn("ocsfs: %d orphan inode(s) — filesystem needs fsck\n",
+			total);
+
+	return total;
+}
