@@ -42,14 +42,13 @@ static int journal_read(struct super_block *sb, struct ocsfs_journal *j,
 /* ═══════════════════════════════════════════════════════════════
  * JOURNAL REPLAY
  *
- * Scans tail→head. For each BEGIN without a matching COMMIT,
- * replays before-images to restore blocks to pre-transaction state.
+ * Scans tail→head. Committed txns: apply AFTER-images (redo).
+ * Uncommitted/aborted txns: apply BEFORE-images (undo).
  * ═══════════════════════════════════════════════════════════════ */
 
-int ocsfs_journal_replay(struct super_block *sb)
+static int journal_replay_j(struct super_block *sb, struct ocsfs_journal *j)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
-	struct ocsfs_journal *j = &sbi->s_journal;
 	struct ocsfs_disk_journal_txn jt;
 	u64 scan_pos;
 	int replayed = 0;
@@ -107,6 +106,11 @@ int ocsfs_journal_replay(struct super_block *sb)
 					committed = true;
 					break;
 				}
+			}
+			if (le32_to_cpu(jt2.jt_type) == OCSFS_JTYPE_ABORT &&
+			    le64_to_cpu(jt2.jt_id) == tid) {
+				/* Explicit abort — rollback same as uncommitted */
+				break;
 			}
 			if (le32_to_cpu(jt2.jt_type) == OCSFS_JTYPE_BEGIN) {
 				/* Next txn started — current never committed */
@@ -222,10 +226,14 @@ int ocsfs_journal_replay(struct super_block *sb)
 	return 0;
 }
 
+int ocsfs_journal_replay(struct super_block *sb)
+{
+	return journal_replay_j(sb, &OCSFS_SB(sb)->s_journal);
+}
+
 /*
  * Replay a specific node's journal (used by crash recovery of a peer node).
- * Opens the target node's journal region and replays it by temporarily
- * swapping sbi->s_journal.
+ * Uses journal_replay_j directly — no sbi->s_journal swap needed.
  */
 int ocsfs_journal_replay_node(struct super_block *sb, u16 node_slot)
 {
@@ -282,13 +290,7 @@ int ocsfs_journal_replay_node(struct super_block *sb, u16 node_slot)
 	pr_info("ocsfs: replaying journal for node %u (tail=%llu head=%llu)\n",
 		node_slot, tmp_j.tail, tmp_j.head);
 
-	{
-		struct ocsfs_journal saved = sbi->s_journal;
-
-		sbi->s_journal = tmp_j;
-		ret = ocsfs_journal_replay(sb);
-		sbi->s_journal = saved;
-	}
+	ret = journal_replay_j(sb, &tmp_j);
 
 	jh->jh_head     = jh->jh_tail;
 	jh->jh_checksum = cpu_to_le32(

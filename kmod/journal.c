@@ -316,8 +316,20 @@ void ocsfs_txn_abort(struct ocsfs_txn *txn)
 		kfree(tb);
 	}
 
-	if (txn->t_started)
+	if (txn->t_started) {
+		struct ocsfs_disk_journal_txn jt;
+
+		memset(&jt, 0, sizeof(jt));
+		jt.jt_type      = cpu_to_le32(OCSFS_JTYPE_ABORT);
+		jt.jt_id        = cpu_to_le64(txn->t_id);
+		jt.jt_timestamp = cpu_to_le64(ktime_get_real_ns());
+		jt.jt_node_slot = cpu_to_le16(j->j_node_slot);
+		jt.jt_checksum  = cpu_to_le32(
+			ocsfs_crc32c(~0U, &jt, sizeof(jt) - sizeof(__le32)));
+		journal_write(j->j_sb, j, &jt, sizeof(jt));
+
 		mutex_unlock(&j->j_lock);
+	}
 
 	kfree(txn);
 }
