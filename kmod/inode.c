@@ -412,8 +412,21 @@ struct inode *ocsfs_new_inode(struct inode *dir, umode_t mode)
 	insert_inode_hash(inode);
 	mark_inode_dirty(inode);
 
-	if (sbi->s_clustered)
+	if (sbi->s_clustered) {
+		/*
+		 * Write the new inode to disk before releasing EX.  ocsfs_add_dirent
+		 * will flush the parent dir while holding its own EX, making the
+		 * new name visible to other nodes.  If we haven't written the inode
+		 * first, a remote iget immediately after that dir flush would call
+		 * ocsfs_inode_invalidate_cache and read garbage from the inode slot.
+		 */
+		int fr = ocsfs_flush_inode_locked(inode, true);
+
+		if (fr)
+			pr_warn_ratelimited("ocsfs: new_inode flush failed (%d)\n", fr);
+
 		ocsfs_lock_release(sb, &oi->i_lock_res);
+	}
 
 	return inode;
 }
