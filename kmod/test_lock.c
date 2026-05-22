@@ -338,6 +338,63 @@ static void test_dir_btree_build_above_threshold(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, count >= OCSFS_DIR_BTREE_THRESHOLD && !root);
 }
 
+/* ─── journal bref flag invariants ───────────────────────────── */
+
+/*
+ * The undo-scan fix in journal_replay.c relies on OCSFS_JBR_BEFORE and
+ * OCSFS_JBR_AFTER being distinct bitmask bits so that:
+ *   (flags & (OCSFS_JBR_BEFORE | OCSFS_JBR_AFTER)) != 0
+ * reliably identifies any bref record regardless of direction.
+ * A COMMIT/BEGIN record has jbr_flags == 0 (or unknown type bits) and
+ * the loop must stop there.
+ */
+static void test_jbr_flags_are_distinct_bits(struct kunit *test)
+{
+	KUNIT_EXPECT_NE(test, (int)OCSFS_JBR_BEFORE, 0);
+	KUNIT_EXPECT_NE(test, (int)OCSFS_JBR_AFTER,  0);
+	KUNIT_EXPECT_EQ(test, (int)(OCSFS_JBR_BEFORE & OCSFS_JBR_AFTER), 0);
+}
+
+static void test_jbr_before_only_detected(struct kunit *test)
+{
+	u32 flags = OCSFS_JBR_BEFORE;
+
+	KUNIT_EXPECT_TRUE(test, !!(flags & (OCSFS_JBR_BEFORE | OCSFS_JBR_AFTER)));
+	KUNIT_EXPECT_TRUE(test,  !!(flags & OCSFS_JBR_BEFORE));
+	KUNIT_EXPECT_FALSE(test, !!(flags & OCSFS_JBR_AFTER));
+}
+
+static void test_jbr_after_only_detected(struct kunit *test)
+{
+	u32 flags = OCSFS_JBR_AFTER;
+
+	KUNIT_EXPECT_TRUE(test, !!(flags & (OCSFS_JBR_BEFORE | OCSFS_JBR_AFTER)));
+	KUNIT_EXPECT_FALSE(test, !!(flags & OCSFS_JBR_BEFORE));
+	KUNIT_EXPECT_TRUE(test,  !!(flags & OCSFS_JBR_AFTER));
+}
+
+/* A zero flags value (as seen in a COMMIT/BEGIN header misread as bref) stops the loop */
+static void test_jbr_zero_flags_stops_loop(struct kunit *test)
+{
+	u32 flags = 0;
+
+	KUNIT_EXPECT_FALSE(test, !!(flags & (OCSFS_JBR_BEFORE | OCSFS_JBR_AFTER)));
+}
+
+/* ─── iomap pre-allocation constant sanity ────────────────────── */
+
+static void test_prealloc_blocks_minimum_is_positive(struct kunit *test)
+{
+	KUNIT_EXPECT_GT(test, (int)OCSFS_MIN_PREALLOC_BLOCKS, 0);
+}
+
+static void test_prealloc_blocks_minimum_is_power_of_two(struct kunit *test)
+{
+	u32 v = OCSFS_MIN_PREALLOC_BLOCKS;
+	/* Power of two: v & (v-1) == 0 */
+	KUNIT_EXPECT_EQ(test, (int)(v & (v - 1)), 0);
+}
+
 /* ─── test suite registration ─────────────────────────────────── */
 
 static struct kunit_case ocsfs_lock_test_cases[] = {
@@ -361,6 +418,12 @@ static struct kunit_case ocsfs_lock_test_cases[] = {
 	KUNIT_CASE(test_dir_btree_build_at_threshold),
 	KUNIT_CASE(test_dir_btree_no_build_when_root_set),
 	KUNIT_CASE(test_dir_btree_build_above_threshold),
+	KUNIT_CASE(test_jbr_flags_are_distinct_bits),
+	KUNIT_CASE(test_jbr_before_only_detected),
+	KUNIT_CASE(test_jbr_after_only_detected),
+	KUNIT_CASE(test_jbr_zero_flags_stops_loop),
+	KUNIT_CASE(test_prealloc_blocks_minimum_is_positive),
+	KUNIT_CASE(test_prealloc_blocks_minimum_is_power_of_two),
 	{},
 };
 

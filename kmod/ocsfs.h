@@ -79,6 +79,7 @@
 #define OCSFS_INLINE_EXTENTS        16
 #define OCSFS_MAX_NAME_LEN          255
 #define OCSFS_DIR_BTREE_THRESHOLD   64u  /* entries before building dir index */
+#define OCSFS_MIN_PREALLOC_BLOCKS   8u   /* min blocks per iomap write alloc */
 #define OCSFS_DIRENT_SIZE           sizeof(struct ocsfs_disk_dirent)
 
 #define OCSFS_ROOT_INO              2

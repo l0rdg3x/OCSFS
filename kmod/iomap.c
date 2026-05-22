@@ -16,12 +16,7 @@
 #include "ocsfs.h"
 #include <linux/iomap.h>
 
-/*
- * Minimum blocks to pre-allocate per iomap_begin write call.
- * Reduces per-txn overhead for VM workloads with many small writes.
- * Staged fallback: prealloc → write size → single block.
- */
-#define OCSFS_MIN_PREALLOC_BLOCKS  8
+/* OCSFS_MIN_PREALLOC_BLOCKS defined in ocsfs.h */
 
 /* ═══════════════════════════════════════════════════════════════
  * IOMAP BEGIN / END CALLBACKS
