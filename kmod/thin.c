@@ -205,18 +205,31 @@ int ocsfs_zero_range(struct inode *inode, loff_t offset, loff_t len)
 long ocsfs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 {
 	struct inode *inode = file_inode(file);
+	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
+	struct ocsfs_inode_info *oi = OCSFS_I(inode);
 	int ret = 0;
 
-	/* Check for unsupported mode combinations */
 	if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE |
 		     FALLOC_FL_ZERO_RANGE))
 		return -EOPNOTSUPP;
 
-	/* PUNCH_HOLE requires KEEP_SIZE */
 	if ((mode & FALLOC_FL_PUNCH_HOLE) && !(mode & FALLOC_FL_KEEP_SIZE))
 		return -EOPNOTSUPP;
 
 	inode_lock(inode);
+
+	/*
+	 * All three operations (punch_hole, zero_range, prealloc) modify the
+	 * inode's extent map. In clustered mode, hold DLM EX across the entire
+	 * operation and flush before releasing so other nodes see a coherent
+	 * extent map immediately after we release EX.
+	 */
+	if (sbi->s_clustered) {
+		ret = ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
+					 OCSFS_LOCK_EX);
+		if (ret)
+			goto out_inode_unlock;
+	}
 
 	if (mode & FALLOC_FL_PUNCH_HOLE) {
 		ret = ocsfs_punch_hole(inode, offset, len);
@@ -227,8 +240,6 @@ long ocsfs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 		ret = ocsfs_zero_range(inode, offset, len);
 		if (ret)
 			goto out;
-
-		/* Extend file if not KEEP_SIZE and range goes past EOF */
 		if (!(mode & FALLOC_FL_KEEP_SIZE) &&
 		    offset + len > inode->i_size) {
 			i_size_write(inode, offset + len);
@@ -237,12 +248,10 @@ long ocsfs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 		goto out;
 	}
 
-	/* Default: preallocate blocks */
 	ret = ocsfs_prealloc_blocks(inode, offset, len);
 	if (ret)
 		goto out;
 
-	/* Update file size unless KEEP_SIZE */
 	if (!(mode & FALLOC_FL_KEEP_SIZE) && offset + len > inode->i_size) {
 		i_size_write(inode, offset + len);
 		mark_inode_dirty(inode);
@@ -252,6 +261,17 @@ long ocsfs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 	mark_inode_dirty(inode);
 
 out:
+	if (sbi->s_clustered) {
+		if (ret == 0) {
+			int fr = ocsfs_flush_inode_locked(inode, true);
+
+			if (fr)
+				pr_warn_ratelimited(
+					"ocsfs: fallocate inode flush failed (%d)\n", fr);
+		}
+		ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
+	}
+out_inode_unlock:
 	inode_unlock(inode);
 	return ret;
 }
