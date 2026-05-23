@@ -293,6 +293,14 @@ int ocsfs_lock_recover_node(struct super_block *sb, u16 node_slot,
 			recovered++;
 		}
 
+		if (!modified) {
+			u32 wbyte = node_slot / 8;
+			u8  wbit  = 1u << (node_slot % 8);
+
+			if (wbyte < sizeof(dl.le_waiters) &&
+			    (dl.le_waiters[wbyte] & wbit))
+				modified = true;
+		}
 		clear_waiter_bit(&dl, node_slot);
 
 		if (modified) {
