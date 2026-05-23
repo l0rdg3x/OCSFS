@@ -34,8 +34,7 @@ static int ocsfs_ag_alloc_blocks(struct super_block *sb, u32 ag_no,
 	if (ag->free_blocks < count)
 		return -ENOSPC;
 
-	/* Cross-node serialisation: acquire EX on the AG before touching the
-	 * bitmap.  This prevents two nodes from allocating the same blocks. */
+	/* Cross-node: DLM EX on AG prevents two nodes allocating same blocks. */
 	if (sbi->s_clustered) {
 		ret = ocsfs_lock_acquire(sb, &ag->ag_lock_res, OCSFS_LOCK_EX);
 		if (ret)
@@ -215,11 +214,8 @@ int ocsfs_alloc_blocks_txn(struct ocsfs_txn *txn, struct super_block *sb,
  * BLOCK FREE
  * ═══════════════════════════════════════════════════════════════ */
 
-/*
- * Journalized free: logs before-images of bitmap blocks into @txn BEFORE
- * clearing bits, so crash recovery can restore them if the txn never commits.
- * Caller must have an open transaction; AG DLM EX + ag_lock are acquired here.
- */
+/* Journalized free: journals BEFORE-images so crash recovery can restore them.
+ * Caller must have an open txn; acquires AG DLM EX + ag_lock internally. */
 int ocsfs_free_blocks_txn(struct ocsfs_txn *txn, u64 block, u32 count)
 {
 	struct ocsfs_journal *j = txn->t_journal;
@@ -334,8 +330,12 @@ int ocsfs_alloc_inode_num(struct super_block *sb, u32 ag_hint, u64 *ino_out)
 		if (ag->free_inodes == 0)
 			continue;
 
-		if (sbi->s_clustered)
-			ocsfs_lock_acquire(sb, &ag->ag_lock_res, OCSFS_LOCK_EX);
+		if (sbi->s_clustered) {
+			int lret = ocsfs_lock_acquire(sb, &ag->ag_lock_res,
+						      OCSFS_LOCK_EX);
+			if (lret)
+				continue; /* can't lock this AG — try next */
+		}
 
 		mutex_lock(&ag->ag_lock);
 
@@ -417,8 +417,13 @@ void ocsfs_free_inode_num(struct super_block *sb, u64 ino)
 
 	ag = &sbi->s_ags[ag_no];
 
-	if (sbi->s_clustered)
-		ocsfs_lock_acquire(sb, &ag->ag_lock_res, OCSFS_LOCK_EX);
+	if (sbi->s_clustered &&
+	    ocsfs_lock_acquire(sb, &ag->ag_lock_res, OCSFS_LOCK_EX)) {
+		pr_warn_ratelimited("ocsfs: free_inode_num %llu: DLM EX failed\n",
+				    ino);
+		ocsfs_txn_abort(txn);
+		return;
+	}
 
 	mutex_lock(&ag->ag_lock);
 

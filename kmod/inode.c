@@ -45,7 +45,9 @@ static void ocsfs_inode_invalidate_cache(struct super_block *sb, u64 ino)
 	if (!bh)
 		return;
 	clear_buffer_uptodate(bh);
-	bh_read(bh, 0);   /* re-read from block device */
+	if (bh_read(bh, 0) < 0)
+		pr_warn_ratelimited("ocsfs: inode cache invalidate I/O error "
+				    "for ino %llu\n", ino);
 	brelse(bh);
 }
 
@@ -144,7 +146,7 @@ struct inode *ocsfs_iget(struct super_block *sb, u64 ino)
 	if (S_ISREG(inode->i_mode)) {
 		inode->i_op = &ocsfs_file_inode_ops;
 		inode->i_fop = &ocsfs_file_fops;
-		inode->i_mapping->a_ops = &ocsfs_aops;
+		inode->i_mapping->a_ops = &ocsfs_iomap_aops;
 	} else if (S_ISDIR(inode->i_mode)) {
 		inode->i_op = &ocsfs_dir_inode_ops;
 		inode->i_fop = &ocsfs_dir_fops;
@@ -157,11 +159,7 @@ struct inode *ocsfs_iget(struct super_block *sb, u64 ino)
 				   inode->i_rdev);
 	}
 
-	/*
-	 * Release SH only after all VFS fields are published.
-	 * unlock_new_inode clears I_NEW so other waiters can proceed;
-	 * releasing the DLM just before that keeps the window minimal.
-	 */
+	/* Release SH after all VFS fields are set; window to unlock_new_inode. */
 	if (sbi->s_clustered)
 		ocsfs_lock_release(sb, &oi->i_lock_res);
 
@@ -399,7 +397,7 @@ struct inode *ocsfs_new_inode(struct inode *dir, umode_t mode)
 	if (S_ISREG(mode)) {
 		inode->i_op = &ocsfs_file_inode_ops;
 		inode->i_fop = &ocsfs_file_fops;
-		inode->i_mapping->a_ops = &ocsfs_aops;
+		inode->i_mapping->a_ops = &ocsfs_iomap_aops;
 	} else if (S_ISDIR(mode)) {
 		inode->i_op = &ocsfs_dir_inode_ops;
 		inode->i_fop = &ocsfs_dir_fops;
