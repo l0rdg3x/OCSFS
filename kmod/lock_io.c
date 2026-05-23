@@ -21,9 +21,19 @@ int lock_read_entry(struct super_block *sb, u32 slot,
 	u32 boff  = off % sbi->s_block_size;
 	struct buffer_head *bh;
 
-	bh = sb_bread(sb, block);
+	/*
+	 * Force a fresh read from the block device — the page cache can hold
+	 * stale data written by a remote cluster node.  This matches the
+	 * pattern used by the software CAS path in lock_write_entry().
+	 */
+	bh = sb_getblk(sb, block);
 	if (!bh)
 		return -EIO;
+	clear_buffer_uptodate(bh);
+	if (bh_read(bh, 0) < 0) {
+		brelse(bh);
+		return -EIO;
+	}
 
 	memcpy(out, bh->b_data + boff, sizeof(*out));
 
