@@ -158,7 +158,21 @@ struct inode *ocsfs_iget(struct super_block *sb, u64 ino)
 		inode->i_fop = &ocsfs_dir_fops;
 		inode->i_mapping->a_ops = &ocsfs_aops;
 	} else if (S_ISLNK(inode->i_mode)) {
-		inode->i_op = &ocsfs_special_inode_ops;
+		size_t slen = inode->i_size;
+
+		oi->i_symlink = NULL;
+		if (slen > 0 && slen <= OCSFS_MAX_INLINE_SYMLINK) {
+			oi->i_symlink = kmalloc(slen + 1, GFP_KERNEL);
+			if (!oi->i_symlink) {
+				if (sbi->s_clustered)
+					ocsfs_lock_release(sb, &oi->i_lock_res);
+				iget_failed(inode);
+				return ERR_PTR(-ENOMEM);
+			}
+			memcpy(oi->i_symlink, di.i_inline_extents, slen);
+			oi->i_symlink[slen] = '\0';
+		}
+		inode->i_op = &ocsfs_symlink_inode_ops;
 	} else {
 		inode->i_op = &ocsfs_special_inode_ops;
 		init_special_inode(inode, inode->i_mode,
@@ -280,15 +294,21 @@ int ocsfs_flush_inode_locked(struct inode *inode, bool force_sync)
 	di->i_dir_btree_root   = cpu_to_le64(oi->i_dir_btree_root);
 	di->i_dirent_count     = cpu_to_le32(oi->i_dirent_count);
 
-	for (i = 0; i < oi->i_extent_count && i < OCSFS_INLINE_EXTENTS; i++) {
-		struct ocsfs_disk_extent *de =
-			(struct ocsfs_disk_extent *)
-			(di->i_inline_extents + i * sizeof(*de));
-		de->e_logical_block  = cpu_to_le64(oi->i_extents[i].logical_block);
-		de->e_physical_block = cpu_to_le64(oi->i_extents[i].physical_block);
-		de->e_length         = cpu_to_le32(oi->i_extents[i].length);
-		de->e_flags          = cpu_to_le16(oi->i_extents[i].flags);
-		de->e_checksum       = 0;
+	if (S_ISLNK(inode->i_mode) && oi->i_symlink) {
+		size_t slen = min_t(size_t, inode->i_size, OCSFS_MAX_INLINE_SYMLINK);
+
+		memcpy(di->i_inline_extents, oi->i_symlink, slen);
+	} else {
+		for (i = 0; i < oi->i_extent_count && i < OCSFS_INLINE_EXTENTS; i++) {
+			struct ocsfs_disk_extent *de =
+				(struct ocsfs_disk_extent *)
+				(di->i_inline_extents + i * sizeof(*de));
+			de->e_logical_block  = cpu_to_le64(oi->i_extents[i].logical_block);
+			de->e_physical_block = cpu_to_le64(oi->i_extents[i].physical_block);
+			de->e_length         = cpu_to_le32(oi->i_extents[i].length);
+			de->e_flags          = cpu_to_le16(oi->i_extents[i].flags);
+			de->e_checksum       = 0;
+		}
 	}
 
 	di->i_checksum = cpu_to_le32(
@@ -359,6 +379,9 @@ void ocsfs_evict_inode(struct inode *inode)
 		   oi->i_lock_res.lr_mode != OCSFS_LOCK_NL) {
 		ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
 	}
+
+	kfree(oi->i_symlink);
+	oi->i_symlink = NULL;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -517,6 +540,22 @@ const struct inode_operations ocsfs_file_inode_ops = {
 };
 
 const struct inode_operations ocsfs_special_inode_ops = {
+	.setattr        = ocsfs_setattr,
+	.getattr        = ocsfs_getattr,
+};
+
+static const char *ocsfs_get_link(struct dentry *dentry, struct inode *inode,
+				   struct delayed_call *done)
+{
+	struct ocsfs_inode_info *oi = OCSFS_I(inode);
+
+	if (!oi->i_symlink)
+		return ERR_PTR(-ENOLINK);
+	return oi->i_symlink;
+}
+
+const struct inode_operations ocsfs_symlink_inode_ops = {
+	.get_link       = ocsfs_get_link,
 	.setattr        = ocsfs_setattr,
 	.getattr        = ocsfs_getattr,
 };

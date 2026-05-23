@@ -472,6 +472,54 @@ fail:
 }
 
 /* ═══════════════════════════════════════════════════════════════
+ * VFS SYMLINK
+ * ═══════════════════════════════════════════════════════════════ */
+
+static int ocsfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
+			 struct dentry *dentry, const char *symname)
+{
+	struct inode *inode;
+	struct ocsfs_inode_info *oi;
+	size_t slen = strlen(symname);
+	int ret;
+
+	if (slen > OCSFS_MAX_INLINE_SYMLINK)
+		return -ENAMETOOLONG;
+
+	inode = ocsfs_new_inode(dir, S_IFLNK | S_IRWXUGO);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
+
+	oi = OCSFS_I(inode);
+
+	oi->i_symlink = kmalloc(slen + 1, GFP_KERNEL);
+	if (!oi->i_symlink) {
+		inode_dec_link_count(inode);
+		discard_new_inode(inode);
+		return -ENOMEM;
+	}
+	memcpy(oi->i_symlink, symname, slen + 1);
+	inode->i_size = slen;
+	inode->i_op = &ocsfs_symlink_inode_ops;
+
+	ret = ocsfs_add_dirent(dir, &dentry->d_name,
+			       oi->i_disk_ino,
+			       ocsfs_mode_to_ft(inode->i_mode));
+	if (ret) {
+		kfree(oi->i_symlink);
+		oi->i_symlink = NULL;
+		inode_dec_link_count(inode);
+		discard_new_inode(inode);
+		return ret;
+	}
+
+	oi->i_flags &= ~OCSFS_IFLAG_ORPHAN;
+	mark_inode_dirty(inode);
+	d_instantiate(dentry, inode);
+	return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════
  * OPERATIONS TABLES
  * ═══════════════════════════════════════════════════════════════ */
 
@@ -482,6 +530,7 @@ const struct inode_operations ocsfs_dir_inode_ops = {
 	.rmdir          = ocsfs_rmdir,
 	.unlink         = ocsfs_unlink,
 	.rename         = ocsfs_rename,
+	.symlink        = ocsfs_symlink,
 	.setattr        = ocsfs_setattr,
 	.getattr        = ocsfs_getattr,
 };

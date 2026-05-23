@@ -530,6 +530,12 @@ struct ocsfs_sb_info {
 	size_t          s_decompress_wksp_sz;
 };
 
+/*
+ * Maximum symlink target length that fits inline in the disk inode's
+ * i_inline_extents area (OCSFS_INLINE_EXTENTS * 24 bytes - 1 for NUL).
+ */
+#define OCSFS_MAX_INLINE_SYMLINK  (OCSFS_INLINE_EXTENTS * 24 - 1)
+
 /* Per-inode in-memory info — wraps struct inode */
 struct ocsfs_inode_info {
 	u64                     i_disk_ino;     /* on-disk inode number */
@@ -543,6 +549,8 @@ struct ocsfs_inode_info {
 	/* directory B+ tree index */
 	u64                     i_dir_btree_root; /* 0 = flat-list dir */
 	u32                     i_dirent_count;   /* live entry count */
+	/* symlink target (NULL unless S_ISLNK; freed on evict) */
+	char                   *i_symlink;
 	struct inode            vfs_inode;      /* must be last */
 };
 
@@ -636,6 +644,7 @@ int ocsfs_sync_fs(struct super_block *sb, int wait);
 /* inode.c */
 extern const struct inode_operations ocsfs_file_inode_ops;
 extern const struct inode_operations ocsfs_special_inode_ops;
+extern const struct inode_operations ocsfs_symlink_inode_ops;
 struct inode *ocsfs_iget(struct super_block *sb, u64 ino);
 int ocsfs_flush_inode_locked(struct inode *inode, bool force_sync);
 int ocsfs_inode_refresh(struct inode *inode);

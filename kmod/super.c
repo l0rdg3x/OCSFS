@@ -36,6 +36,7 @@ static struct inode *ocsfs_alloc_inode(struct super_block *sb)
 	oi->i_flags = 0;
 	oi->i_ag = 0;
 	oi->i_disk_ino = 0;
+	oi->i_symlink = NULL;
 
 	return &oi->vfs_inode;
 }
