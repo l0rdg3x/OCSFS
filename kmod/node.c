@@ -195,6 +195,19 @@ int ocsfs_node_claim_slot(struct super_block *sb)
 			goto claim;
 	}
 
+	/*
+	 * Third: reclaim any DEAD slot whose node has already been fully
+	 * recovered (journal replayed, locks released, slot marked DEAD).
+	 * Without this, UUID rotation on each mount causes DEAD slots to
+	 * accumulate — each crash cycle consumes one slot permanently,
+	 * leading to slot exhaustion after max_nodes crash cycles.
+	 */
+	for (i = 0; i < sbi->s_max_nodes; i++) {
+		ni = &sbi->s_nodes[i];
+		if (ni->ni_state == OCSFS_NODE_DEAD)
+			goto claim;
+	}
+
 	spin_unlock(&sbi->s_node_lock);
 	pr_err("ocsfs: no free node slots (max=%u)\n", sbi->s_max_nodes);
 	return -ENOSPC;
