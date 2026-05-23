@@ -242,7 +242,11 @@ ssize_t ocsfs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 					 OCSFS_LOCK_SH);
 		if (ret)
 			return ret;
-		ocsfs_inode_refresh(inode);
+		ret = ocsfs_inode_refresh(inode);
+		if (ret) {
+			ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
+			return ret;
+		}
 		invalidate_inode_pages2(inode->i_mapping);
 	}
 
