@@ -317,25 +317,24 @@ void ocsfs_evict_inode(struct inode *inode)
 
 	/* If nlink dropped to 0, free on-disk resources */
 	if (!inode->i_nlink && oi->i_disk_ino >= OCSFS_FIRST_USER_INO) {
-		/*
-		 * Need EX to free the inode on disk.  Acquire regardless of
-		 * whatever mode (if any) we may still hold; ocsfs_lock_acquire
-		 * is safe to call when lr_mode == NL.
-		 */
-		if (sbi->s_clustered)
-			ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
-					   OCSFS_LOCK_EX);
-
-		mutex_lock(&oi->i_extent_lock);
-		ocsfs_extent_truncate(inode, 0);
-		mutex_unlock(&oi->i_extent_lock);
-		ocsfs_free_inode_num(inode->i_sb, oi->i_disk_ino);
+		int lr = 0;
 
 		if (sbi->s_clustered)
-			ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
+			lr = ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
+						OCSFS_LOCK_EX);
+		if (lr) {
+			pr_err_ratelimited("ocsfs: evict: DLM EX failed (%d), ino %llu leaked\n",
+					   lr, oi->i_disk_ino);
+		} else {
+			mutex_lock(&oi->i_extent_lock);
+			ocsfs_extent_truncate(inode, 0);
+			mutex_unlock(&oi->i_extent_lock);
+			ocsfs_free_inode_num(inode->i_sb, oi->i_disk_ino);
+			if (sbi->s_clustered)
+				ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
+		}
 	} else if (sbi->s_clustered &&
 		   oi->i_lock_res.lr_mode != OCSFS_LOCK_NL) {
-		/* Release any lock left over from an error path in iget. */
 		ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
 	}
 }
@@ -445,9 +444,13 @@ int ocsfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 				OCSFS_SB(inode->i_sb)->s_block_size - 1) /
 				OCSFS_SB(inode->i_sb)->s_block_size;
 
-			if (sbi->s_clustered)
-				ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
-						   OCSFS_LOCK_EX);
+			if (sbi->s_clustered) {
+				ret = ocsfs_lock_acquire(inode->i_sb,
+							 &oi->i_lock_res,
+							 OCSFS_LOCK_EX);
+				if (ret)
+					return ret;
+			}
 			mutex_lock(&oi->i_extent_lock);
 			ocsfs_extent_truncate(inode, from_block);
 			mutex_unlock(&oi->i_extent_lock);
