@@ -387,6 +387,7 @@ int ocsfs_cow_extent(struct inode *inode, u64 logical, u32 len)
 	} else {
 		/* Partial CoW — split the existing inline extent */
 		u16 j;
+		u16 saved_count = oi->i_extent_count;
 
 		for (j = 0; j < oi->i_extent_count; j++) {
 			struct ocsfs_extent *e = &oi->i_extents[j];
@@ -398,25 +399,46 @@ int ocsfs_cow_extent(struct inode *inode, u64 logical, u32 len)
 					u32 tail_start = (u32)(offset_in_ext + len);
 
 					e->length = head_len;
-					ocsfs_extent_insert(inode, logical,
-							    new_phys, len,
-							    OCSFS_EXT_WRITTEN);
-					if (tail_start < ext.length)
-						ocsfs_extent_insert(inode,
+					ret = ocsfs_extent_insert(inode, logical,
+								  new_phys, len,
+								  OCSFS_EXT_WRITTEN);
+					if (ret) {
+						e->length = ext.length;
+						oi->i_extent_count = saved_count;
+						ocsfs_free_blocks(sb, new_phys, len);
+						return ret;
+					}
+					if (tail_start < ext.length) {
+						ret = ocsfs_extent_insert(inode,
 							ext.logical_block + tail_start,
 							ext.physical_block + tail_start,
 							ext.length - tail_start,
 							ext.flags);
+						if (ret) {
+							e->length = ext.length;
+							oi->i_extent_count = saved_count;
+							ocsfs_free_blocks(sb, new_phys, len);
+							return ret;
+						}
+					}
 				} else {
 					u32 remaining = ext.length - len;
 
 					e->physical_block = new_phys;
 					e->length = len;
-					if (remaining > 0)
-						ocsfs_extent_insert(inode,
+					if (remaining > 0) {
+						ret = ocsfs_extent_insert(inode,
 							logical + len,
 							ext.physical_block + len,
 							remaining, ext.flags);
+						if (ret) {
+							e->physical_block = ext.physical_block;
+							e->length         = ext.length;
+							oi->i_extent_count = saved_count;
+							ocsfs_free_blocks(sb, new_phys, len);
+							return ret;
+						}
+					}
 				}
 				break;
 			}

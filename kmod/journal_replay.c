@@ -330,11 +330,13 @@ int ocsfs_journal_replay_node(struct super_block *sb, u16 node_slot)
 
 	ret = journal_replay_j(sb, &tmp_j);
 
-	jh->jh_head     = jh->jh_tail;
-	jh->jh_checksum = cpu_to_le32(
-		ocsfs_crc32c(~0U, jh, sizeof(*jh) - sizeof(__le32)));
-	mark_buffer_dirty(bh);
-	sync_dirty_buffer(bh);
+	if (!ret) {
+		jh->jh_head     = jh->jh_tail;
+		jh->jh_checksum = cpu_to_le32(
+			ocsfs_crc32c(~0U, jh, sizeof(*jh) - sizeof(__le32)));
+		mark_buffer_dirty(bh);
+		sync_dirty_buffer(bh);
+	}
 	brelse(bh);
 
 	return ret;
