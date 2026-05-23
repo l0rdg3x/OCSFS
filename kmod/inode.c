@@ -6,6 +6,7 @@
  * Phase 1: single-node, inline extents only.
  */
 
+#include <linux/security.h>
 #include "ocsfs.h"
 
 /* ═══════════════════════════════════════════════════════════════
@@ -485,6 +486,10 @@ int ocsfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	int ret;
 
 	ret = setattr_prepare(idmap, dentry, attr);
+	if (ret)
+		return ret;
+
+	ret = security_inode_setattr(idmap, dentry, attr);
 	if (ret)
 		return ret;
 
