@@ -317,11 +317,35 @@ int ocsfs_discard_blocks(struct super_block *sb, u64 block, u32 count)
  * block counts for an inode.
  * ═══════════════════════════════════════════════════════════════ */
 
+struct thin_stats_ctx { u64 written; u64 unwritten; };
+
+static int thin_stats_iter(u64 logical, u64 physical, u32 length,
+			   u16 flags, void *ctx)
+{
+	struct thin_stats_ctx *ts = ctx;
+
+	(void)logical; (void)physical;
+	if (flags & OCSFS_EXT_UNWRITTEN)
+		ts->unwritten += length;
+	else
+		ts->written += length;
+	return 0;
+}
+
 void ocsfs_thin_stats(struct inode *inode, u64 *written, u64 *unwritten)
 {
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
 	u64 w = 0, u = 0;
 	u16 i;
+
+	if (oi->i_extent_tree_root) {
+		struct thin_stats_ctx ts = {};
+
+		ocsfs_extent_btree_iterate(inode, thin_stats_iter, &ts);
+		*written   = ts.written;
+		*unwritten = ts.unwritten;
+		return;
+	}
 
 	mutex_lock(&oi->i_extent_lock);
 
