@@ -4,7 +4,33 @@
  * VFS rename, readdir, unlink, rmdir and directory operations tables.
  */
 
+#include <linux/security.h>
 #include "ocsfs.h"
+
+/* ═══════════════════════════════════════════════════════════════
+ * LSM SECURITY LABEL INITIALISATION
+ *
+ * Called by security_inode_init_security() to set the initial xattrs
+ * chosen by the active LSM (SELinux, Smack, etc.) on a newly created
+ * inode.  The inode is not yet visible in the directory at this point.
+ * ═══════════════════════════════════════════════════════════════ */
+
+static int ocsfs_initxattrs(struct inode *inode,
+			     const struct xattr *xattr_array, void *fs_data)
+{
+	const struct xattr *xattr;
+	int ret = 0;
+
+	for (xattr = xattr_array; xattr->name != NULL; xattr++) {
+		ret = ocsfs_xattr_set_internal(inode, OCSFS_XATTR_NS_SECURITY,
+					       xattr->name,
+					       xattr->value, xattr->value_len,
+					       0);
+		if (ret < 0)
+			break;
+	}
+	return ret;
+}
 
 /* ═══════════════════════════════════════════════════════════════
  * VFS UNLINK
@@ -420,18 +446,26 @@ int ocsfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	if (IS_ERR(inode))
 		return PTR_ERR(inode);
 
+	ret = security_inode_init_security(inode, dir, &dentry->d_name,
+					   ocsfs_initxattrs, NULL);
+	if (ret && ret != -EOPNOTSUPP)
+		goto fail;
+
 	ret = ocsfs_add_dirent(dir, &dentry->d_name,
 			       OCSFS_I(inode)->i_disk_ino,
 			       ocsfs_mode_to_ft(mode));
-	if (ret) {
-		inode_dec_link_count(inode);
-		discard_new_inode(inode);
-		return ret;
-	}
+	if (ret)
+		goto fail;
+
 	OCSFS_I(inode)->i_flags &= ~OCSFS_IFLAG_ORPHAN;
 	mark_inode_dirty(inode);
 	d_instantiate(dentry, inode);
 	return 0;
+
+fail:
+	inode_dec_link_count(inode);
+	discard_new_inode(inode);
+	return ret;
 }
 
 struct dentry *ocsfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
@@ -443,6 +477,11 @@ struct dentry *ocsfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	inode = ocsfs_new_inode(dir, S_IFDIR | mode);
 	if (IS_ERR(inode))
 		return ERR_CAST(inode);
+
+	ret = security_inode_init_security(inode, dir, &dentry->d_name,
+					   ocsfs_initxattrs, NULL);
+	if (ret && ret != -EOPNOTSUPP)
+		goto fail;
 
 	ret = ocsfs_add_dirent(inode, &(struct qstr)QSTR_INIT(".", 1),
 			       OCSFS_I(inode)->i_disk_ino, OCSFS_FT_DIR);
@@ -502,10 +541,16 @@ static int ocsfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	inode->i_size = slen;
 	inode->i_op = &ocsfs_symlink_inode_ops;
 
+	ret = security_inode_init_security(inode, dir, &dentry->d_name,
+					   ocsfs_initxattrs, NULL);
+	if (ret && ret != -EOPNOTSUPP)
+		goto symlink_fail;
+
 	ret = ocsfs_add_dirent(dir, &dentry->d_name,
 			       oi->i_disk_ino,
 			       ocsfs_mode_to_ft(inode->i_mode));
 	if (ret) {
+symlink_fail:
 		kfree(oi->i_symlink);
 		oi->i_symlink = NULL;
 		inode_dec_link_count(inode);
