@@ -53,9 +53,18 @@ int ocsfs_heartbeat_write(struct super_block *sb)
 	u64 block = off / sbi->s_block_size;
 	u32 boff = off % sbi->s_block_size;
 
-	bh = sb_bread(sb, block);
+	/*
+	 * Use a bounded read so a hung FC path cannot stall the heartbeat
+	 * thread indefinitely during the initial block fetch.
+	 */
+	bh = sb_getblk(sb, block);
 	if (!bh)
 		return -EIO;
+	ret = heartbeat_read_timeout(bh);
+	if (ret) {
+		brelse(bh);
+		return ret;
+	}
 
 	dhb = (struct ocsfs_disk_heartbeat *)(bh->b_data + boff);
 
