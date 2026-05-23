@@ -412,6 +412,18 @@ int ocsfs_set_compression(struct inode *inode, u8 algo)
  * @disk_size:   actual on-disk blocks (compressed)
  * @logical_size: logical blocks (uncompressed)
  */
+struct compress_stats_ctx { u64 disk; };
+
+static int compress_stats_iter(u64 logical, u64 physical, u32 length,
+				u16 flags, void *ctx)
+{
+	struct compress_stats_ctx *cs = ctx;
+
+	(void)logical; (void)physical; (void)flags;
+	cs->disk += length;
+	return 0;
+}
+
 void ocsfs_compress_stats(struct inode *inode, u64 *disk_size,
 			  u64 *logical_size)
 {
@@ -419,6 +431,21 @@ void ocsfs_compress_stats(struct inode *inode, u64 *disk_size,
 	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
 	u64 disk = 0, logical = 0;
 	u16 i;
+
+	/*
+	 * For btree-backed inodes, the inline i_extents[] is empty.
+	 * Use the iterate API for the physical (disk) sum; the total logical
+	 * blocks equal ceil(i_size / block_size) regardless of compression.
+	 */
+	if (oi->i_extent_tree_root) {
+		struct compress_stats_ctx cs = {};
+
+		ocsfs_extent_btree_iterate(inode, compress_stats_iter, &cs);
+		*disk_size    = cs.disk;
+		*logical_size = (i_size_read(inode) + sbi->s_block_size - 1) /
+				sbi->s_block_size;
+		return;
+	}
 
 	mutex_lock(&oi->i_extent_lock);
 
