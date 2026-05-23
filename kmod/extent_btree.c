@@ -124,19 +124,13 @@ int ocsfs_extent_btree_lookup(struct inode *inode, u64 logical,
 	struct ocsfs_btree bt;
 	struct ext_btree_ctx ec;
 	u64 key, val;
-	int ret;
+	int ret = ext_btree_open(inode, &bt, &ec);
 
-	ret = ext_btree_open(inode, &bt, &ec);
 	if (ret)
 		return ret;
-
 	ret = ocsfs_btree_search_le(&bt, logical, &key, &val);
-	if (ret)
+	if (ret || logical >= key + ext_len(val))
 		return -ENOENT;
-
-	if (logical >= key + ext_len(val))
-		return -ENOENT;  /* hole */
-
 	out->logical_block  = key;
 	out->physical_block = ext_phys(val);
 	out->length         = ext_len(val);
@@ -151,19 +145,15 @@ int ocsfs_extent_btree_insert(struct inode *inode, u64 logical, u64 physical,
 	struct ocsfs_txn *txn;
 	struct ocsfs_btree bt;
 	struct ext_btree_ctx ec;
-	int ret;
+	int ret = ext_btree_open(inode, &bt, &ec);
 
-	ret = ext_btree_open(inode, &bt, &ec);
 	if (ret)
 		return ret;
-
 	txn = ocsfs_txn_begin(inode->i_sb);
 	if (IS_ERR(txn))
 		return PTR_ERR(txn);
 	ec.txn = txn;
-
-	ret = ocsfs_btree_insert(&bt, logical,
-				 ext_encode(physical, len, flags));
+	ret = ocsfs_btree_insert(&bt, logical, ext_encode(physical, len, flags));
 	oi->i_extent_tree_root = bt.root_block;
 	if (ret) {
 		ocsfs_txn_abort(txn);
@@ -451,13 +441,11 @@ int ocsfs_extent_btree_clear(struct inode *inode)
 	struct ocsfs_btree bt;
 	struct ext_btree_ctx ec;
 	struct ext_trunc_ctx tc;
+	int ret = ext_btree_open(inode, &bt, &ec);
 	u32 i;
-	int ret;
 
-	ret = ext_btree_open(inode, &bt, &ec);
 	if (ret)
 		return ret;
-
 	do {
 		tc.count = 0;
 		ocsfs_btree_range_scan(&bt, 0, U64_MAX, ext_trunc_collect, &tc);
@@ -466,33 +454,46 @@ int ocsfs_extent_btree_clear(struct inode *inode)
 			oi->i_extent_tree_root = bt.root_block;
 		}
 	} while (tc.count > 0);
-
 	oi->i_extent_tree_root = 0;
 	mark_inode_dirty(inode);
 	return 0;
 }
 
-/* ── count total blocks ── */
+/* ── iterate / count ── */
 
-static int ext_count_cb(u64 key, u64 val, void *ctx)
+struct ext_iter_state { ocsfs_extent_iter_fn fn; void *ctx; };
+
+static int ext_iter_wrap(u64 k, u64 v, void *c)
 {
-	u64 *total = ctx;
+	struct ext_iter_state *s = c;
+	return s->fn(k, ext_phys(v), ext_len(v), ext_flags(v), s->ctx);
+}
 
-	(void)key;
-	*total += ext_len(val);
+int ocsfs_extent_btree_iterate(struct inode *inode,
+			       ocsfs_extent_iter_fn fn, void *ctx)
+{
+	struct ext_iter_state s = { fn, ctx };
+	struct ocsfs_btree bt;
+	struct ext_btree_ctx ec;
+	int ret = ext_btree_open(inode, &bt, &ec);
+
+	if (ret)
+		return ret;
+	ocsfs_btree_range_scan(&bt, 0, U64_MAX, ext_iter_wrap, &s);
 	return 0;
 }
+
+static int ext_count_cb(u64 key, u64 val, void *ctx)
+	{ (void)key; *(u64 *)ctx += ext_len(val); return 0; }
 
 int ocsfs_extent_btree_count(struct inode *inode, u64 *count)
 {
 	struct ocsfs_btree bt;
 	struct ext_btree_ctx ec;
-	int ret;
+	int ret = ext_btree_open(inode, &bt, &ec);
 
-	ret = ext_btree_open(inode, &bt, &ec);
 	if (ret)
 		return ret;
-
 	*count = 0;
 	ocsfs_btree_range_scan(&bt, 0, U64_MAX, ext_count_cb, count);
 	return 0;

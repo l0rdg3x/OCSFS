@@ -172,6 +172,34 @@ int ocsfs_snapshot_create(struct inode *src, struct inode *dir,
 	return 0;
 }
 
+/* Context for the B+ tree extent iterator used in snapshot_delete */
+struct snap_del_ctx {
+	struct super_block   *sb;
+	struct ocsfs_sb_info *sbi;
+	struct inode         *snap;
+};
+
+static int snap_del_cb(u64 logical, u64 physical, u32 length, u16 flags,
+		       void *ctx)
+{
+	struct snap_del_ctx *sc = ctx;
+	bool should_free = false;
+	int ret;
+
+	(void)logical;
+	if (!physical || (flags & OCSFS_EXT_UNWRITTEN))
+		return 0;
+	ret = ocsfs_refcount_dec(sc->sb, physical, length, &should_free);
+	if (ret)
+		pr_warn("ocsfs: snapshot_delete: refcount_dec failed block %llu\n",
+			physical);
+	if (should_free) {
+		ocsfs_free_blocks(sc->sb, physical, length);
+		sc->snap->i_blocks -= (u64)length * (sc->sbi->s_block_size / 512);
+	}
+	return 0;
+}
+
 /*
  * ocsfs_snapshot_delete() — Delete a snapshot, freeing unshared extents.
  *
@@ -195,16 +223,9 @@ int ocsfs_snapshot_delete(struct inode *snap)
 	mutex_lock(&oi->i_extent_lock);
 
 	if (oi->i_extent_tree_root) {
-		/*
-		 * B+ tree path: refcount and free managed inline loop is not
-		 * available here (ocsfs_extent_btree_iterate would require a
-		 * separate iterator API).  Clear the tree without freeing data
-		 * blocks — this is a known limitation; fsck can reclaim leaked
-		 * blocks.  TODO: implement full B+ tree snapshot delete.
-		 */
-		pr_warn_ratelimited(
-			"ocsfs: snapshot_delete: B+ tree not fully reclaimed "
-			"(blocks may leak until fsck)\n");
+		struct snap_del_ctx sc = { sb, sbi, snap };
+
+		ocsfs_extent_btree_iterate(snap, snap_del_cb, &sc);
 		ocsfs_extent_btree_clear(snap);
 	} else {
 		for (i = 0; i < oi->i_extent_count; i++) {
