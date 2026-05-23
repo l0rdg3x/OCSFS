@@ -184,20 +184,22 @@ int __ocsfs_add_dirent(struct inode *dir, const struct qstr *name,
 		if (ret)
 			goto out;
 
+		mutex_lock(&dir_oi->i_extent_lock);
 		ret = ocsfs_extent_insert(dir, dir_blocks, phys, 1,
 					  OCSFS_EXT_WRITTEN);
 		if (ret) {
+			mutex_unlock(&dir_oi->i_extent_lock);
 			ocsfs_free_blocks(dir->i_sb, phys, 1);
 			goto out;
 		}
-
 		dir->i_size += sbi->s_block_size;
+		mutex_unlock(&dir_oi->i_extent_lock);
 
 		bh = sb_bread(dir->i_sb, phys);
 		if (!bh) {
 			/* Roll back extent and size: block exists but is unreadable */
-			dir->i_size -= sbi->s_block_size;
 			mutex_lock(&dir_oi->i_extent_lock);
+			dir->i_size -= sbi->s_block_size;
 			ocsfs_extent_truncate(dir, dir_blocks);
 			mutex_unlock(&dir_oi->i_extent_lock);
 			ret = -EIO;
