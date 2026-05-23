@@ -135,6 +135,7 @@ static inline u64 ocsfs_btree_count(const struct ocsfs_btree *bt)
 /* internal — used by btree_mod.c */
 int  ocsfs_btree_find_leaf(struct ocsfs_btree *bt, u64 key, void *buf,
 			   u64 *path, int *path_len, int max_path);
+int  ocsfs_btree_verify_node(const struct ocsfs_btree *bt, const void *buf);
 void ocsfs_btree_node_update_csum(void *buf, u32 block_size);
 void ocsfs_btree_init_leaf(void *buf, u32 bsz, u64 block_num);
 void ocsfs_btree_init_internal(void *buf, u32 bsz, u64 block_num, u16 level);

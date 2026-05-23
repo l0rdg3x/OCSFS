@@ -14,7 +14,11 @@ static int write_node(struct ocsfs_btree *bt, u64 block, const void *buf)
 
 static int read_node(struct ocsfs_btree *bt, u64 block, void *buf)
 {
-	return bt->read_block(bt->io_ctx, block, buf, bt->block_size);
+	int ret = bt->read_block(bt->io_ctx, block, buf, bt->block_size);
+
+	if (ret < 0)
+		return ret;
+	return ocsfs_btree_verify_node(bt, buf);
 }
 
 static int alloc_node(struct ocsfs_btree *bt, u64 *out)

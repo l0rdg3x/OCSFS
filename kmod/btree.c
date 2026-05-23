@@ -15,7 +15,7 @@
  * Rejects corrupted or maliciously crafted blocks before any array access.
  * VULN-001/VULN-002: without this, bn_count > leaf_order causes heap OOB.
  */
-static int verify_node(const struct ocsfs_btree *bt, const void *buf)
+int ocsfs_btree_verify_node(const struct ocsfs_btree *bt, const void *buf)
 {
 	const struct ocsfs_btree_node_hdr *hdr = node_hdr((void *)buf);
 	u32 expected_magic, stored_csum, computed_csum;
@@ -81,7 +81,7 @@ static int read_node(struct ocsfs_btree *bt, u64 block, void *buf)
 
 	if (ret < 0)
 		return ret;
-	return verify_node(bt, buf);
+	return ocsfs_btree_verify_node(bt, buf);
 }
 
 static int write_node(struct ocsfs_btree *bt, u64 block, const void *buf)
