@@ -29,10 +29,27 @@ struct ext_btree_ctx {
 static int ext_btree_read(void *ctx, u64 block, void *buf, u32 size)
 {
 	struct ext_btree_ctx *ec = ctx;
-	struct buffer_head *bh   = sb_bread(ec->sb, block);
+	struct buffer_head *bh;
 
-	if (!bh)
-		return -EIO;
+	if (OCSFS_SB(ec->sb)->s_clustered) {
+		/*
+		 * In cluster mode the page cache is not coherent across nodes.
+		 * After another node takes EX, modifies, and flushes the btree
+		 * nodes, our next read must bypass our stale cached copy.
+		 */
+		bh = sb_getblk(ec->sb, block);
+		if (!bh)
+			return -EIO;
+		clear_buffer_uptodate(bh);
+		if (bh_read(bh, 0) < 0) {
+			brelse(bh);
+			return -EIO;
+		}
+	} else {
+		bh = sb_bread(ec->sb, block);
+		if (!bh)
+			return -EIO;
+	}
 	memcpy(buf, bh->b_data, size);
 	brelse(bh);
 	return 0;
@@ -44,10 +61,31 @@ static int ext_btree_write(void *ctx, u64 block, const void *buf, u32 size)
 	struct buffer_head *bh;
 	int ret = 0;
 
-	/* txn path needs sb_bread to capture the real BEFORE-image */
-	bh = ec->txn ? sb_bread(ec->sb, block) : sb_getblk(ec->sb, block);
-	if (!bh)
-		return -EIO;
+	/*
+	 * txn path: capture real BEFORE-image; in cluster mode force a fresh
+	 * read so the journal records the true on-disk state, not a stale
+	 * cached copy from before another node's modification.
+	 */
+	if (ec->txn) {
+		if (OCSFS_SB(ec->sb)->s_clustered) {
+			bh = sb_getblk(ec->sb, block);
+			if (!bh)
+				return -EIO;
+			clear_buffer_uptodate(bh);
+			if (bh_read(bh, 0) < 0) {
+				brelse(bh);
+				return -EIO;
+			}
+		} else {
+			bh = sb_bread(ec->sb, block);
+			if (!bh)
+				return -EIO;
+		}
+	} else {
+		bh = sb_getblk(ec->sb, block);
+		if (!bh)
+			return -EIO;
+	}
 
 	if (ec->txn) {
 		ret = ocsfs_txn_add_bh(ec->txn, bh);
