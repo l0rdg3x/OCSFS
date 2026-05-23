@@ -21,15 +21,35 @@
  */
 struct buffer_head *ocsfs_dir_bread(struct inode *dir, u64 logical_block)
 {
+	struct ocsfs_sb_info *sbi = OCSFS_SB(dir->i_sb);
 	struct ocsfs_extent ext;
+	u64 phys_block;
 	int ret;
 
 	ret = ocsfs_extent_lookup(dir, logical_block, &ext);
 	if (ret || ext.physical_block == 0)
 		return NULL;
 
-	return sb_bread(dir->i_sb, ext.physical_block +
-			(logical_block - ext.logical_block));
+	phys_block = ext.physical_block + (logical_block - ext.logical_block);
+
+	if (sbi->s_clustered) {
+		/*
+		 * In cluster mode, another node may have written to this
+		 * directory block since our cached copy was loaded.  Force a
+		 * fresh read so we see the latest entries.
+		 */
+		struct buffer_head *bh = sb_getblk(dir->i_sb, phys_block);
+
+		if (!bh)
+			return NULL;
+		clear_buffer_uptodate(bh);
+		if (bh_read(bh, 0) < 0) {
+			brelse(bh);
+			return NULL;
+		}
+		return bh;
+	}
+	return sb_bread(dir->i_sb, phys_block);
 }
 
 /*
@@ -115,6 +135,10 @@ u64 ocsfs_find_dirent(struct inode *dir, const struct qstr *name, u8 *ft_out)
 		if (ocsfs_lock_acquire(dir->i_sb, &dir_oi->i_lock_res,
 				       OCSFS_LOCK_SH))
 			return 0;
+		if (ocsfs_inode_refresh(dir)) {
+			ocsfs_lock_release(dir->i_sb, &dir_oi->i_lock_res);
+			return 0;
+		}
 	}
 
 	/* Fast path: B+ tree index for large directories */
@@ -424,6 +448,10 @@ int ocsfs_empty_dir(struct inode *dir)
 		if (ocsfs_lock_acquire(dir->i_sb, &dir_oi->i_lock_res,
 				       OCSFS_LOCK_SH))
 			return 0; /* conservative: lock failed → assume not empty */
+		if (ocsfs_inode_refresh(dir)) {
+			ocsfs_lock_release(dir->i_sb, &dir_oi->i_lock_res);
+			return 0;
+		}
 	}
 
 	ret = __ocsfs_empty_dir(dir);
