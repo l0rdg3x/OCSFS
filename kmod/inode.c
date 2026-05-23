@@ -224,10 +224,26 @@ int ocsfs_flush_inode_locked(struct inode *inode, bool force_sync)
 	block = off / sbi->s_block_size;
 	boff  = off % sbi->s_block_size;
 
-	bh = sb_bread(inode->i_sb, block);
-	if (!bh) {
-		ret = -EIO;
-		goto out_abort;
+	/*
+	 * In cluster mode force a fresh disk read so the journal captures the
+	 * true on-disk BEFORE-image.  The caller holds DLM EX, guaranteeing the
+	 * previous holder already flushed; our page cache may lag behind.
+	 */
+	if (sbi->s_clustered) {
+		bh = sb_getblk(inode->i_sb, block);
+		if (!bh) { ret = -EIO; goto out_abort; }
+		clear_buffer_uptodate(bh);
+		if (bh_read(bh, 0) < 0) {
+			brelse(bh);
+			ret = -EIO;
+			goto out_abort;
+		}
+	} else {
+		bh = sb_bread(inode->i_sb, block);
+		if (!bh) {
+			ret = -EIO;
+			goto out_abort;
+		}
 	}
 
 	ret = ocsfs_txn_add_bh(txn, bh);
