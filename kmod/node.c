@@ -27,40 +27,42 @@ int ocsfs_node_read_table(struct super_block *sb)
 
 	slots_per_block = sbi->s_block_size / sizeof(struct ocsfs_disk_node_slot);
 
-	spin_lock(&sbi->s_node_lock);
-
+	/*
+	 * sb_bread can sleep (I/O); must NOT hold s_node_lock across it.
+	 * Read each slot into a stack copy, then update in-memory state
+	 * under the lock in a separate step.
+	 */
 	for (i = 0; i < sbi->s_max_nodes; i++) {
-		struct ocsfs_disk_node_slot *dns;
-		struct ocsfs_node_info *ni = &sbi->s_nodes[i];
+		struct ocsfs_disk_node_slot dns;
+		struct ocsfs_disk_node_slot *pdns;
+		struct ocsfs_node_info *ni;
 		u64 off = table_off + (u64)i * sizeof(struct ocsfs_disk_node_slot);
 		u64 block = off / sbi->s_block_size;
 		u32 boff = off % sbi->s_block_size;
 
 		bh = sb_bread(sb, block);
-		if (!bh) {
-			spin_unlock(&sbi->s_node_lock);
+		if (!bh)
 			return -EIO;
-		}
-
-		dns = (struct ocsfs_disk_node_slot *)(bh->b_data + boff);
-
-		ni->ni_slot = i;
-		ni->ni_state = dns->ns_state;
-		ni->ni_mount_gen = le32_to_cpu(dns->ns_mount_gen);
-		ni->ni_pr_key = le64_to_cpu(dns->ns_pr_key);
-		ni->ni_last_hb = le64_to_cpu(dns->ns_last_heartbeat);
-		memcpy(ni->ni_uuid, dns->ns_uuid, 16);
-		memcpy(ni->ni_name, dns->ns_name, 64);
-
-		/* Verify cluster secret for active peer nodes */
-		if (ni->ni_state == OCSFS_NODE_ACTIVE &&
-		    ocsfs_node_verify_auth(sb, dns) < 0)
-			ni->ni_state = OCSFS_NODE_SUSPECTED;
-
+		pdns = (struct ocsfs_disk_node_slot *)(bh->b_data + boff);
+		memcpy(&dns, pdns, sizeof(dns));
 		brelse(bh);
+
+		spin_lock(&sbi->s_node_lock);
+		ni             = &sbi->s_nodes[i];
+		ni->ni_slot    = i;
+		ni->ni_state   = dns.ns_state;
+		ni->ni_mount_gen = le32_to_cpu(dns.ns_mount_gen);
+		ni->ni_pr_key  = le64_to_cpu(dns.ns_pr_key);
+		ni->ni_last_hb = le64_to_cpu(dns.ns_last_heartbeat);
+		memcpy(ni->ni_uuid, dns.ns_uuid, 16);
+		memcpy(ni->ni_name, dns.ns_name, 64);
+
+		if (ni->ni_state == OCSFS_NODE_ACTIVE &&
+		    ocsfs_node_verify_auth(sb, &dns) < 0)
+			ni->ni_state = OCSFS_NODE_SUSPECTED;
+		spin_unlock(&sbi->s_node_lock);
 	}
 
-	spin_unlock(&sbi->s_node_lock);
 	return 0;
 }
 

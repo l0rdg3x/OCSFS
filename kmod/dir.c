@@ -195,6 +195,11 @@ int __ocsfs_add_dirent(struct inode *dir, const struct qstr *name,
 
 		bh = sb_bread(dir->i_sb, phys);
 		if (!bh) {
+			/* Roll back extent and size: block exists but is unreadable */
+			dir->i_size -= sbi->s_block_size;
+			mutex_lock(&dir_oi->i_extent_lock);
+			ocsfs_extent_truncate(dir, dir_blocks);
+			mutex_unlock(&dir_oi->i_extent_lock);
 			ret = -EIO;
 			goto out;
 		}
@@ -413,9 +418,11 @@ int ocsfs_empty_dir(struct inode *dir)
 	struct ocsfs_inode_info *dir_oi = OCSFS_I(dir);
 	int ret;
 
-	if (sbi->s_clustered)
-		ocsfs_lock_acquire(dir->i_sb, &dir_oi->i_lock_res,
-				   OCSFS_LOCK_SH);
+	if (sbi->s_clustered) {
+		if (ocsfs_lock_acquire(dir->i_sb, &dir_oi->i_lock_res,
+				       OCSFS_LOCK_SH))
+			return 0; /* conservative: lock failed → assume not empty */
+	}
 
 	ret = __ocsfs_empty_dir(dir);
 

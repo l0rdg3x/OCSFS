@@ -59,6 +59,10 @@ int ocsfs_snapshot_create(struct inode *src, struct inode *dir,
 	if (!S_ISREG(src->i_mode))
 		return -EINVAL;
 
+	/* B+ tree extents require ocsfs_extent_btree_iterate (not yet impl.) */
+	if (src_oi->i_extent_tree_root)
+		return -EOPNOTSUPP;
+
 	/* Create the snapshot inode */
 	snap = ocsfs_new_inode(dir, src->i_mode);
 	if (IS_ERR(snap))

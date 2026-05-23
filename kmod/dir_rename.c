@@ -288,11 +288,7 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 		mark_inode_dirty(new_inode);
 	}
 
-	/*
-	 * Add to new location BEFORE removing from old.  On crash between
-	 * these two commits the file appears in both dirs (fsck fixes the
-	 * link count) rather than disappearing from the namespace entirely.
-	 */
+	/* Add-before-remove: on crash, file in both dirs (fsck fixes nlink). */
 	ret = __ocsfs_add_dirent(new_dir, &new_dentry->d_name,
 				 OCSFS_I(old_inode)->i_disk_ino,
 				 ocsfs_mode_to_ft(old_inode->i_mode));
@@ -300,8 +296,11 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 		goto out_unlock;
 
 	ret = __ocsfs_del_dirent(old_dir, &old_dentry->d_name);
-	if (ret)
+	if (ret) {
+		/* Compensate: undo new entry to avoid ghost in new_dir */
+		__ocsfs_del_dirent(new_dir, &new_dentry->d_name);
 		goto out_unlock;
+	}
 
 	/* Update ".." in moved directory — single in-place txn */
 	if (S_ISDIR(old_inode->i_mode) && old_dir != new_dir) {
