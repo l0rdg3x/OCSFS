@@ -214,16 +214,20 @@ int ocsfs_node_release_slot(struct super_block *sb)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	struct ocsfs_node_info *ni;
+	int ret;
 
 	spin_lock(&sbi->s_node_lock);
 	ni = &sbi->s_nodes[sbi->s_node_slot];
 	ni->ni_state = OCSFS_NODE_FREE;
 	spin_unlock(&sbi->s_node_lock);
 
-	ocsfs_node_write_slot(sb, sbi->s_node_slot);
+	ret = ocsfs_node_write_slot(sb, sbi->s_node_slot);
+	if (ret)
+		pr_err("ocsfs: failed to release node slot %u on disk: %d\n",
+		       sbi->s_node_slot, ret);
 
 	pr_info("ocsfs: released node slot %u\n", sbi->s_node_slot);
-	return 0;
+	return ret;
 }
 
 /* ═══════════════════════════════════════════════════════════════

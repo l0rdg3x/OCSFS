@@ -20,6 +20,8 @@
  * HEARTBEAT I/O
  * ═══════════════════════════════════════════════════════════════ */
 
+static int heartbeat_read_timeout(struct buffer_head *bh);
+
 /* Submit a heartbeat block write with bounded I/O timeout. */
 static int heartbeat_write_timeout(struct buffer_head *bh)
 {
