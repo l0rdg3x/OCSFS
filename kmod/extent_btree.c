@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/*
- * OCSFS — extent_btree.c
- * B+ tree overflow for files with more than OCSFS_INLINE_EXTENTS extents.
- *
- * Value encoding: bits[0..39]=physical_block, bits[40..61]=length, bits[62..63]=flags.
- * Max addressable: ~4 PB (40-bit phys @ 4 KiB blocks), ~16 GiB per extent (22-bit len).
- */
+/* OCSFS — extent_btree.c: B+ tree overflow for OCSFS_INLINE_EXTENTS+.
+ * Value: bits[0..39]=phys, bits[40..61]=len(22-bit), bits[62..63]=flags.
+ * Max: ~4 PB phys @ 4 KiB/block; ~16 GiB per extent. */
 
 #include "ocsfs.h"
 #include "ocsfs_btree.h"
@@ -93,12 +89,11 @@ static int ext_btree_free(void *ctx, u64 block)
 static int ext_btree_open(struct inode *inode, struct ocsfs_btree *bt,
 			  struct ext_btree_ctx *ec)
 {
-	struct ocsfs_sb_info *sbi   = OCSFS_SB(inode->i_sb);
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
-
 	ec->sb  = inode->i_sb;
 	ec->txn = NULL;
-	return ocsfs_btree_open(bt, oi->i_extent_tree_root, sbi->s_block_size,
+	return ocsfs_btree_open(bt, oi->i_extent_tree_root,
+				OCSFS_SB(inode->i_sb)->s_block_size,
 				ext_btree_read, ext_btree_write,
 				ext_btree_alloc, ext_btree_free, ec);
 }
@@ -106,17 +101,13 @@ static int ext_btree_open(struct inode *inode, struct ocsfs_btree *bt,
 static int ext_btree_create(struct inode *inode, struct ocsfs_btree *bt,
 			    struct ext_btree_ctx *ec)
 {
-	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
-
 	ec->sb = inode->i_sb;
-	return ocsfs_btree_create(bt, sbi->s_block_size,
+	return ocsfs_btree_create(bt, OCSFS_SB(inode->i_sb)->s_block_size,
 				  ext_btree_read, ext_btree_write,
 				  ext_btree_alloc, ext_btree_free, ec);
 }
 
-/* ═══════════════════════════════════════════════════════════════
- * PUBLIC API
- * ═══════════════════════════════════════════════════════════════ */
+/* ── PUBLIC API ── */
 
 int ocsfs_extent_btree_lookup(struct inode *inode, u64 logical,
 			      struct ocsfs_extent *out)
@@ -154,11 +145,11 @@ int ocsfs_extent_btree_insert(struct inode *inode, u64 logical, u64 physical,
 		return PTR_ERR(txn);
 	ec.txn = txn;
 	ret = ocsfs_btree_insert(&bt, logical, ext_encode(physical, len, flags));
-	oi->i_extent_tree_root = bt.root_block;
 	if (ret) {
 		ocsfs_txn_abort(txn);
 		return ret;
 	}
+	oi->i_extent_tree_root = bt.root_block;
 	ret = ocsfs_txn_commit(txn);
 	if (!ret)
 		mark_inode_dirty(inode);
@@ -262,10 +253,14 @@ int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block)
 			if (ret)
 				goto abort;
 			inode->i_blocks -= (u64)freed * (sbi->s_block_size / 512);
-			ocsfs_btree_delete(&bt, key);
-			ocsfs_btree_insert(&bt, key,
-					   ext_encode(ext_phys(val), keep,
-						      ext_flags(val)));
+			ret = ocsfs_btree_delete(&bt, key);
+			if (ret)
+				goto abort;
+			ret = ocsfs_btree_insert(&bt, key,
+						 ext_encode(ext_phys(val), keep,
+							    ext_flags(val)));
+			if (ret)
+				goto abort;
 			oi->i_extent_tree_root = bt.root_block;
 		}
 	}
@@ -286,7 +281,9 @@ int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block)
 					goto abort;
 				inode->i_blocks -= (u64)ext_len(v) *
 						   (sbi->s_block_size / 512);
-				ocsfs_btree_delete(&bt, tc.keys[i]);
+				ret = ocsfs_btree_delete(&bt, tc.keys[i]);
+				if (ret)
+					goto abort;
 				oi->i_extent_tree_root = bt.root_block;
 			}
 		}

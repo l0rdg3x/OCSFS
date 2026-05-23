@@ -315,9 +315,13 @@ int ocsfs_dir_btree_migrate(struct inode *dir)
 		u64 phys;
 		u32 off;
 
-		if (ocsfs_extent_lookup(dir, b, &ext) || !ext.physical_block)
+		mutex_lock(&oi->i_extent_lock);
+		if (ocsfs_extent_lookup(dir, b, &ext) || !ext.physical_block) {
+			mutex_unlock(&oi->i_extent_lock);
 			continue;
+		}
 		phys = ext.physical_block + (b - ext.logical_block);
+		mutex_unlock(&oi->i_extent_lock);
 		bh = sb_bread(dir->i_sb, phys);
 		if (!bh)
 			continue;
