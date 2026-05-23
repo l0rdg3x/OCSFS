@@ -212,7 +212,6 @@ abort:
  * convert the affected range to WRITTEN. This may split an extent
  * if only part of it is being written.
  *
- * Called from iomap_begin() when writing to UNWRITTEN extents.
  * Caller must hold i_extent_lock.
  * ═══════════════════════════════════════════════════════════════ */
 

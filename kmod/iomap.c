@@ -81,20 +81,10 @@ static int ocsfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 		iomap->bdev = inode->i_sb->s_bdev;
 		iomap->offset = pos;
 
-		if (ext.flags & OCSFS_EXT_UNWRITTEN) {
+		if (ext.flags & OCSFS_EXT_UNWRITTEN)
 			iomap->type = IOMAP_UNWRITTEN;
-
-			/* For writes: convert UNWRITTEN → WRITTEN */
-			if (flags & IOMAP_WRITE) {
-				ocsfs_extent_convert_unwritten(inode,
-					ext.logical_block + offset_in_ext,
-					min_t(u32, remaining_blocks,
-					      (length + sbi->s_block_size - 1) /
-					      sbi->s_block_size));
-			}
-		} else {
+		else
 			iomap->type = IOMAP_MAPPED;
-		}
 
 		mutex_unlock(&oi->i_extent_lock);
 		return 0;
@@ -183,14 +173,36 @@ static int ocsfs_iomap_end(struct inode *inode, loff_t pos, loff_t length,
 			   ssize_t written, unsigned flags,
 			   struct iomap *iomap)
 {
-	/* Update file size if we wrote past the end */
-	if ((flags & IOMAP_WRITE) && written > 0) {
-		loff_t new_size = pos + written;
+	struct ocsfs_inode_info *oi = OCSFS_I(inode);
+	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
 
-		if (new_size > inode->i_size) {
-			i_size_write(inode, new_size);
-			mark_inode_dirty(inode);
+	if ((flags & IOMAP_WRITE) && written > 0) {
+		/*
+		 * Convert UNWRITTEN→WRITTEN only after confirmed I/O.
+		 * Doing this in iomap_begin was premature: if the write
+		 * failed, the extent would be WRITTEN over garbage data.
+		 */
+		if (iomap->type == IOMAP_UNWRITTEN) {
+			u64 start_block = pos / sbi->s_block_size;
+			u32 nblocks = (u32)((written + sbi->s_block_size - 1) /
+					    sbi->s_block_size);
+			int cr;
+
+			mutex_lock(&oi->i_extent_lock);
+			cr = ocsfs_extent_convert_unwritten(inode,
+							    start_block,
+							    nblocks);
+			mutex_unlock(&oi->i_extent_lock);
+			if (cr)
+				pr_warn_ratelimited(
+					"ocsfs: UNWRITTEN→WRITTEN failed (%d)\n",
+					cr);
 		}
+
+		if (pos + written > inode->i_size)
+			i_size_write(inode, pos + written);
+
+		mark_inode_dirty(inode);
 	}
 
 	return 0;
