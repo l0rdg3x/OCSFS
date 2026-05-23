@@ -305,6 +305,32 @@ static void test_btree_search_le_no_floor(struct kunit *test)
 	kfree(s);
 }
 
+/*
+ * Regression for ocsfs_extent_btree_goal_block(): search_le with key=U64_MAX
+ * must return the last entry in the tree.  This is the O(log n) path used to
+ * find the physical block past the last extent for goal-oriented allocation.
+ */
+static void test_btree_search_le_u64max_returns_last(struct kunit *test)
+{
+	struct mem_bt_store *s = kzalloc(sizeof(*s), GFP_KERNEL);
+	struct ocsfs_btree bt;
+	u64 out_key, out_val;
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(test, s);
+	KUNIT_ASSERT_EQ(test, ocsfs_btree_create(&bt, MEM_BT_BSIZE,
+		mem_bt_read, mem_bt_write, mem_bt_alloc, mem_bt_free, s), 0);
+	KUNIT_ASSERT_EQ(test, ocsfs_btree_insert(&bt, 10, 100), 0);
+	KUNIT_ASSERT_EQ(test, ocsfs_btree_insert(&bt, 30, 300), 0);
+	KUNIT_ASSERT_EQ(test, ocsfs_btree_insert(&bt, 50, 500), 0);
+
+	ret = ocsfs_btree_search_le(&bt, U64_MAX, &out_key, &out_val);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, out_key, 50ULL);   /* last key */
+	KUNIT_EXPECT_EQ(test, out_val, 500ULL);  /* last value */
+	kfree(s);
+}
+
 /* ─── dir B+ tree build threshold ────────────────────────────── */
 
 static void test_dir_btree_no_build_below_threshold(struct kunit *test)
@@ -475,6 +501,7 @@ static struct kunit_case ocsfs_lock_test_cases[] = {
 	KUNIT_CASE(test_btree_search_le_exact_hit),
 	KUNIT_CASE(test_btree_search_le_floor),
 	KUNIT_CASE(test_btree_search_le_no_floor),
+	KUNIT_CASE(test_btree_search_le_u64max_returns_last),
 	KUNIT_CASE(test_dir_btree_no_build_below_threshold),
 	KUNIT_CASE(test_dir_btree_build_at_threshold),
 	KUNIT_CASE(test_dir_btree_no_build_when_root_set),
