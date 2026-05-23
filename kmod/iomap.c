@@ -349,17 +349,41 @@ static sector_t ocsfs_iomap_bmap(struct address_space *mapping, sector_t bno)
 	return iomap_bmap(mapping, bno, &ocsfs_iomap_ops);
 }
 
+/*
+ * Writeback map_blocks callback: find the physical mapping for a page being
+ * written back. Re-use ocsfs_iomap_begin with IOMAP_WRITE; for dirty pages,
+ * blocks are already allocated, so the lookup returns IOMAP_MAPPED. Holes
+ * that reach writeback (e.g., from IOMAP_F_NEW pages) get allocated here.
+ * Skip the lookup if the current wpc->iomap already covers pos.
+ */
+static int ocsfs_map_blocks(struct iomap_writepage_ctx *wpc,
+			    struct inode *inode, loff_t pos)
+{
+	if (wpc->iomap.length && wpc->iomap.offset <= pos &&
+	    wpc->iomap.offset + wpc->iomap.length > pos)
+		return 0;
+	return ocsfs_iomap_begin(inode, pos, inode->i_sb->s_blocksize,
+				 IOMAP_WRITE, &wpc->iomap, NULL);
+}
+
+static const struct iomap_writeback_ops ocsfs_writeback_ops = {
+	.map_blocks = ocsfs_map_blocks,
+};
+
+static int ocsfs_writepages(struct address_space *mapping,
+			    struct writeback_control *wbc)
+{
+	struct iomap_writepage_ctx wpc = {};
+
+	return iomap_writepages(mapping, wbc, &wpc, &ocsfs_writeback_ops);
+}
+
 const struct address_space_operations ocsfs_iomap_aops = {
 	.dirty_folio      = iomap_dirty_folio,
 	.invalidate_folio = iomap_invalidate_folio,
 	.release_folio    = iomap_release_folio,
 	.read_folio       = ocsfs_iomap_read_folio,
 	.readahead        = ocsfs_iomap_readahead,
+	.writepages       = ocsfs_writepages,
 	.bmap             = ocsfs_iomap_bmap,
-	/*
-	 * writepages: not set — background writeback requires iomap_writepages
-	 * with a struct iomap_writeback_ops (non-trivial). Clustered writes are
-	 * flushed explicitly via filemap_write_and_wait before EX release.
-	 * TODO: implement iomap_writepages to support VM dirty-page writeback.
-	 */
 };
