@@ -39,6 +39,9 @@ int ocsfs_punch_hole(struct inode *inode, loff_t offset, loff_t len)
 	if (start_block >= end_block)
 		return 0;
 
+	if (oi->i_extent_tree_root)
+		return -EOPNOTSUPP;
+
 	/* Invalidate page cache for the punched region */
 	truncate_pagecache_range(inode, offset,
 				 offset + len - 1);
@@ -159,6 +162,9 @@ int ocsfs_zero_range(struct inode *inode, loff_t offset, loff_t len)
 	u64 end_block = (offset + len + sbi->s_block_size - 1) /
 			sbi->s_block_size;
 	u16 i;
+
+	if (oi->i_extent_tree_root)
+		return -EOPNOTSUPP;
 
 	/* Invalidate page cache for zeroed region */
 	truncate_pagecache_range(inode, offset, offset + len - 1);
