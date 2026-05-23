@@ -704,6 +704,7 @@ int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block);
 int ocsfs_extent_btree_convert_unwritten(struct inode *inode, u64 logical,
 					 u32 len);
 int ocsfs_extent_btree_count(struct inode *inode, u64 *count);
+u64 ocsfs_extent_btree_goal_block(struct inode *inode);
 typedef int (*ocsfs_extent_iter_fn)(u64 logical, u64 physical, u32 length,
 				    u16 flags, void *ctx);
 int ocsfs_extent_btree_iterate(struct inode *inode, ocsfs_extent_iter_fn fn,

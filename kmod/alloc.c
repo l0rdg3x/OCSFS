@@ -78,7 +78,10 @@ static u64 ocsfs_find_goal_block(struct inode *inode)
 	u16 i;
 	u64 best_end = 0;
 
-	/* Find the extent with the highest logical_block */
+	if (oi->i_extent_tree_root)
+		return ocsfs_extent_btree_goal_block(inode);
+
+	/* Inline extents: find the one with the highest physical end */
 	for (i = 0; i < oi->i_extent_count; i++) {
 		struct ocsfs_extent *e = &oi->i_extents[i];
 		u64 end = e->physical_block + e->length;

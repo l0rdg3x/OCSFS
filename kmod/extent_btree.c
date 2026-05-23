@@ -480,6 +480,25 @@ int ocsfs_extent_btree_iterate(struct inode *inode,
 	return 0;
 }
 
+/*
+ * Return the physical block just past the last extent in the btree.
+ * Uses a floor-search for key=U64_MAX — finds the entry with the
+ * largest logical_block in O(log n) without a full scan.
+ * Returns 0 if the btree is empty or on error (caller falls back to no-goal).
+ */
+u64 ocsfs_extent_btree_goal_block(struct inode *inode)
+{
+	struct ocsfs_btree bt;
+	struct ext_btree_ctx ec;
+	u64 key = 0, val = 0;
+
+	if (ext_btree_open(inode, &bt, &ec))
+		return 0;
+	if (ocsfs_btree_search_le(&bt, U64_MAX, &key, &val))
+		return 0;
+	return ext_phys(val) + ext_len(val);
+}
+
 static int ext_count_cb(u64 key, u64 val, void *ctx)
 	{ (void)key; *(u64 *)ctx += ext_len(val); return 0; }
 
