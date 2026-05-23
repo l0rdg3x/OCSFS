@@ -12,6 +12,34 @@
 #include "ocsfs.h"
 
 /* ═══════════════════════════════════════════════════════════════
+ * HELPERS
+ * ═══════════════════════════════════════════════════════════════ */
+
+/*
+ * In cluster mode the local page cache may hold a stale copy of shared
+ * metadata blocks (bitmap, inode table) from before another node's last
+ * write.  Even though DLM EX guarantees exclusive access *now*, the old
+ * data can linger in our cache.  Use the forced-read pattern to bypass it.
+ */
+static struct buffer_head *ocsfs_meta_getblk(struct super_block *sb, u64 blkno)
+{
+	struct buffer_head *bh;
+
+	if (OCSFS_SB(sb)->s_clustered) {
+		bh = sb_getblk(sb, blkno);
+		if (!bh)
+			return NULL;
+		clear_buffer_uptodate(bh);
+		if (bh_read(bh, 0) < 0) {
+			brelse(bh);
+			return NULL;
+		}
+		return bh;
+	}
+	return sb_bread(sb, blkno);
+}
+
+/* ═══════════════════════════════════════════════════════════════
  * BLOCK ALLOCATION
  *
  * Allocates @count contiguous blocks from the specified AG (or any AG
@@ -59,7 +87,7 @@ static int ocsfs_ag_alloc_blocks(struct super_block *sb, u32 ag_no,
 		if ((b + 1) * bits_in_block > ag->block_count)
 			bits_in_block = (u32)(ag->block_count - b * bits_in_block);
 
-		bh = sb_bread(sb, bm_block);
+		bh = ocsfs_meta_getblk(sb, bm_block);
 		if (!bh) {
 			ret = -EIO;
 			goto out_unlock;
@@ -89,7 +117,7 @@ static int ocsfs_ag_alloc_blocks(struct super_block *sb, u32 ag_no,
 						if (mb == b) {
 							mbh = bh;
 						} else {
-							mbh = sb_bread(sb,
+							mbh = ocsfs_meta_getblk(sb,
 								(ag->bitmap_off / sbi->s_block_size) + mb);
 							if (!mbh) {
 								brelse(bh);
@@ -255,7 +283,7 @@ int ocsfs_free_blocks_txn(struct ocsfs_txn *txn, u64 block, u32 count)
 		u32 bm_bit = (u32)(bit % (sbi->s_block_size * 8));
 		struct buffer_head *bh;
 
-		bh = sb_bread(sb,
+		bh = ocsfs_meta_getblk(sb,
 			      (ag->bitmap_off / sbi->s_block_size) + bm_block_idx);
 		if (!bh) {
 			ret = -EIO;
@@ -347,7 +375,7 @@ int ocsfs_alloc_inode_num(struct super_block *sb, u32 ag_hint, u64 *ino_out)
 			u32 boff = off % sbi->s_block_size;
 			struct ocsfs_disk_inode *di;
 
-			bh = sb_bread(sb, block);
+			bh = ocsfs_meta_getblk(sb, block);
 			if (!bh)
 				continue;
 
@@ -431,7 +459,7 @@ void ocsfs_free_inode_num(struct super_block *sb, u64 ino)
 	block = off / sbi->s_block_size;
 	boff = off % sbi->s_block_size;
 
-	bh = sb_bread(sb, block);
+	bh = ocsfs_meta_getblk(sb, block);
 	if (bh) {
 		if (ocsfs_txn_add_bh(txn, bh) == 0) {
 			di = (struct ocsfs_disk_inode *)(bh->b_data + boff);
