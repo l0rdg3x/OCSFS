@@ -336,6 +336,7 @@ int ocsfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 {
 	struct super_block *sb = dentry->d_sb;
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	u64 total_inodes = 0;
 	u64 free_inodes = 0;
 	u32 i;
 
@@ -344,12 +345,13 @@ int ocsfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	buf->f_blocks = sbi->s_total_blocks;
 
 	for (i = 0; i < sbi->s_ag_count; i++) {
-		free_inodes += sbi->s_ags[i].free_inodes;
+		total_inodes += sbi->s_ags[i].inode_count;
+		free_inodes  += sbi->s_ags[i].free_inodes;
 	}
 
 	buf->f_bfree = sbi->s_free_blocks;
 	buf->f_bavail = sbi->s_free_blocks;
-	buf->f_files = sbi->s_total_blocks;     /* upper bound */
+	buf->f_files = total_inodes;
 	buf->f_ffree = free_inodes;
 	buf->f_namelen = OCSFS_MAX_NAME_LEN;
 	buf->f_frsize = sbi->s_block_size;
