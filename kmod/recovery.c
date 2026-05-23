@@ -33,23 +33,27 @@
 static bool ocsfs_is_recovery_leader(struct super_block *sb, u16 failed_slot)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	bool is_leader = true;
 	u16 i;
 
-	/* The lowest active slot (excluding the failed one) is the leader */
+	/*
+	 * Hold the lock for the entire scan so no node changes state between
+	 * iterations.  Dropping and re-acquiring per iteration creates a TOCTOU
+	 * window where a lower-numbered slot could become ACTIVE after we
+	 * already skipped it, causing two nodes to both believe they are leader.
+	 */
+	spin_lock(&sbi->s_node_lock);
 	for (i = 0; i < sbi->s_max_nodes; i++) {
 		if (i == failed_slot)
 			continue;
-
-		spin_lock(&sbi->s_node_lock);
 		if (sbi->s_nodes[i].ni_state == OCSFS_NODE_ACTIVE) {
-			spin_unlock(&sbi->s_node_lock);
-			return (i == sbi->s_node_slot);
+			is_leader = (i == sbi->s_node_slot);
+			goto out;
 		}
-		spin_unlock(&sbi->s_node_lock);
 	}
-
-	/* No other active nodes — we are the leader by default */
-	return true;
+out:
+	spin_unlock(&sbi->s_node_lock);
+	return is_leader;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -126,9 +130,20 @@ int ocsfs_recovery_run(struct super_block *sb, u16 failed_slot)
 
 	ret = ocsfs_journal_replay_node(sb, failed_slot);
 	if (ret) {
-		pr_err("ocsfs: journal replay for node %u failed: %d\n",
+		/*
+		 * Journal replay failure means we cannot guarantee the
+		 * consistency of shared data.  Continuing would allow
+		 * other nodes to write on top of potentially dirty blocks.
+		 * Force this node read-only and abort recovery so the
+		 * administrator can intervene.
+		 */
+		pr_err("ocsfs: journal replay for node %u failed: %d — "
+		       "forcing read-only to prevent data corruption\n",
 		       failed_slot, ret);
-		/* Non-fatal: continue with lock recovery */
+		sb->s_flags |= SB_RDONLY;
+		sbi->s_recovery_in_progress = false;
+		mutex_unlock(&sbi->s_recovery_lock);
+		return ret;
 	}
 
 	/*
