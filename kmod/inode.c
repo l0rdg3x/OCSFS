@@ -31,6 +31,12 @@ static int ocsfs_read_disk_inode(struct super_block *sb, u64 ino,
 	if (le32_to_cpu(di->i_magic) != OCSFS_INODE_MAGIC)
 		return -EINVAL;
 
+	if (le32_to_cpu(di->i_checksum) !=
+	    ocsfs_crc32c(~0U, di, OCSFS_INODE_SIZE - 4)) {
+		pr_err_ratelimited("ocsfs: inode %llu checksum mismatch\n", ino);
+		return -EIO;
+	}
+
 	return 0;
 }
 
