@@ -40,9 +40,18 @@ int ocsfs_node_read_table(struct super_block *sb)
 		u64 block = off / sbi->s_block_size;
 		u32 boff = off % sbi->s_block_size;
 
-		bh = sb_bread(sb, block);
+		/*
+		 * Force a fresh read: another node may have written to this
+		 * block (e.g., claiming a slot) since we last read it.
+		 */
+		bh = sb_getblk(sb, block);
 		if (!bh)
 			return -EIO;
+		clear_buffer_uptodate(bh);
+		if (bh_read(bh, 0) < 0) {
+			brelse(bh);
+			return -EIO;
+		}
 		pdns = (struct ocsfs_disk_node_slot *)(bh->b_data + boff);
 		memcpy(&dns, pdns, sizeof(dns));
 		brelse(bh);
@@ -81,9 +90,19 @@ static int ocsfs_node_write_slot(struct super_block *sb, u16 slot)
 	u64 block = off / sbi->s_block_size;
 	u32 boff = off % sbi->s_block_size;
 
-	bh = sb_bread(sb, block);
+	/*
+	 * Force a fresh read so we get the current state of all slots in
+	 * this block before overwriting our slot — stale cached state for
+	 * other slots would be written back, losing their recent changes.
+	 */
+	bh = sb_getblk(sb, block);
 	if (!bh)
 		return -EIO;
+	clear_buffer_uptodate(bh);
+	if (bh_read(bh, 0) < 0) {
+		brelse(bh);
+		return -EIO;
+	}
 
 	dns = (struct ocsfs_disk_node_slot *)(bh->b_data + boff);
 
