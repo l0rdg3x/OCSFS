@@ -20,7 +20,6 @@ static int verify_node(const struct ocsfs_btree *bt, const void *buf)
 	const struct ocsfs_btree_node_hdr *hdr = node_hdr((void *)buf);
 	u32 expected_magic, stored_csum, computed_csum;
 	u16 count, max_count;
-	void *tmp;
 
 	/* magic check */
 	if (le16_to_cpu(hdr->bn_level) == 0)
@@ -36,14 +35,21 @@ static int verify_node(const struct ocsfs_btree *bt, const void *buf)
 		return -EIO;
 	}
 
-	/* checksum check — requires a writable copy to zero the field */
-	tmp = kmemdup(buf, bt->block_size, GFP_KERNEL);
-	if (!tmp)
-		return -ENOMEM;
-	stored_csum = le32_to_cpu(node_hdr(tmp)->bn_checksum);
-	node_hdr(tmp)->bn_checksum = 0;
-	computed_csum = ocsfs_crc32c(0, tmp, bt->block_size);
-	kfree(tmp);
+	/*
+	 * Checksum: 3-pass CRC over the block with the checksum field treated
+	 * as zero — avoids kmemdup(block_size) on every read.
+	 */
+	{
+		static const u8 zero4[4] = {0};
+		u32 coff = offsetof(struct ocsfs_btree_node_hdr, bn_checksum);
+
+		stored_csum   = le32_to_cpu(hdr->bn_checksum);
+		computed_csum = ocsfs_crc32c(0, buf, coff);
+		computed_csum = ocsfs_crc32c(computed_csum, zero4, 4);
+		computed_csum = ocsfs_crc32c(computed_csum,
+					     (const u8 *)buf + coff + 4,
+					     bt->block_size - coff - 4);
+	}
 
 	if (stored_csum != computed_csum) {
 		pr_err_ratelimited("ocsfs: btree: checksum mismatch at block %llu "
