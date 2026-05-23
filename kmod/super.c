@@ -36,7 +36,8 @@ static struct inode *ocsfs_alloc_inode(struct super_block *sb)
 	oi->i_flags = 0;
 	oi->i_ag = 0;
 	oi->i_disk_ino = 0;
-	oi->i_symlink = NULL;
+	oi->i_symlink    = NULL;
+	oi->i_xattr_block = 0;
 
 	return &oi->vfs_inode;
 }
@@ -232,6 +233,7 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	/* Set up super_block fields */
 	sb->s_magic = OCSFS_MAGIC;
 	sb->s_op = &ocsfs_sops;
+	sb->s_xattr = ocsfs_xattr_handlers;
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 	sb->s_time_gran = 1;  /* nanosecond timestamps */
 

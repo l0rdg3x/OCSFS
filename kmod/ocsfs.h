@@ -78,6 +78,8 @@
 #define OCSFS_INODE_SIZE            512
 #define OCSFS_INLINE_EXTENTS        16
 #define OCSFS_MAX_NAME_LEN          255
+#define OCSFS_XATTR_MAGIC           0x4F435841  /* "OCXA" */
+#define OCSFS_XATTR_DATA_SIZE       (OCSFS_DEFAULT_BLOCK_SIZE - 16)
 #define OCSFS_DIR_BTREE_THRESHOLD   64u  /* entries before building dir index */
 #define OCSFS_MIN_PREALLOC_BLOCKS   8u   /* min blocks per iomap write alloc */
 #define OCSFS_DIRENT_SIZE           sizeof(struct ocsfs_disk_dirent)
@@ -241,7 +243,8 @@ struct ocsfs_disk_inode {
 	__u8    i_inline_extents[OCSFS_INLINE_EXTENTS * 24];
 	__le64  i_dir_btree_root;   /* dir B+ tree root block, 0 = flat list */
 	__le32  i_dirent_count;     /* number of directory entries */
-	__u8    i_reserved[20];     /* was [32], reduced by 12 bytes */
+	__le64  i_xattr_block;      /* xattr block number, 0 = no xattrs */
+	__u8    i_reserved[12];
 	__le32  i_checksum;
 } __packed;
 
@@ -313,6 +316,16 @@ struct ocsfs_disk_journal_bref {
 	__le64  jbr_block_num;
 	__le32  jbr_flags;
 	__le32  jbr_checksum;
+} __packed;
+
+/* Xattr block — one per inode, allocated lazily, exactly one 4096-byte block */
+struct ocsfs_disk_xattr_block {
+	__le32  xb_magic;                       /* OCSFS_XATTR_MAGIC */
+	__le32  xb_count;                       /* number of live entries */
+	__le16  xb_data_len;                    /* bytes used in xb_data[] */
+	__le16  xb_reserved;
+	__u8    xb_data[OCSFS_XATTR_DATA_SIZE]; /* packed entries */
+	__le32  xb_checksum;                    /* CRC32C([0..4091]) */
 } __packed;
 
 /* Node Slot — 256 bytes, up to 256 nodes */
@@ -551,6 +564,8 @@ struct ocsfs_inode_info {
 	u32                     i_dirent_count;   /* live entry count */
 	/* symlink target (NULL unless S_ISLNK; freed on evict) */
 	char                   *i_symlink;
+	/* xattr block (0 = no xattr block allocated yet) */
+	u64                     i_xattr_block;
 	struct inode            vfs_inode;      /* must be last */
 };
 
@@ -645,6 +660,12 @@ int ocsfs_sync_fs(struct super_block *sb, int wait);
 extern const struct inode_operations ocsfs_file_inode_ops;
 extern const struct inode_operations ocsfs_special_inode_ops;
 extern const struct inode_operations ocsfs_symlink_inode_ops;
+extern const struct xattr_handler * const ocsfs_xattr_handlers[];
+int ocsfs_xattr_get_internal(struct inode *inode, u8 ns, const char *name,
+			     void *buffer, size_t size);
+int ocsfs_xattr_set_internal(struct inode *inode, u8 ns, const char *name,
+			     const void *value, size_t size, int flags);
+ssize_t ocsfs_listxattr(struct dentry *dentry, char *buffer, size_t size);
 struct inode *ocsfs_iget(struct super_block *sb, u64 ino);
 int ocsfs_flush_inode_locked(struct inode *inode, bool force_sync);
 int ocsfs_inode_refresh(struct inode *inode);

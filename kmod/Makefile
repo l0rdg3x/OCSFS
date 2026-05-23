@@ -13,10 +13,16 @@ PWD  := $(shell pwd)
 
 # When building out-of-tree, CONFIG_OCSFS_FS=m
 obj-m += ocsfs.o
-ocsfs-y := super.o inode.o dir.o file.o extent.o journal.o bitmap.o \
-           scsi_pr.o lock.o heartbeat.o node.o recovery.o \
-           iomap.o alloc.o thin.o \
-           snapshot.o refcount.o compress.o
+ocsfs-y := super.o inode.o dir.o dir_rename.o file.o \
+           extent.o extent_btree.o \
+           btree.o btree_mod.o \
+           journal.o journal_replay.o \
+           bitmap.o alloc.o \
+           lock.o lock_io.o \
+           heartbeat.o node.o recovery.o \
+           iomap.o thin.o \
+           snapshot.o refcount.o compress.o \
+           scsi_pr.o xattr.o
 
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules

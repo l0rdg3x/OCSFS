@@ -147,6 +147,7 @@ struct inode *ocsfs_iget(struct super_block *sb, u64 ino)
 
 	oi->i_dir_btree_root = le64_to_cpu(di.i_dir_btree_root);
 	oi->i_dirent_count   = le32_to_cpu(di.i_dirent_count);
+	oi->i_xattr_block    = le64_to_cpu(di.i_xattr_block);
 
 	/* Set up operations based on file type */
 	if (S_ISREG(inode->i_mode)) {
@@ -206,6 +207,7 @@ int ocsfs_inode_refresh(struct inode *inode)
 	inode_set_ctime_to_ts(inode, ns_to_timespec64(le64_to_cpu(di.i_ctime)));
 	oi->i_flags            = le32_to_cpu(di.i_flags);
 	oi->i_extent_tree_root = le64_to_cpu(di.i_extent_tree_root);
+	oi->i_xattr_block      = le64_to_cpu(di.i_xattr_block);
 	ocsfs_parse_extents(oi, &di);
 	mutex_unlock(&oi->i_extent_lock);
 	return 0;
@@ -293,6 +295,7 @@ int ocsfs_flush_inode_locked(struct inode *inode, bool force_sync)
 	di->i_extent_tree_root = cpu_to_le64(oi->i_extent_tree_root);
 	di->i_dir_btree_root   = cpu_to_le64(oi->i_dir_btree_root);
 	di->i_dirent_count     = cpu_to_le32(oi->i_dirent_count);
+	di->i_xattr_block      = cpu_to_le64(oi->i_xattr_block);
 
 	if (S_ISLNK(inode->i_mode) && oi->i_symlink) {
 		size_t slen = min_t(size_t, inode->i_size, OCSFS_MAX_INLINE_SYMLINK);
@@ -371,6 +374,9 @@ void ocsfs_evict_inode(struct inode *inode)
 			mutex_lock(&oi->i_extent_lock);
 			ocsfs_extent_truncate(inode, 0);
 			mutex_unlock(&oi->i_extent_lock);
+			if (oi->i_xattr_block)
+				ocsfs_free_blocks(inode->i_sb, oi->i_xattr_block,
+						  1);
 			ocsfs_free_inode_num(inode->i_sb, oi->i_disk_ino);
 			if (sbi->s_clustered)
 				ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
@@ -419,6 +425,7 @@ struct inode *ocsfs_new_inode(struct inode *dir, umode_t mode)
 	oi->i_flags = OCSFS_IFLAG_ORPHAN;
 	oi->i_dir_btree_root = 0;
 	oi->i_dirent_count   = 0;
+	oi->i_xattr_block    = 0;
 
 	/* Initialise per-inode DLM lock and take EX during creation. */
 	ocsfs_lock_init(&oi->i_lock_res,
@@ -537,6 +544,7 @@ int ocsfs_getattr(struct mnt_idmap *idmap, const struct path *path,
 const struct inode_operations ocsfs_file_inode_ops = {
 	.setattr        = ocsfs_setattr,
 	.getattr        = ocsfs_getattr,
+	.listxattr      = ocsfs_listxattr,
 };
 
 const struct inode_operations ocsfs_special_inode_ops = {
@@ -558,4 +566,5 @@ const struct inode_operations ocsfs_symlink_inode_ops = {
 	.get_link       = ocsfs_get_link,
 	.setattr        = ocsfs_setattr,
 	.getattr        = ocsfs_getattr,
+	.listxattr      = ocsfs_listxattr,
 };

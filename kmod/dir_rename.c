@@ -531,6 +531,7 @@ const struct inode_operations ocsfs_dir_inode_ops = {
 	.unlink         = ocsfs_unlink,
 	.rename         = ocsfs_rename,
 	.symlink        = ocsfs_symlink,
+	.listxattr      = ocsfs_listxattr,
 	.setattr        = ocsfs_setattr,
 	.getattr        = ocsfs_getattr,
 };
