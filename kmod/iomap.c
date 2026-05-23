@@ -351,10 +351,13 @@ static sector_t ocsfs_iomap_bmap(struct address_space *mapping, sector_t bno)
 
 /*
  * Writeback map_blocks callback: find the physical mapping for a page being
- * written back. Re-use ocsfs_iomap_begin with IOMAP_WRITE; for dirty pages,
- * blocks are already allocated, so the lookup returns IOMAP_MAPPED. Holes
- * that reach writeback (e.g., from IOMAP_F_NEW pages) get allocated here.
- * Skip the lookup if the current wpc->iomap already covers pos.
+ * written back. Flags=0 (no IOMAP_WRITE) so we only look up existing extents
+ * without allocating new blocks or triggering CoW. Dirty pages always have
+ * blocks allocated from the original write path; holes would produce
+ * IOMAP_HOLE and iomap_writepages skips them safely.
+ *
+ * Passing IOMAP_WRITE here would be wrong in clustered mode: writepages is
+ * called by the VM without holding DLM EX, but ocsfs_cow_extent requires it.
  */
 static int ocsfs_map_blocks(struct iomap_writepage_ctx *wpc,
 			    struct inode *inode, loff_t pos)
@@ -363,7 +366,7 @@ static int ocsfs_map_blocks(struct iomap_writepage_ctx *wpc,
 	    wpc->iomap.offset + wpc->iomap.length > pos)
 		return 0;
 	return ocsfs_iomap_begin(inode, pos, inode->i_sb->s_blocksize,
-				 IOMAP_WRITE, &wpc->iomap, NULL);
+				 0, &wpc->iomap, NULL);
 }
 
 static const struct iomap_writeback_ops ocsfs_writeback_ops = {
