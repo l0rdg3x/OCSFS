@@ -130,9 +130,20 @@ int ocsfs_refcount_get(struct super_block *sb, u64 phys_block,
 	bucket = ocsfs_rc_hash(phys_block, OCSFS_REFCOUNT_BLOCKS_PER_AG);
 	rc_block = ocsfs_rc_table_block(sbi, ag, bucket);
 
-	bh = sb_bread(sb, rc_block);
+	/*
+	 * Force a fresh read from the block device — the refcount table is
+	 * shared across nodes, and each node has an independent page cache.
+	 * sb_bread() can return stale data, leading to incorrect CoW decisions
+	 * (e.g., thinking a block is unshared when another node holds a ref).
+	 */
+	bh = sb_getblk(sb, rc_block);
 	if (!bh) {
-		/* No refcount table block — default refcount is 1 */
+		*refcount_out = 1;
+		return 0;
+	}
+	clear_buffer_uptodate(bh);
+	if (bh_read(bh, 0) < 0) {
+		brelse(bh);
 		*refcount_out = 1;
 		return 0;
 	}
@@ -143,6 +154,16 @@ int ocsfs_refcount_get(struct super_block *sb, u64 phys_block,
 	for (i = 0; i < nr_entries; i++) {
 		if (le64_to_cpu(entries[i].rc_block) == phys_block &&
 		    le32_to_cpu(entries[i].rc_count) > 0) {
+			u32 csum = ocsfs_crc32c(0, &entries[i],
+						sizeof(*entries) - 4);
+
+			if (le32_to_cpu(entries[i].rc_checksum) != csum) {
+				pr_warn_ratelimited(
+					"ocsfs: refcount checksum mismatch "
+					"block %llu\n", phys_block);
+				brelse(bh);
+				return -EIO;
+			}
 			*refcount_out = le32_to_cpu(entries[i].rc_count);
 			brelse(bh);
 			return 0;
@@ -189,8 +210,19 @@ static int ocsfs_refcount_set(struct super_block *sb, u64 phys_block,
 	bucket = ocsfs_rc_hash(phys_block, OCSFS_REFCOUNT_BLOCKS_PER_AG);
 	rc_block = ocsfs_rc_table_block(sbi, ag, bucket);
 
-	bh = sb_bread(sb, rc_block);
+	/*
+	 * Same forced-read pattern as ocsfs_refcount_get: must bypass page
+	 * cache to see the latest on-disk refcount written by other nodes.
+	 * The txn captures the BEFORE-image after this read.
+	 */
+	bh = sb_getblk(sb, rc_block);
 	if (!bh) {
+		ocsfs_txn_abort(txn);
+		return -EIO;
+	}
+	clear_buffer_uptodate(bh);
+	if (bh_read(bh, 0) < 0) {
+		brelse(bh);
 		ocsfs_txn_abort(txn);
 		return -EIO;
 	}
