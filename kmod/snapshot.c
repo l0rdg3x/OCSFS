@@ -325,10 +325,30 @@ int ocsfs_cow_extent(struct inode *inode, u64 logical, u32 len)
 
 	/* Copy data block by block */
 	for (i = 0; i < len; i++) {
-		old_bh = sb_bread(sb, old_phys + i);
-		if (!old_bh) {
-			ocsfs_free_blocks(sb, new_phys, len);
-			return -EIO;
+		/*
+		 * In cluster mode force a fresh disk read: the page cache may
+		 * hold a stale copy of the source blocks if another node wrote
+		 * to this extent before triggering our CoW.  Copying stale data
+		 * to the new blocks would silently lose the other node's writes.
+		 */
+		if (sbi->s_clustered) {
+			old_bh = sb_getblk(sb, old_phys + i);
+			if (!old_bh) {
+				ocsfs_free_blocks(sb, new_phys, len);
+				return -EIO;
+			}
+			clear_buffer_uptodate(old_bh);
+			if (bh_read(old_bh, 0) < 0) {
+				brelse(old_bh);
+				ocsfs_free_blocks(sb, new_phys, len);
+				return -EIO;
+			}
+		} else {
+			old_bh = sb_bread(sb, old_phys + i);
+			if (!old_bh) {
+				ocsfs_free_blocks(sb, new_phys, len);
+				return -EIO;
+			}
 		}
 
 		new_bh = sb_getblk(sb, new_phys + i);
