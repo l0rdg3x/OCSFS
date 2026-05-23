@@ -220,6 +220,7 @@ int ocsfs_extent_convert_unwritten(struct inode *inode, u64 logical_block,
 {
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
 	u16 i;
+	int ret;
 
 	if (oi->i_extent_tree_root)
 		return ocsfs_extent_btree_convert_unwritten(inode,
@@ -260,15 +261,19 @@ int ocsfs_extent_convert_unwritten(struct inode *inode, u64 logical_block,
 			u64 tail_logical = e->logical_block + cvt_len;
 			u64 tail_physical = e->physical_block + cvt_len;
 			u32 tail_len = e->length - cvt_len;
+			u32 orig_len = e->length;
 
-			/* Shrink current to converted prefix */
 			e->length = cvt_len;
 			e->flags = OCSFS_EXT_WRITTEN;
 
-			/* Insert the UNWRITTEN tail */
-			ocsfs_extent_insert(inode, tail_logical,
-					    tail_physical, tail_len,
-					    OCSFS_EXT_UNWRITTEN);
+			ret = ocsfs_extent_insert(inode, tail_logical,
+						  tail_physical, tail_len,
+						  OCSFS_EXT_UNWRITTEN);
+			if (ret) {
+				e->length = orig_len;
+				e->flags = OCSFS_EXT_UNWRITTEN;
+				return ret;
+			}
 			mark_inode_dirty(inode);
 			return 0;
 		}
@@ -282,14 +287,17 @@ int ocsfs_extent_convert_unwritten(struct inode *inode, u64 logical_block,
 			u32 head_len = (u32)(logical_block - e->logical_block);
 			u64 cvt_physical = e->physical_block + head_len;
 			u32 cvt_len = e->length - head_len;
+			u32 orig_len = e->length;
 
-			/* Shrink current to UNWRITTEN head */
 			e->length = head_len;
 
-			/* Insert the WRITTEN suffix */
-			ocsfs_extent_insert(inode, logical_block,
-					    cvt_physical, cvt_len,
-					    OCSFS_EXT_WRITTEN);
+			ret = ocsfs_extent_insert(inode, logical_block,
+						  cvt_physical, cvt_len,
+						  OCSFS_EXT_WRITTEN);
+			if (ret) {
+				e->length = orig_len;
+				return ret;
+			}
 			mark_inode_dirty(inode);
 			continue;
 		}
@@ -297,6 +305,10 @@ int ocsfs_extent_convert_unwritten(struct inode *inode, u64 logical_block,
 		/*
 		 * Case 4: Convert the middle (3-way split).
 		 * [UNWRITTEN head] + [WRITTEN middle] + [UNWRITTEN tail]
+		 *
+		 * Requires 2 free inline slots. Migrate to btree first if
+		 * the inline array cannot accommodate both new extents —
+		 * this guarantees neither insert can fail due to capacity.
 		 */
 		{
 			u32 head_len = (u32)(logical_block - e->logical_block);
@@ -304,22 +316,34 @@ int ocsfs_extent_convert_unwritten(struct inode *inode, u64 logical_block,
 			u32 tail_len = (u32)(ext_end - (logical_block + len));
 			u64 cvt_physical = e->physical_block + head_len;
 			u64 tail_logical = logical_block + len;
-			u64 tail_physical = e->physical_block + head_len +
-					    cvt_len;
+			u64 tail_physical = e->physical_block + head_len + cvt_len;
+			u32 orig_len = e->length;
 
-			/* Shrink current to UNWRITTEN head */
+			if (!oi->i_extent_tree_root &&
+			    oi->i_extent_count + 2 > OCSFS_INLINE_EXTENTS) {
+				ret = ocsfs_extent_btree_migrate(inode);
+				if (ret)
+					return ret;
+				return ocsfs_extent_btree_convert_unwritten(
+					inode, logical_block, len);
+			}
+
 			e->length = head_len;
 
-			/* Insert WRITTEN middle */
-			ocsfs_extent_insert(inode, logical_block,
-					    cvt_physical, cvt_len,
-					    OCSFS_EXT_WRITTEN);
-
-			/* Insert UNWRITTEN tail */
-			ocsfs_extent_insert(inode, tail_logical,
-					    tail_physical, tail_len,
-					    OCSFS_EXT_UNWRITTEN);
-
+			ret = ocsfs_extent_insert(inode, logical_block,
+						  cvt_physical, cvt_len,
+						  OCSFS_EXT_WRITTEN);
+			if (ret) {
+				e->length = orig_len;
+				return ret;
+			}
+			ret = ocsfs_extent_insert(inode, tail_logical,
+						  tail_physical, tail_len,
+						  OCSFS_EXT_UNWRITTEN);
+			if (ret) {
+				e->length = orig_len;
+				return ret;
+			}
 			mark_inode_dirty(inode);
 			return 0;
 		}
