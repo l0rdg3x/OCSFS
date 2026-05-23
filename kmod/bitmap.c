@@ -111,7 +111,8 @@ static int ocsfs_ag_alloc_blocks(struct super_block *sb, u32 ag_no,
 
 						((u8 *)mbh->b_data)[mbit / 8] |=
 							(1 << (mbit % 8));
-						mark_buffer_dirty(mbh);
+						if (!txn)
+							mark_buffer_dirty(mbh);
 
 						if (mb != b)
 							brelse(mbh);
@@ -272,7 +273,6 @@ int ocsfs_free_blocks_txn(struct ocsfs_txn *txn, u64 block, u32 count)
 		}
 
 		((u8 *)bh->b_data)[bm_bit / 8] &= ~(1 << (bm_bit % 8));
-		mark_buffer_dirty(bh);
 		brelse(bh);
 	}
 
@@ -361,7 +361,6 @@ int ocsfs_alloc_inode_num(struct super_block *sb, u32 ag_hint, u64 *ino_out)
 					di->i_magic = cpu_to_le32(OCSFS_INODE_MAGIC);
 					di->i_ino = cpu_to_le64(
 						ag_no * sbi->s_ag_size + i);
-					mark_buffer_dirty(bh);
 					brelse(bh);
 
 					ag->free_inodes--;
@@ -432,7 +431,6 @@ void ocsfs_free_inode_num(struct super_block *sb, u64 ino)
 		if (ocsfs_txn_add_bh(txn, bh) == 0) {
 			di = (struct ocsfs_disk_inode *)(bh->b_data + boff);
 			memset(di, 0, OCSFS_INODE_SIZE);
-			mark_buffer_dirty(bh);
 		}
 		brelse(bh);
 	}

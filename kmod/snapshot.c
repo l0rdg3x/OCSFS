@@ -190,30 +190,44 @@ int ocsfs_snapshot_delete(struct inode *snap)
 
 	mutex_lock(&oi->i_extent_lock);
 
-	for (i = 0; i < oi->i_extent_count; i++) {
-		struct ocsfs_extent *e = &oi->i_extents[i];
+	if (oi->i_extent_tree_root) {
+		/*
+		 * B+ tree path: refcount and free managed inline loop is not
+		 * available here (ocsfs_extent_btree_iterate would require a
+		 * separate iterator API).  Clear the tree without freeing data
+		 * blocks — this is a known limitation; fsck can reclaim leaked
+		 * blocks.  TODO: implement full B+ tree snapshot delete.
+		 */
+		pr_warn_ratelimited(
+			"ocsfs: snapshot_delete: B+ tree not fully reclaimed "
+			"(blocks may leak until fsck)\n");
+		ocsfs_extent_btree_clear(snap);
+	} else {
+		for (i = 0; i < oi->i_extent_count; i++) {
+			struct ocsfs_extent *e = &oi->i_extents[i];
 
-		if (e->physical_block == 0)
-			continue;
+			if (e->physical_block == 0)
+				continue;
 
-		should_free = false;
-		ret = ocsfs_refcount_dec(sb, e->physical_block, e->length,
-					 &should_free);
-		if (ret)
-			pr_warn("ocsfs: snapshot_delete: refcount_dec failed "
-				"for block %llu\n", e->physical_block);
+			should_free = false;
+			ret = ocsfs_refcount_dec(sb, e->physical_block, e->length,
+						 &should_free);
+			if (ret)
+				pr_warn("ocsfs: snapshot_delete: refcount_dec failed "
+					"for block %llu\n", e->physical_block);
 
-		if (should_free) {
-			ocsfs_free_blocks(sb, e->physical_block, e->length);
-			snap->i_blocks -= (u64)e->length *
-					  (sbi->s_block_size / 512);
+			if (should_free) {
+				ocsfs_free_blocks(sb, e->physical_block, e->length);
+				snap->i_blocks -= (u64)e->length *
+						  (sbi->s_block_size / 512);
+			}
+
+			e->physical_block = 0;
+			e->length = 0;
 		}
-
-		e->physical_block = 0;
-		e->length = 0;
+		oi->i_extent_count = 0;
 	}
 
-	oi->i_extent_count = 0;
 	i_size_write(snap, 0);
 	mark_inode_dirty(snap);
 
@@ -310,14 +324,30 @@ int ocsfs_cow_extent(struct inode *inode, u64 logical, u32 len)
 	}
 
 	/*
-	 * Update the extent map. We need to split the existing extent
-	 * if the CoW region doesn't cover the entire extent.
-	 *
-	 * For simplicity, we remove and re-insert the affected range.
-	 * The extent insert/merge logic handles the split.
+	 * Flush CoW data to disk before updating the extent map.
+	 * If we crash after the extent update but before writeback,
+	 * the file would point to blocks containing stale data.
 	 */
-	if (offset_in_ext == 0 && len == ext.length) {
-		/* Full extent replacement — find and update in place */
+	ret = blkdev_issue_flush(sb->s_bdev);
+	if (ret) {
+		ocsfs_free_blocks(sb, new_phys, len);
+		return ret;
+	}
+
+	/*
+	 * Update the extent map. B+ tree and inline paths are handled
+	 * separately: btree uses ocsfs_extent_btree_replace, inline
+	 * directly manipulates oi->i_extents[].
+	 */
+	if (oi->i_extent_tree_root) {
+		ret = ocsfs_extent_btree_replace(inode, &ext, offset_in_ext,
+						 len, new_phys);
+		if (ret) {
+			ocsfs_free_blocks(sb, new_phys, len);
+			return ret;
+		}
+	} else if (offset_in_ext == 0 && len == ext.length) {
+		/* Full extent replacement — update in place */
 		u16 j;
 
 		for (j = 0; j < oi->i_extent_count; j++) {
@@ -330,11 +360,7 @@ int ocsfs_cow_extent(struct inode *inode, u64 logical, u32 len)
 			}
 		}
 	} else {
-		/*
-		 * Partial CoW: we need to split the extent.
-		 * The original extent keeps the unmodified parts,
-		 * the new allocation covers the modified range.
-		 */
+		/* Partial CoW — split the existing inline extent */
 		u16 j;
 
 		for (j = 0; j < oi->i_extent_count; j++) {
@@ -343,40 +369,29 @@ int ocsfs_cow_extent(struct inode *inode, u64 logical, u32 len)
 			if (e->logical_block == ext.logical_block &&
 			    e->physical_block == ext.physical_block) {
 				if (offset_in_ext > 0) {
-					/* Keep head, split off */
-					u32 head_len = (u32)offset_in_ext;
+					u32 head_len   = (u32)offset_in_ext;
 					u32 tail_start = (u32)(offset_in_ext + len);
 
-					/* Shrink to head */
 					e->length = head_len;
-
-					/* Insert new CoW'd region */
 					ocsfs_extent_insert(inode, logical,
 							    new_phys, len,
 							    OCSFS_EXT_WRITTEN);
-
-					/* Insert tail if exists */
-					if (tail_start < ext.length) {
+					if (tail_start < ext.length)
 						ocsfs_extent_insert(inode,
 							ext.logical_block + tail_start,
 							ext.physical_block + tail_start,
 							ext.length - tail_start,
 							ext.flags);
-					}
 				} else {
-					/* CoW starts at extent start */
 					u32 remaining = ext.length - len;
 
 					e->physical_block = new_phys;
 					e->length = len;
-
-					if (remaining > 0) {
+					if (remaining > 0)
 						ocsfs_extent_insert(inode,
 							logical + len,
 							ext.physical_block + len,
-							remaining,
-							ext.flags);
-					}
+							remaining, ext.flags);
 				}
 				break;
 			}

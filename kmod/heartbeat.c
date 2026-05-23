@@ -20,12 +20,34 @@
  * HEARTBEAT I/O
  * ═══════════════════════════════════════════════════════════════ */
 
+/* Submit a heartbeat block write with bounded I/O timeout. */
+static int heartbeat_write_timeout(struct buffer_head *bh)
+{
+	lock_buffer(bh);
+	if (!test_clear_buffer_dirty(bh)) {
+		unlock_buffer(bh);
+		return 0;
+	}
+	get_bh(bh);
+	bh->b_end_io = end_buffer_write_sync;
+	submit_bh(REQ_OP_WRITE | REQ_SYNC, bh);
+	if (wait_on_bit_timeout(&bh->b_state, BH_Lock, TASK_UNINTERRUPTIBLE,
+				msecs_to_jiffies(OCSFS_HB_IO_TIMEOUT_MS))) {
+		pr_warn_ratelimited(
+			"ocsfs: heartbeat I/O timeout after %ums -- FC path hung\n",
+			OCSFS_HB_IO_TIMEOUT_MS);
+		return -ETIMEDOUT;
+	}
+	return buffer_uptodate(bh) ? 0 : -EIO;
+}
+
 /* Write this node's heartbeat entry to disk */
 int ocsfs_heartbeat_write(struct super_block *sb)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	struct buffer_head *bh;
 	struct ocsfs_disk_heartbeat *dhb;
+	int ret;
 	u64 off = OCSFS_HEARTBEAT_OFF +
 		  (u64)sbi->s_node_slot * OCSFS_HEARTBEAT_ENTRY_SIZE;
 	u64 block = off / sbi->s_block_size;
@@ -49,10 +71,28 @@ int ocsfs_heartbeat_write(struct super_block *sb)
 			     OCSFS_HEARTBEAT_ENTRY_SIZE - sizeof(__le32)));
 
 	mark_buffer_dirty(bh);
-	sync_dirty_buffer(bh);
+	ret = heartbeat_write_timeout(bh);
 	brelse(bh);
 
-	return 0;
+	return ret;
+}
+
+/* Submit a heartbeat block read with bounded I/O timeout. */
+static int heartbeat_read_timeout(struct buffer_head *bh)
+{
+	lock_buffer(bh);
+	clear_buffer_uptodate(bh);
+	get_bh(bh);
+	bh->b_end_io = end_buffer_read_sync;
+	submit_bh(REQ_OP_READ, bh);
+	if (wait_on_bit_timeout(&bh->b_state, BH_Lock, TASK_UNINTERRUPTIBLE,
+				msecs_to_jiffies(OCSFS_HB_IO_TIMEOUT_MS))) {
+		pr_warn_ratelimited(
+			"ocsfs: heartbeat read timeout after %ums -- FC path hung\n",
+			OCSFS_HB_IO_TIMEOUT_MS);
+		return -ETIMEDOUT;
+	}
+	return buffer_uptodate(bh) ? 0 : -EIO;
 }
 
 /* Read a specific node's heartbeat from disk */
@@ -65,20 +105,22 @@ static int heartbeat_read(struct super_block *sb, u16 slot,
 		  (u64)slot * OCSFS_HEARTBEAT_ENTRY_SIZE;
 	u64 block = off / sbi->s_block_size;
 	u32 boff = off % sbi->s_block_size;
+	int ret;
 
 	/*
 	 * Always force a fresh read from the block device — never return a
 	 * cached copy.  Another node's heartbeat writer may have updated the
-	 * disk since we last read it.  A stale buffer-cache entry would make
-	 * a live node look dead and trigger false-positive recovery.
+	 * disk since we last read it.  Use a bounded timeout so a hung FC
+	 * path cannot stall the heartbeat thread and starve our own writes.
 	 */
 	bh = sb_getblk(sb, block);
 	if (!bh)
 		return -EIO;
-	clear_buffer_uptodate(bh);
-	if (bh_read(bh, 0) < 0) {
+
+	ret = heartbeat_read_timeout(bh);
+	if (ret) {
 		brelse(bh);
-		return -EIO;
+		return ret;
 	}
 
 	memcpy(out, bh->b_data + boff, sizeof(*out));

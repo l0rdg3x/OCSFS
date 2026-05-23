@@ -218,7 +218,6 @@ fill:
 		memcpy(de->de_name, name->name, name->len);
 		de->de_rec_len = cpu_to_le16(OCSFS_DIRENT_SIZE);
 
-		mark_buffer_dirty(bh);
 		brelse(bh);
 		bh = NULL;
 	}
@@ -330,7 +329,6 @@ int __ocsfs_del_dirent(struct inode *dir, const struct qstr *name)
 				de->de_name_len = 0;
 				de->de_ino = 0;
 				de->de_magic = 0;
-				mark_buffer_dirty(bh);
 				brelse(bh);
 				tr = ocsfs_txn_commit(txn);
 				if (tr) return tr;

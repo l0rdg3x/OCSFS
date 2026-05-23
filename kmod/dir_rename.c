@@ -198,7 +198,6 @@ static int ocsfs_rename_update_dotdot(struct inode *inode, u64 new_parent_ino)
 				tr = ocsfs_txn_add_bh(txn, bh);
 				if (tr) { ocsfs_txn_abort(txn); brelse(bh); return tr; }
 				de->de_ino = cpu_to_le64(new_parent_ino);
-				mark_buffer_dirty(bh);
 				brelse(bh);
 				return ocsfs_txn_commit(txn);
 			}

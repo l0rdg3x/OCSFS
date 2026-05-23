@@ -16,6 +16,9 @@ static int journal_read(struct super_block *sb, struct ocsfs_journal *j,
 	u64 journal_start    = sizeof(struct ocsfs_disk_journal_hdr);
 	u64 journal_data_size = j->size - journal_start;
 
+	if (pos < journal_start)
+		pos = journal_start;
+
 	while (len > 0) {
 		struct buffer_head *bh;
 		u64 wrapped = journal_start + (pos - journal_start) %
@@ -153,16 +156,26 @@ static int journal_replay_j(struct super_block *sb, struct ocsfs_journal *j)
 
 				if (flags & OCSFS_JBR_BEFORE) {
 					u64 blk = le64_to_cpu(bref.jbr_block_num);
+					u32 expected_crc = le32_to_cpu(bref.jbr_checksum);
 					struct buffer_head *bh = sb_bread(sb, blk);
 
 					if (bh) {
 						if (!journal_read(sb, j, replay_pos,
 								  bh->b_data,
 								  bh->b_size)) {
-							mark_buffer_dirty(bh);
-							sync_dirty_buffer(bh);
-							this_replayed++;
-							replayed++;
+							u32 actual = ocsfs_crc32c(~0U,
+								bh->b_data,
+								bh->b_size);
+							if (actual == expected_crc) {
+								mark_buffer_dirty(bh);
+								sync_dirty_buffer(bh);
+								this_replayed++;
+								replayed++;
+							} else {
+								pr_warn("ocsfs: BEFORE-image CRC mismatch for block %llu in txn %llu, skipping\n",
+									blk, tid);
+								clear_buffer_uptodate(bh);
+							}
 						}
 						brelse(bh);
 					}
@@ -196,16 +209,26 @@ static int journal_replay_j(struct super_block *sb, struct ocsfs_journal *j)
 
 				if (flags & OCSFS_JBR_AFTER) {
 					u64 blk = le64_to_cpu(bref.jbr_block_num);
+					u32 expected_crc = le32_to_cpu(bref.jbr_checksum);
 					struct buffer_head *bh = sb_bread(sb, blk);
 
 					if (bh) {
 						if (!journal_read(sb, j, replay_pos,
 								  bh->b_data,
 								  bh->b_size)) {
-							mark_buffer_dirty(bh);
-							sync_dirty_buffer(bh);
-							this_replayed++;
-							replayed++;
+							u32 actual = ocsfs_crc32c(~0U,
+								bh->b_data,
+								bh->b_size);
+							if (actual == expected_crc) {
+								mark_buffer_dirty(bh);
+								sync_dirty_buffer(bh);
+								this_replayed++;
+								replayed++;
+							} else {
+								pr_warn("ocsfs: AFTER-image CRC mismatch for block %llu in txn %llu, skipping\n",
+									blk, tid);
+								clear_buffer_uptodate(bh);
+							}
 						}
 						brelse(bh);
 					}

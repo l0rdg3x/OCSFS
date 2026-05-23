@@ -274,12 +274,11 @@ int ocsfs_flush_inode_locked(struct inode *inode, bool force_sync)
 	di->i_checksum = cpu_to_le32(
 		ocsfs_crc32c(~0U, di, OCSFS_INODE_SIZE - 4));
 
-	mark_buffer_dirty(bh);
-	if (force_sync)
+	ret = ocsfs_txn_commit(txn);
+	if (ret == 0 && force_sync)
 		sync_dirty_buffer(bh);
 	brelse(bh);
-
-	return ocsfs_txn_commit(txn);
+	return ret;
 
 out_abort:
 	ocsfs_txn_abort(txn);

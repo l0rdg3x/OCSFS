@@ -409,6 +409,10 @@ int ocsfs_txn_commit(struct ocsfs_txn *txn)
 	if (ret)
 		goto out;
 
+	/* COMMIT durable — now safe to allow writeback on txn buffers. */
+	list_for_each_entry(tb, &txn->t_buffers, list)
+		mark_buffer_dirty(tb->bh);
+
 	j->tail = j->head;
 
 out:

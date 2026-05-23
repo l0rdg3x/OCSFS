@@ -167,6 +167,7 @@ static int ocsfs_refcount_set(struct super_block *sb, u64 phys_block,
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	struct ocsfs_ag_info *ag;
+	struct ocsfs_txn *txn;
 	u64 local;
 	u32 bucket;
 	u64 rc_block;
@@ -175,17 +176,31 @@ static int ocsfs_refcount_set(struct super_block *sb, u64 phys_block,
 	u32 nr_entries;
 	u32 i;
 	int free_slot = -1;
+	int ret;
 
 	ag = ocsfs_block_to_ag(sbi, phys_block, &local);
 	if (!ag)
 		return -EINVAL;
 
+	txn = ocsfs_txn_begin(sb);
+	if (IS_ERR(txn))
+		return PTR_ERR(txn);
+
 	bucket = ocsfs_rc_hash(phys_block, OCSFS_REFCOUNT_BLOCKS_PER_AG);
 	rc_block = ocsfs_rc_table_block(sbi, ag, bucket);
 
 	bh = sb_bread(sb, rc_block);
-	if (!bh)
+	if (!bh) {
+		ocsfs_txn_abort(txn);
 		return -EIO;
+	}
+
+	ret = ocsfs_txn_add_bh(txn, bh);
+	if (ret) {
+		brelse(bh);
+		ocsfs_txn_abort(txn);
+		return ret;
+	}
 
 	entries = (struct ocsfs_disk_refcount *)bh->b_data;
 	nr_entries = ocsfs_rc_entries_per_block(sbi);
@@ -198,19 +213,16 @@ static int ocsfs_refcount_set(struct super_block *sb, u64 phys_block,
 		if (blk == phys_block && cnt > 0) {
 			/* Found existing entry */
 			if (count <= 1) {
-				/* Remove entry (revert to default) */
 				entries[i].rc_block = 0;
 				entries[i].rc_count = 0;
 			} else {
 				entries[i].rc_count = cpu_to_le32(count);
 			}
-
 			entries[i].rc_checksum = cpu_to_le32(
 				ocsfs_crc32c(0, &entries[i],
 					     sizeof(*entries) - 4));
-			mark_buffer_dirty(bh);
 			brelse(bh);
-			return 0;
+			return ocsfs_txn_commit(txn);
 		}
 
 		if (free_slot < 0 && (blk == 0 || cnt == 0))
@@ -219,13 +231,14 @@ static int ocsfs_refcount_set(struct super_block *sb, u64 phys_block,
 
 	/* No existing entry found */
 	if (count <= 1) {
-		/* Nothing to do — 1 is the default */
 		brelse(bh);
+		ocsfs_txn_abort(txn);
 		return 0;
 	}
 
 	if (free_slot < 0) {
 		brelse(bh);
+		ocsfs_txn_abort(txn);
 		pr_warn("ocsfs: refcount table full for AG %u\n", ag->ag_no);
 		return -ENOSPC;
 	}
@@ -236,10 +249,8 @@ static int ocsfs_refcount_set(struct super_block *sb, u64 phys_block,
 	entries[free_slot].rc_checksum = cpu_to_le32(
 		ocsfs_crc32c(0, &entries[free_slot],
 			     sizeof(*entries) - 4));
-
-	mark_buffer_dirty(bh);
 	brelse(bh);
-	return 0;
+	return ocsfs_txn_commit(txn);
 }
 
 /*

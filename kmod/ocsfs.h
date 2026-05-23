@@ -152,6 +152,7 @@
 #define OCSFS_HB_TIMEOUT_MS     15000  /* 3 missed → suspected */
 #define OCSFS_HB_CONFIRM_MS     10000  /* 2 more missed → confirmed dead */
 #define OCSFS_HB_CHECK_MS       2000   /* check peers every 2s */
+#define OCSFS_HB_IO_TIMEOUT_MS  3000   /* heartbeat write I/O deadline */
 
 /* Lock acquisition retry */
 #define OCSFS_LOCK_RETRY_MIN_US 1000   /* 1 ms */
@@ -698,6 +699,10 @@ int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block);
 int ocsfs_extent_btree_convert_unwritten(struct inode *inode, u64 logical,
 					 u32 len);
 int ocsfs_extent_btree_count(struct inode *inode, u64 *count);
+int ocsfs_extent_btree_replace(struct inode *inode,
+				const struct ocsfs_extent *orig,
+				u64 offset_in_ext, u32 cow_len, u64 new_phys);
+int ocsfs_extent_btree_clear(struct inode *inode);
 
 /* bitmap.c */
 int ocsfs_alloc_blocks(struct super_block *sb, u32 ag_hint, u32 count,

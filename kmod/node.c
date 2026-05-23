@@ -348,8 +348,15 @@ void ocsfs_cluster_exit(struct super_block *sb)
 
 	if (sbi->s_clustered) {
 		ocsfs_heartbeat_stop(sb);
+		/*
+		 * Cancel recovery work before tearing down DLM and node state.
+		 * The work function accesses both — if it races with dlm_exit
+		 * or node_exit, it can dereference freed/zeroed structures.
+		 */
+		ocsfs_recovery_exit(sb);
 		ocsfs_dlm_exit(sb);
 		ocsfs_node_exit(sb);
+	} else {
+		ocsfs_recovery_exit(sb);
 	}
-	ocsfs_recovery_exit(sb);
 }

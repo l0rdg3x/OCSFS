@@ -87,7 +87,8 @@ static int dir_btree_write(void *ctx, u64 block, const void *buf, u32 size)
 	memcpy(bh->b_data, buf, size);
 	set_buffer_uptodate(bh);
 	unlock_buffer(bh);
-	mark_buffer_dirty(bh);
+	if (!dc->txn)
+		mark_buffer_dirty(bh);
 	brelse(bh);
 	return 0;
 }
