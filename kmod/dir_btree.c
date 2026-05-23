@@ -52,10 +52,22 @@ struct dir_btree_ctx {
 static int dir_btree_read(void *ctx, u64 block, void *buf, u32 size)
 {
 	struct dir_btree_ctx *dc = ctx;
-	struct buffer_head *bh   = sb_bread(dc->sb, block);
+	struct buffer_head *bh;
 
-	if (!bh)
-		return -EIO;
+	if (OCSFS_SB(dc->sb)->s_clustered) {
+		bh = sb_getblk(dc->sb, block);
+		if (!bh)
+			return -EIO;
+		clear_buffer_uptodate(bh);
+		if (bh_read(bh, 0) < 0) {
+			brelse(bh);
+			return -EIO;
+		}
+	} else {
+		bh = sb_bread(dc->sb, block);
+		if (!bh)
+			return -EIO;
+	}
 	memcpy(buf, bh->b_data, size);
 	brelse(bh);
 	return 0;
@@ -63,7 +75,8 @@ static int dir_btree_read(void *ctx, u64 block, void *buf, u32 size)
 
 /*
  * Journal before-image then overwrite: makes btree node writes atomic.
- * sb_bread is used (not sb_getblk) to capture the real before-image.
+ * In cluster mode force a fresh read for the BEFORE-image so the journal
+ * records the true on-disk state rather than a stale cached copy.
  */
 static int dir_btree_write(void *ctx, u64 block, const void *buf, u32 size)
 {
@@ -71,9 +84,20 @@ static int dir_btree_write(void *ctx, u64 block, const void *buf, u32 size)
 	struct buffer_head *bh;
 	int ret;
 
-	bh = sb_bread(dc->sb, block);
-	if (!bh)
-		return -EIO;
+	if (OCSFS_SB(dc->sb)->s_clustered) {
+		bh = sb_getblk(dc->sb, block);
+		if (!bh)
+			return -EIO;
+		clear_buffer_uptodate(bh);
+		if (bh_read(bh, 0) < 0) {
+			brelse(bh);
+			return -EIO;
+		}
+	} else {
+		bh = sb_bread(dc->sb, block);
+		if (!bh)
+			return -EIO;
+	}
 
 	if (dc->txn) {
 		ret = ocsfs_txn_add_bh(dc->txn, bh);
