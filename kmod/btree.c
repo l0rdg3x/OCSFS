@@ -263,7 +263,7 @@ int ocsfs_btree_open(struct ocsfs_btree *bt, u64 root_block, u32 block_size,
 out:
 	kfree(buf);
 	kfree(cur);
-	return 0;
+	return ret;
 }
 
 /* ── find_leaf — traverse root→leaf tracking path ── */

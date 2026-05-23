@@ -45,20 +45,26 @@ static int ext_btree_read(void *ctx, u64 block, void *buf, u32 size)
 static int ext_btree_write(void *ctx, u64 block, const void *buf, u32 size)
 {
 	struct ext_btree_ctx *ec = ctx;
-	struct buffer_head *bh   = sb_getblk(ec->sb, block);
+	struct buffer_head *bh;
+	int ret = 0;
 
+	/* txn path needs sb_bread to capture the real BEFORE-image */
+	bh = ec->txn ? sb_bread(ec->sb, block) : sb_getblk(ec->sb, block);
 	if (!bh)
 		return -EIO;
+
+	if (ec->txn) {
+		ret = ocsfs_txn_add_bh(ec->txn, bh);
+		if (ret) { brelse(bh); return ret; }
+	}
+
 	lock_buffer(bh);
 	memcpy(bh->b_data, buf, size);
 	set_buffer_uptodate(bh);
 	unlock_buffer(bh);
-	if (ec->txn) {
-		int r = ocsfs_txn_add_bh(ec->txn, bh);
-		brelse(bh);
-		return r;
-	}
-	mark_buffer_dirty(bh);
+
+	if (!ec->txn)
+		mark_buffer_dirty(bh);
 	brelse(bh);
 	return 0;
 }
