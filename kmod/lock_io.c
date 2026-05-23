@@ -102,16 +102,11 @@ software_fallback:
 		brelse(bh_check);
 		return -EAGAIN;
 	}
-	brelse(bh_check);
 
 	entry->le_version  = cpu_to_le32(expected_version + 1);
 	entry->le_checksum = cpu_to_le32(
 		ocsfs_crc32c(~0U, entry,
 			     OCSFS_LOCK_ENTRY_SIZE - sizeof(__le32)));
-
-	bh_check = sb_bread(sb, block);
-	if (!bh_check)
-		return -EIO;
 
 	memcpy(bh_check->b_data + boff, entry, sizeof(*entry));
 	mark_buffer_dirty(bh_check);
@@ -190,7 +185,7 @@ void clear_waiter_bit(struct ocsfs_disk_lock *dl, u16 slot)
 bool is_sh_holder(struct ocsfs_disk_lock *dl, u16 slot)
 {
 	if (slot < 32)
-		return !!(le32_to_cpu(dl->le_sh_holders) & (1 << slot));
+		return !!(le32_to_cpu(dl->le_sh_holders) & (1U << slot));
 	if (slot - 32 < sizeof(dl->le_sh_holders_ext) * 8)
 		return !!(dl->le_sh_holders_ext[(slot - 32) / 8] &
 			  (1 << ((slot - 32) % 8)));
@@ -202,7 +197,7 @@ void add_sh_holder(struct ocsfs_disk_lock *dl, u16 slot)
 	if (slot < 32) {
 		u32 mask = le32_to_cpu(dl->le_sh_holders);
 
-		mask |= (1 << slot);
+		mask |= (1U << slot);
 		dl->le_sh_holders = cpu_to_le32(mask);
 	} else if (slot - 32 < sizeof(dl->le_sh_holders_ext) * 8) {
 		dl->le_sh_holders_ext[(slot - 32) / 8] |=
@@ -215,7 +210,7 @@ void remove_sh_holder(struct ocsfs_disk_lock *dl, u16 slot)
 	if (slot < 32) {
 		u32 mask = le32_to_cpu(dl->le_sh_holders);
 
-		mask &= ~(1 << slot);
+		mask &= ~(1U << slot);
 		dl->le_sh_holders = cpu_to_le32(mask);
 	} else if (slot - 32 < sizeof(dl->le_sh_holders_ext) * 8) {
 		dl->le_sh_holders_ext[(slot - 32) / 8] &=
