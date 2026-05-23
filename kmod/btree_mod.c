@@ -252,16 +252,38 @@ int ocsfs_btree_insert(struct ocsfs_btree *bt, u64 key, u64 value)
 								     bt->block_size);
 					ret = write_node(bt, new_int, ni_buf);
 				}
+				/* Fix bn_parent for all children of the new right node */
+				if (!ret) {
+					void *cb = kzalloc(bt->block_size, GFP_KERNEL);
+
+					if (cb) {
+						int ci;
+						u64 cblk = le64_to_cpu(
+							*internal_first_child(ni_buf));
+
+						if (read_node(bt, cblk, cb) == 0) {
+							node_hdr(cb)->bn_parent =
+								cpu_to_le64(new_int);
+							ocsfs_btree_node_update_csum(
+								cb, bt->block_size);
+							write_node(bt, cblk, cb);
+						}
+						for (ci = 0; ci < ni_count; ci++) {
+							cblk = le64_to_cpu(
+								internal_ptrs(ni_buf)[ci].child);
+							if (read_node(bt, cblk, cb) == 0) {
+								node_hdr(cb)->bn_parent =
+									cpu_to_le64(new_int);
+								ocsfs_btree_node_update_csum(
+									cb, bt->block_size);
+								write_node(bt, cblk, cb);
+							}
+						}
+						kfree(cb);
+					}
+				}
 				kfree(ni_buf);
 				kfree(tp);
-				/*
-				 * Children of ni_buf still carry stale bn_parent
-				 * pointing to the old (left) node. This is a known
-				 * limitation: delete uses bn_parent only when a leaf
-				 * empties; for large trees this can cause a wrong
-				 * parent update. Full fix requires iterating all
-				 * children of the new right node — deferred.
-				 */
 				if (ret)
 					goto err_free_buf;
 
