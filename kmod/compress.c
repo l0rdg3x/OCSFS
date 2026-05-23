@@ -261,19 +261,23 @@ int ocsfs_compress_extent_read(struct inode *inode,
 	u8 algo;
 	void *comp_buf;
 	void *decomp_buf;
-	u32 comp_size;
-	u32 decomp_size;
+	size_t comp_size;
+	size_t decomp_size;
 	struct buffer_head *bh;
 	u32 i;
-	u32 copied;
+	size_t copied;
 	int ret;
 
 	if (!(ext->flags & OCSFS_EXT_COMPRESSED))
 		return -EINVAL;
 
 	algo = ocsfs_ext_comp_algo(ext->flags);
-	comp_size = ext->length * sbi->s_block_size;
-	decomp_size = nr_pages * PAGE_SIZE;
+	comp_size = (size_t)ext->length * sbi->s_block_size;
+	decomp_size = (size_t)nr_pages * PAGE_SIZE;
+
+	/* Guard against truncation when passing to unsigned int APIs */
+	if (comp_size > UINT_MAX || decomp_size > UINT_MAX)
+		return -EFBIG;
 
 	/* Allocate buffers */
 	comp_buf = kvmalloc(comp_size, GFP_NOFS);
@@ -296,7 +300,7 @@ int ocsfs_compress_extent_read(struct inode *inode,
 		}
 
 		memcpy(comp_buf + copied, bh->b_data,
-		       min_t(u32, sbi->s_block_size, comp_size - copied));
+		       min_t(size_t, sbi->s_block_size, comp_size - copied));
 		copied += sbi->s_block_size;
 		brelse(bh);
 	}
@@ -312,7 +316,7 @@ int ocsfs_compress_extent_read(struct inode *inode,
 		void *kaddr = kmap_local_page(pages[i]);
 
 		memcpy(kaddr, decomp_buf + i * PAGE_SIZE,
-		       min_t(u32, PAGE_SIZE, decomp_size - i * PAGE_SIZE));
+		       min_t(size_t, PAGE_SIZE, decomp_size - i * PAGE_SIZE));
 		kunmap_local(kaddr);
 		SetPageUptodate(pages[i]);
 	}

@@ -277,10 +277,13 @@ ssize_t ocsfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		ret = iomap_dio_rw(iocb, from, &ocsfs_dio_iomap_ops,
 				   NULL, 0, NULL, 0);
 	} else {
+		/*
+		 * iomap_file_buffered_write (kernel >= 6.0, 5-arg form) updates
+		 * iocb->ki_pos internally before returning. Do NOT add ret here
+		 * again — that would double-advance the file position.
+		 */
 		ret = iomap_file_buffered_write(iocb, from,
 						&ocsfs_iomap_ops, NULL, NULL);
-		if (ret > 0)
-			iocb->ki_pos += ret;
 	}
 
 out:
@@ -347,8 +350,16 @@ static sector_t ocsfs_iomap_bmap(struct address_space *mapping, sector_t bno)
 }
 
 const struct address_space_operations ocsfs_iomap_aops = {
-	.dirty_folio    = iomap_dirty_folio,
-	.read_folio     = ocsfs_iomap_read_folio,
-	.readahead      = ocsfs_iomap_readahead,
-	.bmap           = ocsfs_iomap_bmap,
+	.dirty_folio      = iomap_dirty_folio,
+	.invalidate_folio = iomap_invalidate_folio,
+	.release_folio    = iomap_release_folio,
+	.read_folio       = ocsfs_iomap_read_folio,
+	.readahead        = ocsfs_iomap_readahead,
+	.bmap             = ocsfs_iomap_bmap,
+	/*
+	 * writepages: not set — background writeback requires iomap_writepages
+	 * with a struct iomap_writeback_ops (non-trivial). Clustered writes are
+	 * flushed explicitly via filemap_write_and_wait before EX release.
+	 * TODO: implement iomap_writepages to support VM dirty-page writeback.
+	 */
 };
