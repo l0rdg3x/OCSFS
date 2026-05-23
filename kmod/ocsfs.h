@@ -328,6 +328,9 @@ struct ocsfs_disk_xattr_block {
 	__le32  xb_checksum;                    /* CRC32C([0..4091]) */
 } __packed;
 
+static_assert(sizeof(struct ocsfs_disk_xattr_block) == OCSFS_DEFAULT_BLOCK_SIZE,
+	      "ocsfs_disk_xattr_block must be exactly 4096 bytes");
+
 /* Node Slot — 256 bytes, up to 256 nodes */
 struct ocsfs_disk_node_slot {
 	__u8    ns_uuid[16];

@@ -85,6 +85,16 @@ static struct buffer_head *xattr_read_bh(struct inode *inode)
 		brelse(bh);
 		return ERR_PTR(-EIO);
 	}
+	{
+		u32 csum = ocsfs_crc32c(~0U, xb,
+				OCSFS_DEFAULT_BLOCK_SIZE - sizeof(__le32));
+		if (csum != le32_to_cpu(xb->xb_checksum)) {
+			pr_err_ratelimited("ocsfs: xattr block checksum mismatch ino %llu\n",
+					   oi->i_disk_ino);
+			brelse(bh);
+			return ERR_PTR(-EIO);
+		}
+	}
 	return bh;
 }
 
