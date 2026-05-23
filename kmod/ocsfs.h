@@ -523,6 +523,11 @@ struct ocsfs_sb_info {
 
 	/* SCSI Compare-And-Write capability (probed at mount time) */
 	bool            s_caw_supported;
+
+	/* ZSTD decompression workspace — lazy-allocated on first ZSTD read */
+	struct mutex    s_decompress_lock;
+	void           *s_decompress_wksp;
+	size_t          s_decompress_wksp_sz;
 };
 
 /* Per-inode in-memory info — wraps struct inode */
@@ -850,7 +855,8 @@ int ocsfs_refcount_init_ag(struct super_block *sb, u32 ag_no);
 /* compress.c — Inline LZ4/ZSTD compression */
 int ocsfs_compress_data(u8 algo, const void *src, unsigned int src_len,
 			void *dst, unsigned int *dst_len);
-int ocsfs_decompress_data(u8 algo, const void *src, unsigned int src_len,
+int ocsfs_decompress_data(struct super_block *sb, u8 algo,
+			  const void *src, unsigned int src_len,
 			  void *dst, unsigned int dst_len);
 int ocsfs_compress_extent_read(struct inode *inode,
 			       struct ocsfs_extent *ext,

@@ -226,6 +226,7 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 
 	init_rwsem(&sbi->s_global_lock);
 	spin_lock_init(&sbi->s_free_lock);
+	mutex_init(&sbi->s_decompress_lock);
 
 	/* Set up super_block fields */
 	sb->s_magic = OCSFS_MAGIC;
@@ -278,15 +279,9 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		goto fail_journal;
 	}
 
-	/* Update mount count and timestamp */
-	ds->s_mount_count = cpu_to_le64(
-		le64_to_cpu(ds->s_mount_count) + 1);
-	ds->s_last_mount_time = cpu_to_le64(
-		ktime_get_real_ns());
-
-	/* Recompute checksum after updates */
-	ds->s_checksum = cpu_to_le32(
-		ocsfs_crc32c(~0U, ds, OCSFS_SUPERBLOCK_SIZE - 4));
+	ds->s_mount_count = cpu_to_le64(le64_to_cpu(ds->s_mount_count) + 1);
+	ds->s_last_mount_time = cpu_to_le64(ktime_get_real_ns());
+	ds->s_checksum = cpu_to_le32(ocsfs_crc32c(~0U, ds, OCSFS_SUPERBLOCK_SIZE - 4));
 	mark_buffer_dirty(bh);
 	sync_dirty_buffer(bh);
 
@@ -324,6 +319,8 @@ void ocsfs_put_super(struct super_block *sb)
 
 	ocsfs_journal_exit(sb);   /* flush journal before releasing cluster slot */
 	ocsfs_cluster_exit(sb);
+	kvfree(sbi->s_decompress_wksp);
+	mutex_destroy(&sbi->s_decompress_lock);
 	kvfree(sbi->s_ags);
 	brelse(sbi->s_sbh);
 	kfree(sbi);

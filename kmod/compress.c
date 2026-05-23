@@ -113,27 +113,17 @@ static int ocsfs_zstd_compress(const void *src, unsigned int src_len,
 }
 
 static int ocsfs_zstd_decompress(const void *src, unsigned int src_len,
-				 void *dst, unsigned int dst_len)
+				 void *dst, unsigned int dst_len,
+				 void *workspace, size_t wksp_size)
 {
-	size_t ret;
 	zstd_dctx *dctx;
-	void *workspace;
-	size_t wksp_size;
-
-	wksp_size = zstd_dctx_workspace_bound();
-	workspace = kvmalloc(wksp_size, GFP_NOFS);
-	if (!workspace)
-		return -ENOMEM;
+	size_t ret;
 
 	dctx = zstd_init_dctx(workspace, wksp_size);
-	if (!dctx) {
-		kvfree(workspace);
+	if (!dctx)
 		return -ENOMEM;
-	}
 
 	ret = zstd_decompress_dctx(dctx, dst, dst_len, src, src_len);
-	kvfree(workspace);
-
 	if (zstd_is_error(ret))
 		return -EINVAL;
 
@@ -212,15 +202,34 @@ int ocsfs_compress_data(u8 algo, const void *src, unsigned int src_len,
  * @dst:      output buffer
  * @dst_len:  expected uncompressed length
  */
-int ocsfs_decompress_data(u8 algo, const void *src, unsigned int src_len,
+int ocsfs_decompress_data(struct super_block *sb, u8 algo,
+			  const void *src, unsigned int src_len,
 			  void *dst, unsigned int dst_len)
 {
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	int ret;
+
 	switch (algo) {
 	case OCSFS_COMPRESS_LZ4:
 		return ocsfs_lz4_decompress(src, src_len, dst, dst_len);
 
 	case OCSFS_COMPRESS_ZSTD:
-		return ocsfs_zstd_decompress(src, src_len, dst, dst_len);
+		mutex_lock(&sbi->s_decompress_lock);
+		if (!sbi->s_decompress_wksp) {
+			size_t sz = zstd_dctx_workspace_bound();
+
+			sbi->s_decompress_wksp = kvmalloc(sz, GFP_NOFS);
+			if (!sbi->s_decompress_wksp) {
+				mutex_unlock(&sbi->s_decompress_lock);
+				return -ENOMEM;
+			}
+			sbi->s_decompress_wksp_sz = sz;
+		}
+		ret = ocsfs_zstd_decompress(src, src_len, dst, dst_len,
+					    sbi->s_decompress_wksp,
+					    sbi->s_decompress_wksp_sz);
+		mutex_unlock(&sbi->s_decompress_lock);
+		return ret;
 
 	default:
 		return -EINVAL;
@@ -306,7 +315,7 @@ int ocsfs_compress_extent_read(struct inode *inode,
 	}
 
 	/* Decompress */
-	ret = ocsfs_decompress_data(algo, comp_buf, comp_size,
+	ret = ocsfs_decompress_data(sb, algo, comp_buf, comp_size,
 				    decomp_buf, decomp_size);
 	if (ret)
 		goto out;
