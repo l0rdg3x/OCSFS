@@ -137,6 +137,7 @@ int ocsfs_lock_release(struct super_block *sb, struct ocsfs_lock_res *lr)
 	struct ocsfs_disk_lock dl;
 	struct buffer_head *bh;
 	int ret;
+	int retries = 0;
 
 	if (!sbi->s_clustered) {
 		lr->lr_mode = OCSFS_LOCK_NL;
@@ -145,6 +146,7 @@ int ocsfs_lock_release(struct super_block *sb, struct ocsfs_lock_res *lr)
 
 	mutex_lock(&lr->lr_mutex);
 
+retry_release:
 	ret = lock_read_entry(sb, lr->lr_slot, &dl, &bh);
 	if (ret) {
 		mutex_unlock(&lr->lr_mutex);
@@ -170,6 +172,14 @@ int ocsfs_lock_release(struct super_block *sb, struct ocsfs_lock_res *lr)
 
 	ret = lock_write_entry(sb, lr->lr_slot, &dl, bh);
 	brelse(bh);
+
+	if (ret == -EAGAIN && ++retries < OCSFS_LOCK_MAX_RETRIES)
+		goto retry_release;
+
+	if (ret)
+		pr_warn_ratelimited("ocsfs: lock_release failed for resource "
+				    "0x%llx (%d) — lock may be stranded on disk\n",
+				    lr->lr_resource_id, ret);
 
 	lr->lr_mode          = OCSFS_LOCK_NL;
 	lr->lr_cached        = false;
@@ -285,8 +295,12 @@ int ocsfs_lock_recover_node(struct super_block *sb, u16 node_slot,
 
 		clear_waiter_bit(&dl, node_slot);
 
-		if (modified)
-			lock_write_entry(sb, i, &dl, bh);
+		if (modified) {
+			ret = lock_write_entry(sb, i, &dl, bh);
+			if (ret)
+				pr_warn("ocsfs: lock recovery write failed for "
+					"entry %u (%d)\n", i, ret);
+		}
 
 		brelse(bh);
 	}

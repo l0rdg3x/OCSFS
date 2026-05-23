@@ -154,11 +154,17 @@ int ocsfs_btree_insert(struct ocsfs_btree *bt, u64 key, u64 value)
 		}
 
 		ocsfs_btree_node_update_csum(buf, bt->block_size);
-		write_node(bt, le64_to_cpu(hdr->bn_block_num), buf);
-		ocsfs_btree_node_update_csum(new_buf, bt->block_size);
-		write_node(bt, new_block, new_buf);
+		ret = write_node(bt, le64_to_cpu(hdr->bn_block_num), buf);
+		if (!ret) {
+			ocsfs_btree_node_update_csum(new_buf, bt->block_size);
+			ret = write_node(bt, new_block, new_buf);
+		}
 		kfree(new_buf);
 		kfree(tmp);
+		if (ret) {
+			free_node(bt, new_block);
+			goto err_free_buf;
+		}
 		bt->entry_count++;
 
 		promote_key   = split_key;
@@ -184,9 +190,10 @@ int ocsfs_btree_insert(struct ocsfs_btree *bt, u64 key, u64 value)
 				internal_insert_at(buf, ipos, promote_key,
 						   promote_child);
 				ocsfs_btree_node_update_csum(buf, bt->block_size);
-				write_node(bt, le64_to_cpu(hdr->bn_block_num), buf);
+				ret = write_node(bt, le64_to_cpu(hdr->bn_block_num),
+						 buf);
 				kfree(buf);
-				return 0;
+				return ret;
 			}
 
 			/* internal node full — split */
@@ -216,8 +223,12 @@ int ocsfs_btree_insert(struct ocsfs_btree *bt, u64 key, u64 value)
 				if (ret < 0) { kfree(tp); goto err_free_buf; }
 
 				ni_buf = kzalloc(bt->block_size, GFP_KERNEL);
-				if (!ni_buf) { kfree(tp); ret = -ENOMEM;
-					       goto err_free_buf; }
+				if (!ni_buf) {
+					free_node(bt, new_int);
+					kfree(tp);
+					ret = -ENOMEM;
+					goto err_free_buf;
+				}
 
 				ocsfs_btree_init_internal(ni_buf, bt->block_size,
 							  new_int,
@@ -234,11 +245,25 @@ int ocsfs_btree_insert(struct ocsfs_btree *bt, u64 key, u64 value)
 				ni_hdr->bn_parent = hdr->bn_parent;
 
 				ocsfs_btree_node_update_csum(buf, bt->block_size);
-				write_node(bt, le64_to_cpu(hdr->bn_block_num), buf);
-				ocsfs_btree_node_update_csum(ni_buf, bt->block_size);
-				write_node(bt, new_int, ni_buf);
+				ret = write_node(bt, le64_to_cpu(hdr->bn_block_num),
+						 buf);
+				if (!ret) {
+					ocsfs_btree_node_update_csum(ni_buf,
+								     bt->block_size);
+					ret = write_node(bt, new_int, ni_buf);
+				}
 				kfree(ni_buf);
 				kfree(tp);
+				/*
+				 * Children of ni_buf still carry stale bn_parent
+				 * pointing to the old (left) node. This is a known
+				 * limitation: delete uses bn_parent only when a leaf
+				 * empties; for large trees this can cause a wrong
+				 * parent update. Full fix requires iterating all
+				 * children of the new right node — deferred.
+				 */
+				if (ret)
+					goto err_free_buf;
 
 				promote_key   = new_promote;
 				promote_child = new_int;
@@ -260,7 +285,11 @@ int ocsfs_btree_insert(struct ocsfs_btree *bt, u64 key, u64 value)
 			internal_ptrs(buf)[0].child = cpu_to_le64(promote_child);
 			node_hdr(buf)->bn_count = cpu_to_le16(1);
 			ocsfs_btree_node_update_csum(buf, bt->block_size);
-			write_node(bt, new_root, buf);
+			ret = write_node(bt, new_root, buf);
+			if (ret) {
+				free_node(bt, new_root);
+				goto err_free_buf;
+			}
 
 			/* clear root flag on old root */
 			if (read_node(bt, bt->root_block, buf) == 0) {
