@@ -331,13 +331,10 @@ out_unlock:
 						"ocsfs: rename new_inode flush failed (%d)\n",
 						fr);
 			}
-			if (S_ISDIR(old_inode->i_mode) && old_dir != new_dir) {
-				fr = ocsfs_flush_inode_locked(old_inode, true);
-				if (fr)
-					pr_warn_ratelimited(
-						"ocsfs: rename dotdot flush failed (%d)\n",
-						fr);
-			}
+			fr = ocsfs_flush_inode_locked(old_inode, true);
+			if (fr)
+				pr_warn_ratelimited(
+					"ocsfs: rename old_inode flush failed (%d)\n", fr);
 			fr = ocsfs_flush_inode_locked(old_dir, true);
 			if (fr)
 				pr_warn_ratelimited(
