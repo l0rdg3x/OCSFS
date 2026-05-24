@@ -17,7 +17,10 @@
 #include "ocsfs.h"
 #include <linux/pr.h>
 #include <linux/unaligned.h>
+#include <linux/kprobes.h>
 #include <scsi/scsi_proto.h>
+#include <scsi/scsi_device.h>
+#include <scsi/scsi_cmnd.h>
 
 /*
  * Derive a unique, hard-to-predict PR key from the full 16-byte UUID
@@ -175,30 +178,91 @@ bool ocsfs_pr_probe(struct super_block *sb)
 }
 
 /*
- * Probe whether the block device supports SCSI Compare-And-Write.
- *
- * NOTE: Full CAW support requires scsi_device_from_queue() + scsi_execute_cmd().
- * scsi_execute_cmd is EXPORT_SYMBOL, but scsi_device_from_queue is NOT exported
- * in all kernel configurations (not present in Module.symvers for this kernel).
- * Until it is exported, this probe always returns false and the software
- * version-check fallback in lock_write_entry() is used instead.
- *
- * To enable hardware CAW: add EXPORT_SYMBOL_GPL(scsi_device_from_queue) to
- * drivers/scsi/scsi_lib.c and uncomment the SCSI implementation below.
+ * scsi_device_from_queue() is present in vmlinux but not exported to modules.
+ * Resolve it once at probe time via kprobe so we can call it without a
+ * kernel patch. The kprobe is registered and immediately unregistered —
+ * we keep only the resolved function pointer.
  */
-bool ocsfs_scsi_caw_probe(struct super_block *sb)
+typedef struct scsi_device *(*ocsfs_sdfq_fn_t)(struct request_queue *q);
+static ocsfs_sdfq_fn_t ocsfs_sdfq;
+
+static bool ocsfs_caw_resolve_sdfq(void)
 {
-	return false;
+	struct kprobe kp = { .symbol_name = "scsi_device_from_queue" };
+
+	if (ocsfs_sdfq)
+		return true;
+
+	if (register_kprobe(&kp) < 0)
+		return false;
+
+	ocsfs_sdfq = (ocsfs_sdfq_fn_t)kp.addr;
+	unregister_kprobe(&kp);
+	return ocsfs_sdfq != NULL;
 }
 
 /*
- * Issue a SCSI Compare-And-Write for one logical block.
- * Currently returns -EOPNOTSUPP — see ocsfs_scsi_caw_probe() for rationale.
- * lock_write_entry() falls through to the software version-check path.
+ * Probe whether the block device supports SCSI Compare-And-Write.
+ * Resolves scsi_device_from_queue via kprobe; returns false on non-SCSI
+ * devices (virtio, loop) so the CAS engine falls through to PR-lease.
+ */
+bool ocsfs_scsi_caw_probe(struct super_block *sb)
+{
+	struct scsi_device *sdev;
+
+	if (!ocsfs_caw_resolve_sdfq())
+		return false;
+
+	sdev = ocsfs_sdfq(bdev_get_queue(sb->s_bdev));
+	return sdev != NULL;
+}
+
+/*
+ * Issue a SCSI Compare-And-Write (opcode 0x89, SBC-4 §5.3) for one LBA.
+ * Buffer layout: expected (lbs bytes) || new_data (lbs bytes).
+ * MISCOMPARE (sense key 0x0e) → -EAGAIN so the CAS loop retries.
  */
 int ocsfs_scsi_caw(struct super_block *sb, u64 lba,
 		   const void *expected, const void *new_data,
 		   unsigned int lbs)
 {
-	return -EOPNOTSUPP;
+	u8 sense[SCSI_SENSE_BUFFERSIZE];
+	struct scsi_exec_args args = {
+		.sense     = sense,
+		.sense_len = sizeof(sense),
+	};
+	struct scsi_device *sdev;
+	u8 cdb[16];
+	u8 *buf;
+	int ret;
+
+	if (!ocsfs_sdfq)
+		return -EOPNOTSUPP;
+
+	sdev = ocsfs_sdfq(bdev_get_queue(sb->s_bdev));
+	if (!sdev)
+		return -EOPNOTSUPP;
+
+	buf = kmalloc(2 * lbs, GFP_NOIO);
+	if (!buf)
+		return -ENOMEM;
+
+	memcpy(buf,       expected, lbs);
+	memcpy(buf + lbs, new_data, lbs);
+
+	ocsfs_build_caw_cdb(cdb, lba);
+
+	ret = scsi_execute_cmd(sdev, cdb, REQ_OP_DRV_OUT, buf, 2 * lbs,
+			       HZ * 5, 3, &args);
+	kfree(buf);
+
+	if (ret < 0)
+		return ret;
+	if (ret > 0) {
+		if ((sense[2] & 0x0f) == MISCOMPARE)
+			return -EAGAIN;
+		return -EIO;
+	}
+
+	return 0;
 }
