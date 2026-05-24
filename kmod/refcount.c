@@ -99,27 +99,21 @@ static u64 ocsfs_rc_table_block(struct ocsfs_sb_info *sbi,
 	return rc_start + bucket;
 }
 
-/* ═══════════════════════════════════════════════════════════════
- * REFCOUNT OPERATIONS
- * ═══════════════════════════════════════════════════════════════ */
+/* refcount operations */
 
 /*
- * ocsfs_refcount_get() — Get the refcount for a physical block.
- *
- * Returns 1 (default) if no explicit entry exists.
+ * ocsfs_refcount_get() — legge il refcount per un blocco fisico.
+ * Ritorna 1 (default) se non esiste entry esplicita.
  */
 int ocsfs_refcount_get(struct super_block *sb, u64 phys_block,
 		       u32 *refcount_out)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	struct ocsfs_ag_info *ag;
-	u64 local;
-	u32 bucket;
-	u64 rc_block;
 	struct buffer_head *bh;
 	struct ocsfs_disk_refcount *entries;
-	u32 nr_entries;
-	u32 i;
+	u64 local, rc_block;
+	u32 bucket, nr_entries, i;
 
 	ag = ocsfs_block_to_ag(sbi, phys_block, &local);
 	if (!ag) {
@@ -127,26 +121,11 @@ int ocsfs_refcount_get(struct super_block *sb, u64 phys_block,
 		return -EINVAL;
 	}
 
-	bucket = ocsfs_rc_hash(phys_block, OCSFS_REFCOUNT_BLOCKS_PER_AG);
+	bucket   = ocsfs_rc_hash(phys_block, OCSFS_REFCOUNT_BLOCKS_PER_AG);
 	rc_block = ocsfs_rc_table_block(sbi, ag, bucket);
 
-	/*
-	 * Force a fresh read from the block device — the refcount table is
-	 * shared across nodes, and each node has an independent page cache.
-	 * sb_bread() can return stale data, leading to incorrect CoW decisions
-	 * (e.g., thinking a block is unshared when another node holds a ref).
-	 */
 	bh = sb_getblk(sb, rc_block);
-	if (!bh) {
-		/*
-		 * Cannot determine refcount — returning 1 (= "unshared") would
-		 * be wrong: it causes the caller to skip CoW on a block that
-		 * may actually be shared with a snapshot, silently corrupting
-		 * the snapshot.  Propagate the error conservatively.
-		 */
-		*refcount_out = 0;
-		return -EIO;
-	}
+	if (!bh) { *refcount_out = 0; return -EIO; }
 	clear_buffer_uptodate(bh);
 	if (bh_read(bh, 0) < 0) {
 		brelse(bh);
@@ -154,7 +133,7 @@ int ocsfs_refcount_get(struct super_block *sb, u64 phys_block,
 		return -EIO;
 	}
 
-	entries = (struct ocsfs_disk_refcount *)bh->b_data;
+	entries    = (struct ocsfs_disk_refcount *)bh->b_data;
 	nr_entries = ocsfs_rc_entries_per_block(sbi);
 
 	for (i = 0; i < nr_entries; i++) {
@@ -164,9 +143,8 @@ int ocsfs_refcount_get(struct super_block *sb, u64 phys_block,
 						sizeof(*entries) - 4);
 
 			if (le32_to_cpu(entries[i].rc_checksum) != csum) {
-				pr_warn_ratelimited(
-					"ocsfs: refcount checksum mismatch "
-					"block %llu\n", phys_block);
+				pr_warn_ratelimited("ocsfs: refcount csum mismatch block %llu\n",
+						    phys_block);
 				brelse(bh);
 				return -EIO;
 			}
@@ -177,221 +155,186 @@ int ocsfs_refcount_get(struct super_block *sb, u64 phys_block,
 	}
 
 	brelse(bh);
-
-	/* No entry found — default refcount is 1 for allocated blocks */
-	*refcount_out = 1;
+	*refcount_out = 1;  /* default: blocco allocato non condiviso */
 	return 0;
 }
 
 /*
- * ocsfs_refcount_set() — Set the refcount for a physical block.
+ * ocsfs_refcount_apply_delta — RMW atomico via CAS su un singolo blocco.
  *
- * If count <= 1, removes the entry (1 is the default).
- * If count > 1, creates or updates an entry.
+ * Algoritmo (CRIT-3 fix):
+ *   1. Forced-read del bucket block (4096 byte) per coerenza cluster.
+ *   2. Modifica in-place l'entry per phys_block nel buffer new_buf.
+ *   3. ocsfs_atomic_cas confronta l'intero bucket: se -EAGAIN riprova.
+ *
+ * Il CAS garantisce atomicità cross-node: nessun TOCTOU tra get e set.
+ * Il DLM ag_rc_lock_res non è più necessario per correttezza (rimane
+ * come ottimizzazione locale opzionale per ridurre contesa CAS).
+ *
+ * result_count_out: refcount risultante (0 = blocco da liberare).
  */
-static int ocsfs_refcount_set(struct super_block *sb, u64 phys_block,
-			      u32 count)
+static int ocsfs_refcount_apply_delta(struct super_block *sb, u64 phys_block,
+				      int delta, u32 *result_count_out)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	struct ocsfs_ag_info *ag;
-	struct ocsfs_txn *txn;
-	u64 local;
-	u32 bucket;
-	u64 rc_block;
-	struct buffer_head *bh;
 	struct ocsfs_disk_refcount *entries;
-	u32 nr_entries;
-	u32 i;
-	int free_slot = -1;
-	int ret;
+	u64 local, rc_block;
+	u32 bucket, nr_entries, i, new_count;
+	u8 *expected_buf, *new_buf;
+	int attempt, ret, found_idx, free_slot;
 
 	ag = ocsfs_block_to_ag(sbi, phys_block, &local);
 	if (!ag)
 		return -EINVAL;
 
-	txn = ocsfs_txn_begin(sb);
-	if (IS_ERR(txn))
-		return PTR_ERR(txn);
-
-	bucket = ocsfs_rc_hash(phys_block, OCSFS_REFCOUNT_BLOCKS_PER_AG);
+	bucket   = ocsfs_rc_hash(phys_block, OCSFS_REFCOUNT_BLOCKS_PER_AG);
 	rc_block = ocsfs_rc_table_block(sbi, ag, bucket);
-
-	/*
-	 * Same forced-read pattern as ocsfs_refcount_get: must bypass page
-	 * cache to see the latest on-disk refcount written by other nodes.
-	 * The txn captures the BEFORE-image after this read.
-	 */
-	bh = sb_getblk(sb, rc_block);
-	if (!bh) {
-		ocsfs_txn_abort(txn);
-		return -EIO;
-	}
-	clear_buffer_uptodate(bh);
-	if (bh_read(bh, 0) < 0) {
-		brelse(bh);
-		ocsfs_txn_abort(txn);
-		return -EIO;
-	}
-
-	ret = ocsfs_txn_add_bh(txn, bh);
-	if (ret) {
-		brelse(bh);
-		ocsfs_txn_abort(txn);
-		return ret;
-	}
-
-	entries = (struct ocsfs_disk_refcount *)bh->b_data;
 	nr_entries = ocsfs_rc_entries_per_block(sbi);
 
-	/* Search for existing entry or free slot */
-	for (i = 0; i < nr_entries; i++) {
-		u64 blk = le64_to_cpu(entries[i].rc_block);
-		u32 cnt = le32_to_cpu(entries[i].rc_count);
+	expected_buf = kmalloc(sbi->s_block_size, GFP_KERNEL);
+	new_buf      = kmalloc(sbi->s_block_size, GFP_KERNEL);
+	if (!expected_buf || !new_buf) {
+		ret = -ENOMEM;
+		goto out_free;
+	}
 
-		if (blk == phys_block && cnt > 0) {
-			/* Found existing entry */
-			if (count <= 1) {
-				entries[i].rc_block = 0;
-				entries[i].rc_count = 0;
-			} else {
-				entries[i].rc_count = cpu_to_le32(count);
+	for (attempt = 0; attempt < CAS_MAX_ATTEMPTS; attempt++) {
+		struct buffer_head *bh;
+
+		bh = sb_getblk(sb, rc_block);
+		if (!bh) { ret = -EIO; break; }
+		clear_buffer_uptodate(bh);
+		ret = bh_read(bh, 0);
+		if (ret < 0) { brelse(bh); break; }
+
+		memcpy(expected_buf, bh->b_data, sbi->s_block_size);
+		brelse(bh);
+		memcpy(new_buf, expected_buf, sbi->s_block_size);
+
+		entries   = (struct ocsfs_disk_refcount *)new_buf;
+		found_idx = -1;
+		free_slot = -1;
+
+		for (i = 0; i < nr_entries; i++) {
+			u64 blk = le64_to_cpu(entries[i].rc_block);
+			u32 cnt = le32_to_cpu(entries[i].rc_count);
+
+			if (blk == phys_block && cnt > 0) {
+				found_idx = (int)i;
+				break;
 			}
-			entries[i].rc_checksum = cpu_to_le32(
-				ocsfs_crc32c(0, &entries[i],
-					     sizeof(*entries) - 4));
-			brelse(bh);
-			return ocsfs_txn_commit(txn);
+			if (free_slot < 0 && (blk == 0 || cnt == 0))
+				free_slot = (int)i;
 		}
 
-		if (free_slot < 0 && (blk == 0 || cnt == 0))
-			free_slot = i;
+		if (found_idx >= 0) {
+			u32 old = le32_to_cpu(entries[found_idx].rc_count);
+
+			if (delta >= 0)
+				new_count = old + (u32)delta;
+			else
+				new_count = (old > (u32)(-delta)) ?
+					    old - (u32)(-delta) : 0;
+
+			if (new_count <= 1) {
+				entries[found_idx].rc_block    = 0;
+				entries[found_idx].rc_count    = 0;
+				entries[found_idx].rc_checksum = 0;
+			} else {
+				entries[found_idx].rc_count = cpu_to_le32(new_count);
+				entries[found_idx].rc_checksum = cpu_to_le32(
+					ocsfs_crc32c(0, &entries[found_idx],
+						     sizeof(*entries) - 4));
+			}
+		} else if (delta > 0) {
+			/* Blocco era a refcount implicito 1; inc → 2+ */
+			if (free_slot < 0) {
+				pr_warn("ocsfs: refcount table full AG %u\n",
+					ag->ag_no);
+				ret = -ENOSPC;
+				break;
+			}
+			new_count = 1 + (u32)delta;
+			entries[free_slot].rc_block = cpu_to_le64(phys_block);
+			entries[free_slot].rc_count = cpu_to_le32(new_count);
+			entries[free_slot].rc_checksum = cpu_to_le32(
+				ocsfs_crc32c(0, &entries[free_slot],
+					     sizeof(*entries) - 4));
+		} else {
+			/* Dec su blocco a refcount implicito 1 → 0 (da liberare) */
+			new_count = 0;
+			if (result_count_out)
+				*result_count_out = 0;
+			ret = 0;
+			goto out_free;
+		}
+
+		ret = ocsfs_atomic_cas(sb, rc_block, 0, sbi->s_block_size,
+				       expected_buf, new_buf);
+		if (ret == 0) {
+			if (result_count_out)
+				*result_count_out = new_count;
+			break;
+		}
+		if (ret != -EAGAIN)
+			break;
+		udelay(1 << min(attempt, 8));
 	}
 
-	/* No existing entry found */
-	if (count <= 1) {
-		brelse(bh);
-		ocsfs_txn_abort(txn);
-		return 0;
-	}
+	if (attempt == CAS_MAX_ATTEMPTS)
+		ret = -EBUSY;
 
-	if (free_slot < 0) {
-		brelse(bh);
-		ocsfs_txn_abort(txn);
-		pr_warn("ocsfs: refcount table full for AG %u\n", ag->ag_no);
-		return -ENOSPC;
-	}
-
-	/* Create new entry */
-	entries[free_slot].rc_block = cpu_to_le64(phys_block);
-	entries[free_slot].rc_count = cpu_to_le32(count);
-	entries[free_slot].rc_checksum = cpu_to_le32(
-		ocsfs_crc32c(0, &entries[free_slot],
-			     sizeof(*entries) - 4));
-	brelse(bh);
-	return ocsfs_txn_commit(txn);
-}
-
-/*
- * ocsfs_refcount_inc() — Increment refcount on a range of blocks.
- *
- * For snapshot creation: all shared extents go from 1 → 2
- * (or n → n+1 for multi-layer snapshots).
- *
- * Holds DLM EX on the AG refcount lock in cluster mode so that the
- * read-modify-write is atomic across nodes.
- */
-int ocsfs_refcount_inc(struct super_block *sb, u64 phys_block, u32 len)
-{
-	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
-	struct ocsfs_ag_info *ag = NULL;
-	u64 local;
-	u32 i;
-	int ret = 0;
-
-	if (sbi->s_clustered) {
-		ag = ocsfs_block_to_ag(sbi, phys_block, &local);
-		if (!ag)
-			return -EINVAL;
-		ret = ocsfs_lock_acquire(sb, &ag->ag_rc_lock_res, OCSFS_LOCK_EX);
-		if (ret)
-			return ret;
-	}
-
-	for (i = 0; i < len; i++) {
-		u32 current_rc;
-
-		ret = ocsfs_refcount_get(sb, phys_block + i, &current_rc);
-		if (ret)
-			goto out;
-
-		ret = ocsfs_refcount_set(sb, phys_block + i, current_rc + 1);
-		if (ret)
-			goto out;
-	}
-
-out:
-	if (sbi->s_clustered && ag)
-		ocsfs_lock_release(sb, &ag->ag_rc_lock_res);
+out_free:
+	kfree(expected_buf);
+	kfree(new_buf);
 	return ret;
 }
 
 /*
- * ocsfs_refcount_dec() — Decrement refcount on a range of blocks.
+ * ocsfs_refcount_inc — incrementa refcount su un range di blocchi.
  *
- * @should_free: set to true if refcount drops to 0 (caller should
- *               free the blocks).
+ * Usa apply_delta (CAS atomico) invece del vecchio get+set TOCTOU.
+ */
+int ocsfs_refcount_inc(struct super_block *sb, u64 phys_block, u32 len)
+{
+	u32 i;
+
+	for (i = 0; i < len; i++) {
+		int ret = ocsfs_refcount_apply_delta(sb, phys_block + i, +1, NULL);
+
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+/*
+ * ocsfs_refcount_dec — decrementa refcount su un range di blocchi.
  *
- * For snapshot deletion and CoW: decrements shared extent refcounts.
- *
- * Holds DLM EX on the AG refcount lock in cluster mode so that the
- * read-modify-write is atomic across nodes.
+ * Usa apply_delta (CAS atomico) invece del vecchio get+set TOCTOU.
+ * should_free viene settato a true se TUTTI i blocchi scendono a 0.
  */
 int ocsfs_refcount_dec(struct super_block *sb, u64 phys_block, u32 len,
 		       bool *should_free)
 {
-	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
-	struct ocsfs_ag_info *ag = NULL;
-	u64 local;
-	u32 i;
-	int ret = 0;
 	bool all_free = true;
-
-	if (sbi->s_clustered) {
-		ag = ocsfs_block_to_ag(sbi, phys_block, &local);
-		if (!ag)
-			return -EINVAL;
-		ret = ocsfs_lock_acquire(sb, &ag->ag_rc_lock_res, OCSFS_LOCK_EX);
-		if (ret)
-			return ret;
-	}
+	u32 i;
 
 	for (i = 0; i < len; i++) {
-		u32 current_rc;
+		u32 result_count = 1;
+		int ret = ocsfs_refcount_apply_delta(sb, phys_block + i, -1,
+						     &result_count);
 
-		ret = ocsfs_refcount_get(sb, phys_block + i, &current_rc);
 		if (ret)
-			goto out;
-
-		if (current_rc <= 1) {
-			/* Already at 1 or 0 — will be freed */
-			ret = ocsfs_refcount_set(sb, phys_block + i, 0);
-		} else {
-			ret = ocsfs_refcount_set(sb, phys_block + i,
-						 current_rc - 1);
+			return ret;
+		if (result_count > 0)
 			all_free = false;
-		}
-
-		if (ret)
-			goto out;
 	}
 
 	if (should_free)
 		*should_free = all_free;
-
-out:
-	if (sbi->s_clustered && ag)
-		ocsfs_lock_release(sb, &ag->ag_rc_lock_res);
-	return ret;
+	return 0;
 }
 
 /*
