@@ -153,14 +153,17 @@ static int heartbeat_read(struct super_block *sb, u16 slot,
 int ocsfs_heartbeat_check_peers(struct super_block *sb)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
-	struct ocsfs_disk_heartbeat dhb;
 	u64 now = ktime_get_real_ns();
 	u64 timeout_ns = (u64)OCSFS_HB_TIMEOUT_MS * 1000000ULL;
+	struct buffer_head *cur_bh = NULL;
+	u64 cur_block = (u64)-1;
 	u16 i;
-	int ret;
 
 	for (i = 0; i < sbi->s_max_nodes; i++) {
 		struct ocsfs_node_info *ni;
+		struct ocsfs_disk_heartbeat *dhb;
+		u64 off, block, hb_ts;
+		u32 boff;
 
 		/* Skip ourselves */
 		if (i == sbi->s_node_slot)
@@ -174,19 +177,44 @@ int ocsfs_heartbeat_check_peers(struct super_block *sb)
 		}
 		spin_unlock(&sbi->s_node_lock);
 
-		ret = heartbeat_read(sb, i, &dhb);
-		if (ret)
+		off   = OCSFS_HEARTBEAT_OFF + (u64)i * OCSFS_HEARTBEAT_ENTRY_SIZE;
+		block = off / sbi->s_block_size;
+		boff  = (u32)(off % sbi->s_block_size);
+
+		/*
+		 * Read the physical block only when it changes.  With 4 HB
+		 * entries per 4 KiB block this cuts I/O by up to 4x for
+		 * dense node tables.  heartbeat_read_timeout forces a fresh
+		 * read past the page cache so all slots in the block are
+		 * coherent with each other (same point-in-time snapshot).
+		 */
+		if (block != cur_block) {
+			if (cur_bh) {
+				brelse(cur_bh);
+				cur_bh = NULL;
+			}
+			cur_bh = sb_getblk(sb, block);
+			if (cur_bh && heartbeat_read_timeout(cur_bh) < 0) {
+				brelse(cur_bh);
+				cur_bh = NULL;
+			}
+			cur_block = block;
+		}
+
+		if (!cur_bh)
 			continue;
 
-		if (le32_to_cpu(dhb.hb_magic) != OCSFS_HEARTBEAT_MAGIC)
+		dhb = (struct ocsfs_disk_heartbeat *)(cur_bh->b_data + boff);
+
+		if (le32_to_cpu(dhb->hb_magic) != OCSFS_HEARTBEAT_MAGIC)
 			continue;
 
-		u64 hb_ts = le64_to_cpu(dhb.hb_timestamp);
+		hb_ts = le64_to_cpu(dhb->hb_timestamp);
 
 		/* Update cached heartbeat info */
 		spin_lock(&sbi->s_node_lock);
 		ni->ni_last_hb = hb_ts;
-		ni->ni_hb_sequence = le64_to_cpu(dhb.hb_sequence);
+		ni->ni_hb_sequence = le64_to_cpu(dhb->hb_sequence);
 		spin_unlock(&sbi->s_node_lock);
 
 		/* Two-stage detection: SUSPECTED → confirmed dead */
@@ -226,6 +254,9 @@ int ocsfs_heartbeat_check_peers(struct super_block *sb)
 			spin_unlock(&sbi->s_node_lock);
 		}
 	}
+
+	if (cur_bh)
+		brelse(cur_bh);
 
 	return 0;
 }

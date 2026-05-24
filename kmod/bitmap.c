@@ -79,7 +79,7 @@ static int ocsfs_ag_alloc_blocks(struct super_block *sb, u32 ag_no,
 		struct buffer_head *bh;
 		u64 bm_block = (ag->bitmap_off / sbi->s_block_size) + b;
 		u32 bits_in_block = sbi->s_block_size * 8;
-		u32 bit;
+		u32 scan_pos;
 
 		/* Clamp to actual block count in this AG */
 		if (b * bits_in_block >= ag->block_count)
@@ -93,76 +93,118 @@ static int ocsfs_ag_alloc_blocks(struct super_block *sb, u32 ag_no,
 			goto out_unlock;
 		}
 
-		for (bit = 0; bit < bits_in_block; bit++) {
-			u32 byte_idx = bit / 8;
-			u32 bit_idx = bit % 8;
-			u8 *byte_ptr = (u8 *)bh->b_data + byte_idx;
+		/*
+		 * Use LE bitmap primitives to skip used bits in bulk rather
+		 * than testing each bit individually.
+		 */
+		if (found > 0) {
+			/*
+			 * Continuation: check whether leading free bits in
+			 * this block extend the cross-block run.
+			 */
+			u32 first_used = find_next_bit_le(bh->b_data,
+							   bits_in_block, 0);
 
-			if (!(*byte_ptr & (1 << bit_idx))) {
-				/* Free bit */
-				if (found == 0)
-					start_bit = b * (sbi->s_block_size * 8) + bit;
-				found++;
-				if (found == count) {
-					/* Mark bits as allocated */
-					u64 mark_bit;
-
-					for (mark_bit = start_bit;
-					     mark_bit < start_bit + count;
-					     mark_bit++) {
-						u64 mb = mark_bit / (sbi->s_block_size * 8);
-						u32 mbit = (u32)(mark_bit % (sbi->s_block_size * 8));
-						struct buffer_head *mbh;
-
-						if (mb == b) {
-							mbh = bh;
-						} else {
-							mbh = ocsfs_meta_getblk(sb,
-								(ag->bitmap_off / sbi->s_block_size) + mb);
-							if (!mbh) {
-								brelse(bh);
-								ret = -EIO;
-								goto out_unlock;
-							}
-						}
-
-						if (txn) {
-							ret = ocsfs_txn_add_bh(txn, mbh);
-							if (ret) {
-								if (mb != b)
-									brelse(mbh);
-								brelse(bh);
-								goto out_unlock;
-							}
-						}
-
-						((u8 *)mbh->b_data)[mbit / 8] |=
-							(1 << (mbit % 8));
-						if (!txn)
-							mark_buffer_dirty(mbh);
-
-						if (mb != b)
-							brelse(mbh);
-					}
-
-					brelse(bh);
-
-					ag->free_blocks -= count;
-					spin_lock(&sbi->s_free_lock);
-					sbi->s_free_blocks -= count;
-					spin_unlock(&sbi->s_free_lock);
-
-					*block_out = ag->block_start + start_bit;
-					ret = 0;
-					goto out_unlock;
-				}
-			} else {
-				/* Used bit — reset counter */
-				found = 0;
+			if (first_used > 0) {
+				found += first_used;
+				if (found >= count)
+					goto do_mark;
 			}
+			if (first_used == bits_in_block) {
+				/* Whole block free — run continues */
+				brelse(bh);
+				continue;
+			}
+			/* Run broken; reset and scan from first_used */
+			found = 0;
+			scan_pos = first_used;
+		} else {
+			scan_pos = 0;
+		}
+
+		while (scan_pos < bits_in_block) {
+			u32 zbit = find_next_zero_bit_le(bh->b_data,
+							  bits_in_block,
+							  scan_pos);
+			u32 next_set;
+
+			if (zbit >= bits_in_block)
+				break;
+
+			next_set = find_next_bit_le(bh->b_data,
+						     bits_in_block, zbit);
+			found = next_set - zbit;
+			start_bit = b * (sbi->s_block_size * 8) + zbit;
+
+			if (found >= count)
+				goto do_mark;
+
+			if (next_set >= bits_in_block)
+				break; /* run extends into next block */
+
+			/* Run ended — try next free region */
+			scan_pos = next_set;
+			found = 0;
 		}
 
 		brelse(bh);
+		continue;
+
+do_mark:
+		{
+			u64 mark_bit;
+
+			for (mark_bit = start_bit;
+			     mark_bit < start_bit + count;
+			     mark_bit++) {
+				u64 mb = mark_bit / (sbi->s_block_size * 8);
+				u32 mbit = (u32)(mark_bit %
+						 (sbi->s_block_size * 8));
+				struct buffer_head *mbh;
+
+				if (mb == b) {
+					mbh = bh;
+				} else {
+					mbh = ocsfs_meta_getblk(sb,
+						(ag->bitmap_off /
+						 sbi->s_block_size) + mb);
+					if (!mbh) {
+						brelse(bh);
+						ret = -EIO;
+						goto out_unlock;
+					}
+				}
+
+				if (txn) {
+					ret = ocsfs_txn_add_bh(txn, mbh);
+					if (ret) {
+						if (mb != b)
+							brelse(mbh);
+						brelse(bh);
+						goto out_unlock;
+					}
+				}
+
+				((u8 *)mbh->b_data)[mbit / 8] |=
+					(1 << (mbit % 8));
+				if (!txn)
+					mark_buffer_dirty(mbh);
+
+				if (mb != b)
+					brelse(mbh);
+			}
+
+			brelse(bh);
+
+			ag->free_blocks -= count;
+			spin_lock(&sbi->s_free_lock);
+			sbi->s_free_blocks -= count;
+			spin_unlock(&sbi->s_free_lock);
+
+			*block_out = ag->block_start + start_bit;
+			ret = 0;
+			goto out_unlock;
+		}
 	}
 
 	ret = -ENOSPC;
