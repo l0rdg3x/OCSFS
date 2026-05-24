@@ -62,13 +62,21 @@ static int journal_replay_j(struct super_block *sb, struct ocsfs_journal *j)
 		return 0;
 	}
 
+	/* Wrap-around sanity: tail must not exceed head */
+	if (j->tail > j->head || j->head > j->size) {
+		pr_err("ocsfs: journal corrupt (tail=%llu head=%llu size=%llu) — reset\n",
+		       j->tail, j->head, j->size);
+		j->tail = j->head = sizeof(struct ocsfs_disk_journal_hdr);
+		return -EUCLEAN;
+	}
+
 	pr_info("ocsfs: replaying journal (tail=%llu head=%llu)\n",
 		j->tail, j->head);
 
 	scan_pos = j->tail;
 
 	while (scan_pos < j->head) {
-		u32 type;
+		u32 type, crc_got, crc_exp;
 		u64 tid;
 		bool committed = false;
 		u64 ahead;
@@ -80,17 +88,19 @@ static int journal_replay_j(struct super_block *sb, struct ocsfs_journal *j)
 		type = le32_to_cpu(jt.jt_type);
 
 		if (type != OCSFS_JTYPE_BEGIN) {
-			/*
-			 * Unexpected record type at this position.  Advancing
-			 * by sizeof(jt) could land in the middle of a block
-			 * payload where 0x00000001 happens to appear, causing
-			 * the replayer to treat data as a BEGIN header and apply
-			 * BEFORE-images to the wrong blocks — bricking the fs.
-			 * Abort and require fsck instead.
-			 */
 			pr_err("ocsfs: journal replay: unexpected record type %u "
 			       "at pos %llu — aborting, filesystem requires fsck\n",
 			       type, scan_pos);
+			return -EUCLEAN;
+		}
+
+		/* Verify BEGIN record integrity before trusting its fields */
+		crc_exp = le32_to_cpu(jt.jt_checksum);
+		crc_got = ocsfs_crc32c(~0U, &jt, sizeof(jt) - sizeof(__le32));
+		if (crc_got != crc_exp) {
+			pr_err("ocsfs: journal replay: BEGIN CRC mismatch at pos %llu "
+			       "(exp=%08x got=%08x) — aborting\n",
+			       scan_pos, crc_exp, crc_got);
 			return -EUCLEAN;
 		}
 

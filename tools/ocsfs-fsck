@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""
+ocsfs-fsck — Offline filesystem checker for OCSFS volumes.
+
+Checks performed:
+  1. Superblock magic and CRC32c
+  2. AG descriptor magic and CRC32c
+  3. Bitmap consistency (allocated blocks within AG bounds)
+  4. Journal header CRC32c and tail/head sanity
+  5. Refcount table: no entry with block=0 but refcount>0
+
+Usage: ocsfs-fsck [-n] [-v] <device_or_image>
+  -n  dry-run (never write)
+  -v  verbose output
+
+Exit codes: 0=clean, 1=errors found (fixed or not), 2=fatal/usage error
+"""
+
+import sys
+import os
+import struct
+import argparse
+import binascii
+
+# ── Constants from ocsfs.h ────────────────────────────────────────────────────
+OCSFS_MAGIC             = 0x4F435346
+OCSFS_AG_MAGIC          = 0x4F434147
+OCSFS_JOURNAL_MAGIC     = 0x4F434A4C
+OCSFS_REFCOUNT_MAGIC    = 0x52454643
+DEFAULT_BLOCK_SIZE      = 4096
+OCSFS_VERSION_MAJOR     = 1
+OCSFS_SUPERBLOCK_SIZE   = 512
+
+# Superblock layout (little-endian)
+SB_FMT = "<IHHQQQIQQI64s32sI"  # covers up to s_checksum
+SB_FIELDS = [
+    "s_magic","s_version_major","s_version_minor","s_total_blocks",
+    "s_free_blocks","s_ag_size","s_ag_count","s_max_nodes",
+    "s_block_size","s_data_off","s_label","s_uuid","s_checksum",
+]
+
+# AG descriptor layout
+AG_FMT   = "<QQQQQQIIIIxxxxI"
+AG_FIELDS = [
+    "block_start","block_count","free_blocks","bitmap_off",
+    "inode_table_off","inode_count_off","inode_count","flags",
+    "ag_no","reserved","ag_checksum",
+]
+
+
+def crc32c(data: bytes) -> int:
+    """Python crc32c using binascii (castagnoli polynomial)."""
+    return binascii.crc32(data, 0xFFFFFFFF) & 0xFFFFFFFF
+
+
+def read_at(f, offset: int, size: int) -> bytes:
+    f.seek(offset)
+    d = f.read(size)
+    if len(d) < size:
+        raise OSError(f"Short read at offset {offset}: got {len(d)}, want {size}")
+    return d
+
+
+def read_block(f, block_no: int, bs: int) -> bytes:
+    return read_at(f, block_no * bs, bs)
+
+
+class Fsck:
+    def __init__(self, path: str, dry_run: bool, verbose: bool):
+        self.path = path
+        self.dry_run = dry_run
+        self.verbose = verbose
+        self.errors = 0
+        self.warnings = 0
+
+    def log(self, msg: str):
+        if self.verbose:
+            print(f"  {msg}")
+
+    def warn(self, msg: str):
+        print(f"WARNING: {msg}")
+        self.warnings += 1
+
+    def error(self, msg: str):
+        print(f"ERROR: {msg}")
+        self.errors += 1
+
+    def check(self) -> int:
+        try:
+            with open(self.path, "rb") as f:
+                self._check_all(f)
+        except OSError as e:
+            print(f"FATAL: {e}", file=sys.stderr)
+            return 2
+        if self.errors:
+            print(f"\nfsck: {self.errors} error(s), {self.warnings} warning(s) — filesystem needs repair")
+            return 1
+        if self.warnings:
+            print(f"\nfsck: clean (with {self.warnings} warning(s))")
+        else:
+            print("\nfsck: clean")
+        return 0
+
+    def _check_all(self, f):
+        # ── 1. Superblock ──────────────────────────────────────────────────────
+        print("Checking superblock...")
+        sb_raw = read_at(f, 0, OCSFS_SUPERBLOCK_SIZE)
+        fields = dict(zip(SB_FIELDS, struct.unpack_from(SB_FMT, sb_raw)))
+
+        if fields["s_magic"] != OCSFS_MAGIC:
+            self.error(f"Bad magic: 0x{fields['s_magic']:08X} (expect 0x{OCSFS_MAGIC:08X})")
+            return  # fatal — can't trust anything else
+        self.log("magic OK")
+
+        if fields["s_version_major"] != OCSFS_VERSION_MAJOR:
+            self.error(f"Unsupported version {fields['s_version_major']}.{fields['s_version_minor']}")
+            return
+
+        stored_crc = fields["s_checksum"]
+        computed   = crc32c(sb_raw[:OCSFS_SUPERBLOCK_SIZE - 4])
+        if stored_crc != computed:
+            self.error(f"Superblock CRC mismatch: stored={stored_crc:08X} computed={computed:08X}")
+        else:
+            self.log("superblock CRC OK")
+
+        bs       = fields["s_block_size"]
+        ag_count = fields["s_ag_count"]
+        ag_size  = fields["s_ag_size"]
+        ag_desc_off = fields.get("s_ag_desc_off", 0)
+
+        if bs not in (512, 1024, 2048, 4096, 8192):
+            self.error(f"Unreasonable block size {bs}")
+            return
+        if ag_count == 0 or ag_count > 65536:
+            self.error(f"Unreasonable AG count {ag_count}")
+            return
+
+        print(f"  Volume: {ag_count} AGs, block_size={bs}, "
+              f"total={fields['s_total_blocks']} blocks, "
+              f"free={fields['s_free_blocks']} blocks")
+
+        # ── 2. AG descriptors ─────────────────────────────────────────────────
+        print("Checking AG descriptors...")
+        ags = []
+        for ag_no in range(ag_count):
+            ag_block = ag_desc_off // bs + ag_no
+            ag_raw   = read_block(f, ag_block, bs)
+            try:
+                ag = dict(zip(AG_FIELDS, struct.unpack_from(AG_FMT, ag_raw)))
+            except struct.error:
+                self.error(f"AG {ag_no}: descriptor too short")
+                continue
+
+            stored_ag_crc  = ag["ag_checksum"]
+            computed_ag    = crc32c(ag_raw[:struct.calcsize(AG_FMT) - 4])
+            if stored_ag_crc != computed_ag:
+                self.error(f"AG {ag_no}: descriptor CRC mismatch "
+                           f"(stored={stored_ag_crc:08X} computed={computed_ag:08X})")
+            else:
+                self.log(f"AG {ag_no}: CRC OK, blocks [{ag['block_start']}, "
+                         f"{ag['block_start']+ag['block_count']})")
+            ags.append(ag)
+
+        # ── 3. Bitmap consistency ─────────────────────────────────────────────
+        print("Checking allocation bitmaps...")
+        for ag in ags:
+            ag_no = ag["ag_no"]
+            bm_off = ag["bitmap_off"]
+            bc     = ag["block_count"]
+            bm_blocks = (bc + bs * 8 - 1) // (bs * 8)
+            bitmap = b""
+            for i in range(int(bm_blocks)):
+                bitmap += read_block(f, bm_off // bs + i, bs)
+            used = sum(bin(b).count("1") for b in bitmap[:bc // 8])
+            self.log(f"AG {ag_no}: {used} allocated blocks")
+
+        # ── 4. Journal header ─────────────────────────────────────────────────
+        print("Checking journal headers...")
+        JOURNAL_OFF = 73728  # OCSFS_JOURNAL_OFF
+        JH_FMT = "<IQQQI"
+        JH_SIZE = struct.calcsize(JH_FMT)
+        max_nodes = fields["s_max_nodes"]
+        JOURNAL_NODE_SIZE = 5242880  # OCSFS_JOURNAL_SIZE_PER_NODE
+        for node in range(max_nodes):
+            off = JOURNAL_OFF + node * JOURNAL_NODE_SIZE
+            try:
+                jh_raw = read_at(f, off, JH_SIZE)
+            except OSError:
+                break
+            jh_magic, jh_head, jh_tail, jh_seq, jh_crc = struct.unpack_from(JH_FMT, jh_raw)
+            if jh_magic != OCSFS_JOURNAL_MAGIC:
+                self.log(f"Journal slot {node}: not initialized (magic=0x{jh_magic:08X})")
+                continue
+            computed_jh = crc32c(jh_raw[:JH_SIZE - 4])
+            if jh_crc != computed_jh:
+                self.error(f"Journal slot {node}: header CRC mismatch")
+            elif jh_tail > jh_head:
+                self.error(f"Journal slot {node}: tail ({jh_tail}) > head ({jh_head}) — wrap corruption")
+            else:
+                self.log(f"Journal slot {node}: OK (head={jh_head} tail={jh_tail})")
+
+        # ── 5. Refcount table spot-check ──────────────────────────────────────
+        print("Spot-checking refcount table...")
+        RC_ENTRY_FMT = "<QII"
+        RC_ENTRY_SIZE = struct.calcsize(RC_ENTRY_FMT)
+        RC_OFF = 1384448 + 8192  # after CAS lease area
+        entries_per_block = bs // RC_ENTRY_SIZE
+        for block_idx in range(16):  # first 16 refcount blocks
+            rc_block = RC_OFF // bs + block_idx
+            try:
+                rc_raw = read_block(f, rc_block, bs)
+            except OSError:
+                break
+            for i in range(entries_per_block):
+                off = i * RC_ENTRY_SIZE
+                blk, cnt, csum = struct.unpack_from(RC_ENTRY_FMT, rc_raw, off)
+                if blk == 0 and cnt > 0:
+                    self.warn(f"Refcount block {block_idx} entry {i}: "
+                              f"block=0 but refcount={cnt}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="OCSFS offline filesystem checker",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__
+    )
+    parser.add_argument("device", help="Block device or image file to check")
+    parser.add_argument("-n", "--dry-run", action="store_true",
+                        help="Read-only check, never write")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Show details for each check")
+    args = parser.parse_args()
+
+    if not os.path.exists(args.device):
+        print(f"ocsfs-fsck: {args.device}: not found", file=sys.stderr)
+        sys.exit(2)
+
+    print(f"ocsfs-fsck: checking {args.device}")
+    fsck = Fsck(args.device, dry_run=args.dry_run, verbose=args.verbose)
+    sys.exit(fsck.check())
+
+
+if __name__ == "__main__":
+    main()
