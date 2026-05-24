@@ -6,54 +6,149 @@
  * When a node is detected as failed (heartbeat timeout), the surviving
  * nodes execute a 5-phase recovery:
  *
- *   Phase 1 — Leader Election:   lowest-slot surviving node wins
+ *   Phase 1 — Leader Election:   CAS on-disk recovery leader block
  *   Phase 2 — SCSI PR Fencing:   preempt-and-abort the failed node's key
  *   Phase 3 — Journal Replay:    replay the failed node's journal
  *   Phase 4 — Lock Recovery:     release all locks held by the failed node
  *   Phase 5 — Slot Cleanup:      mark the slot as DEAD
  *
- * Only the elected leader performs recovery. Other nodes wait.
- * The SCSI PR fencing ensures the failed node cannot write even if
- * it is still running (zombie/partitioned).
- *
- * Multiple concurrent failures are handled via s_recovery_pending bitmask:
- * each failed slot sets its bit; the work function drains them in order.
+ * Leader election uses ocsfs_atomic_cas() on an on-disk block at
+ * OCSFS_RECOVERY_LEADER_OFF.  Only the node that wins the CAS proceeds.
+ * This eliminates the TOCTOU window between in-memory is_leader check
+ * and DLM acquire that could cause two nodes to run recovery in parallel.
  */
 
 #include "ocsfs.h"
 
 /* ═══════════════════════════════════════════════════════════════
- * LEADER ELECTION
- *
- * The active node with the lowest slot number becomes recovery leader.
- * We use a special lock in the Lock Table (LOCKRES_RECOVERY) to
- * ensure only one node performs recovery at a time.
+ * RECOVERY LEADER BLOCK — CAS-based distributed election
  * ═══════════════════════════════════════════════════════════════ */
 
-static bool ocsfs_is_recovery_leader(struct super_block *sb, u16 failed_slot)
+static u64 ocsfs_rl_block(struct super_block *sb)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
-	bool is_leader = true;
-	u16 i;
 
-	/*
-	 * Hold the lock for the entire scan so no node changes state between
-	 * iterations.  Dropping and re-acquiring per iteration creates a TOCTOU
-	 * window where a lower-numbered slot could become ACTIVE after we
-	 * already skipped it, causing two nodes to both believe they are leader.
-	 */
-	spin_lock(&sbi->s_node_lock);
-	for (i = 0; i < sbi->s_max_nodes; i++) {
-		if (i == failed_slot)
-			continue;
-		if (sbi->s_nodes[i].ni_state == OCSFS_NODE_ACTIVE) {
-			is_leader = (i == sbi->s_node_slot);
-			goto out;
+	return OCSFS_RECOVERY_LEADER_OFF / sbi->s_block_size;
+}
+
+static u32 ocsfs_rl_crc(const struct ocsfs_disk_recovery_leader *rl)
+{
+	return ocsfs_crc32c(0, rl, offsetof(struct ocsfs_disk_recovery_leader,
+					    rl_checksum));
+}
+
+/*
+ * ocsfs_recovery_leader_acquire — attempt to become recovery leader via CAS.
+ *
+ * Returns 0 on success (this node is now leader).
+ *         -EAGAIN if another node already holds leadership.
+ *         -errno on I/O or other error.
+ *
+ * epoch_out receives the epoch to pass to ocsfs_recovery_leader_release().
+ */
+static int ocsfs_recovery_leader_acquire(struct super_block *sb,
+					 u16 failed_slot, u32 *epoch_out)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	struct ocsfs_disk_recovery_leader cur, new;
+	struct buffer_head *bh;
+	u64 block = ocsfs_rl_block(sb);
+	u64 now;
+	int attempt, ret;
+
+	for (attempt = 0; attempt < CAS_MAX_ATTEMPTS; attempt++) {
+		bh = sb_getblk(sb, block);
+		if (!bh)
+			return -EIO;
+		clear_buffer_uptodate(bh);
+		ret = bh_read(bh, 0);
+		if (ret < 0) {
+			brelse(bh);
+			return -EIO;
 		}
+		memcpy(&cur, bh->b_data, sizeof(cur));
+		brelse(bh);
+
+		now = ktime_get_real_ns();
+
+		/* If the block is uninitialised or leadership has expired, we can claim. */
+		if (le32_to_cpu(cur.rl_magic) == OCSFS_RECOVERY_LEADER_MAGIC &&
+		    le16_to_cpu(cur.rl_leader_slot) != OCSFS_RL_SLOT_FREE &&
+		    le64_to_cpu(cur.rl_deadline_ns) > now) {
+			/* Valid leader exists and hasn't expired */
+			if (le16_to_cpu(cur.rl_leader_slot) == sbi->s_node_slot) {
+				/* We already hold it (retry after own timeout?) */
+				if (epoch_out)
+					*epoch_out = le32_to_cpu(cur.rl_epoch);
+				return 0;
+			}
+			return -EAGAIN;
+		}
+
+		/* Build new leader block claiming leadership for this node */
+		memset(&new, 0, sizeof(new));
+		new.rl_magic       = cpu_to_le32(OCSFS_RECOVERY_LEADER_MAGIC);
+		new.rl_leader_slot = cpu_to_le16(sbi->s_node_slot);
+		new.rl_target_slot = cpu_to_le16(failed_slot);
+		new.rl_leader_gen  = cpu_to_le32(sbi->s_mount_gen);
+		new.rl_epoch       = cpu_to_le32(le32_to_cpu(cur.rl_epoch) + 1);
+		new.rl_deadline_ns = cpu_to_le64(now + RECOVERY_LEADER_TIMEOUT_NS);
+		new.rl_checksum    = cpu_to_le32(ocsfs_rl_crc(&new));
+
+		ret = ocsfs_atomic_cas(sb, block, 0, sizeof(cur), &cur, &new);
+		if (ret == 0) {
+			if (epoch_out)
+				*epoch_out = le32_to_cpu(new.rl_epoch);
+			return 0;
+		}
+		if (ret != -EAGAIN)
+			return ret;
+
+		udelay(1 << min(attempt, 8));
 	}
-out:
-	spin_unlock(&sbi->s_node_lock);
-	return is_leader;
+	return -EBUSY;
+}
+
+/*
+ * ocsfs_recovery_leader_release — relinquish the recovery leader role.
+ *
+ * Only releases if we still hold leadership (epoch matches).
+ */
+static void ocsfs_recovery_leader_release(struct super_block *sb,
+					  u16 failed_slot, u32 epoch)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	struct ocsfs_disk_recovery_leader cur, free;
+	struct buffer_head *bh;
+	u64 block = ocsfs_rl_block(sb);
+	int ret;
+
+	bh = sb_getblk(sb, block);
+	if (!bh)
+		return;
+	clear_buffer_uptodate(bh);
+	if (bh_read(bh, 0) < 0) {
+		brelse(bh);
+		return;
+	}
+	memcpy(&cur, bh->b_data, sizeof(cur));
+	brelse(bh);
+
+	/* Verify we still own the slot */
+	if (le16_to_cpu(cur.rl_leader_slot) != sbi->s_node_slot ||
+	    le32_to_cpu(cur.rl_epoch) != epoch)
+		return;
+
+	memset(&free, 0, sizeof(free));
+	free.rl_magic       = cpu_to_le32(OCSFS_RECOVERY_LEADER_MAGIC);
+	free.rl_leader_slot = cpu_to_le16(OCSFS_RL_SLOT_FREE);
+	free.rl_target_slot = cpu_to_le16(OCSFS_RL_SLOT_FREE);
+	free.rl_epoch       = cur.rl_epoch;
+	free.rl_checksum    = cpu_to_le32(ocsfs_rl_crc(&free));
+
+	/* Best-effort CAS — if it fails, the deadline will expire naturally */
+	ret = ocsfs_atomic_cas(sb, block, 0, sizeof(cur), &cur, &free);
+	(void)ret;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -64,12 +159,11 @@ int ocsfs_recovery_run(struct super_block *sb, u16 failed_slot)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	struct ocsfs_node_info *ni;
-	u32 failed_gen;
+	u32 failed_gen, leader_epoch;
 	u64 failed_pr_key;
 	int ret;
 
 	mutex_lock(&sbi->s_recovery_lock);
-
 	sbi->s_recovery_in_progress = true;
 
 	pr_warn("ocsfs: ═══ RECOVERY START for node slot %u ═══\n",
@@ -83,42 +177,26 @@ int ocsfs_recovery_run(struct super_block *sb, u16 failed_slot)
 	spin_unlock(&sbi->s_node_lock);
 
 	/*
-	 * Phase 1 — Leader Election
+	 * Phase 1 — Leader Election via CAS on-disk.
+	 *
+	 * ocsfs_recovery_leader_acquire() atomically writes our node slot
+	 * into the on-disk recovery leader block.  Only the node that wins
+	 * the CAS will proceed; others get -EAGAIN and defer gracefully.
+	 * This replaces both the in-memory scan and the DLM re-check that
+	 * had a TOCTOU window between them.
 	 */
-	pr_info("ocsfs: recovery phase 1: leader election\n");
+	pr_info("ocsfs: recovery phase 1: CAS leader election\n");
 
-	if (!ocsfs_is_recovery_leader(sb, failed_slot)) {
-		pr_info("ocsfs: not the recovery leader, deferring\n");
+	ret = ocsfs_recovery_leader_acquire(sb, failed_slot, &leader_epoch);
+	if (ret) {
+		if (ret == -EAGAIN)
+			pr_info("ocsfs: not the recovery leader, deferring\n");
+		else
+			pr_warn("ocsfs: leader election failed (%d), deferring\n",
+				ret);
 		sbi->s_recovery_in_progress = false;
 		mutex_unlock(&sbi->s_recovery_lock);
 		return 0;
-	}
-
-	/*
-	 * In cluster mode, acquire the distributed recovery lock before
-	 * proceeding.  This ensures only one node performs recovery even
-	 * if in-memory node-state diverges during a partial partition.
-	 * Re-check leadership after acquiring to handle the TOCTOU window.
-	 */
-	if (sbi->s_clustered) {
-		ret = ocsfs_lock_acquire(sb, &sbi->s_recovery_lock_res,
-					 OCSFS_LOCK_EX);
-		if (ret) {
-			pr_info("ocsfs: recovery DLM lock failed (%d), deferring\n",
-				ret);
-			/* Re-arm so the work queue retries this slot */
-			set_bit(failed_slot, sbi->s_recovery_pending);
-			sbi->s_recovery_in_progress = false;
-			mutex_unlock(&sbi->s_recovery_lock);
-			return ret;
-		}
-		if (!ocsfs_is_recovery_leader(sb, failed_slot)) {
-			pr_info("ocsfs: leadership lost after DLM acquire, deferring\n");
-			ocsfs_lock_release(sb, &sbi->s_recovery_lock_res);
-			sbi->s_recovery_in_progress = false;
-			mutex_unlock(&sbi->s_recovery_lock);
-			return 0;
-		}
 	}
 
 	pr_info("ocsfs: this node (slot %u) is the recovery leader\n",
@@ -126,10 +204,6 @@ int ocsfs_recovery_run(struct super_block *sb, u16 failed_slot)
 
 	/*
 	 * Phase 2 — SCSI PR Fencing
-	 *
-	 * Issue PREEMPT AND ABORT to revoke the failed node's PR key.
-	 * After this, the SAN fabric will reject any I/O from the
-	 * failed node's HBA, providing hardware-level fencing.
 	 */
 	pr_info("ocsfs: recovery phase 2: SCSI PR fencing\n");
 
@@ -139,87 +213,58 @@ int ocsfs_recovery_run(struct super_block *sb, u16 failed_slot)
 
 	ret = ocsfs_pr_preempt_abort(sb, failed_pr_key,
 				     OCSFS_PR_TYPE_WRITE_EXCL_REG);
-	if (ret) {
-		pr_warn("ocsfs: PR fencing failed (ret=%d), "
-			"continuing with recovery\n", ret);
-		/* Continue anyway — the node may be on a non-SCSI device */
-	}
+	if (ret)
+		pr_warn("ocsfs: PR fencing failed (ret=%d), continuing\n", ret);
 
 	/*
 	 * Phase 3 — Journal Replay
-	 *
-	 * Read the failed node's journal and replay committed but
-	 * uncheckpointed transactions. Uncommitted transactions are
-	 * rolled back (before-images restored).
 	 */
 	pr_info("ocsfs: recovery phase 3: journal replay for node %u\n",
 		failed_slot);
 
 	ret = ocsfs_journal_replay_node(sb, failed_slot);
 	if (ret) {
-		/*
-		 * Journal replay failure means we cannot guarantee the
-		 * consistency of shared data.  Continuing would allow
-		 * other nodes to write on top of potentially dirty blocks.
-		 * Force this node read-only and abort recovery so the
-		 * administrator can intervene.
-		 */
 		pr_err("ocsfs: journal replay for node %u failed: %d — "
-		       "forcing read-only to prevent data corruption\n",
-		       failed_slot, ret);
+		       "forcing read-only\n", failed_slot, ret);
 		sb->s_flags |= SB_RDONLY;
+		ocsfs_recovery_leader_release(sb, failed_slot, leader_epoch);
 		sbi->s_recovery_in_progress = false;
-		if (sbi->s_clustered)
-			ocsfs_lock_release(sb, &sbi->s_recovery_lock_res);
 		mutex_unlock(&sbi->s_recovery_lock);
 		return ret;
 	}
 
 	/*
 	 * Phase 4 — Lock Recovery
-	 *
-	 * Scan the entire Lock Table and release/clear any locks held
-	 * by the failed node (matching slot + mount generation).
 	 */
 	pr_info("ocsfs: recovery phase 4: lock recovery\n");
 
 	ret = ocsfs_lock_recover_node(sb, failed_slot, failed_gen);
-	if (ret) {
+	if (ret)
 		pr_err("ocsfs: lock recovery for node %u failed: %d\n",
 		       failed_slot, ret);
-	}
 
 	/*
 	 * Phase 5 — Slot Cleanup
-	 *
-	 * Mark the failed node's slot as DEAD in the Node Slot Table.
-	 * The slot becomes reusable when the node re-mounts.
 	 */
 	pr_info("ocsfs: recovery phase 5: slot cleanup\n");
 
 	ret = ocsfs_node_mark_dead(sb, failed_slot);
-	if (ret) {
+	if (ret)
 		pr_err("ocsfs: failed to mark node %u as dead: %d\n",
 		       failed_slot, ret);
-	}
 
+	ocsfs_recovery_leader_release(sb, failed_slot, leader_epoch);
 	sbi->s_recovery_in_progress = false;
 
 	pr_warn("ocsfs: ═══ RECOVERY COMPLETE for node slot %u ═══\n",
 		failed_slot);
 
-	if (sbi->s_clustered)
-		ocsfs_lock_release(sb, &sbi->s_recovery_lock_res);
 	mutex_unlock(&sbi->s_recovery_lock);
 	return 0;
 }
 
 /* ═══════════════════════════════════════════════════════════════
  * RECOVERY WORK — drains s_recovery_pending bitmask
- *
- * Processes all pending failed slots in slot-number order.
- * New failures arriving while the work runs are picked up by
- * the while loop on the next iteration without losing any event.
  * ═══════════════════════════════════════════════════════════════ */
 
 static void ocsfs_recovery_work_fn(struct work_struct *work)
@@ -231,12 +276,6 @@ static void ocsfs_recovery_work_fn(struct work_struct *work)
 
 	while ((slot = find_first_bit(sbi->s_recovery_pending,
 				      OCSFS_MAX_NODES)) < OCSFS_MAX_NODES) {
-		/*
-		 * Clear the bit before running recovery so that a new
-		 * failure on the same slot arriving during recovery is
-		 * not silently dropped — it will set the bit again and
-		 * the loop will process it.
-		 */
 		clear_bit(slot, sbi->s_recovery_pending);
 		ocsfs_recovery_run(sb, (u16)slot);
 	}
@@ -262,9 +301,6 @@ int ocsfs_recovery_init(struct super_block *sb)
 	sbi->s_recovery_in_progress = false;
 	bitmap_zero(sbi->s_recovery_pending, OCSFS_MAX_NODES);
 	INIT_WORK(&sbi->s_recovery_work, ocsfs_recovery_work_fn);
-	ocsfs_lock_init(&sbi->s_recovery_lock_res,
-			ocsfs_lock_hash_recovery(),
-			OCSFS_LOCKRES_RECOVERY);
 
 	return 0;
 }

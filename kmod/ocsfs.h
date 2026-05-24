@@ -70,8 +70,25 @@
 #define OCSFS_CAS_LEASE_OFF         1384448ULL   /* = LOCK_TABLE_OFF + LOCK_TABLE_SIZE */
 #define OCSFS_CAS_LEASE_ENTRIES     256
 #define OCSFS_CAS_LEASE_MAGIC       0x4F43414CU  /* "OCAL" */
+#define OCSFS_CAS_LEASE_SIZE        8192ULL      /* 256 × 32 byte */
 #define CAS_MAX_ATTEMPTS            32
 #define CAS_LEASE_TIMEOUT_NS        (2ULL * NSEC_PER_SEC)
+
+/* Recovery leader election block — dopo l'area CAS lease */
+#define OCSFS_RECOVERY_LEADER_OFF   (OCSFS_CAS_LEASE_OFF + OCSFS_CAS_LEASE_SIZE)
+#define OCSFS_RECOVERY_LEADER_MAGIC 0x52454C44U  /* "RELD" */
+#define OCSFS_RL_SLOT_FREE          0xFFFFU
+#define RECOVERY_LEADER_TIMEOUT_NS  (60ULL * NSEC_PER_SEC)
+
+struct ocsfs_disk_recovery_leader {
+	__le32  rl_magic;
+	__le16  rl_leader_slot;   /* 0xFFFF = nessun leader attivo */
+	__le16  rl_target_slot;   /* slot del nodo in recovery */
+	__le32  rl_leader_gen;    /* mount gen del leader (anti-zombie) */
+	__le32  rl_epoch;         /* monotonic — incrementato ad ogni elezione */
+	__le64  rl_deadline_ns;   /* scadenza leadership (ktime_get_real_ns) */
+	__le32  rl_checksum;      /* crc32c dei primi 24 byte */
+} __packed;
 
 /* 32 byte per entry; 128 entry per blocco da 4096 byte */
 struct ocsfs_disk_cas_lease {
@@ -559,7 +576,6 @@ struct ocsfs_sb_info {
 	DECLARE_BITMAP(s_recovery_pending, OCSFS_MAX_NODES); /* one bit per failed slot */
 	bool                    s_recovery_in_progress;
 	struct mutex            s_recovery_lock;
-	struct ocsfs_lock_res   s_recovery_lock_res; /* DLM leader-election lock */
 
 	/* Cluster auth */
 	u8              s_cluster_secret[32];   /* raw secret from mount option */
@@ -692,6 +708,12 @@ int ocsfs_sync_fs(struct super_block *sb, int wait);
 extern const struct inode_operations ocsfs_file_inode_ops;
 extern const struct inode_operations ocsfs_special_inode_ops;
 extern const struct inode_operations ocsfs_symlink_inode_ops;
+/* xattr namespace identifiers (shared between xattr.c and dir_rename.c) */
+#define OCSFS_XATTR_NS_USER     0
+#define OCSFS_XATTR_NS_TRUSTED  1
+#define OCSFS_XATTR_NS_SECURITY 2
+#define OCSFS_XATTR_NS_SYSTEM   3
+
 extern const struct xattr_handler * const ocsfs_xattr_handlers[];
 int ocsfs_xattr_get_internal(struct inode *inode, u8 ns, const char *name,
 			     void *buffer, size_t size);
@@ -851,12 +873,6 @@ static inline u64 ocsfs_lock_hash_ag(u32 ag_num)
 static inline u64 ocsfs_lock_hash_rc(u32 ag_num)
 {
 	return ocsfs_lock_hash_inode((u64)ag_num | 0xAC00000000000000ULL);
-}
-
-static inline u64 ocsfs_lock_hash_recovery(void)
-{
-	/* Fixed well-known resource ID for the recovery leader lock. */
-	return ocsfs_lock_hash_inode(0x5245434F00000000ULL); /* 'RECO' */
 }
 
 static inline u32 ocsfs_lock_table_slot(u64 resource_id)
