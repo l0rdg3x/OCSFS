@@ -397,9 +397,20 @@ void ocsfs_evict_inode(struct inode *inode)
 			mutex_lock(&oi->i_extent_lock);
 			ocsfs_extent_truncate(inode, 0);
 			mutex_unlock(&oi->i_extent_lock);
-			if (oi->i_xattr_block)
-				ocsfs_free_blocks(inode->i_sb, oi->i_xattr_block,
-						  1);
+			if (oi->i_xattr_block) {
+				struct ocsfs_txn *xt =
+					ocsfs_txn_begin(inode->i_sb);
+
+				if (!IS_ERR(xt)) {
+					ocsfs_free_blocks_txn(xt,
+							      oi->i_xattr_block,
+							      1);
+					ocsfs_txn_commit(xt);
+				} else {
+					ocsfs_free_blocks(inode->i_sb,
+							  oi->i_xattr_block, 1);
+				}
+			}
 			ocsfs_free_inode_num(inode->i_sb, oi->i_disk_ino);
 			if (sbi->s_clustered)
 				ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
