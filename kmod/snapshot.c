@@ -34,6 +34,91 @@
  * snapshot inode shares extents with the source via refcounting.
  * ═══════════════════════════════════════════════════════════════ */
 
+/* Callback context for collecting extents from a btree into an array */
+struct snap_copy_ctx { struct ocsfs_extent *ext; u32 idx; };
+
+static int snap_copy_extent_cb(u64 logical, u64 physical, u32 length,
+				u16 flags, void *ctx_)
+{
+	struct snap_copy_ctx *c = ctx_;
+
+	c->ext[c->idx++] = (struct ocsfs_extent){
+		.logical_block  = logical,
+		.physical_block = physical,
+		.length         = length,
+		.flags          = flags,
+	};
+	return 0;
+}
+
+/*
+ * Copy a btree-backed extent map from @src to @snap, incrementing refcounts.
+ * Caller holds i_extent_lock on both inodes.
+ * On failure, rolls back all refcounts and clears any partial btree state.
+ */
+static int snapshot_copy_btree_extents(struct inode *src, struct inode *snap)
+{
+	struct super_block *sb = src->i_sb;
+	struct snap_copy_ctx cc;
+	u64 count64;
+	u32 i;
+	int ret;
+
+	ret = ocsfs_extent_btree_count(src, &count64);
+	if (ret)
+		return ret;
+
+	if (count64 == 0)
+		return ocsfs_extent_btree_init_empty(snap);
+
+	if (count64 > UINT_MAX / sizeof(*cc.ext))
+		return -EFBIG;
+
+	cc.idx = 0;
+	cc.ext = kvmalloc_array((u32)count64, sizeof(*cc.ext), GFP_NOFS);
+	if (!cc.ext)
+		return -ENOMEM;
+
+	ocsfs_extent_btree_iterate(src, snap_copy_extent_cb, &cc);
+
+	ret = ocsfs_extent_btree_init_empty(snap);
+	if (ret)
+		goto out;
+
+	i = 0;
+	for (; i < cc.idx; i++) {
+		struct ocsfs_extent *e = &cc.ext[i];
+		bool shared = e->physical_block && !(e->flags & OCSFS_EXT_UNWRITTEN);
+
+		if (shared) {
+			ret = ocsfs_refcount_inc(sb, e->physical_block, e->length);
+			if (ret)
+				goto rollback;
+		}
+		ret = ocsfs_extent_btree_insert(snap, e->logical_block,
+						e->physical_block,
+						e->length, e->flags);
+		if (ret) {
+			if (shared)
+				ocsfs_refcount_dec(sb, e->physical_block, e->length, NULL);
+			goto rollback;
+		}
+	}
+	goto out;
+
+rollback:
+	ocsfs_extent_btree_clear(snap);
+	while (i-- > 0) {
+		struct ocsfs_extent *e = &cc.ext[i];
+
+		if (e->physical_block && !(e->flags & OCSFS_EXT_UNWRITTEN))
+			ocsfs_refcount_dec(sb, e->physical_block, e->length, NULL);
+	}
+out:
+	kvfree(cc.ext);
+	return ret;
+}
+
 /*
  * ocsfs_snapshot_create() — Create a CoW snapshot of a file.
  *
@@ -58,11 +143,6 @@ int ocsfs_snapshot_create(struct inode *src, struct inode *dir,
 	/* Only regular files can be snapshotted */
 	if (!S_ISREG(src->i_mode))
 		return -EINVAL;
-
-	/* Snapshotting btree-backed inodes requires refcount iteration over the
-	 * btree; not yet implemented — reject to avoid partial refcount state. */
-	if (src_oi->i_extent_tree_root)
-		return -EOPNOTSUPP;
 
 	/* Create the snapshot inode */
 	snap = ocsfs_new_inode(dir, src->i_mode);
@@ -110,51 +190,49 @@ int ocsfs_snapshot_create(struct inode *src, struct inode *dir,
 		mutex_lock_nested(&src_oi->i_extent_lock, SINGLE_DEPTH_NESTING);
 	}
 
-	/* Copy the extent map */
-	snap_oi->i_extent_count = src_oi->i_extent_count;
-	memcpy(snap_oi->i_extents, src_oi->i_extents,
-	       src_oi->i_extent_count * sizeof(struct ocsfs_extent));
+	/* Copy extent map with refcount increments */
+	if (src_oi->i_extent_tree_root) {
+		ret = snapshot_copy_btree_extents(src, snap);
+	} else {
+		/* Inline extents: copy array then bump each refcount */
+		snap_oi->i_extent_count = src_oi->i_extent_count;
+		memcpy(snap_oi->i_extents, src_oi->i_extents,
+		       src_oi->i_extent_count * sizeof(struct ocsfs_extent));
 
-	/* Increment refcount on all shared extents */
-	for (i = 0; i < src_oi->i_extent_count; i++) {
-		struct ocsfs_extent *e = &src_oi->i_extents[i];
-
-		if (e->physical_block == 0 ||
-		    (e->flags & OCSFS_EXT_UNWRITTEN))
-			continue;
-
-		ret = ocsfs_refcount_inc(sb, e->physical_block, e->length);
-		if (ret) {
-			/* Rollback: decrement already-incremented extents */
+		for (i = 0; i < src_oi->i_extent_count; i++) {
+			struct ocsfs_extent *e = &src_oi->i_extents[i];
 			u16 j;
 
-			for (j = 0; j < i; j++) {
-				struct ocsfs_extent *prev = &src_oi->i_extents[j];
+			if (e->physical_block == 0 ||
+			    (e->flags & OCSFS_EXT_UNWRITTEN))
+				continue;
 
-				if (prev->physical_block == 0 ||
-				    (prev->flags & OCSFS_EXT_UNWRITTEN))
-					continue;
-				ocsfs_refcount_dec(sb, prev->physical_block,
-						   prev->length, NULL);
+			ret = ocsfs_refcount_inc(sb, e->physical_block, e->length);
+			if (ret) {
+				for (j = 0; j < i; j++) {
+					struct ocsfs_extent *p = &src_oi->i_extents[j];
+
+					if (p->physical_block == 0 ||
+					    (p->flags & OCSFS_EXT_UNWRITTEN))
+						continue;
+					ocsfs_refcount_dec(sb, p->physical_block,
+							   p->length, NULL);
+				}
+				snap_oi->i_extent_count = 0;
+				break;
 			}
-
-			/*
-			 * Clear snap's extent map before dropping locks. The snap
-			 * inode carries the ORPHAN flag so evict_inode will call
-			 * ocsfs_extent_truncate(snap, 0). Without this, truncate
-			 * would free the physical blocks still owned by src.
-			 */
-			snap_oi->i_extent_count = 0;
-
-			mutex_unlock(&snap_oi->i_extent_lock);
-			mutex_unlock(&src_oi->i_extent_lock);
-			if (sbi->s_clustered) {
-				ocsfs_lock_release(sb, &snap_oi->i_lock_res);
-				ocsfs_lock_release(sb, &src_oi->i_lock_res);
-			}
-			iput(snap);
-			return ret;
 		}
+	}
+
+	if (ret) {
+		mutex_unlock(&snap_oi->i_extent_lock);
+		mutex_unlock(&src_oi->i_extent_lock);
+		if (sbi->s_clustered) {
+			ocsfs_lock_release(sb, &snap_oi->i_lock_res);
+			ocsfs_lock_release(sb, &src_oi->i_lock_res);
+		}
+		iput(snap);
+		return ret;
 	}
 
 	mutex_unlock(&snap_oi->i_extent_lock);

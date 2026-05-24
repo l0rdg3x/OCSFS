@@ -800,6 +800,7 @@ int ocsfs_extent_btree_replace(struct inode *inode,
 				const struct ocsfs_extent *orig,
 				u64 offset_in_ext, u32 cow_len, u64 new_phys);
 int ocsfs_extent_btree_clear(struct inode *inode);
+int ocsfs_extent_btree_init_empty(struct inode *inode);
 int ocsfs_extent_btree_punch_hole(struct inode *inode,
 				  u64 start_block, u64 end_block);
 int ocsfs_extent_btree_zero_range(struct inode *inode,

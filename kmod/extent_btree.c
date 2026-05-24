@@ -543,6 +543,38 @@ abort:
 	return ret;
 }
 
+/*
+ * Allocate an empty extent B+ tree for a freshly created inode.
+ * Caller must hold i_extent_lock; inode must have i_extent_tree_root == 0.
+ */
+int ocsfs_extent_btree_init_empty(struct inode *inode)
+{
+	struct ocsfs_inode_info *oi = OCSFS_I(inode);
+	struct ocsfs_txn *txn;
+	struct ocsfs_btree bt;
+	struct ext_btree_ctx ec;
+	int ret;
+
+	WARN_ON(oi->i_extent_tree_root);
+
+	txn = ocsfs_txn_begin(inode->i_sb);
+	if (IS_ERR(txn))
+		return PTR_ERR(txn);
+	ec.txn = txn;
+
+	ret = ext_btree_create(inode, &bt, &ec);
+	if (ret) {
+		ocsfs_txn_abort(txn);
+		return ret;
+	}
+
+	oi->i_extent_tree_root = bt.root_block;
+	ret = ocsfs_txn_commit(txn);
+	if (!ret)
+		mark_inode_dirty(inode);
+	return ret;
+}
+
 /* ── iterate / count ── */
 
 struct ext_iter_state { ocsfs_extent_iter_fn fn; void *ctx; };
