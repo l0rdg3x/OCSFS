@@ -15,6 +15,7 @@ static struct kmem_cache *ocsfs_inode_cachep;
 struct ocsfs_fs_context {
 	u8   fc_secret[32];
 	bool fc_has_secret;
+	bool fc_degraded;
 };
 
 /* inode slab */
@@ -199,7 +200,7 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sbi->s_sbh = bh;
 	sbi->s_ds = ds;
 
-	/* Apply cluster_secret mount option */
+	/* Apply mount options */
 	if (fc->fs_private) {
 		struct ocsfs_fs_context *ctx = fc->fs_private;
 
@@ -207,6 +208,7 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 			memcpy(sbi->s_cluster_secret, ctx->fc_secret, 32);
 			sbi->s_auth_required = true;
 		}
+		sbi->s_degraded = ctx->fc_degraded;
 	}
 
 	/* Cache frequently-used fields */
@@ -256,16 +258,14 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 
 	sbi->s_caw_supported = ocsfs_scsi_caw_probe(sb);
 
-	ret = ocsfs_cas_probe(sb);
-	if (ret < 0) {
-		pr_err("ocsfs: CAS probe failed: %d\n", ret);
+	ret = ocsfs_cas_probe(sb);  /* also sets s_pr_capable */
+	if (ret < 0 || (sbi->s_clustered && sbi->s_cas_backend == CAS_BACKEND_NONE)) {
+		pr_err("ocsfs: clustered mount requires CAS backend (ret=%d)\n", ret);
+		ret = ret < 0 ? ret : -EOPNOTSUPP;
 		goto fail_ags;
 	}
-	if (sbi->s_clustered && sbi->s_cas_backend == CAS_BACKEND_NONE) {
-		pr_err("ocsfs: clustered mount requires CAS backend\n");
-		ret = -EOPNOTSUPP;
-		goto fail_ags;
-	}
+	if (sbi->s_clustered && !sbi->s_pr_capable && !sbi->s_degraded)
+		pr_warn("ocsfs: no SCSI PR — zombie node risk; mount with degraded to silence\n");
 
 	/* Initialize journal at our node slot's region */
 	ret = ocsfs_journal_init(sb);
@@ -299,11 +299,10 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	mark_buffer_dirty(bh);
 	sync_dirty_buffer(bh);
 
-	pr_info("ocsfs: mounted volume \"%.64s\" (%u AGs, %llu blocks free, "
-		"node slot %u%s)\n",
-		ds->s_label, sbi->s_ag_count, sbi->s_free_blocks,
-		sbi->s_node_slot,
-		sbi->s_clustered ? ", clustered" : "");
+	pr_info("ocsfs: mounted \"%.64s\" AGs=%u free=%llu slot=%u%s%s\n",
+		ds->s_label, sbi->s_ag_count, sbi->s_free_blocks, sbi->s_node_slot,
+		sbi->s_clustered ? " clustered" : "",
+		sbi->s_degraded  ? " degraded"  : "");
 
 	return 0;
 
@@ -399,6 +398,7 @@ static int ocsfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 	size_t len;
 	int i;
 
+	if (strcmp(param->key, "degraded") == 0) { ctx->fc_degraded = true; return 0; }
 	if (strcmp(param->key, "cluster_secret") != 0)
 		return -ENOPARAM;
 

@@ -50,6 +50,8 @@ int ocsfs_cas_probe(struct super_block *sb)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 
+	sbi->s_pr_capable = ocsfs_pr_probe(sb);
+
 	if (!sbi->s_clustered) {
 		sbi->s_cas_backend = CAS_BACKEND_NONE;
 		return 0;
@@ -62,7 +64,8 @@ int ocsfs_cas_probe(struct super_block *sb)
 	}
 
 	sbi->s_cas_backend = CAS_BACKEND_PR_LEASE;
-	pr_info("ocsfs: CAS backend: PR-lease (software)\n");
+	pr_info("ocsfs: CAS backend: PR-lease (software), PR-capable: %s\n",
+		sbi->s_pr_capable ? "yes" : "no");
 	return 0;
 }
 

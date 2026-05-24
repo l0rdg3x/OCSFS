@@ -163,6 +163,18 @@ void ocsfs_build_caw_cdb(u8 cdb[16], u64 lba)
 }
 
 /*
+ * Probe whether the block device supports SCSI Persistent Reservations.
+ * Returns true if both pr_register and pr_preempt are present and usable.
+ * A device without PR cannot fence zombie nodes (see s_degraded for override).
+ */
+bool ocsfs_pr_probe(struct super_block *sb)
+{
+	const struct pr_ops *ops = ocsfs_pr_ops(sb);
+
+	return ops && ops->pr_register && ops->pr_preempt;
+}
+
+/*
  * Probe whether the block device supports SCSI Compare-And-Write.
  *
  * NOTE: Full CAW support requires scsi_device_from_queue() + scsi_execute_cmd().

@@ -583,6 +583,8 @@ struct ocsfs_sb_info {
 
 	/* SCSI Compare-And-Write capability (probed at mount time) */
 	bool            s_caw_supported;
+	bool            s_pr_capable;   /* device has working SCSI PR (pr_register + pr_preempt) */
+	bool            s_degraded;     /* mount option: allow cluster without fencing */
 	enum ocsfs_cas_backend s_cas_backend;
 
 	/* ZSTD decompression workspace — lazy-allocated on first ZSTD read */
@@ -829,6 +831,7 @@ int ocsfs_pr_reserve(struct super_block *sb, u8 type);
 int ocsfs_pr_release(struct super_block *sb, u8 type);
 int ocsfs_pr_preempt(struct super_block *sb, u64 victim_key, u8 type);
 int ocsfs_pr_preempt_abort(struct super_block *sb, u64 victim_key, u8 type);
+bool ocsfs_pr_probe(struct super_block *sb);
 u64 ocsfs_pr_make_key(const u8 *uuid, u32 mount_gen);
 /* CAW — atomic lock-table write via SCSI Compare-And-Write (opcode 0x89) */
 void ocsfs_build_caw_cdb(u8 cdb[16], u64 lba);
