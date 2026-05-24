@@ -89,6 +89,28 @@ static int ocsfs_validate_super(struct ocsfs_disk_super *ds,
 		return -EINVAL;
 	}
 
+	if (le32_to_cpu(ds->s_ag_count) == 0 ||
+	    le32_to_cpu(ds->s_ag_count) > 65536) {
+		pr_err("ocsfs: invalid ag_count %u\n",
+		       le32_to_cpu(ds->s_ag_count));
+		return -EINVAL;
+	}
+
+	if (le16_to_cpu(ds->s_max_nodes) == 0 ||
+	    le16_to_cpu(ds->s_max_nodes) > OCSFS_MAX_NODES) {
+		pr_err("ocsfs: invalid max_nodes %u\n",
+		       le16_to_cpu(ds->s_max_nodes));
+		return -EINVAL;
+	}
+
+	/* 1 TiB limit per AG (268435456 blocks of 4096 bytes) */
+	if (le64_to_cpu(ds->s_ag_size) == 0 ||
+	    le64_to_cpu(ds->s_ag_size) > 268435456ULL) {
+		pr_err("ocsfs: invalid ag_size %llu\n",
+		       le64_to_cpu(ds->s_ag_size));
+		return -EINVAL;
+	}
+
 	return 0;
 }
 

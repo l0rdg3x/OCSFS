@@ -411,7 +411,8 @@ static int ocsfs_readdir(struct file *file, struct dir_context *ctx)
 				continue;
 
 			if (le32_to_cpu(de->de_magic) != OCSFS_DIRENT_MAGIC ||
-			    de->de_name_len == 0)
+			    de->de_name_len == 0 ||
+			    de->de_name_len > OCSFS_MAX_NAME_LEN)
 				continue;
 
 			if (!dir_emit(ctx, (char *)de->de_name,

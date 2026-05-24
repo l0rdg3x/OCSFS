@@ -150,6 +150,18 @@ struct inode *ocsfs_iget(struct super_block *sb, u64 ino)
 	oi->i_dirent_count   = le32_to_cpu(di.i_dirent_count);
 	oi->i_xattr_block    = le64_to_cpu(di.i_xattr_block);
 
+	if (oi->i_ag >= sbi->s_ag_count ||
+	    (oi->i_extent_tree_root &&
+	     oi->i_extent_tree_root >= sbi->s_total_blocks) ||
+	    (oi->i_xattr_block && oi->i_xattr_block >= sbi->s_total_blocks)) {
+		pr_err_ratelimited("ocsfs: inode %llu: corrupt block pointers\n",
+				   ino);
+		if (sbi->s_clustered)
+			ocsfs_lock_release(sb, &oi->i_lock_res);
+		iget_failed(inode);
+		return ERR_PTR(-EUCLEAN);
+	}
+
 	/* Set up operations based on file type */
 	if (S_ISREG(inode->i_mode)) {
 		inode->i_op = &ocsfs_file_inode_ops;
@@ -209,6 +221,16 @@ int ocsfs_inode_refresh(struct inode *inode)
 	oi->i_flags            = le32_to_cpu(di.i_flags);
 	oi->i_extent_tree_root = le64_to_cpu(di.i_extent_tree_root);
 	oi->i_xattr_block      = le64_to_cpu(di.i_xattr_block);
+
+	if ((oi->i_extent_tree_root &&
+	     oi->i_extent_tree_root >= sbi->s_total_blocks) ||
+	    (oi->i_xattr_block && oi->i_xattr_block >= sbi->s_total_blocks)) {
+		pr_err_ratelimited("ocsfs: inode %llu: corrupt block pointers on refresh\n",
+				   oi->i_disk_ino);
+		mutex_unlock(&oi->i_extent_lock);
+		return -EUCLEAN;
+	}
+
 	ocsfs_parse_extents(oi, &di);
 	mutex_unlock(&oi->i_extent_lock);
 	return 0;

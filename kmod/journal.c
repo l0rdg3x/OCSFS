@@ -48,9 +48,18 @@ int ocsfs_journal_init(struct super_block *sb)
 	jh = (struct ocsfs_disk_journal_hdr *)bh->b_data;
 
 	if (le32_to_cpu(jh->jh_magic) == OCSFS_JOURNAL_MAGIC) {
-		j->head     = le64_to_cpu(jh->jh_head);
-		j->tail     = le64_to_cpu(jh->jh_tail);
-		j->sequence = le64_to_cpu(jh->jh_sequence);
+		u32 crc = ocsfs_crc32c(~0U, jh, sizeof(*jh) - sizeof(__le32));
+
+		if (crc != le32_to_cpu(jh->jh_checksum)) {
+			pr_warn("ocsfs: journal header checksum mismatch — starting fresh\n");
+			j->head     = sizeof(struct ocsfs_disk_journal_hdr);
+			j->tail     = j->head;
+			j->sequence = 1;
+		} else {
+			j->head     = le64_to_cpu(jh->jh_head);
+			j->tail     = le64_to_cpu(jh->jh_tail);
+			j->sequence = le64_to_cpu(jh->jh_sequence);
+		}
 	} else {
 		j->head     = sizeof(struct ocsfs_disk_journal_hdr);
 		j->tail     = j->head;

@@ -313,6 +313,17 @@ int ocsfs_journal_replay_node(struct super_block *sb, u16 node_slot)
 		return 0;
 	}
 
+	{
+		u32 crc = ocsfs_crc32c(~0U, jh, sizeof(*jh) - sizeof(__le32));
+
+		if (crc != le32_to_cpu(jh->jh_checksum)) {
+			pr_warn("ocsfs: node %u journal header checksum mismatch, skipping\n",
+				node_slot);
+			brelse(bh);
+			return 0;
+		}
+	}
+
 	tmp_j.head     = le64_to_cpu(jh->jh_head);
 	tmp_j.tail     = le64_to_cpu(jh->jh_tail);
 	tmp_j.sequence = le64_to_cpu(jh->jh_sequence);
@@ -331,7 +342,7 @@ int ocsfs_journal_replay_node(struct super_block *sb, u16 node_slot)
 	ret = journal_replay_j(sb, &tmp_j);
 
 	if (!ret) {
-		jh->jh_head     = jh->jh_tail;
+		jh->jh_tail     = jh->jh_head;
 		jh->jh_checksum = cpu_to_le32(
 			ocsfs_crc32c(~0U, jh, sizeof(*jh) - sizeof(__le32)));
 		mark_buffer_dirty(bh);
