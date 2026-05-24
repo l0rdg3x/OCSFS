@@ -409,11 +409,38 @@ int ocsfs_txn_commit(struct ocsfs_txn *txn)
 	if (ret)
 		goto out;
 
-	/* COMMIT durable — now safe to allow writeback on txn buffers. */
-	list_for_each_entry(tb, &txn->t_buffers, list)
-		mark_buffer_dirty(tb->bh);
+	/*
+	 * COMMIT durable.  Now write all modified blocks to their final disk
+	 * locations synchronously before advancing j->tail.
+	 *
+	 * Why this ordering matters: j->tail is persisted in journal_sync()
+	 * above.  If we advance j->tail = j->head and then crash before the
+	 * data blocks reach disk, recovery will see tail == head and replay
+	 * nothing — the committed AFTER-images in the journal are effectively
+	 * lost.  Syncing the data blocks first means the checkpoint is only
+	 * recorded once the data is guaranteed durable; if sync fails, tail
+	 * stays where it was and the next recovery can re-apply the AFTER-images.
+	 */
+	{
+		int ckpt_ret = 0;
 
-	j->tail = j->head;
+		list_for_each_entry(tb, &txn->t_buffers, list) {
+			mark_buffer_dirty(tb->bh);
+			if (sync_dirty_buffer(tb->bh) && !ckpt_ret)
+				ckpt_ret = -EIO;
+		}
+		if (!ckpt_ret)
+			ckpt_ret = blkdev_issue_flush(sb->s_bdev);
+
+		if (!ckpt_ret) {
+			j->tail = j->head;
+		} else {
+			pr_warn_ratelimited(
+				"ocsfs: journal checkpoint failed (%d) — "
+				"tail not advanced, recovery will replay\n",
+				ckpt_ret);
+		}
+	}
 
 out:
 	list_for_each_entry_safe(tb, tmp, &txn->t_buffers, list) {
