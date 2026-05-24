@@ -17,8 +17,7 @@ struct ocsfs_fs_context {
 	bool fc_has_secret;
 };
 
-/* ─── Inode slab ─────────────────────────────────────────────── */
-
+/* inode slab */
 static struct inode *ocsfs_alloc_inode(struct super_block *sb)
 {
 	struct ocsfs_inode_info *oi;
@@ -53,8 +52,6 @@ static void ocsfs_inode_init_once(void *obj)
 	inode_init_once(&oi->vfs_inode);
 }
 
-/* ─── Superblock validation ──────────────────────────────────── */
-
 static int ocsfs_validate_super(struct ocsfs_disk_super *ds,
 				struct super_block *sb, int silent)
 {
@@ -62,62 +59,46 @@ static int ocsfs_validate_super(struct ocsfs_disk_super *ds,
 
 	if (le32_to_cpu(ds->s_magic) != OCSFS_MAGIC) {
 		if (!silent)
-			pr_err("ocsfs: bad magic 0x%08x (expected 0x%08x)\n",
-			       le32_to_cpu(ds->s_magic), OCSFS_MAGIC);
+			pr_err("ocsfs: bad magic 0x%08x\n", le32_to_cpu(ds->s_magic));
 		return -EINVAL;
 	}
-
 	if (le16_to_cpu(ds->s_version_major) != OCSFS_VERSION_MAJOR) {
 		pr_err("ocsfs: unsupported version %u.%u\n",
 		       le16_to_cpu(ds->s_version_major),
 		       le16_to_cpu(ds->s_version_minor));
 		return -EINVAL;
 	}
-
-	/* Validate CRC32C (covers bytes 0..4091) */
 	crc = ocsfs_crc32c(~0U, ds, OCSFS_SUPERBLOCK_SIZE - 4);
 	if (crc != le32_to_cpu(ds->s_checksum)) {
-		pr_err("ocsfs: superblock checksum mismatch "
-		       "(computed 0x%08x, stored 0x%08x)\n",
-		       crc, le32_to_cpu(ds->s_checksum));
+		pr_err("ocsfs: superblock checksum mismatch\n");
 		return -EINVAL;
 	}
-
 	if (le32_to_cpu(ds->s_block_size) != OCSFS_DEFAULT_BLOCK_SIZE) {
-		pr_err("ocsfs: unsupported block size %u (only 4096 supported)\n",
+		pr_err("ocsfs: unsupported block size %u\n",
 		       le32_to_cpu(ds->s_block_size));
 		return -EINVAL;
 	}
-
 	if (le32_to_cpu(ds->s_ag_count) == 0 ||
 	    le32_to_cpu(ds->s_ag_count) > 65536) {
-		pr_err("ocsfs: invalid ag_count %u\n",
-		       le32_to_cpu(ds->s_ag_count));
+		pr_err("ocsfs: invalid ag_count %u\n", le32_to_cpu(ds->s_ag_count));
 		return -EINVAL;
 	}
-
 	if (le16_to_cpu(ds->s_max_nodes) == 0 ||
 	    le16_to_cpu(ds->s_max_nodes) > OCSFS_MAX_NODES) {
 		pr_err("ocsfs: invalid max_nodes %u\n",
 		       le16_to_cpu(ds->s_max_nodes));
 		return -EINVAL;
 	}
-
-	/* 1 TiB limit per AG (268435456 blocks of 4096 bytes) */
 	if (le64_to_cpu(ds->s_ag_size) == 0 ||
 	    le64_to_cpu(ds->s_ag_size) > 268435456ULL) {
 		pr_err("ocsfs: invalid ag_size %llu\n",
 		       le64_to_cpu(ds->s_ag_size));
 		return -EINVAL;
 	}
-
 	return 0;
 }
 
-/* ═══════════════════════════════════════════════════════════════
- * LOAD ALLOCATION GROUPS
- * ═══════════════════════════════════════════════════════════════ */
-
+/* load allocation groups */
 static int ocsfs_load_ags(struct super_block *sb)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
@@ -175,10 +156,7 @@ static int ocsfs_load_ags(struct super_block *sb)
 	return 0;
 }
 
-/* ═══════════════════════════════════════════════════════════════
- * FILL SUPER — called during mount
- * ═══════════════════════════════════════════════════════════════ */
-
+/* fill_super — called during mount */
 int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
 	struct ocsfs_sb_info *sbi;
@@ -342,10 +320,7 @@ fail:
 	return ret;
 }
 
-/* ═══════════════════════════════════════════════════════════════
- * PUT SUPER — called during unmount
- * ═══════════════════════════════════════════════════════════════ */
-
+/* put_super — called during unmount */
 void ocsfs_put_super(struct super_block *sb)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
@@ -363,8 +338,7 @@ void ocsfs_put_super(struct super_block *sb)
 	sb->s_fs_info = NULL;
 }
 
-/* ─── statfs ─────────────────────────────────────────────────── */
-
+/* statfs */
 int ocsfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 {
 	struct super_block *sb = dentry->d_sb;
@@ -392,8 +366,7 @@ int ocsfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	return 0;
 }
 
-/* ─── sync_fs ────────────────────────────────────────────────── */
-
+/* sync_fs */
 int ocsfs_sync_fs(struct super_block *sb, int wait)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
@@ -407,8 +380,7 @@ int ocsfs_sync_fs(struct super_block *sb, int wait)
 	return 0;
 }
 
-/* ─── super_operations ───────────────────────────────────────── */
-
+/* super_operations table */
 const struct super_operations ocsfs_sops = {
 	.alloc_inode    = ocsfs_alloc_inode,
 	.free_inode     = ocsfs_free_inode,
@@ -419,10 +391,7 @@ const struct super_operations ocsfs_sops = {
 	.sync_fs        = ocsfs_sync_fs,
 };
 
-/* ═══════════════════════════════════════════════════════════════
- * MOUNT / MODULE INIT
- * ═══════════════════════════════════════════════════════════════ */
-
+/* mount / module init */
 static int ocsfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 {
 	struct ocsfs_fs_context *ctx = fc->fs_private;
@@ -481,10 +450,7 @@ static int ocsfs_init_fs_context(struct fs_context *fc)
 	return 0;
 }
 
-static void ocsfs_kill_sb(struct super_block *sb)
-{
-	kill_block_super(sb);
-}
+static void ocsfs_kill_sb(struct super_block *sb) { kill_block_super(sb); }
 
 static struct file_system_type ocsfs_fs_type = {
 	.owner           = THIS_MODULE,
@@ -523,8 +489,6 @@ static void __exit ocsfs_exit(void)
 	unregister_filesystem(&ocsfs_fs_type);
 	rcu_barrier();
 	kmem_cache_destroy(ocsfs_inode_cachep);
-
-	pr_info("ocsfs: module unloaded\n");
 }
 
 module_init(ocsfs_init);

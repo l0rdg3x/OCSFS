@@ -482,6 +482,19 @@ static void test_sh_release_last_holder_with_waiter_yields_nl(struct kunit *test
 	KUNIT_EXPECT_TRUE(test, has_waiters(&dl));
 }
 
+/* ─── node slot ns_version layout ─────────────────────────────── */
+
+static void test_node_slot_ns_version_sum(struct kunit *test)
+{
+	struct ocsfs_disk_node_slot slot;
+
+	/* ns_version (4 byte) + ns_reserved2[104] = 108 byte totali,
+	 * identici al precedente ns_reserved2[108]. Layout stabile. */
+	KUNIT_EXPECT_EQ(test,
+		(int)(sizeof(slot.ns_version) + sizeof(slot.ns_reserved2)),
+		108);
+}
+
 /* ─── test suite registration ─────────────────────────────────── */
 
 static struct kunit_case ocsfs_lock_test_cases[] = {
@@ -514,6 +527,7 @@ static struct kunit_case ocsfs_lock_test_cases[] = {
 	KUNIT_CASE(test_prealloc_blocks_minimum_is_power_of_two),
 	KUNIT_CASE(test_ex_release_with_waiter_yields_nl),
 	KUNIT_CASE(test_sh_release_last_holder_with_waiter_yields_nl),
+	KUNIT_CASE(test_node_slot_ns_version_sum),
 	{},
 };
 

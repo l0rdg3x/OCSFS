@@ -79,22 +79,62 @@ int ocsfs_node_read_table(struct super_block *sb)
  * WRITE NODE SLOT — persist a single slot to disk
  * ═══════════════════════════════════════════════════════════════ */
 
-static int ocsfs_node_write_slot(struct super_block *sb, u16 slot)
+/*
+ * ocsfs_build_new_slot — riempie `new_dns` con lo stato che vogliamo scrivere.
+ * `expected_dns` è lo stato letto da disco; `ns_version` viene incrementato.
+ */
+static void ocsfs_build_new_slot(struct super_block *sb, u16 slot,
+				 const struct ocsfs_disk_node_slot *expected_dns,
+				 struct ocsfs_disk_node_slot *new_dns)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	struct ocsfs_node_info *ni = &sbi->s_nodes[slot];
-	struct buffer_head *bh;
-	struct ocsfs_disk_node_slot *dns;
-	u64 off = OCSFS_NODE_SLOT_TABLE_OFF +
-		  (u64)slot * sizeof(struct ocsfs_disk_node_slot);
-	u64 block = off / sbi->s_block_size;
-	u32 boff = off % sbi->s_block_size;
 
-	/*
-	 * Force a fresh read so we get the current state of all slots in
-	 * this block before overwriting our slot — stale cached state for
-	 * other slots would be written back, losing their recent changes.
-	 */
+	memcpy(new_dns, expected_dns, sizeof(*new_dns));
+
+	memcpy(new_dns->ns_uuid, ni->ni_uuid, 16);
+	memcpy(new_dns->ns_name, ni->ni_name, 64);
+	new_dns->ns_state          = ni->ni_state;
+	new_dns->ns_slot_id        = cpu_to_le16(slot);
+	new_dns->ns_mount_gen      = cpu_to_le32(ni->ni_mount_gen);
+	new_dns->ns_mount_time     = cpu_to_le64(ktime_get_real_ns());
+	new_dns->ns_last_heartbeat = cpu_to_le64(ni->ni_last_hb);
+	new_dns->ns_pr_key         = cpu_to_le64(ni->ni_pr_key);
+	new_dns->ns_version        = cpu_to_le32(
+		le32_to_cpu(expected_dns->ns_version) + 1);
+
+	if (sbi->s_auth_required) {
+		__le32 tok = cpu_to_le32(ocsfs_crc32c(0, sbi->s_cluster_secret, 32));
+
+		memcpy(new_dns->ns_auth_token, &tok, sizeof(tok));
+		memset(new_dns->ns_auth_token + sizeof(tok), 0,
+		       sizeof(new_dns->ns_auth_token) - sizeof(tok));
+	} else {
+		memset(new_dns->ns_auth_token, 0, sizeof(new_dns->ns_auth_token));
+	}
+
+	new_dns->ns_checksum = cpu_to_le32(
+		ocsfs_crc32c(~0U, new_dns, sizeof(*new_dns) - sizeof(__le32)));
+}
+
+/*
+ * ocsfs_node_write_slot — scrive lo slot via CAS atomico (CRIT-2 fix).
+ *
+ * Legge lo stato corrente on-disk, costruisce il nuovo, chiama ocsfs_atomic_cas.
+ * Ritorna -EAGAIN se un altro nodo ha scritto nel frattempo (race persa).
+ * Il chiamante (ocsfs_node_claim_slot) ri-scansiona la tabella su -EAGAIN.
+ */
+static int ocsfs_node_write_slot(struct super_block *sb, u16 slot)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	u64 off   = OCSFS_NODE_SLOT_TABLE_OFF +
+		    (u64)slot * sizeof(struct ocsfs_disk_node_slot);
+	u64 block = off / sbi->s_block_size;
+	u32 boff  = off % sbi->s_block_size;
+	struct buffer_head *bh;
+	struct ocsfs_disk_node_slot expected_dns, new_dns;
+	int ret;
+
 	bh = sb_getblk(sb, block);
 	if (!bh)
 		return -EIO;
@@ -104,36 +144,15 @@ static int ocsfs_node_write_slot(struct super_block *sb, u16 slot)
 		return -EIO;
 	}
 
-	dns = (struct ocsfs_disk_node_slot *)(bh->b_data + boff);
-
-	memcpy(dns->ns_uuid, ni->ni_uuid, 16);
-	memcpy(dns->ns_name, ni->ni_name, 64);
-	dns->ns_state = ni->ni_state;
-	dns->ns_slot_id = cpu_to_le16(slot);
-	dns->ns_mount_gen = cpu_to_le32(ni->ni_mount_gen);
-	dns->ns_mount_time = cpu_to_le64(ktime_get_real_ns());
-	dns->ns_last_heartbeat = cpu_to_le64(ni->ni_last_hb);
-	dns->ns_pr_key = cpu_to_le64(ni->ni_pr_key);
-
-	if (sbi->s_auth_required) {
-		__le32 tok = cpu_to_le32(ocsfs_crc32c(0, sbi->s_cluster_secret, 32));
-		memcpy(dns->ns_auth_token, &tok, sizeof(tok));
-		memset(dns->ns_auth_token + sizeof(tok), 0,
-		       sizeof(dns->ns_auth_token) - sizeof(tok));
-	} else {
-		memset(dns->ns_auth_token, 0, sizeof(dns->ns_auth_token));
-	}
-
-	/* Compute checksum */
-	dns->ns_checksum = cpu_to_le32(
-		ocsfs_crc32c(~0U, dns,
-			     sizeof(*dns) - sizeof(__le32)));
-
-	mark_buffer_dirty(bh);
-	sync_dirty_buffer(bh);
+	memcpy(&expected_dns, bh->b_data + boff, sizeof(expected_dns));
 	brelse(bh);
 
-	return 0;
+	ocsfs_build_new_slot(sb, slot, &expected_dns, &new_dns);
+
+	ret = ocsfs_atomic_cas(sb, block, boff,
+			       sizeof(struct ocsfs_disk_node_slot),
+			       &expected_dns, &new_dns);
+	return ret;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -170,72 +189,90 @@ int ocsfs_node_claim_slot(struct super_block *sb)
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	struct ocsfs_node_info *ni;
 	u16 i;
-	int ret;
+	int attempt, ret;
 
-	/* Read current table state */
-	ret = ocsfs_node_read_table(sb);
-	if (ret)
-		return ret;
+	for (attempt = 0; attempt < CAS_MAX_ATTEMPTS; attempt++) {
+		/* Fresh read della tabella da disco ad ogni tentativo */
+		ret = ocsfs_node_read_table(sb);
+		if (ret)
+			return ret;
 
-	spin_lock(&sbi->s_node_lock);
+		spin_lock(&sbi->s_node_lock);
+		i = sbi->s_max_nodes;  /* sentinel: nessuno slot trovato */
 
-	/* First: look for a DEAD slot from a previous mount of this node */
-	for (i = 0; i < sbi->s_max_nodes; i++) {
-		ni = &sbi->s_nodes[i];
-		if (ni->ni_state == OCSFS_NODE_DEAD &&
-		    memcmp(ni->ni_uuid, sbi->s_node_uuid, 16) == 0) {
-			goto claim;
+		/* Prima: slot DEAD del nostro stesso UUID (remount dopo crash) */
+		for (u16 k = 0; k < sbi->s_max_nodes; k++) {
+			ni = &sbi->s_nodes[k];
+			if (ni->ni_state == OCSFS_NODE_DEAD &&
+			    memcmp(ni->ni_uuid, sbi->s_node_uuid, 16) == 0) {
+				i = k;
+				break;
+			}
 		}
+
+		/* Seconda: slot FREE */
+		if (i == sbi->s_max_nodes) {
+			for (u16 k = 0; k < sbi->s_max_nodes; k++) {
+				ni = &sbi->s_nodes[k];
+				if (ni->ni_state == OCSFS_NODE_FREE) {
+					i = k;
+					break;
+				}
+			}
+		}
+
+		/* Terza: qualsiasi slot DEAD */
+		if (i == sbi->s_max_nodes) {
+			for (u16 k = 0; k < sbi->s_max_nodes; k++) {
+				ni = &sbi->s_nodes[k];
+				if (ni->ni_state == OCSFS_NODE_DEAD) {
+					i = k;
+					break;
+				}
+			}
+		}
+
+		if (i == sbi->s_max_nodes) {
+			spin_unlock(&sbi->s_node_lock);
+			pr_err("ocsfs: no free node slots (max=%u)\n",
+			       sbi->s_max_nodes);
+			return -ENOSPC;
+		}
+
+		/* Prepara il nuovo stato in memoria */
+		ni               = &sbi->s_nodes[i];
+		sbi->s_node_slot = i;
+		ni->ni_state     = OCSFS_NODE_ACTIVE;
+		ni->ni_mount_gen++;
+		sbi->s_mount_gen = ni->ni_mount_gen;
+		memcpy(ni->ni_uuid, sbi->s_node_uuid, 16);
+		memcpy(ni->ni_name, sbi->s_node_name, 64);
+		ni->ni_pr_key  = ocsfs_pr_make_key(sbi->s_node_uuid,
+						   sbi->s_mount_gen);
+		ni->ni_last_hb = ktime_get_real_ns();
+
+		spin_unlock(&sbi->s_node_lock);
+
+		/* CAS atomico: se -EAGAIN un altro nodo ha preso lo slot */
+		ret = ocsfs_node_write_slot(sb, i);
+		if (ret == 0) {
+			pr_info("ocsfs: claimed node slot %u (gen=%u)\n",
+				i, sbi->s_mount_gen);
+			return 0;
+		}
+		if (ret != -EAGAIN) {
+			pr_err("ocsfs: failed to write node slot %u: %d\n",
+			       i, ret);
+			return ret;
+		}
+
+		/* -EAGAIN: race con un altro nodo — rileggi la tabella e riprova */
+		udelay(1 << min(attempt, 8));
 	}
 
-	/* Second: look for any FREE slot */
-	for (i = 0; i < sbi->s_max_nodes; i++) {
-		ni = &sbi->s_nodes[i];
-		if (ni->ni_state == OCSFS_NODE_FREE)
-			goto claim;
-	}
-
-	/*
-	 * Third: reclaim any DEAD slot whose node has already been fully
-	 * recovered (journal replayed, locks released, slot marked DEAD).
-	 * Without this, UUID rotation on each mount causes DEAD slots to
-	 * accumulate — each crash cycle consumes one slot permanently,
-	 * leading to slot exhaustion after max_nodes crash cycles.
-	 */
-	for (i = 0; i < sbi->s_max_nodes; i++) {
-		ni = &sbi->s_nodes[i];
-		if (ni->ni_state == OCSFS_NODE_DEAD)
-			goto claim;
-	}
-
-	spin_unlock(&sbi->s_node_lock);
-	pr_err("ocsfs: no free node slots (max=%u)\n", sbi->s_max_nodes);
-	return -ENOSPC;
-
-claim:
-	/* Fill in our info */
-	sbi->s_node_slot = i;
-	ni->ni_state = OCSFS_NODE_ACTIVE;
-	ni->ni_mount_gen++;
-	sbi->s_mount_gen = ni->ni_mount_gen;
-	memcpy(ni->ni_uuid, sbi->s_node_uuid, 16);
-	memcpy(ni->ni_name, sbi->s_node_name, 64);
-	ni->ni_pr_key = ocsfs_pr_make_key(sbi->s_node_uuid,
-					    sbi->s_mount_gen);
-	ni->ni_last_hb = ktime_get_real_ns();
-
-	spin_unlock(&sbi->s_node_lock);
-
-	/* Persist to disk */
-	ret = ocsfs_node_write_slot(sb, i);
-	if (ret) {
-		pr_err("ocsfs: failed to write node slot %u\n", i);
-		return ret;
-	}
-
-	pr_info("ocsfs: claimed node slot %u (gen=%u)\n",
-		i, sbi->s_mount_gen);
-	return 0;
+	pr_err("ocsfs: node slot claim timeout after %d attempts\n",
+	       CAS_MAX_ATTEMPTS);
+	return -EBUSY;
 }
 
 /* ═══════════════════════════════════════════════════════════════
