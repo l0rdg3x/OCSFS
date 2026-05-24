@@ -66,6 +66,29 @@
 #define OCSFS_LOCK_ENTRY_SIZE       256
 #define OCSFS_LOCK_ENTRY_COUNT      (OCSFS_LOCK_TABLE_SIZE / OCSFS_LOCK_ENTRY_SIZE)
 
+/* CAS lease area — immediatamente dopo la lock table */
+#define OCSFS_CAS_LEASE_OFF         1384448ULL   /* = LOCK_TABLE_OFF + LOCK_TABLE_SIZE */
+#define OCSFS_CAS_LEASE_ENTRIES     256
+#define OCSFS_CAS_LEASE_MAGIC       0x4F43414CU  /* "OCAL" */
+#define CAS_MAX_ATTEMPTS            32
+#define CAS_LEASE_TIMEOUT_NS        (2ULL * NSEC_PER_SEC)
+
+/* 32 byte per entry; 128 entry per blocco da 4096 byte */
+struct ocsfs_disk_cas_lease {
+	__le32  cl_magic;
+	__le16  cl_owner_slot;    /* 0xFFFF = libero */
+	__le16  cl_reserved;
+	__le64  cl_deadline_ns;
+	__le32  cl_checksum;      /* crc32c dei primi 28 byte */
+	__le32  cl_pad;
+} __packed;
+
+enum ocsfs_cas_backend {
+	CAS_BACKEND_NONE = 0,
+	CAS_BACKEND_PR_LEASE,
+	CAS_BACKEND_SCSI_CAW,     /* fast-path hardware opzionale */
+};
+
 #define OCSFS_MAX_NODES             256
 #define OCSFS_DEFAULT_MAX_NODES     64
 #define OCSFS_MAX_LABEL             64
@@ -344,7 +367,8 @@ struct ocsfs_disk_node_slot {
 	__le64  ns_last_heartbeat;
 	__le64  ns_pr_key;
 	__u8    ns_auth_token[32];  /* crc32c(secret,32) LE; 0 if no auth */
-	__u8    ns_reserved2[108];
+	__le32  ns_version;       /* CAS version per slot claim race-free */
+	__u8    ns_reserved2[104];
 	__le32  ns_checksum;
 } __packed;
 
@@ -543,6 +567,7 @@ struct ocsfs_sb_info {
 
 	/* SCSI Compare-And-Write capability (probed at mount time) */
 	bool            s_caw_supported;
+	enum ocsfs_cas_backend s_cas_backend;
 
 	/* ZSTD decompression workspace — lazy-allocated on first ZSTD read */
 	struct mutex    s_decompress_lock;
@@ -918,5 +943,10 @@ u8 ocsfs_get_compression_algo(struct inode *inode);
 int ocsfs_set_compression(struct inode *inode, u8 algo);
 void ocsfs_compress_stats(struct inode *inode, u64 *disk_size,
 			  u64 *logical_size);
+
+/* cas.c */
+int ocsfs_cas_probe(struct super_block *sb);
+int ocsfs_atomic_cas(struct super_block *sb, u64 block, u32 boff,
+		     u32 len, const void *expected, const void *new_data);
 
 #endif /* _OCSFS_KMOD_H */
