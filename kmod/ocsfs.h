@@ -148,6 +148,7 @@
 #define OCSFS_LOCKRES_RENAME    4
 #define OCSFS_LOCKRES_RECOVERY  5
 #define OCSFS_LOCKRES_SUPER     6
+#define OCSFS_LOCKRES_REFCOUNT  7
 
 /* Heartbeat constants */
 #define OCSFS_HB_INTERVAL_MS    5000   /* write every 5s */
@@ -415,6 +416,7 @@ struct ocsfs_ag_info {
 	u64             free_inodes;
 	struct mutex    ag_lock;        /* protects bitmap + inode table (local) */
 	struct ocsfs_lock_res ag_lock_res; /* cross-node DLM lock for this AG */
+	struct ocsfs_lock_res ag_rc_lock_res; /* cross-node DLM refcount lock */
 };
 
 /* Journal in-memory state */
@@ -532,6 +534,7 @@ struct ocsfs_sb_info {
 	DECLARE_BITMAP(s_recovery_pending, OCSFS_MAX_NODES); /* one bit per failed slot */
 	bool                    s_recovery_in_progress;
 	struct mutex            s_recovery_lock;
+	struct ocsfs_lock_res   s_recovery_lock_res; /* DLM leader-election lock */
 
 	/* Cluster auth */
 	u8              s_cluster_secret[32];   /* raw secret from mount option */
@@ -813,6 +816,17 @@ static inline u64 ocsfs_lock_hash_inode(u64 ino)
 static inline u64 ocsfs_lock_hash_ag(u32 ag_num)
 {
 	return ocsfs_lock_hash_inode((u64)ag_num | 0xA600000000000000ULL);
+}
+
+static inline u64 ocsfs_lock_hash_rc(u32 ag_num)
+{
+	return ocsfs_lock_hash_inode((u64)ag_num | 0xAC00000000000000ULL);
+}
+
+static inline u64 ocsfs_lock_hash_recovery(void)
+{
+	/* Fixed well-known resource ID for the recovery leader lock. */
+	return ocsfs_lock_hash_inode(0x5245434F00000000ULL); /* 'RECO' */
 }
 
 static inline u32 ocsfs_lock_table_slot(u64 resource_id)

@@ -166,6 +166,8 @@ static int ocsfs_load_ags(struct super_block *sb)
 		mutex_init(&ag->ag_lock);
 		ocsfs_lock_init(&ag->ag_lock_res,
 				ocsfs_lock_hash_ag(i), OCSFS_LOCKRES_AG);
+		ocsfs_lock_init(&ag->ag_rc_lock_res,
+				ocsfs_lock_hash_rc(i), OCSFS_LOCKRES_REFCOUNT);
 
 		brelse(bh);
 	}

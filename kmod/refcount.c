@@ -290,25 +290,43 @@ static int ocsfs_refcount_set(struct super_block *sb, u64 phys_block,
  *
  * For snapshot creation: all shared extents go from 1 → 2
  * (or n → n+1 for multi-layer snapshots).
+ *
+ * Holds DLM EX on the AG refcount lock in cluster mode so that the
+ * read-modify-write is atomic across nodes.
  */
 int ocsfs_refcount_inc(struct super_block *sb, u64 phys_block, u32 len)
 {
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	struct ocsfs_ag_info *ag = NULL;
+	u64 local;
 	u32 i;
-	int ret;
+	int ret = 0;
+
+	if (sbi->s_clustered) {
+		ag = ocsfs_block_to_ag(sbi, phys_block, &local);
+		if (!ag)
+			return -EINVAL;
+		ret = ocsfs_lock_acquire(sb, &ag->ag_rc_lock_res, OCSFS_LOCK_EX);
+		if (ret)
+			return ret;
+	}
 
 	for (i = 0; i < len; i++) {
 		u32 current_rc;
 
 		ret = ocsfs_refcount_get(sb, phys_block + i, &current_rc);
 		if (ret)
-			return ret;
+			goto out;
 
 		ret = ocsfs_refcount_set(sb, phys_block + i, current_rc + 1);
 		if (ret)
-			return ret;
+			goto out;
 	}
 
-	return 0;
+out:
+	if (sbi->s_clustered && ag)
+		ocsfs_lock_release(sb, &ag->ag_rc_lock_res);
+	return ret;
 }
 
 /*
@@ -318,20 +336,35 @@ int ocsfs_refcount_inc(struct super_block *sb, u64 phys_block, u32 len)
  *               free the blocks).
  *
  * For snapshot deletion and CoW: decrements shared extent refcounts.
+ *
+ * Holds DLM EX on the AG refcount lock in cluster mode so that the
+ * read-modify-write is atomic across nodes.
  */
 int ocsfs_refcount_dec(struct super_block *sb, u64 phys_block, u32 len,
 		       bool *should_free)
 {
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	struct ocsfs_ag_info *ag = NULL;
+	u64 local;
 	u32 i;
-	int ret;
+	int ret = 0;
 	bool all_free = true;
+
+	if (sbi->s_clustered) {
+		ag = ocsfs_block_to_ag(sbi, phys_block, &local);
+		if (!ag)
+			return -EINVAL;
+		ret = ocsfs_lock_acquire(sb, &ag->ag_rc_lock_res, OCSFS_LOCK_EX);
+		if (ret)
+			return ret;
+	}
 
 	for (i = 0; i < len; i++) {
 		u32 current_rc;
 
 		ret = ocsfs_refcount_get(sb, phys_block + i, &current_rc);
 		if (ret)
-			return ret;
+			goto out;
 
 		if (current_rc <= 1) {
 			/* Already at 1 or 0 — will be freed */
@@ -343,13 +376,16 @@ int ocsfs_refcount_dec(struct super_block *sb, u64 phys_block, u32 len,
 		}
 
 		if (ret)
-			return ret;
+			goto out;
 	}
 
 	if (should_free)
 		*should_free = all_free;
 
-	return 0;
+out:
+	if (sbi->s_clustered && ag)
+		ocsfs_lock_release(sb, &ag->ag_rc_lock_res);
+	return ret;
 }
 
 /*

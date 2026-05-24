@@ -94,6 +94,31 @@ int ocsfs_recovery_run(struct super_block *sb, u16 failed_slot)
 		return 0;
 	}
 
+	/*
+	 * In cluster mode, acquire the distributed recovery lock before
+	 * proceeding.  This ensures only one node performs recovery even
+	 * if in-memory node-state diverges during a partial partition.
+	 * Re-check leadership after acquiring to handle the TOCTOU window.
+	 */
+	if (sbi->s_clustered) {
+		ret = ocsfs_lock_acquire(sb, &sbi->s_recovery_lock_res,
+					 OCSFS_LOCK_EX);
+		if (ret) {
+			pr_info("ocsfs: recovery DLM lock failed (%d), deferring\n",
+				ret);
+			sbi->s_recovery_in_progress = false;
+			mutex_unlock(&sbi->s_recovery_lock);
+			return ret;
+		}
+		if (!ocsfs_is_recovery_leader(sb, failed_slot)) {
+			pr_info("ocsfs: leadership lost after DLM acquire, deferring\n");
+			ocsfs_lock_release(sb, &sbi->s_recovery_lock_res);
+			sbi->s_recovery_in_progress = false;
+			mutex_unlock(&sbi->s_recovery_lock);
+			return 0;
+		}
+	}
+
 	pr_info("ocsfs: this node (slot %u) is the recovery leader\n",
 		sbi->s_node_slot);
 
@@ -142,6 +167,8 @@ int ocsfs_recovery_run(struct super_block *sb, u16 failed_slot)
 		       failed_slot, ret);
 		sb->s_flags |= SB_RDONLY;
 		sbi->s_recovery_in_progress = false;
+		if (sbi->s_clustered)
+			ocsfs_lock_release(sb, &sbi->s_recovery_lock_res);
 		mutex_unlock(&sbi->s_recovery_lock);
 		return ret;
 	}
@@ -179,6 +206,8 @@ int ocsfs_recovery_run(struct super_block *sb, u16 failed_slot)
 	pr_warn("ocsfs: ═══ RECOVERY COMPLETE for node slot %u ═══\n",
 		failed_slot);
 
+	if (sbi->s_clustered)
+		ocsfs_lock_release(sb, &sbi->s_recovery_lock_res);
 	mutex_unlock(&sbi->s_recovery_lock);
 	return 0;
 }
@@ -231,6 +260,9 @@ int ocsfs_recovery_init(struct super_block *sb)
 	sbi->s_recovery_in_progress = false;
 	bitmap_zero(sbi->s_recovery_pending, OCSFS_MAX_NODES);
 	INIT_WORK(&sbi->s_recovery_work, ocsfs_recovery_work_fn);
+	ocsfs_lock_init(&sbi->s_recovery_lock_res,
+			ocsfs_lock_hash_recovery(),
+			OCSFS_LOCKRES_RECOVERY);
 
 	return 0;
 }
