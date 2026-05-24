@@ -390,26 +390,40 @@ static sector_t ocsfs_iomap_bmap(struct address_space *mapping, sector_t bno)
  * Passing IOMAP_WRITE here would be wrong in clustered mode: writepages is
  * called by the VM without holding DLM EX, but ocsfs_cow_extent requires it.
  */
-static int ocsfs_map_blocks(struct iomap_writepage_ctx *wpc,
-			    struct inode *inode, loff_t pos)
+static ssize_t ocsfs_writeback_range(struct iomap_writepage_ctx *wpc,
+				     struct folio *folio, u64 pos,
+				     unsigned int len, u64 end_pos)
 {
-	if (wpc->iomap.length && wpc->iomap.offset <= pos &&
-	    wpc->iomap.offset + wpc->iomap.length > pos)
-		return 0;
-	return ocsfs_iomap_begin(inode, pos, inode->i_sb->s_blocksize,
-				 0, &wpc->iomap, NULL);
+	int ret;
+
+	/* Remap solo se il blocco corrente non copre pos */
+	if (!wpc->iomap.length || pos < wpc->iomap.offset ||
+	    pos >= wpc->iomap.offset + wpc->iomap.length) {
+		ret = ocsfs_iomap_begin(wpc->inode, pos,
+					wpc->inode->i_sb->s_blocksize,
+					0, &wpc->iomap, NULL);
+		if (ret < 0)
+			return ret;
+	}
+
+	return iomap_add_to_ioend(wpc, folio, pos, end_pos, len);
 }
 
 static const struct iomap_writeback_ops ocsfs_writeback_ops = {
-	.map_blocks = ocsfs_map_blocks,
+	.writeback_range  = ocsfs_writeback_range,
+	.writeback_submit = iomap_ioend_writeback_submit,
 };
 
 static int ocsfs_writepages(struct address_space *mapping,
 			    struct writeback_control *wbc)
 {
-	struct iomap_writepage_ctx wpc = {};
+	struct iomap_writepage_ctx wpc = {
+		.inode = mapping->host,
+		.wbc   = wbc,
+		.ops   = &ocsfs_writeback_ops,
+	};
 
-	return iomap_writepages(mapping, wbc, &wpc, &ocsfs_writeback_ops);
+	return iomap_writepages(&wpc);
 }
 
 const struct address_space_operations ocsfs_iomap_aops = {

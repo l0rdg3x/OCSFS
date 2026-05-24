@@ -22,7 +22,8 @@ ocsfs-y := super.o inode.o dir.o dir_rename.o file.o \
            heartbeat.o node.o recovery.o \
            iomap.o thin.o \
            snapshot.o refcount.o compress.o \
-           scsi_pr.o xattr.o
+           scsi_pr.o xattr.o cas.o \
+           test_lock.o test_cas.o
 
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules

@@ -12,11 +12,6 @@
 #include <linux/xattr.h>
 #include "ocsfs.h"
 
-#define OCSFS_XATTR_NS_USER     0
-#define OCSFS_XATTR_NS_TRUSTED  1
-#define OCSFS_XATTR_NS_SECURITY 2
-#define OCSFS_XATTR_NS_SYSTEM   3
-
 struct ocsfs_xattr_entry {
 	u8    xe_ns;
 	u8    xe_name_len;
@@ -426,7 +421,7 @@ static int handler_get(const struct xattr_handler *handler,
 		       const char *name, void *buffer, size_t size)
 {
 	return ocsfs_xattr_get_internal(inode,
-					(u8)(unsigned long)handler->private,
+					(u8)handler->flags,
 					name, buffer, size);
 }
 
@@ -437,29 +432,29 @@ static int handler_set(const struct xattr_handler *handler,
 		       size_t size, int flags)
 {
 	return ocsfs_xattr_set_internal(inode,
-					(u8)(unsigned long)handler->private,
+					(u8)handler->flags,
 					name, value, size, flags);
 }
 
 static const struct xattr_handler ocsfs_xattr_user_handler = {
-	.prefix  = XATTR_USER_PREFIX,
-	.private = (void *)(unsigned long)OCSFS_XATTR_NS_USER,
-	.get     = handler_get,
-	.set     = handler_set,
+	.prefix = XATTR_USER_PREFIX,
+	.flags  = OCSFS_XATTR_NS_USER,
+	.get    = handler_get,
+	.set    = handler_set,
 };
 
 static const struct xattr_handler ocsfs_xattr_trusted_handler = {
-	.prefix  = XATTR_TRUSTED_PREFIX,
-	.private = (void *)(unsigned long)OCSFS_XATTR_NS_TRUSTED,
-	.get     = handler_get,
-	.set     = handler_set,
+	.prefix = XATTR_TRUSTED_PREFIX,
+	.flags  = OCSFS_XATTR_NS_TRUSTED,
+	.get    = handler_get,
+	.set    = handler_set,
 };
 
 static const struct xattr_handler ocsfs_xattr_security_handler = {
-	.prefix  = XATTR_SECURITY_PREFIX,
-	.private = (void *)(unsigned long)OCSFS_XATTR_NS_SECURITY,
-	.get     = handler_get,
-	.set     = handler_set,
+	.prefix = XATTR_SECURITY_PREFIX,
+	.flags  = OCSFS_XATTR_NS_SECURITY,
+	.get    = handler_get,
+	.set    = handler_set,
 };
 
 const struct xattr_handler * const ocsfs_xattr_handlers[] = {

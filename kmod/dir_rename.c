@@ -5,6 +5,7 @@
  */
 
 #include <linux/security.h>
+#include <linux/xattr.h>
 #include "ocsfs.h"
 
 /* ═══════════════════════════════════════════════════════════════
