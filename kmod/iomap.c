@@ -269,11 +269,21 @@ ssize_t ocsfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
 	ssize_t ret;
 
+	/*
+	 * Lock ordering: inode_lock → DLM EX.
+	 *
+	 * The VFS setattr path holds inode_lock and then acquires DLM EX
+	 * inside ocsfs_setattr.  write_iter must acquire inode_lock first to
+	 * avoid ABBA deadlock:
+	 *   write_iter (DLM EX → inode_lock) vs setattr (inode_lock → DLM EX)
+	 */
+	inode_lock(inode);
+
 	if (sbi->s_clustered) {
 		ret = ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
 					 OCSFS_LOCK_EX);
 		if (ret)
-			return ret;
+			goto out_unlock;
 		/*
 		 * Invalidate the page cache so we start with clean pages.
 		 * Another node may have written to this file since our last
@@ -282,8 +292,6 @@ ssize_t ocsfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		 */
 		invalidate_inode_pages2(inode->i_mapping);
 	}
-
-	inode_lock(inode);
 
 	ret = generic_write_checks(iocb, from);
 	if (ret <= 0)
@@ -303,8 +311,6 @@ ssize_t ocsfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	}
 
 out:
-	inode_unlock(inode);
-
 	if (ret > 0) {
 		inode_set_mtime_to_ts(inode, inode_set_ctime_current(inode));
 		mark_inode_dirty(inode);
@@ -342,6 +348,8 @@ out:
 		ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
 	}
 
+out_unlock:
+	inode_unlock(inode);
 	return ret;
 }
 
