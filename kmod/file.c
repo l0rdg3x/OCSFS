@@ -159,6 +159,19 @@ static int ocsfs_fsync(struct file *file, loff_t start, loff_t end,
 	struct inode *inode = file_inode(file);
 	int ret;
 
+	/*
+	 * Lazily compress inline extents before syncing to disk.
+	 * If compression fails for any extent, log and proceed — the data
+	 * is already safely on disk uncompressed.
+	 */
+	if (ocsfs_get_compression_algo(inode) != OCSFS_COMPRESS_NONE) {
+		int cr = ocsfs_compress_file(inode);
+
+		if (cr)
+			pr_warn_ratelimited("ocsfs: compress_file failed (%d), "
+					    "syncing uncompressed\n", cr);
+	}
+
 	ret = file_write_and_wait_range(file, start, end);
 	if (ret)
 		return ret;

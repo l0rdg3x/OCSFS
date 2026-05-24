@@ -130,6 +130,11 @@ enum ocsfs_cas_backend {
 /* Feature flags */
 #define OCSFS_FEAT_THIN_PROV    (1ULL << 0)
 #define OCSFS_FEAT_COMPRESSION  (1ULL << 1)
+
+/* Compression algorithm IDs (also in compress.c — keep in sync) */
+#define OCSFS_COMPRESS_NONE	0
+#define OCSFS_COMPRESS_LZ4	1
+#define OCSFS_COMPRESS_ZSTD	2
 #define OCSFS_FEAT_ENCRYPTION   (1ULL << 2)
 #define OCSFS_FEAT_SNAPSHOTS    (1ULL << 3)
 #define OCSFS_FEAT_DEDUP        (1ULL << 4)
@@ -962,6 +967,7 @@ int ocsfs_compress_extent_read(struct inode *inode,
 			       struct page **pages, unsigned int nr_pages);
 u8 ocsfs_get_compression_algo(struct inode *inode);
 int ocsfs_set_compression(struct inode *inode, u8 algo);
+int ocsfs_compress_file(struct inode *inode);
 void ocsfs_compress_stats(struct inode *inode, u64 *disk_size,
 			  u64 *logical_size);
 

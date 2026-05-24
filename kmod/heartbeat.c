@@ -106,39 +106,6 @@ static int heartbeat_read_timeout(struct buffer_head *bh)
 	return buffer_uptodate(bh) ? 0 : -EIO;
 }
 
-/* Read a specific node's heartbeat from disk */
-static int heartbeat_read(struct super_block *sb, u16 slot,
-			  struct ocsfs_disk_heartbeat *out)
-{
-	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
-	struct buffer_head *bh;
-	u64 off = OCSFS_HEARTBEAT_OFF +
-		  (u64)slot * OCSFS_HEARTBEAT_ENTRY_SIZE;
-	u64 block = off / sbi->s_block_size;
-	u32 boff = off % sbi->s_block_size;
-	int ret;
-
-	/*
-	 * Always force a fresh read from the block device — never return a
-	 * cached copy.  Another node's heartbeat writer may have updated the
-	 * disk since we last read it.  Use a bounded timeout so a hung FC
-	 * path cannot stall the heartbeat thread and starve our own writes.
-	 */
-	bh = sb_getblk(sb, block);
-	if (!bh)
-		return -EIO;
-
-	ret = heartbeat_read_timeout(bh);
-	if (ret) {
-		brelse(bh);
-		return ret;
-	}
-
-	memcpy(out, bh->b_data + boff, sizeof(*out));
-	brelse(bh);
-
-	return 0;
-}
 
 /* ═══════════════════════════════════════════════════════════════
  * PEER CHECKING

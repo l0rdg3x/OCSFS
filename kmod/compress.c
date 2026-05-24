@@ -485,3 +485,121 @@ void ocsfs_compress_stats(struct inode *inode, u64 *disk_size,
 	*disk_size = disk;
 	*logical_size = logical;
 }
+
+/*
+ * ocsfs_compress_file() — Lazily compress all uncompressed extents of a file.
+ *
+ * Called from ocsfs_fsync(). First flushes dirty pages to disk (uncompressed),
+ * then re-reads each extent, compresses in memory, allocates fewer blocks, and
+ * updates the in-memory extent map. If compression does not reduce size the
+ * extent is left as-is. Btree-backed inodes are skipped (not yet supported).
+ */
+int ocsfs_compress_file(struct inode *inode)
+{
+	struct ocsfs_inode_info *oi = OCSFS_I(inode);
+	struct super_block *sb = inode->i_sb;
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	u8 algo = ocsfs_get_compression_algo(inode);
+	u16 i;
+	int ret = 0;
+
+	if (algo == OCSFS_COMPRESS_NONE)
+		return 0;
+
+	ret = filemap_write_and_wait(inode->i_mapping);
+	if (ret)
+		return ret;
+
+	mutex_lock(&oi->i_extent_lock);
+	if (oi->i_extent_tree_root)
+		goto unlock;  /* btree-backed: skip; data on disk uncompressed */
+
+	for (i = 0; i < oi->i_extent_count; i++) {
+		struct ocsfs_extent *e = &oi->i_extents[i];
+		void *raw, *comp;
+		unsigned int raw_size, comp_size;
+		u32 comp_blocks, j;
+		u64 new_phys, old_phys;
+		u32 old_len;
+
+		if ((e->flags & (OCSFS_EXT_COMPRESSED | OCSFS_EXT_UNWRITTEN)) ||
+		    !e->physical_block)
+			continue;
+
+		raw_size = (unsigned int)e->length * sbi->s_block_size;
+		if (raw_size > (1u << 20))
+			continue;
+
+		raw = kvmalloc(raw_size, GFP_NOFS);
+		if (!raw) { ret = -ENOMEM; break; }
+
+		for (j = 0; j < e->length; j++) {
+			struct buffer_head *bh = sb_bread(sb, e->physical_block + j);
+
+			if (!bh) {
+				kvfree(raw);
+				ret = -EIO;
+				goto unlock;
+			}
+			memcpy(raw + (size_t)j * sbi->s_block_size,
+			       bh->b_data, sbi->s_block_size);
+			brelse(bh);
+		}
+
+		comp = kvmalloc(raw_size, GFP_NOFS);
+		if (!comp) { kvfree(raw); ret = -ENOMEM; break; }
+
+		comp_size = raw_size;
+		if (ocsfs_compress_data(algo, raw, raw_size, comp, &comp_size) ||
+		    comp_size >= raw_size) {
+			kvfree(raw);
+			kvfree(comp);
+			continue;
+		}
+		kvfree(raw);
+
+		comp_blocks = (comp_size + sbi->s_block_size - 1) / sbi->s_block_size;
+		if (ocsfs_alloc_blocks(sb, 0, comp_blocks, &new_phys)) {
+			kvfree(comp);
+			continue;
+		}
+
+		for (j = 0; j < comp_blocks; j++) {
+			struct buffer_head *bh = sb_getblk(sb, new_phys + j);
+			unsigned int off   = j * sbi->s_block_size;
+			unsigned int chunk = min_t(unsigned int,
+						   comp_size - off,
+						   sbi->s_block_size);
+
+			if (!bh) {
+				kvfree(comp);
+				ocsfs_free_blocks(sb, new_phys, comp_blocks);
+				ret = -EIO;
+				goto unlock;
+			}
+			lock_buffer(bh);
+			memcpy(bh->b_data, comp + off, chunk);
+			if (chunk < sbi->s_block_size)
+				memset(bh->b_data + chunk, 0,
+				       sbi->s_block_size - chunk);
+			set_buffer_uptodate(bh);
+			mark_buffer_dirty(bh);
+			unlock_buffer(bh);
+			sync_dirty_buffer(bh);
+			brelse(bh);
+		}
+		kvfree(comp);
+
+		old_phys = e->physical_block;
+		old_len  = e->length;
+		e->physical_block = new_phys;
+		e->length         = comp_blocks;
+		e->flags = ocsfs_ext_set_comp_algo(
+				e->flags | OCSFS_EXT_COMPRESSED, algo);
+		mark_inode_dirty(inode);
+		ocsfs_free_blocks(sb, old_phys, old_len);
+	}
+unlock:
+	mutex_unlock(&oi->i_extent_lock);
+	return ret;
+}
