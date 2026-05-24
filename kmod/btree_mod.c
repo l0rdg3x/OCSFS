@@ -393,6 +393,33 @@ int ocsfs_btree_delete(struct ocsfs_btree *bt, u64 key)
 		u64 parent_block = le64_to_cpu(hdr->bn_parent);
 		void *nb;
 
+		/*
+		 * Check parent capacity BEFORE touching sibling links. If the
+		 * parent has bn_count=0 (only first_child) and self IS that
+		 * first_child, we cannot detach without a full path traversal.
+		 * Leave the empty leaf in place: reads return ENOENT, future
+		 * inserts will reuse it. Updating sibling links first and then
+		 * failing to update the parent would leave a dangling pointer.
+		 */
+		if (parent_block) {
+			bool can_detach = false;
+
+			nb = kzalloc(bt->block_size, GFP_KERNEL);
+			if (nb && read_node(bt, parent_block, nb) == 0) {
+				int pc = le16_to_cpu(node_hdr(nb)->bn_count);
+				u64 pfv = le64_to_cpu(*internal_first_child(nb));
+
+				can_detach = !(pfv == self && pc == 0);
+			}
+			kfree(nb);
+
+			if (!can_detach) {
+				ocsfs_btree_node_update_csum(buf, bt->block_size);
+				ret = write_node(bt, self, buf);
+				goto out;
+			}
+		}
+
 		if (left) {
 			nb = kzalloc(bt->block_size, GFP_KERNEL);
 			if (nb && read_node(bt, left, nb) == 0) {
@@ -421,12 +448,10 @@ int ocsfs_btree_delete(struct ocsfs_btree *bt, u64 key)
 				int pc = le16_to_cpu(ph->bn_count);
 
 				if (le64_to_cpu(*pf) == self) {
-					if (pc > 0) {
-						*pf = pp[0].child;
-						memmove(&pp[0], &pp[1],
-							(pc-1) * sizeof(*pp));
-						ph->bn_count = cpu_to_le16(pc-1);
-					}
+					/* pc > 0 guaranteed by can_detach check above */
+					*pf = pp[0].child;
+					memmove(&pp[0], &pp[1], (pc-1) * sizeof(*pp));
+					ph->bn_count = cpu_to_le16(pc-1);
 				} else {
 					int i;
 
