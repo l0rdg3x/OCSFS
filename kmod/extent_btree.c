@@ -304,28 +304,39 @@ int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block)
 	}
 
 	/* Delete all extents fully beyond from_block */
-	do {
-		tc.count = 0;
-		ocsfs_btree_range_scan(&bt, from_block, U64_MAX,
-				       ext_trunc_collect, &tc);
-		for (i = 0; i < tc.count; i++) {
-			u64 v;
+	{
+		int safety = 1000;
 
-			if (!ocsfs_btree_search(&bt, tc.keys[i], &v)) {
-				ret = ocsfs_free_blocks_txn(txn,
-							    ext_phys(v),
-							    ext_len(v));
-				if (ret)
-					goto abort;
-				inode->i_blocks -= (u64)ext_len(v) *
-						   (sbi->s_block_size / 512);
-				ret = ocsfs_btree_delete(&bt, tc.keys[i]);
-				if (ret)
-					goto abort;
-				oi->i_extent_tree_root = bt.root_block;
+		do {
+			tc.count = 0;
+			ocsfs_btree_range_scan(&bt, from_block, U64_MAX,
+					       ext_trunc_collect, &tc);
+			for (i = 0; i < tc.count; i++) {
+				u64 v;
+
+				if (!ocsfs_btree_search(&bt, tc.keys[i], &v)) {
+					ret = ocsfs_free_blocks_txn(txn,
+								    ext_phys(v),
+								    ext_len(v));
+					if (ret)
+						goto abort;
+					inode->i_blocks -= (u64)ext_len(v) *
+							   (sbi->s_block_size / 512);
+					ret = ocsfs_btree_delete(&bt, tc.keys[i]);
+					if (ret)
+						goto abort;
+					oi->i_extent_tree_root = bt.root_block;
+				}
 			}
-		}
-	} while (tc.count > 0);
+			if (tc.count > 0 && --safety <= 0) {
+				pr_err("ocsfs: extent_btree_truncate: loop limit reached "
+				       "(inode %llu) — btree may be corrupt, run fsck\n",
+				       oi->i_disk_ino);
+				ret = -EUCLEAN;
+				goto abort;
+			}
+		} while (tc.count > 0);
+	}
 
 	ret = ocsfs_txn_commit(txn);
 	if (!ret)
@@ -589,4 +600,230 @@ int ocsfs_extent_btree_count(struct inode *inode, u64 *count)
 	*count = 0;
 	ocsfs_btree_range_scan(&bt, 0, U64_MAX, ext_count_cb, count);
 	return 0;
+}
+
+/* ── punch_hole: free extents overlapping [start_block, end_block) ── */
+
+int ocsfs_extent_btree_punch_hole(struct inode *inode,
+				  u64 start_block, u64 end_block)
+{
+	struct ocsfs_inode_info *oi  = OCSFS_I(inode);
+	struct super_block      *sb  = inode->i_sb;
+	struct ocsfs_sb_info    *sbi = OCSFS_SB(sb);
+	struct ocsfs_btree bt;
+	struct ext_btree_ctx ec;
+	struct ext_trunc_ctx tc;
+	struct ocsfs_txn *txn;
+	u64 search_from;
+	int safety = 1000;
+	u32 i;
+	int ret;
+
+	ret = ext_btree_open(inode, &bt, &ec);
+	if (ret)
+		return ret;
+
+	txn = ocsfs_txn_begin(sb);
+	if (IS_ERR(txn))
+		return PTR_ERR(txn);
+	ec.txn = txn;
+
+	/* search_from: may need to find an extent starting just before start_block */
+	search_from = start_block > 0 ? start_block - 1 : 0;
+
+	do {
+		u64 key, val;
+
+		tc.count = 0;
+		ocsfs_btree_range_scan(&bt, search_from, end_block,
+				       ext_trunc_collect, &tc);
+		if (tc.count == 0)
+			break;
+
+		for (i = 0; i < tc.count; i++) {
+			if (ocsfs_btree_search(&bt, tc.keys[i], &val))
+				continue;
+
+			key = tc.keys[i];
+			{
+				u64 ext_end = key + ext_len(val);
+				u64 phys    = ext_phys(val);
+				u16 flags   = ext_flags(val);
+
+				/* Skip extents entirely before start_block */
+				if (ext_end <= start_block)
+					continue;
+
+				ret = ocsfs_btree_delete(&bt, key);
+				if (ret)
+					goto abort;
+				oi->i_extent_tree_root = bt.root_block;
+
+				/* Head portion: key .. start_block */
+				if (key < start_block) {
+					u32 keep = (u32)(start_block - key);
+
+					ret = ocsfs_btree_insert(&bt, key,
+							ext_encode(phys, keep, flags));
+					if (ret)
+						goto abort;
+					oi->i_extent_tree_root = bt.root_block;
+					/* free only the punched part */
+					phys += keep;
+				}
+
+				/* Tail portion: end_block .. ext_end */
+				if (ext_end > end_block) {
+					u64 tail_off  = end_block - key;
+					u32 tail_len  = (u32)(ext_end - end_block);
+					u64 tail_phys = ext_phys(val) + tail_off;
+
+					ret = ocsfs_btree_insert(&bt, end_block,
+							ext_encode(tail_phys, tail_len, flags));
+					if (ret)
+						goto abort;
+					oi->i_extent_tree_root = bt.root_block;
+					/* free only up to end_block */
+				}
+
+				/* Free the punched physical blocks */
+				{
+					u64 free_start = (key < start_block)
+							? start_block : key;
+					u64 free_end   = (ext_end > end_block)
+							? end_block : ext_end;
+					u32 free_len   = (u32)(free_end - free_start);
+
+					if (free_len && !(flags & OCSFS_EXT_UNWRITTEN)) {
+						ret = ocsfs_free_blocks_txn(txn,
+								phys, free_len);
+						if (ret)
+							goto abort;
+						inode->i_blocks -= (u64)free_len *
+								   (sbi->s_block_size / 512);
+					}
+				}
+			}
+		}
+		if (--safety <= 0) {
+			ret = -EUCLEAN;
+			goto abort;
+		}
+	} while (tc.count > 0);
+
+	ret = ocsfs_txn_commit(txn);
+	if (!ret)
+		mark_inode_dirty(inode);
+	return ret;
+
+abort:
+	ocsfs_txn_abort(txn);
+	return ret;
+}
+
+/* ── zero_range: mark extents UNWRITTEN in [start_block, end_block) ── */
+
+int ocsfs_extent_btree_zero_range(struct inode *inode,
+				  u64 start_block, u64 end_block)
+{
+	struct ocsfs_inode_info *oi = OCSFS_I(inode);
+	struct super_block      *sb = inode->i_sb;
+	struct ocsfs_btree bt;
+	struct ext_btree_ctx ec;
+	struct ext_trunc_ctx tc;
+	struct ocsfs_txn *txn;
+	int safety = 1000;
+	u32 i;
+	int ret;
+
+	ret = ext_btree_open(inode, &bt, &ec);
+	if (ret)
+		return ret;
+
+	txn = ocsfs_txn_begin(sb);
+	if (IS_ERR(txn))
+		return PTR_ERR(txn);
+	ec.txn = txn;
+
+	do {
+		u64 key, val;
+
+		tc.count = 0;
+		ocsfs_btree_range_scan(&bt,
+				       start_block > 0 ? start_block - 1 : 0,
+				       end_block, ext_trunc_collect, &tc);
+		if (tc.count == 0)
+			break;
+
+		for (i = 0; i < tc.count; i++) {
+			if (ocsfs_btree_search(&bt, tc.keys[i], &val))
+				continue;
+
+			key = tc.keys[i];
+			{
+				u64 ext_end = key + ext_len(val);
+				u64 phys    = ext_phys(val);
+
+				if (ext_end <= start_block)
+					continue;
+
+				ret = ocsfs_btree_delete(&bt, key);
+				if (ret)
+					goto abort;
+				oi->i_extent_tree_root = bt.root_block;
+
+				/* Head before start_block: keep as-is */
+				if (key < start_block) {
+					u32 hlen = (u32)(start_block - key);
+
+					ret = ocsfs_btree_insert(&bt, key,
+							ext_encode(phys, hlen, ext_flags(val)));
+					if (ret)
+						goto abort;
+					oi->i_extent_tree_root = bt.root_block;
+				}
+
+				/* Middle: mark UNWRITTEN */
+				{
+					u64 m_key  = (key > start_block) ? key : start_block;
+					u64 m_phys = phys + (m_key - key);
+					u64 m_end  = (ext_end < end_block) ? ext_end : end_block;
+					u32 m_len  = (u32)(m_end - m_key);
+
+					ret = ocsfs_btree_insert(&bt, m_key,
+							ext_encode(m_phys, m_len,
+								   OCSFS_EXT_UNWRITTEN));
+					if (ret)
+						goto abort;
+					oi->i_extent_tree_root = bt.root_block;
+				}
+
+				/* Tail after end_block: keep as-is */
+				if (ext_end > end_block) {
+					u64 t_off  = end_block - key;
+					u64 t_phys = phys + t_off;
+					u32 t_len  = (u32)(ext_end - end_block);
+
+					ret = ocsfs_btree_insert(&bt, end_block,
+							ext_encode(t_phys, t_len, ext_flags(val)));
+					if (ret)
+						goto abort;
+					oi->i_extent_tree_root = bt.root_block;
+				}
+			}
+		}
+		if (--safety <= 0) {
+			ret = -EUCLEAN;
+			goto abort;
+		}
+	} while (tc.count > 0);
+
+	ret = ocsfs_txn_commit(txn);
+	if (!ret)
+		mark_inode_dirty(inode);
+	return ret;
+
+abort:
+	ocsfs_txn_abort(txn);
+	return ret;
 }

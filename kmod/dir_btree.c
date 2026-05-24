@@ -196,9 +196,20 @@ u64 ocsfs_dir_btree_lookup(struct inode *dir, const struct qstr *name,
 	dir_decode_val(encoded, &block, &offset);
 
 	/* Verify name — guards against hash collisions */
-	bh = sb_bread(dir->i_sb, block);
-	if (!bh)
-		return 0;
+	if (sbi->s_clustered) {
+		bh = sb_getblk(dir->i_sb, block);
+		if (!bh)
+			return 0;
+		clear_buffer_uptodate(bh);
+		if (bh_read(bh, 0) < 0) {
+			brelse(bh);
+			return 0;
+		}
+	} else {
+		bh = sb_bread(dir->i_sb, block);
+		if (!bh)
+			return 0;
+	}
 
 	if (offset + sizeof(*de) > sbi->s_block_size) {
 		brelse(bh);

@@ -267,26 +267,38 @@ struct ocsfs_txn *ocsfs_txn_begin(struct super_block *sb)
 	}
 
 	txn->t_journal  = j;
-	txn->t_id       = j->sequence++;
 	txn->t_nr_blocks = 0;
 	txn->t_started  = true;
 	INIT_LIST_HEAD(&txn->t_buffers);
 
-	memset(&jt, 0, sizeof(jt));
-	jt.jt_type        = cpu_to_le32(OCSFS_JTYPE_BEGIN);
-	jt.jt_id          = cpu_to_le64(txn->t_id);
-	jt.jt_timestamp   = cpu_to_le64(ktime_get_real_ns());
-	jt.jt_node_slot   = cpu_to_le16(j->j_node_slot);
-	jt.jt_block_count = 0;   /* BEGIN carries no payload */
-	jt.jt_data_len    = 0;
-	jt.jt_checksum    = cpu_to_le32(
-		ocsfs_crc32c(~0U, &jt, sizeof(jt) - sizeof(__le32)));
+	/*
+	 * Save journal state before modifying it so we can roll back cleanly
+	 * if journal_write() fails (e.g. journal full or I/O error).
+	 */
+	{
+		u64 saved_head = j->head;
+		u64 saved_seq  = j->sequence;
 
-	ret = journal_write(sb, j, &jt, sizeof(jt));
-	if (ret) {
-		mutex_unlock(&j->j_lock);
-		kfree(txn);
-		return ERR_PTR(ret);
+		txn->t_id = j->sequence++;
+
+		memset(&jt, 0, sizeof(jt));
+		jt.jt_type        = cpu_to_le32(OCSFS_JTYPE_BEGIN);
+		jt.jt_id          = cpu_to_le64(txn->t_id);
+		jt.jt_timestamp   = cpu_to_le64(ktime_get_real_ns());
+		jt.jt_node_slot   = cpu_to_le16(j->j_node_slot);
+		jt.jt_block_count = 0;
+		jt.jt_data_len    = 0;
+		jt.jt_checksum    = cpu_to_le32(
+			ocsfs_crc32c(~0U, &jt, sizeof(jt) - sizeof(__le32)));
+
+		ret = journal_write(sb, j, &jt, sizeof(jt));
+		if (ret) {
+			j->sequence = saved_seq;
+			j->head     = saved_head;
+			mutex_unlock(&j->j_lock);
+			kfree(txn);
+			return ERR_PTR(ret);
+		}
 	}
 
 	return txn;

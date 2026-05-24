@@ -106,6 +106,8 @@ int ocsfs_recovery_run(struct super_block *sb, u16 failed_slot)
 		if (ret) {
 			pr_info("ocsfs: recovery DLM lock failed (%d), deferring\n",
 				ret);
+			/* Re-arm so the work queue retries this slot */
+			set_bit(failed_slot, sbi->s_recovery_pending);
 			sbi->s_recovery_in_progress = false;
 			mutex_unlock(&sbi->s_recovery_lock);
 			return ret;

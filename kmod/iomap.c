@@ -146,8 +146,15 @@ static int ocsfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 
 		alloc_blocks = try_blocks;
 
+		/*
+		 * Insert as UNWRITTEN so that blocks not yet reached by the
+		 * write are never exposed as MAPPED.  iomap_end converts the
+		 * written portion to WRITTEN only after confirmed I/O, preventing
+		 * reads of preallocated-but-unwritten blocks from returning stale
+		 * data from a previously freed file (information leak).
+		 */
 		ret = ocsfs_extent_insert(inode, logical_block, phys,
-					  alloc_blocks, OCSFS_EXT_WRITTEN);
+					  alloc_blocks, OCSFS_EXT_UNWRITTEN);
 		if (ret) {
 			ocsfs_free_blocks(inode->i_sb, phys, alloc_blocks);
 			mutex_unlock(&oi->i_extent_lock);
@@ -159,7 +166,7 @@ static int ocsfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 
 		iomap->addr = phys * (u64)sbi->s_block_size;
 		iomap->length = (loff_t)alloc_blocks * sbi->s_block_size;
-		iomap->type = IOMAP_MAPPED;
+		iomap->type = IOMAP_UNWRITTEN;
 		iomap->flags |= IOMAP_F_NEW;
 		iomap->bdev = inode->i_sb->s_bdev;
 		iomap->offset = pos;

@@ -59,7 +59,8 @@ int ocsfs_snapshot_create(struct inode *src, struct inode *dir,
 	if (!S_ISREG(src->i_mode))
 		return -EINVAL;
 
-	/* B+ tree extents require ocsfs_extent_btree_iterate (not yet impl.) */
+	/* Snapshotting btree-backed inodes requires refcount iteration over the
+	 * btree; not yet implemented — reject to avoid partial refcount state. */
 	if (src_oi->i_extent_tree_root)
 		return -EOPNOTSUPP;
 
@@ -95,9 +96,19 @@ int ocsfs_snapshot_create(struct inode *src, struct inode *dir,
 		}
 	}
 
-	/* Lock both inodes for extent manipulation */
-	mutex_lock(&src_oi->i_extent_lock);
-	mutex_lock_nested(&snap_oi->i_extent_lock, SINGLE_DEPTH_NESTING);
+	/*
+	 * Lock both inodes in inode-number order to prevent ABBA deadlock if
+	 * another thread ever takes these locks in the opposite direction.
+	 * snap is always freshly allocated so i_disk_ino(src) < i_disk_ino(snap)
+	 * in practice, but we make the ordering explicit for safety.
+	 */
+	if (src_oi->i_disk_ino < snap_oi->i_disk_ino) {
+		mutex_lock(&src_oi->i_extent_lock);
+		mutex_lock_nested(&snap_oi->i_extent_lock, SINGLE_DEPTH_NESTING);
+	} else {
+		mutex_lock(&snap_oi->i_extent_lock);
+		mutex_lock_nested(&src_oi->i_extent_lock, SINGLE_DEPTH_NESTING);
+	}
 
 	/* Copy the extent map */
 	snap_oi->i_extent_count = src_oi->i_extent_count;

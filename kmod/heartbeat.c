@@ -308,22 +308,35 @@ static int ocsfs_heartbeat_thread(void *data)
 
 	while (!kthread_should_stop()) {
 		unsigned long now = jiffies;
+		long sleep_jiffies;
 
 		/* Write our heartbeat */
 		if (time_after_eq(now, next_write)) {
 			ocsfs_heartbeat_write(sb);
-			next_write = now + write_jiffies;
+			next_write = jiffies + write_jiffies;
+			/*
+			 * Recheck stop after potentially long I/O (up to
+			 * OCSFS_HB_IO_TIMEOUT_MS ms) so umount does not hang
+			 * indefinitely when the FC path is hung.
+			 */
+			if (kthread_should_stop())
+				break;
 		}
 
 		/* Check peers */
 		if (time_after_eq(now, next_check)) {
 			ocsfs_heartbeat_check_peers(sb);
-			next_check = now + check_jiffies;
+			next_check = jiffies + check_jiffies;
+			if (kthread_should_stop())
+				break;
 		}
 
-		/* Sleep until next event */
-		schedule_timeout_interruptible(
-			min(write_jiffies, check_jiffies) / 2);
+		/* Sleep until next event, but not longer than needed */
+		sleep_jiffies = min_t(long,
+				      (long)(next_write - jiffies),
+				      (long)(next_check - jiffies));
+		if (sleep_jiffies > 0)
+			schedule_timeout_interruptible(sleep_jiffies);
 	}
 
 	pr_info("ocsfs: heartbeat thread stopped\n");

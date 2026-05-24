@@ -39,8 +39,10 @@ int ocsfs_punch_hole(struct inode *inode, loff_t offset, loff_t len)
 	if (start_block >= end_block)
 		return 0;
 
-	if (oi->i_extent_tree_root)
-		return -EOPNOTSUPP;
+	if (oi->i_extent_tree_root) {
+		truncate_pagecache_range(inode, offset, offset + len - 1);
+		return ocsfs_extent_btree_punch_hole(inode, start_block, end_block);
+	}
 
 	/* Invalidate page cache for the punched region */
 	truncate_pagecache_range(inode, offset,
@@ -163,8 +165,10 @@ int ocsfs_zero_range(struct inode *inode, loff_t offset, loff_t len)
 			sbi->s_block_size;
 	u16 i;
 
-	if (oi->i_extent_tree_root)
-		return -EOPNOTSUPP;
+	if (oi->i_extent_tree_root) {
+		truncate_pagecache_range(inode, offset, offset + len - 1);
+		return ocsfs_extent_btree_zero_range(inode, start_block, end_block);
+	}
 
 	/* Invalidate page cache for zeroed region */
 	truncate_pagecache_range(inode, offset, offset + len - 1);

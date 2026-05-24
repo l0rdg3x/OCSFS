@@ -252,6 +252,10 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 	if (flags & ~RENAME_NOREPLACE)
 		return -EINVAL;
 
+	/* RENAME_NOREPLACE: fail if target already exists */
+	if ((flags & RENAME_NOREPLACE) && new_inode)
+		return -EEXIST;
+
 	if (sbi->s_clustered) {
 		int j;
 		struct ocsfs_inode_info *key;
@@ -324,7 +328,13 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 	ret = __ocsfs_del_dirent(old_dir, &old_dentry->d_name);
 	if (ret) {
 		/* Compensate: undo new entry to avoid ghost in new_dir */
-		__ocsfs_del_dirent(new_dir, &new_dentry->d_name);
+		int comp = __ocsfs_del_dirent(new_dir, &new_dentry->d_name);
+
+		if (comp)
+			pr_err("ocsfs: rename rollback failed (%d) — "
+			       "inode %llu may appear in both directories, "
+			       "run fsck\n",
+			       comp, OCSFS_I(old_inode)->i_disk_ino);
 		goto out_unlock;
 	}
 

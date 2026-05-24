@@ -277,8 +277,12 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	}
 
 	sbi->s_caw_supported = ocsfs_scsi_caw_probe(sb);
-	if (sbi->s_caw_supported)
+	if (sbi->s_caw_supported) {
 		pr_info("ocsfs: SCSI CAW supported — atomic lock writes enabled\n");
+	} else if (sbi->s_clustered) {
+		pr_warn("ocsfs: SCSI CAW unavailable — DLM using software CAS "
+			"fallback; cluster safety depends on exclusive SAN zoning\n");
+	}
 
 	/* Initialize journal at our node slot's region */
 	ret = ocsfs_journal_init(sb);

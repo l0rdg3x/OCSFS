@@ -292,7 +292,8 @@ void ocsfs_dlm_exit(struct super_block *sb)
 			spin_lock(&sbi->s_lock_list_lock);
 		}
 		list_del(&lr->lr_list);
-		kfree(lr);
+		if (lr->lr_dynamic)
+			kfree(lr);
 	}
 	spin_unlock(&sbi->s_lock_list_lock);
 }
@@ -311,6 +312,7 @@ struct ocsfs_lock_res *ocsfs_lock_alloc(struct super_block *sb,
 	lr->lr_resource_type = resource_type;
 	lr->lr_mode          = OCSFS_LOCK_NL;
 	lr->lr_slot          = ocsfs_lock_table_slot(resource_id);
+	lr->lr_dynamic       = true;
 	mutex_init(&lr->lr_mutex);
 
 	spin_lock(&sbi->s_lock_list_lock);

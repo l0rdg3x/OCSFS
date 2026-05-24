@@ -170,9 +170,16 @@ static int ocsfs_fsync(struct file *file, loff_t start, loff_t end,
 			.nr_to_write = 0,
 		};
 		ret = ocsfs_write_inode(inode, &wbc);
+		if (ret)
+			return ret;
 	}
 
-	return ret;
+	/*
+	 * Flush the block device write cache so data is durable on the SAN.
+	 * Without this, fsync() only guarantees the OS page cache is written
+	 * to the HBA — not that it has reached stable storage.
+	 */
+	return blkdev_issue_flush(inode->i_sb->s_bdev);
 }
 
 const struct file_operations ocsfs_file_fops = {

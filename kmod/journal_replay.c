@@ -80,9 +80,18 @@ static int journal_replay_j(struct super_block *sb, struct ocsfs_journal *j)
 		type = le32_to_cpu(jt.jt_type);
 
 		if (type != OCSFS_JTYPE_BEGIN) {
-			/* Stray or corrupted record — skip one header */
-			scan_pos += sizeof(jt);
-			continue;
+			/*
+			 * Unexpected record type at this position.  Advancing
+			 * by sizeof(jt) could land in the middle of a block
+			 * payload where 0x00000001 happens to appear, causing
+			 * the replayer to treat data as a BEGIN header and apply
+			 * BEFORE-images to the wrong blocks — bricking the fs.
+			 * Abort and require fsck instead.
+			 */
+			pr_err("ocsfs: journal replay: unexpected record type %u "
+			       "at pos %llu — aborting, filesystem requires fsck\n",
+			       type, scan_pos);
+			return -EUCLEAN;
 		}
 
 		tid = le64_to_cpu(jt.jt_id);

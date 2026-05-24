@@ -284,8 +284,13 @@ int ocsfs_compress_extent_read(struct inode *inode,
 	comp_size = (size_t)ext->length * sbi->s_block_size;
 	decomp_size = (size_t)nr_pages * PAGE_SIZE;
 
-	/* Guard against truncation when passing to unsigned int APIs */
-	if (comp_size > UINT_MAX || decomp_size > UINT_MAX)
+	/*
+	 * Cap allocation size to prevent OOM DoS via a corrupted or malicious
+	 * extent descriptor with a huge length field.  A corrupt image with
+	 * ext->length = 0x3FFFFF would otherwise trigger a kvmalloc of ~4 GiB,
+	 * stalling the entire system.  1 MiB per extent is a generous ceiling.
+	 */
+	if (comp_size > (1u << 20) || decomp_size > (1u << 20))
 		return -EFBIG;
 
 	/* Allocate buffers */

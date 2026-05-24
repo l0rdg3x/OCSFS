@@ -397,6 +397,7 @@ struct ocsfs_lock_res {
 	u32             lr_resource_type;
 	u16             lr_mode;         /* currently held mode */
 	u16             lr_slot;         /* lock table slot index */
+	bool            lr_dynamic;      /* allocated via kzalloc; safe to kfree */
 	bool            lr_cached;       /* recently acquired; skip slow path */
 	u64             lr_cache_expires; /* ktime_get_ns() expiry */
 	struct mutex    lr_mutex;        /* local serialization */
@@ -749,6 +750,10 @@ int ocsfs_extent_btree_replace(struct inode *inode,
 				const struct ocsfs_extent *orig,
 				u64 offset_in_ext, u32 cow_len, u64 new_phys);
 int ocsfs_extent_btree_clear(struct inode *inode);
+int ocsfs_extent_btree_punch_hole(struct inode *inode,
+				  u64 start_block, u64 end_block);
+int ocsfs_extent_btree_zero_range(struct inode *inode,
+				  u64 start_block, u64 end_block);
 
 /* bitmap.c */
 int ocsfs_alloc_blocks(struct super_block *sb, u32 ag_hint, u32 count,

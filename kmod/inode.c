@@ -381,9 +381,14 @@ void ocsfs_evict_inode(struct inode *inode)
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
 
 	truncate_inode_pages_final(&inode->i_data);
-	clear_inode(inode);
 
-	/* If nlink dropped to 0, free on-disk resources */
+	/*
+	 * Free on-disk resources BEFORE clear_inode().  After clear_inode()
+	 * the inode is I_FREEING and mark_inode_dirty() becomes a no-op,
+	 * so extent_truncate's i_blocks update and inode flush would be silently
+	 * dropped — leaving stale extent pointers on disk that could cross-link
+	 * with later allocations after the blocks are freed.
+	 */
 	if (!inode->i_nlink && oi->i_disk_ino >= OCSFS_FIRST_USER_INO) {
 		int lr = 0;
 
@@ -419,6 +424,8 @@ void ocsfs_evict_inode(struct inode *inode)
 		   oi->i_lock_res.lr_mode != OCSFS_LOCK_NL) {
 		ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
 	}
+
+	clear_inode(inode);
 
 	kfree(oi->i_symlink);
 	oi->i_symlink = NULL;

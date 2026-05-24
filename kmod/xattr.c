@@ -95,6 +95,12 @@ static struct buffer_head *xattr_read_bh(struct inode *inode)
 			return ERR_PTR(-EIO);
 		}
 	}
+	if (le16_to_cpu(xb->xb_data_len) > OCSFS_XATTR_DATA_SIZE) {
+		pr_err_ratelimited("ocsfs: xattr block corrupt data_len %u ino %llu\n",
+				   le16_to_cpu(xb->xb_data_len), oi->i_disk_ino);
+		brelse(bh);
+		return ERR_PTR(-EUCLEAN);
+	}
 	return bh;
 }
 
@@ -329,7 +335,6 @@ int ocsfs_xattr_set_internal(struct inode *inode, u8 ns, const char *name,
 
 	ret = ocsfs_txn_commit(txn);
 	if (ret == 0) {
-		sync_dirty_buffer(bh);
 		mark_inode_dirty(inode);
 		if (sbi->s_clustered)
 			ocsfs_flush_inode_locked(inode, true);

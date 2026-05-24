@@ -138,14 +138,20 @@ int ocsfs_refcount_get(struct super_block *sb, u64 phys_block,
 	 */
 	bh = sb_getblk(sb, rc_block);
 	if (!bh) {
-		*refcount_out = 1;
-		return 0;
+		/*
+		 * Cannot determine refcount — returning 1 (= "unshared") would
+		 * be wrong: it causes the caller to skip CoW on a block that
+		 * may actually be shared with a snapshot, silently corrupting
+		 * the snapshot.  Propagate the error conservatively.
+		 */
+		*refcount_out = 0;
+		return -EIO;
 	}
 	clear_buffer_uptodate(bh);
 	if (bh_read(bh, 0) < 0) {
 		brelse(bh);
-		*refcount_out = 1;
-		return 0;
+		*refcount_out = 0;
+		return -EIO;
 	}
 
 	entries = (struct ocsfs_disk_refcount *)bh->b_data;
