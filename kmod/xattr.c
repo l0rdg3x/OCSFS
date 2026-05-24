@@ -122,7 +122,11 @@ int ocsfs_xattr_get_internal(struct inode *inode, u8 ns, const char *name,
 					   OCSFS_LOCK_SH);
 		if (r)
 			return r;
-		ocsfs_inode_refresh(inode);
+		r = ocsfs_inode_refresh(inode);
+		if (r) {
+			ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
+			return r;
+		}
 	}
 
 	if (!oi->i_xattr_block) {

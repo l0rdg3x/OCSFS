@@ -483,6 +483,7 @@ int ocsfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 {
 	struct inode *inode = d_inode(dentry);
 	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
+	struct ocsfs_inode_info *oi = OCSFS_I(inode);
 	int ret;
 
 	ret = setattr_prepare(idmap, dentry, attr);
@@ -493,42 +494,42 @@ int ocsfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	if (ret)
 		return ret;
 
+	/*
+	 * All setattr paths (chmod, chown, utimes, truncate, size expansion)
+	 * need DLM EX in cluster mode so every node sees a consistent snapshot
+	 * of the inode — the VFS inode_lock does not cross nodes.
+	 */
+	if (sbi->s_clustered) {
+		ret = ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
+					 OCSFS_LOCK_EX);
+		if (ret)
+			return ret;
+	}
+
 	if (attr->ia_valid & ATTR_SIZE) {
 		if (attr->ia_size < inode->i_size) {
-			/* Truncate: free extents, update i_size, flush before EX release */
-			struct ocsfs_inode_info *oi = OCSFS_I(inode);
-			u64 from_block = (attr->ia_size +
-				OCSFS_SB(inode->i_sb)->s_block_size - 1) /
-				OCSFS_SB(inode->i_sb)->s_block_size;
+			u64 from_block = (attr->ia_size + sbi->s_block_size - 1) /
+					 sbi->s_block_size;
 
-			if (sbi->s_clustered) {
-				ret = ocsfs_lock_acquire(inode->i_sb,
-							 &oi->i_lock_res,
-							 OCSFS_LOCK_EX);
-				if (ret)
-					return ret;
-			}
 			mutex_lock(&oi->i_extent_lock);
 			ocsfs_extent_truncate(inode, from_block);
 			mutex_unlock(&oi->i_extent_lock);
-			truncate_setsize(inode, attr->ia_size);
-			setattr_copy(idmap, inode, attr);
-			mark_inode_dirty(inode);
-			if (sbi->s_clustered) {
-				int fr = ocsfs_flush_inode_locked(inode, true);
-				if (fr)
-					pr_warn_ratelimited(
-						"ocsfs: setattr truncate flush failed (%d)\n",
-						fr);
-				ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
-			}
-			return 0;
 		}
 		truncate_setsize(inode, attr->ia_size);
 	}
 
 	setattr_copy(idmap, inode, attr);
 	mark_inode_dirty(inode);
+
+	if (sbi->s_clustered) {
+		int fr = ocsfs_flush_inode_locked(inode, true);
+
+		if (fr)
+			pr_warn_ratelimited("ocsfs: setattr flush failed (%d)\n",
+					    fr);
+		ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
+	}
+
 	return 0;
 }
 
