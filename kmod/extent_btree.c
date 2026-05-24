@@ -342,6 +342,7 @@ abort:
 int ocsfs_extent_btree_convert_unwritten(struct inode *inode, u64 logical, u32 len)
 {
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
+	struct ocsfs_txn *txn;
 	struct ocsfs_btree bt;
 	struct ext_btree_ctx ec;
 	u64 key, val, ext_end, cvt_end;
@@ -370,14 +371,23 @@ int ocsfs_extent_btree_convert_unwritten(struct inode *inode, u64 logical, u32 l
 	if (logical >= ext_end || cvt_end <= key)
 		return 0;
 
-	ocsfs_btree_delete(&bt, key);
+	txn = ocsfs_txn_begin(inode->i_sb);
+	if (IS_ERR(txn))
+		return PTR_ERR(txn);
+	ec.txn = txn;
+
+	ret = ocsfs_btree_delete(&bt, key);
+	if (ret)
+		goto abort;
 	oi->i_extent_tree_root = bt.root_block;
 
 	if (key < logical) {
 		u32 head_len = (u32)(logical - key);
 
-		ocsfs_btree_insert(&bt, key,
+		ret = ocsfs_btree_insert(&bt, key,
 				   ext_encode(phys, head_len, OCSFS_EXT_UNWRITTEN));
+		if (ret)
+			goto abort;
 		oi->i_extent_tree_root = bt.root_block;
 	}
 
@@ -387,8 +397,10 @@ int ocsfs_extent_btree_convert_unwritten(struct inode *inode, u64 logical, u32 l
 		u64 m_end  = (cvt_end < ext_end) ? cvt_end : ext_end;
 		u32 m_len  = (u32)(m_end - m_key);
 
-		ocsfs_btree_insert(&bt, m_key,
+		ret = ocsfs_btree_insert(&bt, m_key,
 				   ext_encode(m_phys, m_len, OCSFS_EXT_WRITTEN));
+		if (ret)
+			goto abort;
 		oi->i_extent_tree_root = bt.root_block;
 	}
 
@@ -397,14 +409,22 @@ int ocsfs_extent_btree_convert_unwritten(struct inode *inode, u64 logical, u32 l
 		u64 tail_phys = phys + (tail_key - key);
 		u32 tail_len  = (u32)(ext_end - tail_key);
 
-		ocsfs_btree_insert(&bt, tail_key,
+		ret = ocsfs_btree_insert(&bt, tail_key,
 				   ext_encode(tail_phys, tail_len,
 					      OCSFS_EXT_UNWRITTEN));
+		if (ret)
+			goto abort;
 		oi->i_extent_tree_root = bt.root_block;
 	}
 
-	mark_inode_dirty(inode);
-	return 0;
+	ret = ocsfs_txn_commit(txn);
+	if (!ret)
+		mark_inode_dirty(inode);
+	return ret;
+
+abort:
+	ocsfs_txn_abort(txn);
+	return ret;
 }
 
 /* ── replace for CoW: delete original, re-insert head / CoW'd / tail ── */
@@ -428,7 +448,9 @@ int ocsfs_extent_btree_replace(struct inode *inode,
 		return PTR_ERR(txn);
 	ec.txn = txn;
 
-	ocsfs_btree_delete(&bt, orig->logical_block);
+	ret = ocsfs_btree_delete(&bt, orig->logical_block);
+	if (ret)
+		goto abort;
 	oi->i_extent_tree_root = bt.root_block;
 
 	if (offset_in_ext > 0) {
@@ -476,22 +498,38 @@ int ocsfs_extent_btree_clear(struct inode *inode)
 	struct ocsfs_btree bt;
 	struct ext_btree_ctx ec;
 	struct ext_trunc_ctx tc;
+	struct ocsfs_txn *txn;
 	int ret = ext_btree_open(inode, &bt, &ec);
 	u32 i;
 
 	if (ret)
 		return ret;
+
+	txn = ocsfs_txn_begin(inode->i_sb);
+	if (IS_ERR(txn))
+		return PTR_ERR(txn);
+	ec.txn = txn;
+
 	do {
 		tc.count = 0;
 		ocsfs_btree_range_scan(&bt, 0, U64_MAX, ext_trunc_collect, &tc);
 		for (i = 0; i < tc.count; i++) {
-			ocsfs_btree_delete(&bt, tc.keys[i]);
+			ret = ocsfs_btree_delete(&bt, tc.keys[i]);
+			if (ret)
+				goto abort;
 			oi->i_extent_tree_root = bt.root_block;
 		}
 	} while (tc.count > 0);
+
 	oi->i_extent_tree_root = 0;
-	mark_inode_dirty(inode);
-	return 0;
+	ret = ocsfs_txn_commit(txn);
+	if (!ret)
+		mark_inode_dirty(inode);
+	return ret;
+
+abort:
+	ocsfs_txn_abort(txn);
+	return ret;
 }
 
 /* ── iterate / count ── */
