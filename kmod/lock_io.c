@@ -58,71 +58,58 @@ int lock_write_entry(struct super_block *sb, u32 slot,
 	u64 block = off / sbi->s_block_size;
 	u32 boff  = off % sbi->s_block_size;
 	u32 expected_version = le32_to_cpu(entry->le_version);
-	struct buffer_head *bh_check;
-	struct ocsfs_disk_lock *check;
+	u8 expected_buf[sizeof(struct ocsfs_disk_lock)];
+	u8 new_buf[sizeof(struct ocsfs_disk_lock)];
+	struct ocsfs_disk_lock *new_entry = (struct ocsfs_disk_lock *)new_buf;
 
-	if (sbi->s_caw_supported) {
-		unsigned int lbs = bdev_logical_block_size(sb->s_bdev);
-		u32 lbs_start;
-		u8 *exp_buf, *new_buf;
-		u64 scsi_lba;
-		int ret = -ENOMEM;
-
-		/* VULN-003: lbs must not exceed fs block size */
-		if (lbs == 0 || lbs > sbi->s_block_size || !is_power_of_2(lbs))
-			goto software_fallback;
-
-		lbs_start = boff & ~(lbs - 1u);
-		exp_buf   = kmalloc(lbs, GFP_KERNEL);
-		new_buf   = kmalloc(lbs, GFP_KERNEL);
-
-		if (exp_buf && new_buf) {
-			scsi_lba = off / lbs;
-			memcpy(exp_buf, bh->b_data + lbs_start, lbs);
-			memcpy(new_buf, exp_buf, lbs);
-			entry->le_version = cpu_to_le32(expected_version + 1);
-			entry->le_checksum = cpu_to_le32(
-				ocsfs_crc32c(~0U, entry,
-					     OCSFS_LOCK_ENTRY_SIZE - sizeof(__le32)));
-			memcpy(new_buf + (boff & (lbs - 1u)), entry, sizeof(*entry));
-
-			ret = ocsfs_scsi_caw(sb, scsi_lba, exp_buf, new_buf, lbs);
-			if (ret == -EAGAIN)
-				clear_buffer_uptodate(bh);
-		}
-		kfree(exp_buf);
-		kfree(new_buf);
-
-		if (ret != -EOPNOTSUPP)
-			return ret;
-	}
-
-software_fallback:
-	bh_check = sb_getblk(sb, block);
-	if (!bh_check)
-		return -EIO;
-	clear_buffer_uptodate(bh_check);
-	if (bh_read(bh_check, 0) < 0) {
-		brelse(bh_check);
-		return -EIO;
-	}
-
-	check = (struct ocsfs_disk_lock *)(bh_check->b_data + boff);
-	if (le32_to_cpu(check->le_version) != expected_version) {
-		brelse(bh_check);
-		return -EAGAIN;
-	}
-
-	entry->le_version  = cpu_to_le32(expected_version + 1);
-	entry->le_checksum = cpu_to_le32(
-		ocsfs_crc32c(~0U, entry,
+	/* Salva lo stato originale (expected) e costruisci il nuovo (version+1) */
+	memcpy(expected_buf, entry, sizeof(*entry));
+	memcpy(new_buf, entry, sizeof(*entry));
+	new_entry->le_version  = cpu_to_le32(expected_version + 1);
+	new_entry->le_checksum = cpu_to_le32(
+		ocsfs_crc32c(~0U, new_entry,
 			     OCSFS_LOCK_ENTRY_SIZE - sizeof(__le32)));
 
-	memcpy(bh_check->b_data + boff, entry, sizeof(*entry));
-	mark_buffer_dirty(bh_check);
-	sync_dirty_buffer(bh_check);
-	brelse(bh_check);
-	return 0;
+	/* SCSI CAW fast-path (hardware atomicità, opzionale) */
+	if (sbi->s_caw_supported) {
+		unsigned int lbs = bdev_logical_block_size(sb->s_bdev);
+
+		if (lbs > 0 && lbs <= sbi->s_block_size && is_power_of_2(lbs)) {
+			u32 lbs_start = boff & ~(lbs - 1u);
+			u8 *exp_lbs   = kmalloc(lbs, GFP_KERNEL);
+			u8 *new_lbs   = kmalloc(lbs, GFP_KERNEL);
+			int ret       = -ENOMEM;
+
+			if (exp_lbs && new_lbs) {
+				u64 scsi_lba = off / lbs;
+
+				memcpy(exp_lbs, bh->b_data + lbs_start, lbs);
+				memcpy(new_lbs, exp_lbs, lbs);
+				memcpy(new_lbs + (boff & (lbs - 1u)),
+				       new_buf, sizeof(*entry));
+
+				ret = ocsfs_scsi_caw(sb, scsi_lba,
+						     exp_lbs, new_lbs, lbs);
+				if (ret == -EAGAIN)
+					clear_buffer_uptodate(bh);
+			}
+			kfree(exp_lbs);
+			kfree(new_lbs);
+
+			if (ret != -EOPNOTSUPP)
+				return ret;
+		}
+	}
+
+	/*
+	 * CAS atomica cross-node via PR-lease (CRIT-1 fix).
+	 * Sostituisce il vecchio software fallback read→version-check→write
+	 * che aveva una race window TOCTOU tra i due nodi.
+	 * Single-node: ocsfs_atomic_cas usa write diretto (nessun lease).
+	 */
+	return ocsfs_atomic_cas(sb, block, boff,
+				sizeof(struct ocsfs_disk_lock),
+				expected_buf, new_buf);
 }
 
 /*
