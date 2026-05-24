@@ -127,6 +127,14 @@ int ocsfs_snapshot_create(struct inode *src, struct inode *dir,
 						   prev->length, NULL);
 			}
 
+			/*
+			 * Clear snap's extent map before dropping locks. The snap
+			 * inode carries the ORPHAN flag so evict_inode will call
+			 * ocsfs_extent_truncate(snap, 0). Without this, truncate
+			 * would free the physical blocks still owned by src.
+			 */
+			snap_oi->i_extent_count = 0;
+
 			mutex_unlock(&snap_oi->i_extent_lock);
 			mutex_unlock(&src_oi->i_extent_lock);
 			if (sbi->s_clustered) {

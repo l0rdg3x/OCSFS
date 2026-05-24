@@ -470,9 +470,15 @@ void ocsfs_free_inode_num(struct super_block *sb, u64 ino)
 
 	ag->free_inodes++;
 	mutex_unlock(&ag->ag_lock);
+	/*
+	 * Commit before releasing DLM EX. If we release EX first and crash
+	 * before commit, the inode slot remains ACTIVE on disk but is logically
+	 * freed — permanently leaked. Holding EX through commit ensures that
+	 * any node acquiring EX after us sees the committed (zeroed) slot.
+	 */
+	ocsfs_txn_commit(txn);
 	if (sbi->s_clustered)
 		ocsfs_lock_release(sb, &ag->ag_lock_res);
-	ocsfs_txn_commit(txn);
 }
 
 /* Scan all AGs for orphan inodes (OCSFS_IFLAG_ORPHAN) and log warnings. */

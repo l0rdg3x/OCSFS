@@ -338,16 +338,17 @@ void ocsfs_thin_stats(struct inode *inode, u64 *written, u64 *unwritten)
 	u64 w = 0, u = 0;
 	u16 i;
 
+	mutex_lock(&oi->i_extent_lock);
+
 	if (oi->i_extent_tree_root) {
 		struct thin_stats_ctx ts = {};
 
 		ocsfs_extent_btree_iterate(inode, thin_stats_iter, &ts);
+		mutex_unlock(&oi->i_extent_lock);
 		*written   = ts.written;
 		*unwritten = ts.unwritten;
 		return;
 	}
-
-	mutex_lock(&oi->i_extent_lock);
 
 	for (i = 0; i < oi->i_extent_count; i++) {
 		struct ocsfs_extent *e = &oi->i_extents[i];
