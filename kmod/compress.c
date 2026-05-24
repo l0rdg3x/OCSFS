@@ -437,17 +437,18 @@ void ocsfs_compress_stats(struct inode *inode, u64 *disk_size,
 	 * Use the iterate API for the physical (disk) sum; the total logical
 	 * blocks equal ceil(i_size / block_size) regardless of compression.
 	 */
+	mutex_lock(&oi->i_extent_lock);
+
 	if (oi->i_extent_tree_root) {
 		struct compress_stats_ctx cs = {};
 
 		ocsfs_extent_btree_iterate(inode, compress_stats_iter, &cs);
+		mutex_unlock(&oi->i_extent_lock);
 		*disk_size    = cs.disk;
 		*logical_size = (i_size_read(inode) + sbi->s_block_size - 1) /
 				sbi->s_block_size;
 		return;
 	}
-
-	mutex_lock(&oi->i_extent_lock);
 
 	for (i = 0; i < oi->i_extent_count; i++) {
 		struct ocsfs_extent *e = &oi->i_extents[i];
