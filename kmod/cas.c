@@ -57,9 +57,10 @@ int ocsfs_cas_probe(struct super_block *sb)
 		return 0;
 	}
 
-	if (sbi->s_caw_supported) {
-		sbi->s_cas_backend = CAS_BACKEND_SCSI_CAW;
-		pr_info("ocsfs: CAS backend: SCSI CAW\n");
+	if (ocsfs_scsi_caw_probe(sb)) {
+		sbi->s_caw_supported  = true;
+		sbi->s_cas_backend    = CAS_BACKEND_SCSI_CAW;
+		pr_info("ocsfs: CAS backend: SCSI CAW (hardware)\n");
 		return 0;
 	}
 
@@ -231,7 +232,53 @@ int ocsfs_atomic_cas(struct super_block *sb, u64 block, u32 boff,
 	if (sbi->s_cas_backend == CAS_BACKEND_NONE)
 		return cas_single_node(sb, block, boff, len, expected, new_data);
 
-	/* PR-lease (e SCSI CAW non ancora disponibile: usa stesso path) */
+	if (sbi->s_cas_backend == CAS_BACKEND_SCSI_CAW) {
+		unsigned int bs = sb->s_blocksize;
+
+		if (boff == 0 && len == bs) {
+			/* Full-block CAW: pass directly */
+			return ocsfs_scsi_caw(sb, block, expected, new_data, bs);
+		} else {
+			/*
+			 * Partial-block CAW: read the full block, construct
+			 * full expected/new buffers and CAW atomically.
+			 * Any concurrent change to the block (even outside
+			 * boff..boff+len) will MISCOMPARE → -EAGAIN → retry.
+			 */
+			struct buffer_head *bh;
+			u8 *exp_full, *new_full;
+			int caw_ret;
+
+			exp_full = kmalloc(2 * bs, GFP_NOIO);
+			if (!exp_full)
+				return -ENOMEM;
+			new_full = exp_full + bs;
+
+			bh = sb_getblk(sb, block);
+			if (!bh) {
+				kfree(exp_full);
+				return -ENOMEM;
+			}
+			clear_buffer_uptodate(bh);
+			caw_ret = bh_read(bh, 0);
+			if (caw_ret < 0) {
+				brelse(bh);
+				kfree(exp_full);
+				return caw_ret;
+			}
+			memcpy(exp_full, bh->b_data, bs);
+			memcpy(exp_full + boff, expected, len);
+			memcpy(new_full, exp_full, bs);
+			memcpy(new_full + boff, new_data, len);
+			brelse(bh);
+
+			caw_ret = ocsfs_scsi_caw(sb, block, exp_full, new_full, bs);
+			kfree(exp_full);
+			return caw_ret;
+		}
+	}
+
+	/* PR-lease path */
 	for (attempt = 0; attempt < CAS_MAX_ATTEMPTS; attempt++) {
 		ret = cas_acquire_lease(sb, block, &lease_bh, &lease_eidx);
 		if (ret == -EAGAIN) {

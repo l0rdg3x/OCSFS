@@ -157,12 +157,12 @@ int ocsfs_pr_preempt_abort(struct super_block *sb, u64 victim_key, u8 type)
  * Build a 16-byte CDB for COMPARE AND WRITE (SBC-4 §5.3).
  * Pure function — no I/O, safe to call from KUnit tests.
  */
-void ocsfs_build_caw_cdb(u8 cdb[16], u64 lba)
+void ocsfs_build_caw_cdb(u8 cdb[16], u64 lba, u32 num_blocks)
 {
 	memset(cdb, 0, 16);
-	cdb[0] = COMPARE_AND_WRITE;         /* opcode 0x89 */
-	put_unaligned_be64(lba, &cdb[2]);   /* LOGICAL BLOCK ADDRESS */
-	put_unaligned_be32(1, &cdb[10]);    /* NUMBER OF LOGICAL BLOCKS = 1 */
+	cdb[0] = COMPARE_AND_WRITE;               /* opcode 0x89 */
+	put_unaligned_be64(lba, &cdb[2]);         /* LOGICAL BLOCK ADDRESS */
+	put_unaligned_be32(num_blocks, &cdb[10]); /* NUMBER OF LOGICAL BLOCKS */
 }
 
 /*
@@ -231,6 +231,8 @@ int ocsfs_scsi_caw(struct super_block *sb, u64 lba,
 		.sense     = sense,
 		.sense_len = sizeof(sense),
 	};
+	unsigned int lbs_dev;
+	u32 num_blocks;
 	struct scsi_device *sdev;
 	u8 cdb[16];
 	u8 *buf;
@@ -243,6 +245,16 @@ int ocsfs_scsi_caw(struct super_block *sb, u64 lba,
 	if (!sdev)
 		return -EOPNOTSUPP;
 
+	/*
+	 * Convert filesystem block number to SCSI LBA and block count.
+	 * bdev_logical_block_size() gives the device sector size (512 or 4096).
+	 * One FS block covers (lbs / lbs_dev) SCSI logical blocks.
+	 */
+	lbs_dev = bdev_logical_block_size(sb->s_bdev);
+	if (lbs_dev == 0 || lbs % lbs_dev != 0)
+		return -EINVAL;
+	num_blocks = lbs / lbs_dev;
+
 	buf = kmalloc(2 * lbs, GFP_NOIO);
 	if (!buf)
 		return -ENOMEM;
@@ -250,7 +262,7 @@ int ocsfs_scsi_caw(struct super_block *sb, u64 lba,
 	memcpy(buf,       expected, lbs);
 	memcpy(buf + lbs, new_data, lbs);
 
-	ocsfs_build_caw_cdb(cdb, lba);
+	ocsfs_build_caw_cdb(cdb, lba * num_blocks, num_blocks);
 
 	ret = scsi_execute_cmd(sdev, cdb, REQ_OP_DRV_OUT, buf, 2 * lbs,
 			       HZ * 5, 3, &args);

@@ -113,7 +113,7 @@ static void test_caw_cdb_opcode(struct kunit *test)
 {
 	u8 cdb[16] = {};
 
-	ocsfs_build_caw_cdb(cdb, 0ULL);
+	ocsfs_build_caw_cdb(cdb, 0ULL, 1);
 	KUNIT_EXPECT_EQ(test, cdb[0], (u8)0x89);  /* COMPARE AND WRITE */
 }
 
@@ -121,7 +121,7 @@ static void test_caw_cdb_lba_encoding(struct kunit *test)
 {
 	u8 cdb[16] = {};
 
-	ocsfs_build_caw_cdb(cdb, 0x0102030405060708ULL);
+	ocsfs_build_caw_cdb(cdb, 0x0102030405060708ULL, 1);
 	/* LBA in big-endian at bytes 2-9 */
 	KUNIT_EXPECT_EQ(test, cdb[2], (u8)0x01);
 	KUNIT_EXPECT_EQ(test, cdb[3], (u8)0x02);
@@ -137,7 +137,7 @@ static void test_caw_cdb_nblocks_is_one(struct kunit *test)
 {
 	u8 cdb[16] = {};
 
-	ocsfs_build_caw_cdb(cdb, 0ULL);
+	ocsfs_build_caw_cdb(cdb, 0ULL, 1);
 	/* NUMBER OF LOGICAL BLOCKS at bytes 10-13, big-endian, must be 1 */
 	KUNIT_EXPECT_EQ(test, cdb[10], (u8)0x00);
 	KUNIT_EXPECT_EQ(test, cdb[11], (u8)0x00);
