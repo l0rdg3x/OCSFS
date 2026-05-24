@@ -439,8 +439,8 @@ struct ocsfs_lock_res {
 	u16             lr_mode;         /* currently held mode */
 	u16             lr_slot;         /* lock table slot index */
 	bool            lr_dynamic;      /* allocated via kzalloc; safe to kfree */
-	bool            lr_cached;       /* recently acquired; skip slow path */
-	u64             lr_cache_expires; /* ktime_get_ns() expiry */
+	bool            lr_cached;  /* valid if lr_epoch == sbi->s_lock_epoch */
+	u32             lr_epoch;   /* value of s_lock_epoch at acquire time */
 	struct mutex    lr_mutex;        /* local serialization */
 	struct list_head lr_list;        /* link in sb's active lock list */
 };
@@ -570,6 +570,7 @@ struct ocsfs_sb_info {
 	/* Distributed lock manager */
 	struct list_head        s_lock_list;    /* active lock_res list */
 	spinlock_t              s_lock_list_lock;
+	atomic_t                s_lock_epoch;  /* incremented by lock_recover_node */
 
 	/* Recovery */
 	struct work_struct      s_recovery_work;

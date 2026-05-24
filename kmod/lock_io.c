@@ -251,8 +251,7 @@ void ocsfs_lock_init(struct ocsfs_lock_res *lr, u64 resource_id,
 	lr->lr_resource_type = resource_type;
 	lr->lr_mode          = OCSFS_LOCK_NL;
 	lr->lr_slot          = ocsfs_lock_table_slot(resource_id);
-	lr->lr_cached        = false;
-	lr->lr_cache_expires = 0;
+	lr->lr_cached = false;
 	mutex_init(&lr->lr_mutex);
 	INIT_LIST_HEAD(&lr->lr_list);
 }
@@ -263,6 +262,7 @@ int ocsfs_dlm_init(struct super_block *sb)
 
 	INIT_LIST_HEAD(&sbi->s_lock_list);
 	spin_lock_init(&sbi->s_lock_list_lock);
+	atomic_set(&sbi->s_lock_epoch, 0);
 	return 0;
 }
 

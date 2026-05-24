@@ -43,16 +43,18 @@ int ocsfs_lock_acquire(struct super_block *sb, struct ocsfs_lock_res *lr,
 	mutex_lock(&lr->lr_mutex);
 
 	/*
-	 * NOTE: the cache fast-path was removed because it allowed a remote
-	 * node that had preempted/recovered our holder slot to be ignored
-	 * for up to OCSFS_LOCK_CACHE_NS, violating cross-node coherence.
-	 * Every acquire now goes through the on-disk lock table.
-	 *
-	 * The correct optimization is an epoch counter bumped by
-	 * ocsfs_lock_recover_node() and checked here — NOT a wall-clock TTL.
+	 * Epoch-based fast-path: if no recovery has occurred since we last
+	 * acquired this lock (lr_epoch == s_lock_epoch) and we still hold
+	 * a compatible mode, skip the disk round-trip.
+	 * ocsfs_lock_recover_node() increments s_lock_epoch, invalidating
+	 * all cached entries atomically — no wall-clock TTL needed.
 	 */
-	lr->lr_cached        = false;
-	lr->lr_cache_expires = 0;
+	if (lr->lr_cached && lr->lr_mode >= mode &&
+	    lr->lr_epoch == (u32)atomic_read(&sbi->s_lock_epoch)) {
+		mutex_unlock(&lr->lr_mutex);
+		return 0;
+	}
+	lr->lr_cached = false;
 
 	ret = lock_probe_slot(sb, lr);
 	if (ret) {
@@ -99,10 +101,9 @@ retry:
 			goto retry;
 
 		if (ret == 0) {
-			lr->lr_mode          = mode;
-			/* No caching — see comment at top of ocsfs_lock_acquire(). */
-			lr->lr_cached        = false;
-			lr->lr_cache_expires = 0;
+			lr->lr_mode   = mode;
+			lr->lr_cached = true;
+			lr->lr_epoch  = (u32)atomic_read(&sbi->s_lock_epoch);
 		}
 
 		mutex_unlock(&lr->lr_mutex);
@@ -182,8 +183,7 @@ retry_release:
 				    lr->lr_resource_id, ret);
 
 	lr->lr_mode          = OCSFS_LOCK_NL;
-	lr->lr_cached        = false;
-	lr->lr_cache_expires = 0;
+	lr->lr_cached = false;
 	mutex_unlock(&lr->lr_mutex);
 	return ret;
 }
@@ -236,9 +236,8 @@ int ocsfs_lock_downgrade(struct super_block *sb, struct ocsfs_lock_res *lr,
 	brelse(bh);
 
 	if (ret == 0) {
-		lr->lr_mode          = new_mode;
-		lr->lr_cached        = false;
-		lr->lr_cache_expires = 0;
+		lr->lr_mode   = new_mode;
+		lr->lr_cached = false;
 	}
 
 	mutex_unlock(&lr->lr_mutex);
@@ -312,6 +311,13 @@ int ocsfs_lock_recover_node(struct super_block *sb, u16 node_slot,
 
 		brelse(bh);
 	}
+
+	/*
+	 * Bump s_lock_epoch to invalidate all cached lock entries across
+	 * every lock_res on this node. Next acquire will hit the slow path
+	 * and re-validate from disk.
+	 */
+	atomic_inc(&OCSFS_SB(sb)->s_lock_epoch);
 
 	pr_info("ocsfs: recovered %d locks from node slot %u\n",
 		recovered, node_slot);
