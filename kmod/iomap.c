@@ -364,14 +364,139 @@ out_unlock:
  * IOMAP-BASED ADDRESS SPACE OPERATIONS
  * ═══════════════════════════════════════════════════════════════ */
 
+/*
+ * ocsfs_decompress_folio() — Read and decompress a compressed extent into a folio.
+ *
+ * Reads all compressed physical blocks from disk, decompresses the entire
+ * extent, then copies the slice that overlaps this folio into its pages.
+ * Called with the folio locked; returns with it still locked (caller unlocks).
+ */
+static int ocsfs_decompress_folio(struct inode *inode,
+				  const struct ocsfs_extent *ext,
+				  struct folio *folio)
+{
+	struct super_block *sb = inode->i_sb;
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	u8 algo = ocsfs_ext_comp_algo(ext->flags);
+	u32 phys_blks = ext->phys_length ? (u32)ext->phys_length : ext->length;
+	size_t comp_size   = (size_t)phys_blks   * sbi->s_block_size;
+	size_t decomp_size = (size_t)ext->length  * sbi->s_block_size;
+	loff_t ext_start        = (loff_t)ext->logical_block * sbi->s_block_size;
+	loff_t folio_off_in_ext = folio_pos(folio) - ext_start;
+	void *comp_buf, *decomp_buf;
+	struct buffer_head *bh;
+	u32 i;
+	size_t copied;
+	int ret;
+
+	if (folio_off_in_ext < 0 || (size_t)folio_off_in_ext >= decomp_size)
+		return -EIO;
+
+	/* Guard against corrupted/malicious extents causing multi-GiB allocs */
+	if (comp_size > (1u << 20) || decomp_size > (1u << 20))
+		return -EFBIG;
+
+	comp_buf = kvmalloc(comp_size, GFP_NOFS);
+	if (!comp_buf)
+		return -ENOMEM;
+
+	decomp_buf = kvmalloc(decomp_size, GFP_NOFS);
+	if (!decomp_buf) {
+		kvfree(comp_buf);
+		return -ENOMEM;
+	}
+
+	/* Read compressed blocks from disk synchronously */
+	copied = 0;
+	for (i = 0; i < phys_blks && copied < comp_size; i++) {
+		bh = sb_bread(sb, ext->physical_block + i);
+		if (!bh) {
+			ret = -EIO;
+			goto out;
+		}
+		memcpy(comp_buf + copied, bh->b_data,
+		       min_t(size_t, sbi->s_block_size, comp_size - copied));
+		copied += sbi->s_block_size;
+		brelse(bh);
+	}
+
+	ret = ocsfs_decompress_data(sb, algo, comp_buf, comp_size,
+				    decomp_buf, decomp_size);
+	if (ret)
+		goto out;
+
+	/* Copy the folio's slice of decompressed data into the folio pages */
+	{
+		size_t avail   = decomp_size - (size_t)folio_off_in_ext;
+		size_t to_copy = min_t(size_t, folio_size(folio), avail);
+		size_t pg;
+
+		for (pg = 0; pg < folio_nr_pages(folio); pg++) {
+			size_t off   = pg * PAGE_SIZE;
+			size_t chunk;
+			void *kaddr;
+
+			if (off >= to_copy)
+				break;
+			chunk = min_t(size_t, PAGE_SIZE, to_copy - off);
+			kaddr = kmap_local_page(folio_page(folio, pg));
+			memcpy(kaddr,
+			       decomp_buf + (size_t)folio_off_in_ext + off,
+			       chunk);
+			if (chunk < PAGE_SIZE)
+				memset(kaddr + chunk, 0, PAGE_SIZE - chunk);
+			kunmap_local(kaddr);
+		}
+	}
+
+	folio_mark_uptodate(folio);
+	ret = 0;
+out:
+	kvfree(decomp_buf);
+	kvfree(comp_buf);
+	return ret;
+}
+
 static int ocsfs_iomap_read_folio(struct file *file, struct folio *folio)
 {
+	struct inode *inode = folio->mapping->host;
+	struct ocsfs_inode_info *oi = OCSFS_I(inode);
+	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
+	u64 logical_block = (u64)(folio_pos(folio) / sbi->s_block_size);
+	struct ocsfs_extent ext;
+	int ret;
+
+	mutex_lock(&oi->i_extent_lock);
+	ret = ocsfs_extent_lookup(inode, logical_block, &ext);
+	mutex_unlock(&oi->i_extent_lock);
+
+	if (ret == 0 && (ext.flags & OCSFS_EXT_COMPRESSED)) {
+		ret = ocsfs_decompress_folio(inode, &ext, folio);
+		folio_unlock(folio);
+		return ret;
+	}
+
 	iomap_bio_read_folio(folio, &ocsfs_iomap_ops);
 	return 0;
 }
 
 static void ocsfs_iomap_readahead(struct readahead_control *rac)
 {
+	struct inode *inode = rac->mapping->host;
+	struct ocsfs_inode_info *oi = OCSFS_I(inode);
+	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
+	u64 logical_block = (u64)(readahead_pos(rac) / sbi->s_block_size);
+	struct ocsfs_extent ext;
+	int ret;
+
+	mutex_lock(&oi->i_extent_lock);
+	ret = ocsfs_extent_lookup(inode, logical_block, &ext);
+	mutex_unlock(&oi->i_extent_lock);
+
+	/* Skip readahead for compressed extents — read_folio handles decompression */
+	if (ret == 0 && (ext.flags & OCSFS_EXT_COMPRESSED))
+		return;
+
 	iomap_bio_readahead(rac, &ocsfs_iomap_ops);
 }
 

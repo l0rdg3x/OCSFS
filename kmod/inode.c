@@ -74,10 +74,14 @@ static void ocsfs_parse_extents(struct ocsfs_inode_info *oi,
 		struct ocsfs_disk_extent *de =
 			(struct ocsfs_disk_extent *)
 			(di->i_inline_extents + i * sizeof(*de));
-		oi->i_extents[i].logical_block = le64_to_cpu(de->e_logical_block);
+		oi->i_extents[i].logical_block  = le64_to_cpu(de->e_logical_block);
 		oi->i_extents[i].physical_block = le64_to_cpu(de->e_physical_block);
-		oi->i_extents[i].length = le32_to_cpu(de->e_length);
-		oi->i_extents[i].flags = le16_to_cpu(de->e_flags);
+		oi->i_extents[i].length         = le32_to_cpu(de->e_length);
+		oi->i_extents[i].flags          = le16_to_cpu(de->e_flags);
+		/* e_checksum stores physical compressed block count for COMPRESSED extents */
+		oi->i_extents[i].phys_length =
+			(oi->i_extents[i].flags & OCSFS_EXT_COMPRESSED)
+			? le16_to_cpu(de->e_checksum) : 0;
 	}
 }
 
@@ -333,7 +337,9 @@ int ocsfs_flush_inode_locked(struct inode *inode, bool force_sync)
 			de->e_physical_block = cpu_to_le64(oi->i_extents[i].physical_block);
 			de->e_length         = cpu_to_le32(oi->i_extents[i].length);
 			de->e_flags          = cpu_to_le16(oi->i_extents[i].flags);
-			de->e_checksum       = 0;
+			/* Reuse e_checksum to store physical block count for COMPRESSED extents */
+			de->e_checksum = (oi->i_extents[i].flags & OCSFS_EXT_COMPRESSED)
+					 ? cpu_to_le16(oi->i_extents[i].phys_length) : 0;
 		}
 	}
 

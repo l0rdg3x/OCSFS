@@ -17,11 +17,11 @@
  *   The extent stores:
  *     - e_logical_block:  uncompressed logical offset (file space)
  *     - e_physical_block: on-disk location of compressed data
- *     - e_length:         number of COMPRESSED blocks on disk
+ *     - e_length:         LOGICAL block count (range coverage, unchanged by compression)
+ *     - e_checksum:       PHYSICAL compressed block count (reused field, formerly 0)
  *     - e_flags:          OCSFS_EXT_COMPRESSED | algorithm ID
  *
- *   The uncompressed size is derived from the next extent's
- *   logical_block (or i_size for the last extent).
+ *   In-memory: ocsfs_extent.phys_length mirrors e_checksum for COMPRESSED extents.
  *
  * The Linux kernel provides LZ4 and ZSTD libraries natively.
  */
@@ -32,28 +32,9 @@
 
 /* ═══════════════════════════════════════════════════════════════
  * COMPRESSION ALGORITHM INTERFACE
+ * (OCSFS_COMPRESS_*, OCSFS_EXT_COMPRESSED, and ocsfs_ext_comp_algo()
+ *  are defined in ocsfs.h so that iomap.c can also use them)
  * ═══════════════════════════════════════════════════════════════ */
-
-/* Compression algorithm IDs stored in upper bits of extent flags */
-#define OCSFS_COMPRESS_NONE	0
-#define OCSFS_COMPRESS_LZ4	1
-#define OCSFS_COMPRESS_ZSTD	2
-
-#define OCSFS_EXT_COMPRESSED	0x0004  /* extent flag: data is compressed */
-#define OCSFS_EXT_COMP_ALGO_MASK 0x0018 /* bits 3-4: algorithm ID */
-#define OCSFS_EXT_COMP_ALGO_SHIFT 3
-
-static inline u8 ocsfs_ext_comp_algo(u16 flags)
-{
-	return (flags & OCSFS_EXT_COMP_ALGO_MASK) >> OCSFS_EXT_COMP_ALGO_SHIFT;
-}
-
-static inline u16 ocsfs_ext_set_comp_algo(u16 flags, u8 algo)
-{
-	flags &= ~OCSFS_EXT_COMP_ALGO_MASK;
-	flags |= ((u16)algo << OCSFS_EXT_COMP_ALGO_SHIFT);
-	return flags;
-}
 
 /* ═══════════════════════════════════════════════════════════════
  * LZ4 COMPRESSION
@@ -270,6 +251,7 @@ int ocsfs_compress_extent_read(struct inode *inode,
 	u8 algo;
 	void *comp_buf;
 	void *decomp_buf;
+	u32 phys_blks;
 	size_t comp_size;
 	size_t decomp_size;
 	struct buffer_head *bh;
@@ -281,7 +263,10 @@ int ocsfs_compress_extent_read(struct inode *inode,
 		return -EINVAL;
 
 	algo = ocsfs_ext_comp_algo(ext->flags);
-	comp_size = (size_t)ext->length * sbi->s_block_size;
+	/* phys_length is the compressed block count; fall back to length
+	 * for extents written before the phys_length field was introduced. */
+	phys_blks = (ext->phys_length > 0) ? (u32)ext->phys_length : ext->length;
+	comp_size = (size_t)phys_blks * sbi->s_block_size;
 	decomp_size = (size_t)nr_pages * PAGE_SIZE;
 
 	/*
@@ -306,7 +291,7 @@ int ocsfs_compress_extent_read(struct inode *inode,
 
 	/* Read compressed blocks from disk */
 	copied = 0;
-	for (i = 0; i < ext->length && copied < comp_size; i++) {
+	for (i = 0; i < phys_blks && copied < comp_size; i++) {
 		bh = sb_bread(sb, ext->physical_block + i);
 		if (!bh) {
 			ret = -EIO;
@@ -458,7 +443,8 @@ void ocsfs_compress_stats(struct inode *inode, u64 *disk_size,
 	for (i = 0; i < oi->i_extent_count; i++) {
 		struct ocsfs_extent *e = &oi->i_extents[i];
 
-		disk += e->length;
+		disk += ((e->flags & OCSFS_EXT_COMPRESSED) && e->phys_length)
+			? e->phys_length : e->length;
 
 		if (e->flags & OCSFS_EXT_COMPRESSED) {
 			/*
@@ -486,38 +472,21 @@ void ocsfs_compress_stats(struct inode *inode, u64 *disk_size,
 	*logical_size = logical;
 }
 
-/* ── btree collect helper (used by ocsfs_compress_file btree path) ────────── */
-
-struct compress_collect_ctx {
-	struct ocsfs_extent *arr;
-	u32 max;
-	u32 idx;
-};
-
-static int compress_collect_cb(u64 logical, u64 physical, u32 length,
-				u16 flags, void *ctx)
-{
-	struct compress_collect_ctx *cc = ctx;
-
-	if (cc->idx >= cc->max)
-		return 1; /* stop */
-	cc->arr[cc->idx].logical_block  = logical;
-	cc->arr[cc->idx].physical_block = physical;
-	cc->arr[cc->idx].length         = length;
-	cc->arr[cc->idx].flags          = flags;
-	cc->idx++;
-	return 0;
-}
-
 /*
- * ocsfs_compress_file() — Lazily compress all uncompressed extents of a file.
+ * ocsfs_compress_file() — Lazily compress all uncompressed inline extents.
  *
  * Called from ocsfs_fsync(). First flushes dirty pages to disk (uncompressed),
- * then re-reads each extent, compresses in memory, allocates fewer blocks, and
- * updates the on-disk extent map. If compression does not reduce size the
- * extent is left as-is.
+ * then re-reads each inline extent, compresses in memory, allocates fewer
+ * blocks, and updates the in-memory extent map.  If compression does not
+ * reduce size the extent is left as-is.
  *
- * Both inline and btree-backed inodes are handled.
+ * Btree-backed inodes are skipped: the btree encoding does not yet support
+ * separate logical/physical lengths required for compressed extents.
+ *
+ * Key invariant: e->length always stores the LOGICAL block count (range
+ * coverage) so that ocsfs_extent_lookup() range checks remain correct.
+ * e->phys_length stores the physical (compressed) block count and is
+ * persisted in e_checksum on disk.
  */
 int ocsfs_compress_file(struct inode *inode)
 {
@@ -536,130 +505,9 @@ int ocsfs_compress_file(struct inode *inode)
 		return ret;
 
 	mutex_lock(&oi->i_extent_lock);
+	if (oi->i_extent_tree_root)
+		goto unlock; /* btree path not yet supported; data safe uncompressed */
 
-	/* ── btree-backed inodes: collect snapshot, then compress outside lock ── */
-	if (oi->i_extent_tree_root) {
-		struct compress_collect_ctx cc;
-		struct ocsfs_extent *exts;
-		u64 count64 = 0;
-		u32 cnt, k;
-
-		ocsfs_extent_btree_count(inode, &count64);
-		cnt = (u32)min_t(u64, count64, 4096);
-		if (!cnt) {
-			mutex_unlock(&oi->i_extent_lock);
-			return 0;
-		}
-
-		exts = kvmalloc_array(cnt, sizeof(*exts), GFP_NOFS);
-		if (!exts) {
-			mutex_unlock(&oi->i_extent_lock);
-			return -ENOMEM;
-		}
-
-		cc.arr = exts; cc.max = cnt; cc.idx = 0;
-		ocsfs_extent_btree_iterate(inode, compress_collect_cb, &cc);
-		mutex_unlock(&oi->i_extent_lock);
-
-		for (k = 0; k < cc.idx; k++) {
-			struct ocsfs_extent *e = &exts[k];
-			void *raw, *comp;
-			unsigned int raw_size, comp_size;
-			u32 comp_blocks, j;
-			u64 new_phys, old_phys;
-			u32 old_len;
-			u16 new_flags;
-
-			if ((e->flags & (OCSFS_EXT_COMPRESSED | OCSFS_EXT_UNWRITTEN)) ||
-			    !e->physical_block)
-				continue;
-
-			raw_size = (unsigned int)e->length * sbi->s_block_size;
-			if (raw_size > (1u << 20))
-				continue;
-
-			raw = kvmalloc(raw_size, GFP_NOFS);
-			if (!raw) { ret = -ENOMEM; break; }
-
-			for (j = 0; j < e->length; j++) {
-				struct buffer_head *bh =
-					sb_bread(sb, e->physical_block + j);
-
-				if (!bh) { kvfree(raw); ret = -EIO; break; }
-				memcpy(raw + (size_t)j * sbi->s_block_size,
-				       bh->b_data, sbi->s_block_size);
-				brelse(bh);
-			}
-			if (ret) break;
-
-			comp = kvmalloc(raw_size, GFP_NOFS);
-			if (!comp) { kvfree(raw); ret = -ENOMEM; break; }
-
-			comp_size = raw_size;
-			if (ocsfs_compress_data(algo, raw, raw_size, comp,
-						&comp_size) ||
-			    comp_size >= raw_size) {
-				kvfree(raw); kvfree(comp);
-				continue;
-			}
-			kvfree(raw);
-
-			comp_blocks = (comp_size + sbi->s_block_size - 1) /
-				      sbi->s_block_size;
-			if (ocsfs_alloc_blocks(sb, 0, comp_blocks, &new_phys)) {
-				kvfree(comp); continue;
-			}
-
-			for (j = 0; j < comp_blocks; j++) {
-				struct buffer_head *bh =
-					sb_getblk(sb, new_phys + j);
-				unsigned int off   = j * sbi->s_block_size;
-				unsigned int chunk = min_t(unsigned int,
-							   comp_size - off,
-							   sbi->s_block_size);
-
-				if (!bh) {
-					kvfree(comp);
-					ocsfs_free_blocks(sb, new_phys, comp_blocks);
-					ret = -EIO; break;
-				}
-				lock_buffer(bh);
-				memcpy(bh->b_data, comp + off, chunk);
-				if (chunk < sbi->s_block_size)
-					memset(bh->b_data + chunk, 0,
-					       sbi->s_block_size - chunk);
-				set_buffer_uptodate(bh);
-				mark_buffer_dirty(bh);
-				unlock_buffer(bh);
-				sync_dirty_buffer(bh);
-				brelse(bh);
-			}
-			kvfree(comp);
-			if (ret) break;
-
-			new_flags = ocsfs_ext_set_comp_algo(
-					e->flags | OCSFS_EXT_COMPRESSED, algo);
-			old_phys = e->physical_block;
-			old_len  = e->length;
-
-			mutex_lock(&oi->i_extent_lock);
-			ret = ocsfs_extent_btree_compress_one(inode, e,
-							      new_phys,
-							      comp_blocks,
-							      new_flags);
-			mutex_unlock(&oi->i_extent_lock);
-
-			if (!ret)
-				ocsfs_free_blocks(sb, old_phys, old_len);
-			else
-				ocsfs_free_blocks(sb, new_phys, comp_blocks);
-		}
-
-		kvfree(exts);
-		return ret;
-	}
-
-	/* ── inline extents ── */
 	for (i = 0; i < oi->i_extent_count; i++) {
 		struct ocsfs_extent *e = &oi->i_extents[i];
 		void *raw, *comp;
@@ -739,7 +587,8 @@ int ocsfs_compress_file(struct inode *inode)
 		old_phys = e->physical_block;
 		old_len  = e->length;
 		e->physical_block = new_phys;
-		e->length         = comp_blocks;
+		e->phys_length    = (u16)comp_blocks; /* physical compressed blocks */
+		/* e->length remains old_len: logical block count for range checks */
 		e->flags = ocsfs_ext_set_comp_algo(
 				e->flags | OCSFS_EXT_COMPRESSED, algo);
 		mark_inode_dirty(inode);

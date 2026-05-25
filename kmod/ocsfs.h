@@ -150,8 +150,23 @@ enum ocsfs_cas_backend {
 #define OCSFS_IFLAG_ORPHAN      0x0020  /* set at create, cleared after dirent commit */
 
 /* Extent flags */
-#define OCSFS_EXT_WRITTEN       0x0000
-#define OCSFS_EXT_UNWRITTEN     0x0001
+#define OCSFS_EXT_WRITTEN        0x0000
+#define OCSFS_EXT_UNWRITTEN      0x0001
+#define OCSFS_EXT_COMPRESSED     0x0004  /* data is LZ4/ZSTD compressed */
+#define OCSFS_EXT_COMP_ALGO_MASK  0x0018 /* bits 3-4: algorithm ID */
+#define OCSFS_EXT_COMP_ALGO_SHIFT 3
+
+static inline u8 ocsfs_ext_comp_algo(u16 flags)
+{
+	return (flags & OCSFS_EXT_COMP_ALGO_MASK) >> OCSFS_EXT_COMP_ALGO_SHIFT;
+}
+
+static inline u16 ocsfs_ext_set_comp_algo(u16 flags, u8 algo)
+{
+	flags &= ~OCSFS_EXT_COMP_ALGO_MASK;
+	flags |= ((u16)algo << OCSFS_EXT_COMP_ALGO_SHIFT);
+	return flags;
+}
 
 /* File types */
 #define OCSFS_FT_UNKNOWN        0
@@ -432,7 +447,8 @@ struct ocsfs_disk_lock {
 struct ocsfs_extent {
 	u64     logical_block;
 	u64     physical_block;
-	u32     length;         /* blocks */
+	u32     length;         /* logical block count (range coverage) */
+	u16     phys_length;    /* compressed physical blocks; 0 = same as length */
 	u16     flags;
 };
 
