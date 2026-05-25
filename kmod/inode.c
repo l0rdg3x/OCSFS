@@ -564,11 +564,19 @@ int ocsfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			u64 from_block = (attr->ia_size + sbi->s_block_size - 1) /
 					 sbi->s_block_size;
 
+			/*
+			 * truncate_setsize first: shrinks i_size and invalidates
+			 * page cache + mmap mappings before we free blocks.
+			 * This prevents mmap faults on freed blocks in the window
+			 * between extent_truncate and truncate_setsize.
+			 */
+			truncate_setsize(inode, attr->ia_size);
 			mutex_lock(&oi->i_extent_lock);
 			ocsfs_extent_truncate(inode, from_block);
 			mutex_unlock(&oi->i_extent_lock);
+		} else {
+			truncate_setsize(inode, attr->ia_size);
 		}
-		truncate_setsize(inode, attr->ia_size);
 	}
 
 	setattr_copy(idmap, inode, attr);
@@ -623,7 +631,6 @@ int ocsfs_fileattr_set(struct mnt_idmap *idmap, struct dentry *dentry,
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
 	const u32 supported = FS_IMMUTABLE_FL | FS_APPEND_FL | FS_COMPR_FL;
 	u32 old_fs_flags, new_fs_flags;
-	int ret;
 
 	if (fileattr_has_fsx(fa))
 		return -EOPNOTSUPP;
