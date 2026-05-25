@@ -471,6 +471,19 @@ static long ocsfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return ocsfs_snapshot_delete(inode);
 	}
 
+	if (cmd == OCSFS_IOC_DEDUP) {
+		struct ocsfs_dedup_result res;
+
+		if (!inode_owner_or_capable(idmap, inode))
+			return -EPERM;
+		ret = ocsfs_dedup_file(inode, &res.bytes_deduped);
+		if (ret)
+			return ret;
+		if (copy_to_user((void __user *)arg, &res, sizeof(res)))
+			return -EFAULT;
+		return 0;
+	}
+
 	if (cmd != OCSFS_IOC_SNAP_CREATE)
 		return -ENOTTY;
 

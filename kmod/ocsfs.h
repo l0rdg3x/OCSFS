@@ -1048,4 +1048,12 @@ int ocsfs_cas_probe(struct super_block *sb);
 int ocsfs_atomic_cas(struct super_block *sb, u64 block, u32 boff,
 		     u32 len, const void *expected, const void *new_data);
 
+/* dedup.c — content-based block deduplication using refcount infrastructure */
+struct ocsfs_dedup_result {
+	__u64 bytes_deduped;
+};
+#define OCSFS_IOC_DEDUP  _IOR('O', 3, struct ocsfs_dedup_result)
+
+int ocsfs_dedup_file(struct inode *inode, u64 *bytes_deduped);
+
 #endif /* _OCSFS_KMOD_H */
