@@ -586,13 +586,98 @@ symlink_fail:
 }
 
 /* ═══════════════════════════════════════════════════════════════
+ * MKNOD — special files (FIFO, socket, device)
+ * ═══════════════════════════════════════════════════════════════ */
+
+static int ocsfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
+		       struct dentry *dentry, umode_t mode, dev_t rdev)
+{
+	struct inode *inode;
+	int ret;
+
+	inode = ocsfs_new_inode(dir, mode);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
+
+	init_special_inode(inode, inode->i_mode, rdev);
+
+	ret = security_inode_init_security(inode, dir, &dentry->d_name,
+					   ocsfs_initxattrs, NULL);
+	if (ret && ret != -EOPNOTSUPP)
+		goto fail;
+
+	ret = ocsfs_init_acl(idmap, inode, dir);
+	if (ret)
+		goto fail;
+
+	ret = ocsfs_add_dirent(dir, &dentry->d_name,
+			       OCSFS_I(inode)->i_disk_ino,
+			       ocsfs_mode_to_ft(mode));
+	if (ret)
+		goto fail;
+
+	OCSFS_I(inode)->i_flags &= ~OCSFS_IFLAG_ORPHAN;
+	mark_inode_dirty(inode);
+	d_instantiate(dentry, inode);
+	return 0;
+fail:
+	inode_dec_link_count(inode);
+	discard_new_inode(inode);
+	return ret;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * LINK — hard links
+ * ═══════════════════════════════════════════════════════════════ */
+
+static int ocsfs_link(struct dentry *old_dentry, struct inode *dir,
+		      struct dentry *dentry)
+{
+	struct inode *inode = d_inode(old_dentry);
+	struct ocsfs_sb_info *sbi = OCSFS_SB(dir->i_sb);
+	struct ocsfs_inode_info *oi = OCSFS_I(inode);
+	int ret;
+
+	if (S_ISDIR(inode->i_mode))
+		return -EPERM;
+
+	if (sbi->s_clustered) {
+		ret = ocsfs_lock_acquire(dir->i_sb, &oi->i_lock_res,
+					 OCSFS_LOCK_EX);
+		if (ret)
+			return ret;
+	}
+
+	inode_set_ctime_current(inode);
+	inode_inc_link_count(inode);
+	ihold(inode);
+
+	ret = ocsfs_add_dirent(dir, &dentry->d_name,
+			       oi->i_disk_ino,
+			       ocsfs_mode_to_ft(inode->i_mode));
+	if (ret) {
+		inode_dec_link_count(inode);
+		iput(inode);
+	} else {
+		mark_inode_dirty(inode);
+		d_instantiate(dentry, inode);
+	}
+
+	if (sbi->s_clustered)
+		ocsfs_lock_release(dir->i_sb, &oi->i_lock_res);
+	return ret;
+}
+
+/* ═══════════════════════════════════════════════════════════════
  * OPERATIONS TABLES
  * ═══════════════════════════════════════════════════════════════ */
 
 const struct inode_operations ocsfs_dir_inode_ops = {
 	.lookup         = ocsfs_lookup,
 	.create         = ocsfs_create,
+	.link           = ocsfs_link,
 	.mkdir          = ocsfs_mkdir,
+	.mknod          = ocsfs_mknod,
 	.rmdir          = ocsfs_rmdir,
 	.unlink         = ocsfs_unlink,
 	.rename         = ocsfs_rename,
