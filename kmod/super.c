@@ -370,9 +370,11 @@ int ocsfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 int ocsfs_sync_fs(struct super_block *sb, int wait)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
-
 	if (wait) {
 		down_write(&sbi->s_global_lock);
+		spin_lock(&sbi->s_free_lock);
+		sbi->s_ds->s_free_blocks = cpu_to_le64(sbi->s_free_blocks);
+		spin_unlock(&sbi->s_free_lock);
 		mark_buffer_dirty(sbi->s_sbh);
 		sync_dirty_buffer(sbi->s_sbh);
 		up_write(&sbi->s_global_lock);
