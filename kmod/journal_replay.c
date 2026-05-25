@@ -131,12 +131,18 @@ static int journal_replay_j(struct super_block *sb, struct ocsfs_journal *j)
 			}
 			if (le32_to_cpu(jt2.jt_type) == OCSFS_JTYPE_ABORT &&
 			    le64_to_cpu(jt2.jt_id) == tid) {
-				/* Explicit abort — rollback same as uncommitted */
-				break;
+				u32 acrc = ocsfs_crc32c(~0U, &jt2,
+					sizeof(jt2) - sizeof(__le32));
+				if (le32_to_cpu(jt2.jt_checksum) == acrc)
+					break; /* confirmed ABORT */
+				/* CRC mismatch: random data bytes, not a real ABORT */
 			}
 			if (le32_to_cpu(jt2.jt_type) == OCSFS_JTYPE_BEGIN) {
-				/* Next txn started — current never committed */
-				break;
+				u32 bcrc = ocsfs_crc32c(~0U, &jt2,
+					sizeof(jt2) - sizeof(__le32));
+				if (le32_to_cpu(jt2.jt_checksum) == bcrc)
+					break; /* confirmed next txn BEGIN */
+				/* CRC mismatch: data bytes, not a real BEGIN */
 			}
 
 			ahead += sizeof(struct ocsfs_disk_journal_bref) +
@@ -208,52 +214,137 @@ static int journal_replay_j(struct super_block *sb, struct ocsfs_journal *j)
 				tid, this_replayed);
 			scan_pos = replay_pos;
 		} else {
-			/* Redo: apply AFTER-images so committed data survives crash */
-			u64 replay_pos = scan_pos + sizeof(jt);
+			/*
+			 * Redo: apply AFTER-images so committed data survives
+			 * crash.
+			 *
+			 * Coherence guard (CRIT-3): before applying each
+			 * AFTER-image, verify that the current disk content
+			 * matches the stored BEFORE-image CRC for the same
+			 * block.  A mismatch means a live peer node wrote to
+			 * the block after the dead node committed and released
+			 * EX — that peer's data is newer, so we skip the
+			 * stale AFTER-image.
+			 *
+			 * Implementation: single allocation split into two
+			 * parallel arrays (before_blks, before_crcs).  Pass 1
+			 * fills them from BEFORE entries; Pass 2 applies AFTER
+			 * entries using the map as a gate.
+			 */
+			u64 payload_start = scan_pos + sizeof(jt);
 			u64 stride = sizeof(struct ocsfs_disk_journal_bref) +
 				     sbi->s_block_size;
+			u32 max_ent = (ahead > payload_start + stride) ?
+				(u32)((ahead - payload_start) / stride) : 0;
 			int this_replayed = 0;
+			u64 *before_blks = NULL;
+			u32 *before_crcs = NULL;
+			u32 before_count = 0;
 
-			while (replay_pos + stride <= ahead) {
-				struct ocsfs_disk_journal_bref bref;
-				u32 flags;
-
-				ret = journal_read(sb, j, replay_pos,
-						   &bref, sizeof(bref));
-				if (ret)
-					break;
-
-				flags = le32_to_cpu(bref.jbr_flags);
-				replay_pos += sizeof(bref);
-
-				if (flags & OCSFS_JBR_AFTER) {
-					u64 blk = le64_to_cpu(bref.jbr_block_num);
-					u32 expected_crc = le32_to_cpu(bref.jbr_checksum);
-					struct buffer_head *bh = sb_bread(sb, blk);
-
-					if (bh) {
-						if (!journal_read(sb, j, replay_pos,
-								  bh->b_data,
-								  bh->b_size)) {
-							u32 actual = ocsfs_crc32c(~0U,
-								bh->b_data,
-								bh->b_size);
-							if (actual == expected_crc) {
-								mark_buffer_dirty(bh);
-								sync_dirty_buffer(bh);
-								this_replayed++;
-								replayed++;
-							} else {
-								pr_warn("ocsfs: AFTER-image CRC mismatch for block %llu in txn %llu, skipping\n",
-									blk, tid);
-								clear_buffer_uptodate(bh);
-							}
-						}
-						brelse(bh);
-					}
-				}
-				replay_pos += sbi->s_block_size;
+			/* Single kvmalloc: [max_ent u64s][max_ent u32s] */
+			if (max_ent) {
+				before_blks = kvmalloc(
+					max_ent * (sizeof(u64) + sizeof(u32)),
+					GFP_KERNEL);
+				if (before_blks)
+					before_crcs = (u32 *)(before_blks +
+							      max_ent);
 			}
+
+			/* Pass 1: collect BEFORE-image CRCs */
+			if (before_blks) {
+				u64 rpos = payload_start;
+
+				while (rpos + stride <= ahead) {
+					struct ocsfs_disk_journal_bref b2;
+
+					if (journal_read(sb, j, rpos,
+							 &b2, sizeof(b2)))
+						break;
+					if ((le32_to_cpu(b2.jbr_flags) &
+					     OCSFS_JBR_BEFORE) &&
+					    before_count < max_ent) {
+						before_blks[before_count] =
+						    le64_to_cpu(b2.jbr_block_num);
+						before_crcs[before_count] =
+						    le32_to_cpu(b2.jbr_checksum);
+						before_count++;
+					}
+					rpos += stride;
+				}
+			}
+
+			/* Pass 2: apply AFTER-images, gated by BEFORE check */
+			{
+				u64 replay_pos = payload_start;
+
+				while (replay_pos + stride <= ahead) {
+					struct ocsfs_disk_journal_bref bref;
+					u32 flags;
+
+					ret = journal_read(sb, j, replay_pos,
+							   &bref, sizeof(bref));
+					if (ret)
+						break;
+
+					flags = le32_to_cpu(bref.jbr_flags);
+					replay_pos += sizeof(bref);
+
+					if (flags & OCSFS_JBR_AFTER) {
+						u64 blk = le64_to_cpu(
+							bref.jbr_block_num);
+						u32 exp_crc = le32_to_cpu(
+							bref.jbr_checksum);
+						struct buffer_head *bh =
+							sb_bread(sb, blk);
+
+						if (bh) {
+							bool skip = false;
+
+							if (before_blks) {
+								u32 bi;
+
+								for (bi = 0; bi < before_count; bi++) {
+									if (before_blks[bi] != blk)
+										continue;
+									/* Block modified by peer if CRC changed */
+									if (ocsfs_crc32c(~0U, bh->b_data, bh->b_size) != before_crcs[bi]) {
+										pr_info("ocsfs: skip AFTER blk %llu txn %llu (peer-modified)\n",
+											blk, tid);
+										skip = true;
+									}
+									break;
+								}
+							}
+
+							if (!skip && !journal_read(
+								    sb, j,
+								    replay_pos,
+								    bh->b_data,
+								    bh->b_size)) {
+								u32 actual = ocsfs_crc32c(
+									~0U,
+									bh->b_data,
+									bh->b_size);
+								if (actual == exp_crc) {
+									mark_buffer_dirty(bh);
+									sync_dirty_buffer(bh);
+									this_replayed++;
+									replayed++;
+								} else {
+									pr_warn("ocsfs: AFTER CRC mismatch blk %llu txn %llu\n",
+										blk, tid);
+									clear_buffer_uptodate(bh);
+								}
+							}
+							brelse(bh);
+						}
+					}
+					replay_pos += sbi->s_block_size;
+				}
+			}
+
+			kvfree(before_blks);
 
 			if (this_replayed > 0)
 				pr_info("ocsfs: redo txn %llu (%d blocks)\n",

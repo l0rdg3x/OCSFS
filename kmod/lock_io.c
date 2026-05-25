@@ -57,13 +57,25 @@ int lock_write_entry(struct super_block *sb, u32 slot,
 	u64 off   = OCSFS_LOCK_TABLE_OFF + (u64)slot * OCSFS_LOCK_ENTRY_SIZE;
 	u64 block = off / sbi->s_block_size;
 	u32 boff  = off % sbi->s_block_size;
-	u32 expected_version = le32_to_cpu(entry->le_version);
 	u8 expected_buf[sizeof(struct ocsfs_disk_lock)];
 	u8 new_buf[sizeof(struct ocsfs_disk_lock)];
 	struct ocsfs_disk_lock *new_entry = (struct ocsfs_disk_lock *)new_buf;
+	u32 expected_version;
 
-	/* Salva lo stato originale (expected) e costruisci il nuovo (version+1) */
-	memcpy(expected_buf, entry, sizeof(*entry));
+	/*
+	 * expected_buf must capture the BEFORE state (what is currently on
+	 * disk), not the after state.  All callers mutate their local 'dl'
+	 * before calling here, so 'entry' already holds the desired new value.
+	 * bh->b_data + boff still contains the pre-mutation disk content
+	 * because lock_read_entry copies into the caller's local variable and
+	 * returns the buffer_head unmodified.
+	 *
+	 * The SCSI CAW path below also uses bh->b_data for the expected LBS;
+	 * align the software CAS path to the same semantics.
+	 */
+	memcpy(expected_buf, bh->b_data + boff, sizeof(*entry));
+	expected_version = le32_to_cpu(
+		((struct ocsfs_disk_lock *)expected_buf)->le_version);
 	memcpy(new_buf, entry, sizeof(*entry));
 	new_entry->le_version  = cpu_to_le32(expected_version + 1);
 	new_entry->le_checksum = cpu_to_le32(

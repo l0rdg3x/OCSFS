@@ -320,6 +320,31 @@ int ocsfs_atomic_cas(struct super_block *sb, u64 block, u32 boff,
 		ret = sync_dirty_buffer(data_bh);
 		brelse(data_bh);
 
+		/*
+		 * Post-write lease verification (CRIT-4): SAN slow I/O or a
+		 * GC pause may have caused the 10s lease to expire between our
+		 * memcmp and sync_dirty_buffer.  If another node acquired the
+		 * lease in that window it could have overwritten our write.
+		 * Re-read the lease block and confirm ownership; if stolen,
+		 * return -EAGAIN so the caller retries from a clean state.
+		 */
+		if (ret == 0) {
+			struct ocsfs_disk_cas_lease *vcl;
+
+			clear_buffer_uptodate(lease_bh);
+			if (bh_read(lease_bh, 0) >= 0) {
+				vcl = (struct ocsfs_disk_cas_lease *)
+					lease_bh->b_data + lease_eidx;
+				if (le32_to_cpu(vcl->cl_magic) !=
+					OCSFS_CAS_LEASE_MAGIC ||
+				    le16_to_cpu(vcl->cl_owner_slot) !=
+					(u16)sbi->s_node_slot) {
+					cas_release_lease(lease_bh, lease_eidx);
+					return -EAGAIN;
+				}
+			}
+		}
+
 		cas_release_lease(lease_bh, lease_eidx);
 		return ret;
 	}

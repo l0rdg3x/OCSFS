@@ -73,7 +73,7 @@
 #define OCSFS_CAS_LEASE_MAGIC       0x4F43414CU  /* "OCAL" */
 #define OCSFS_CAS_LEASE_SIZE        8192ULL      /* 256 × 32 byte */
 #define CAS_MAX_ATTEMPTS            32
-#define CAS_LEASE_TIMEOUT_NS        (2ULL * NSEC_PER_SEC)
+#define CAS_LEASE_TIMEOUT_NS        (10ULL * NSEC_PER_SEC)
 
 /* Recovery leader election block — dopo l'area CAS lease */
 #define OCSFS_RECOVERY_LEADER_OFF   (OCSFS_CAS_LEASE_OFF + OCSFS_CAS_LEASE_SIZE)

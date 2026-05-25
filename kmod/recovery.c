@@ -190,13 +190,14 @@ int ocsfs_recovery_run(struct super_block *sb, u16 failed_slot)
 	ret = ocsfs_recovery_leader_acquire(sb, failed_slot, &leader_epoch);
 	if (ret) {
 		if (ret == -EAGAIN)
-			pr_info("ocsfs: not the recovery leader, deferring\n");
+			pr_info("ocsfs: not the recovery leader for slot %u, deferring\n",
+				failed_slot);
 		else
-			pr_warn("ocsfs: leader election failed (%d), deferring\n",
-				ret);
+			pr_warn("ocsfs: leader election for slot %u failed (%d), deferring\n",
+				failed_slot, ret);
 		sbi->s_recovery_in_progress = false;
 		mutex_unlock(&sbi->s_recovery_lock);
-		return 0;
+		return ret;
 	}
 
 	pr_info("ocsfs: this node (slot %u) is the recovery leader\n",
@@ -292,8 +293,23 @@ static void ocsfs_recovery_work_fn(struct work_struct *work)
 
 	while ((slot = find_first_bit(sbi->s_recovery_pending,
 				      OCSFS_MAX_NODES)) < OCSFS_MAX_NODES) {
+		int ret = ocsfs_recovery_run(sb, (u16)slot);
+		/*
+		 * Clear the bit AFTER the run so that a crash of this node
+		 * mid-recovery does not silently drop the pending slot.
+		 * If another node won leader election (-EAGAIN), re-arm the bit:
+		 * if that leader dies before finishing, the next work invocation
+		 * (triggered by heartbeat detecting the dead leader) will win
+		 * the CAS and complete recovery for this slot.
+		 */
 		clear_bit(slot, sbi->s_recovery_pending);
-		ocsfs_recovery_run(sb, (u16)slot);
+		if (ret == -EAGAIN) {
+			set_bit(slot, sbi->s_recovery_pending);
+			/* Don't busy-spin: another node is running recovery.
+			 * If it finishes, we win the CAS next round.
+			 * If it dies, heartbeat fires a new trigger. */
+			msleep(50);
+		}
 	}
 }
 

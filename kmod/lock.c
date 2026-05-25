@@ -43,14 +43,16 @@ int ocsfs_lock_acquire(struct super_block *sb, struct ocsfs_lock_res *lr,
 	mutex_lock(&lr->lr_mutex);
 
 	/*
-	 * Epoch-based fast-path: if no recovery has occurred since we last
-	 * acquired this lock (lr_epoch == s_lock_epoch) and we still hold
-	 * a compatible mode, skip the disk round-trip.
-	 * ocsfs_lock_recover_node() increments s_lock_epoch, invalidating
-	 * all cached entries atomically — no wall-clock TTL needed.
+	 * Single-node fast-path: if no other node exists, a cached lock is
+	 * always coherent — skip the disk round-trip.
+	 *
+	 * In clustered mode the cache is DISABLED because s_lock_epoch is
+	 * only bumped on node recovery, not on every EX release from a peer.
+	 * A node holding cached SH would not see a peer's EX acquisition,
+	 * creating split-brain on any mmap or write workload.  Always go to
+	 * disk in cluster mode.
 	 */
-	if (lr->lr_cached && lr->lr_mode >= mode &&
-	    lr->lr_epoch == (u32)atomic_read(&sbi->s_lock_epoch)) {
+	if (!sbi->s_clustered && lr->lr_cached && lr->lr_mode >= mode) {
 		mutex_unlock(&lr->lr_mutex);
 		return 0;
 	}
