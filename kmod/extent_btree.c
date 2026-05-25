@@ -207,6 +207,22 @@ int ocsfs_extent_btree_migrate(struct inode *inode)
 	struct ext_btree_ctx ec;
 	int i, ret;
 
+	/*
+	 * The btree encoding only preserves 2 flag bits (WRITTEN/UNWRITTEN).
+	 * Compressed extents (bit 2) would silently lose the COMPRESSED flag
+	 * after a btree round-trip, making the data unreadable.  Decompress
+	 * all compressed extents before opening the migration txn; each
+	 * decompress call manages its own block alloc/free internally.
+	 */
+	for (i = 0; i < oi->i_extent_count; i++) {
+		if (oi->i_extents[i].flags & OCSFS_EXT_COMPRESSED) {
+			ret = ocsfs_extent_decompress_for_write(
+				inode, oi->i_extents[i].logical_block);
+			if (ret)
+				return ret;
+		}
+	}
+
 	txn = ocsfs_txn_begin(inode->i_sb);
 	if (IS_ERR(txn))
 		return PTR_ERR(txn);
