@@ -15,6 +15,7 @@
 #define _OCSFS_KMOD_H
 
 #include <linux/fs.h>
+#include <linux/fileattr.h>
 #include <linux/buffer_head.h>
 #include <linux/bio.h>
 #include <linux/blkdev.h>
@@ -810,6 +811,9 @@ extern const struct file_operations ocsfs_file_fops;
 extern const struct address_space_operations ocsfs_aops;
 int ocsfs_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
 		 u64 start, u64 len);
+int ocsfs_fileattr_get(struct dentry *dentry, struct file_kattr *fa);
+int ocsfs_fileattr_set(struct mnt_idmap *idmap, struct dentry *dentry,
+		       struct file_kattr *fa);
 
 /* extent.c */
 int ocsfs_extent_lookup(struct inode *inode, u64 logical_block,

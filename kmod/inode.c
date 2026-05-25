@@ -8,6 +8,7 @@
 
 #include <linux/security.h>
 #include <linux/posix_acl.h>
+#include <linux/fileattr.h>
 #include "ocsfs.h"
 
 /* ═══════════════════════════════════════════════════════════════
@@ -146,6 +147,11 @@ struct inode *ocsfs_iget(struct super_block *sb, u64 ino)
 		ns_to_timespec64(le64_to_cpu(di.i_ctime)));
 
 	oi->i_flags = le32_to_cpu(di.i_flags);
+	/* Restore VFS immutable/append enforcement from disk */
+	if (oi->i_flags & OCSFS_IFLAG_IMMUTABLE)
+		inode->i_flags |= S_IMMUTABLE;
+	if (oi->i_flags & OCSFS_IFLAG_APPEND)
+		inode->i_flags |= S_APPEND;
 	oi->i_ag = le32_to_cpu(di.i_ag);
 	oi->i_extent_tree_root = le64_to_cpu(di.i_extent_tree_root);
 
@@ -591,6 +597,66 @@ int ocsfs_getattr(struct mnt_idmap *idmap, const struct path *path,
 }
 
 /* ═══════════════════════════════════════════════════════════════
+ * FILE ATTRIBUTE FLAGS (chattr / lsattr — FS_IOC_GETFLAGS / SETFLAGS)
+ * ═══════════════════════════════════════════════════════════════ */
+
+int ocsfs_fileattr_get(struct dentry *dentry, struct file_kattr *fa)
+{
+	struct ocsfs_inode_info *oi = OCSFS_I(d_inode(dentry));
+	u32 flags = 0;
+
+	if (oi->i_flags & OCSFS_IFLAG_IMMUTABLE)
+		flags |= FS_IMMUTABLE_FL;
+	if (oi->i_flags & OCSFS_IFLAG_APPEND)
+		flags |= FS_APPEND_FL;
+	if (oi->i_flags & OCSFS_IFLAG_COMPRESSED)
+		flags |= FS_COMPR_FL;
+
+	fileattr_fill_flags(fa, flags);
+	return 0;
+}
+
+int ocsfs_fileattr_set(struct mnt_idmap *idmap, struct dentry *dentry,
+		       struct file_kattr *fa)
+{
+	struct inode *inode = d_inode(dentry);
+	struct ocsfs_inode_info *oi = OCSFS_I(inode);
+	const u32 supported = FS_IMMUTABLE_FL | FS_APPEND_FL | FS_COMPR_FL;
+	u32 old_fs_flags, new_fs_flags;
+	int ret;
+
+	if (fileattr_has_fsx(fa))
+		return -EOPNOTSUPP;
+	if (fa->flags & ~supported)
+		return -EOPNOTSUPP;
+
+	old_fs_flags = 0;
+	if (oi->i_flags & OCSFS_IFLAG_IMMUTABLE) old_fs_flags |= FS_IMMUTABLE_FL;
+	if (oi->i_flags & OCSFS_IFLAG_APPEND)    old_fs_flags |= FS_APPEND_FL;
+	new_fs_flags = fa->flags & supported;
+
+	/* Setting or clearing immutable/append requires CAP_LINUX_IMMUTABLE */
+	if ((new_fs_flags ^ old_fs_flags) & (FS_IMMUTABLE_FL | FS_APPEND_FL))
+		if (!capable(CAP_LINUX_IMMUTABLE))
+			return -EPERM;
+
+	oi->i_flags &= ~(OCSFS_IFLAG_IMMUTABLE | OCSFS_IFLAG_APPEND |
+			 OCSFS_IFLAG_COMPRESSED);
+	if (new_fs_flags & FS_IMMUTABLE_FL) oi->i_flags |= OCSFS_IFLAG_IMMUTABLE;
+	if (new_fs_flags & FS_APPEND_FL)    oi->i_flags |= OCSFS_IFLAG_APPEND;
+	if (new_fs_flags & FS_COMPR_FL)     oi->i_flags |= OCSFS_IFLAG_COMPRESSED;
+
+	/* Keep VFS immutable/append in sync so IS_IMMUTABLE/IS_APPEND work */
+	inode->i_flags = (inode->i_flags & ~(S_IMMUTABLE | S_APPEND)) |
+			 ((new_fs_flags & FS_IMMUTABLE_FL) ? S_IMMUTABLE : 0) |
+			 ((new_fs_flags & FS_APPEND_FL)    ? S_APPEND    : 0);
+
+	inode_set_ctime_current(inode);
+	mark_inode_dirty(inode);
+	return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════
  * INODE OPERATIONS TABLES
  * ═══════════════════════════════════════════════════════════════ */
 
@@ -599,6 +665,8 @@ const struct inode_operations ocsfs_file_inode_ops = {
 	.getattr        = ocsfs_getattr,
 	.listxattr      = ocsfs_listxattr,
 	.fiemap         = ocsfs_fiemap,
+	.fileattr_get   = ocsfs_fileattr_get,
+	.fileattr_set   = ocsfs_fileattr_set,
 	.get_inode_acl  = ocsfs_get_inode_acl,
 	.set_acl        = ocsfs_set_acl,
 };
@@ -607,6 +675,8 @@ const struct inode_operations ocsfs_special_inode_ops = {
 	.setattr        = ocsfs_setattr,
 	.getattr        = ocsfs_getattr,
 	.listxattr      = ocsfs_listxattr,
+	.fileattr_get   = ocsfs_fileattr_get,
+	.fileattr_set   = ocsfs_fileattr_set,
 	.get_inode_acl  = ocsfs_get_inode_acl,
 	.set_acl        = ocsfs_set_acl,
 };
@@ -626,6 +696,8 @@ const struct inode_operations ocsfs_symlink_inode_ops = {
 	.setattr        = ocsfs_setattr,
 	.getattr        = ocsfs_getattr,
 	.listxattr      = ocsfs_listxattr,
+	.fileattr_get   = ocsfs_fileattr_get,
+	.fileattr_set   = ocsfs_fileattr_set,
 	.get_inode_acl  = ocsfs_get_inode_acl,
 	.set_acl        = ocsfs_set_acl,
 };
