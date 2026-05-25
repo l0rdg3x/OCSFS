@@ -91,7 +91,8 @@ static int snapshot_copy_btree_extents(struct inode *src, struct inode *snap)
 		bool shared = e->physical_block && !(e->flags & OCSFS_EXT_UNWRITTEN);
 
 		if (shared) {
-			ret = ocsfs_refcount_inc(sb, e->physical_block, e->length);
+			ret = ocsfs_refcount_inc(sb, e->physical_block,
+						 ocsfs_ext_phys_blocks(e));
 			if (ret)
 				goto rollback;
 		}
@@ -100,7 +101,9 @@ static int snapshot_copy_btree_extents(struct inode *src, struct inode *snap)
 						e->length, e->flags);
 		if (ret) {
 			if (shared)
-				ocsfs_refcount_dec(sb, e->physical_block, e->length, NULL);
+				ocsfs_refcount_dec(sb, e->physical_block,
+						   ocsfs_ext_phys_blocks(e),
+						   NULL);
 			goto rollback;
 		}
 	}
@@ -112,7 +115,8 @@ rollback:
 		struct ocsfs_extent *e = &cc.ext[i];
 
 		if (e->physical_block && !(e->flags & OCSFS_EXT_UNWRITTEN))
-			ocsfs_refcount_dec(sb, e->physical_block, e->length, NULL);
+			ocsfs_refcount_dec(sb, e->physical_block,
+					   ocsfs_ext_phys_blocks(e), NULL);
 	}
 out:
 	kvfree(cc.ext);
@@ -207,7 +211,8 @@ int ocsfs_snapshot_create(struct inode *src, struct inode *dir,
 			    (e->flags & OCSFS_EXT_UNWRITTEN))
 				continue;
 
-			ret = ocsfs_refcount_inc(sb, e->physical_block, e->length);
+			ret = ocsfs_refcount_inc(sb, e->physical_block,
+						 ocsfs_ext_phys_blocks(e));
 			if (ret) {
 				for (j = 0; j < i; j++) {
 					struct ocsfs_extent *p = &src_oi->i_extents[j];
@@ -216,7 +221,8 @@ int ocsfs_snapshot_create(struct inode *src, struct inode *dir,
 					    (p->flags & OCSFS_EXT_UNWRITTEN))
 						continue;
 					ocsfs_refcount_dec(sb, p->physical_block,
-							   p->length, NULL);
+							   ocsfs_ext_phys_blocks(p),
+							   NULL);
 				}
 				snap_oi->i_extent_count = 0;
 				break;
@@ -332,16 +338,22 @@ int ocsfs_snapshot_delete(struct inode *snap)
 				continue;
 
 			should_free = false;
-			ret = ocsfs_refcount_dec(sb, e->physical_block, e->length,
-						 &should_free);
-			if (ret)
-				pr_warn("ocsfs: snapshot_delete: refcount_dec failed "
-					"for block %llu\n", e->physical_block);
+			{
+				u32 phys = ocsfs_ext_phys_blocks(e);
 
-			if (should_free) {
-				ocsfs_free_blocks(sb, e->physical_block, e->length);
-				snap->i_blocks -= (u64)e->length *
-						  (sbi->s_block_size / 512);
+				ret = ocsfs_refcount_dec(sb, e->physical_block,
+							 phys, &should_free);
+				if (ret)
+					pr_warn("ocsfs: snapshot_delete: refcount_dec "
+						"failed for block %llu\n",
+						e->physical_block);
+
+				if (should_free) {
+					ocsfs_free_blocks(sb, e->physical_block,
+							  phys);
+					snap->i_blocks -= (u64)phys *
+							  (sbi->s_block_size / 512);
+				}
 			}
 
 			e->physical_block = 0;

@@ -452,6 +452,13 @@ struct ocsfs_extent {
 	u16     flags;
 };
 
+/* Physical block count for an extent (compressed or not). */
+static inline u32 ocsfs_ext_phys_blocks(const struct ocsfs_extent *e)
+{
+	return (e->flags & OCSFS_EXT_COMPRESSED && e->phys_length)
+	       ? (u32)e->phys_length : e->length;
+}
+
 /* In-memory lock resource — must be defined before ocsfs_ag_info and
  * ocsfs_inode_info which embed it. */
 struct ocsfs_lock_res {
