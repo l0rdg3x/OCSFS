@@ -494,13 +494,27 @@ struct ocsfs_ag_info {
 struct ocsfs_journal {
 	u64             disk_off;       /* byte offset on block device */
 	u64             size;           /* journal region size */
-	u64             head;           /* write position */
-	u64             tail;           /* oldest live txn */
-	u64             sequence;       /* next txn ID */
+	u64             head;           /* write position — protected by j_lock */
+	u64             tail;           /* oldest live txn — updated under j_lock */
+	u64             sequence;       /* next txn ID — protected by j_lock */
 	u16             j_node_slot;    /* which node's journal this is */
 	struct mutex    j_lock;
 	struct buffer_head *j_header_bh;
 	struct super_block *j_sb;       /* owning superblock */
+
+	/*
+	 * Ordered-checkpoint ticket system.
+	 *
+	 * j_lock is released immediately after the COMMIT record is durable,
+	 * allowing concurrent txns to begin journaling while the checkpoint
+	 * (parallel write_dirty_buffer + SAN flush) runs lock-free.
+	 *
+	 * Tickets enforce FIFO checkpoint order so j->tail only advances
+	 * monotonically and recovery correctness is preserved.
+	 */
+	atomic64_t      j_ckpt_ticket;  /* next ticket to hand out (incremented under j_lock) */
+	atomic64_t      j_ckpt_now;     /* ticket that currently holds the checkpoint turn */
+	wait_queue_head_t j_ckpt_waitq;
 };
 
 /* Active journal transaction */

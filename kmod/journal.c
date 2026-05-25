@@ -68,6 +68,11 @@ int ocsfs_journal_init(struct super_block *sb)
 
 	j->j_header_bh = bh;
 	j->j_sb        = sb;
+
+	atomic64_set(&j->j_ckpt_ticket, 0);
+	atomic64_set(&j->j_ckpt_now,    0);
+	init_waitqueue_head(&j->j_ckpt_waitq);
+
 	return 0;
 }
 
@@ -75,6 +80,15 @@ void ocsfs_journal_exit(struct super_block *sb)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	struct ocsfs_journal *j = &sbi->s_journal;
+
+	/*
+	 * Wait for all in-flight checkpoints to complete before writing the
+	 * final journal header.  j_ckpt_ticket is the next ticket to hand
+	 * out; j_ckpt_now is the one currently running.  Equal means idle.
+	 */
+	wait_event(j->j_ckpt_waitq,
+		   atomic64_read(&j->j_ckpt_now) ==
+		   atomic64_read(&j->j_ckpt_ticket));
 
 	if (j->j_header_bh) {
 		struct ocsfs_disk_journal_hdr *jh =
@@ -361,6 +375,8 @@ int ocsfs_txn_commit(struct ocsfs_txn *txn)
 	struct ocsfs_txn_buf *tb, *tmp;
 	struct super_block *sb;
 	u32 data_len;
+	s64 my_ticket;
+	u64 my_head;
 	int ret;
 
 	if (list_empty(&txn->t_buffers)) {
@@ -395,10 +411,10 @@ int ocsfs_txn_commit(struct ocsfs_txn *txn)
 
 		ret = journal_write(sb, j, &abref, sizeof(abref));
 		if (ret)
-			goto out;
+			goto out_locked;
 		ret = journal_write(sb, j, tb->after_buf, tb->bh->b_size);
 		if (ret)
-			goto out;
+			goto out_locked;
 	}
 
 	/*
@@ -426,39 +442,56 @@ int ocsfs_txn_commit(struct ocsfs_txn *txn)
 	 */
 	ret = blkdev_issue_flush(sb->s_bdev);
 	if (ret)
-		goto out;
+		goto out_locked;
 
 	/* Synchronous write of the COMMIT record itself. */
 	ret = journal_write_sync(sb, j, &jt, sizeof(jt));
 	if (ret)
-		goto out;
+		goto out_locked;
 
 	ret = journal_sync(sb, j);
 	if (ret)
-		goto out;
+		goto out_locked;
 
 	/*
-	 * COMMIT durable.  Now write all modified blocks to their final disk
-	 * locations synchronously before advancing j->tail.
+	 * COMMIT is durable.  Claim a checkpoint ticket (in commit order, under
+	 * j_lock) then release j_lock so other txns can begin journaling while
+	 * this txn checkpoints its blocks to their final disk locations.
 	 *
-	 * Why this ordering matters: j->tail is persisted in journal_sync()
-	 * above.  If we advance j->tail = j->head and then crash before the
-	 * data blocks reach disk, recovery will see tail == head and replay
-	 * nothing — the committed AFTER-images in the journal are effectively
-	 * lost.  Syncing the data blocks first means the checkpoint is only
-	 * recorded once the data is guaranteed durable; if sync fails, tail
-	 * stays where it was and the next recovery can re-apply the AFTER-images.
+	 * The ticket ensures checkpoints run in FIFO order, which guarantees
+	 * j->tail only advances monotonically and recovery remains correct:
+	 * if txn A committed before B, A checkpoints before B, so j->tail
+	 * never skips over A's AFTER-images before they reach final locations.
+	 */
+	my_ticket = atomic64_add_return(1, &j->j_ckpt_ticket) - 1;
+	my_head   = j->head;
+	mutex_unlock(&j->j_lock);
+
+	/*
+	 * Wait for our turn.  Earlier txns may still be checkpointing;
+	 * sleep until j_ckpt_now equals our ticket.
+	 */
+	wait_event(j->j_ckpt_waitq,
+		   atomic64_read(&j->j_ckpt_now) == my_ticket);
+
+	/*
+	 * Checkpoint: write all modified blocks to their final disk locations.
+	 * Submit all writes in parallel (one SAN round-trip per txn regardless
+	 * of block count), then wait for completion.
+	 *
+	 * j_lock is NOT held here, so new txns can commit their journal writes
+	 * concurrently.  The ticket ensures only one checkpoint runs at a time,
+	 * preserving tail ordering.
+	 *
+	 * Why syncing blocks before advancing tail matters: if we move tail
+	 * before blocks reach disk and then crash, recovery sees an empty
+	 * journal window and skips replay — the AFTER-images are gone and the
+	 * data blocks are not at their final locations.  Syncing first ensures
+	 * the checkpoint is only "recorded" once durable.
 	 */
 	{
 		int ckpt_ret = 0;
 
-		/*
-		 * Checkpoint: write all modified blocks to their final disk
-		 * locations.  Submit all writes in parallel (one round-trip on
-		 * SAN regardless of transaction size), then wait for completion.
-		 * This replaces the previous serial sync_dirty_buffer() loop which
-		 * incurred one SAN round-trip per block.
-		 */
 		list_for_each_entry(tb, &txn->t_buffers, list) {
 			mark_buffer_dirty(tb->bh);
 			write_dirty_buffer(tb->bh, REQ_SYNC);
@@ -471,17 +504,29 @@ int ocsfs_txn_commit(struct ocsfs_txn *txn)
 		if (!ckpt_ret)
 			ckpt_ret = blkdev_issue_flush(sb->s_bdev);
 
+		/* Advance tail under j_lock for consistency with journal_write readers. */
+		mutex_lock(&j->j_lock);
 		if (!ckpt_ret) {
-			j->tail = j->head;
+			j->tail = my_head;
 		} else {
 			pr_warn_ratelimited(
 				"ocsfs: journal checkpoint failed (%d) — "
 				"tail not advanced, recovery will replay\n",
 				ckpt_ret);
 		}
+		mutex_unlock(&j->j_lock);
 	}
 
-out:
+	/* Signal the next checkpoint it may proceed. */
+	atomic64_inc(&j->j_ckpt_now);
+	wake_up_all(&j->j_ckpt_waitq);
+
+	goto cleanup;
+
+out_locked:
+	mutex_unlock(&j->j_lock);
+
+cleanup:
 	list_for_each_entry_safe(tb, tmp, &txn->t_buffers, list) {
 		list_del(&tb->list);
 		brelse(tb->bh);
@@ -491,7 +536,6 @@ out:
 	}
 
 	txn->t_started = false;
-	mutex_unlock(&j->j_lock);
 	kfree(txn);
 	return ret;
 }

@@ -8,6 +8,9 @@ Checks performed:
   3. Bitmap consistency (allocated blocks within AG bounds)
   4. Journal header CRC32c and tail/head sanity
   5. Refcount table: no entry with block=0 but refcount>0
+  6. Inode table: magic and CRC32c for every allocated inode slot
+  7. Heartbeat area: magic and CRC32c for each node slot
+  8. Lock table: detect stale EX/SH locks after crash
 
 Usage: ocsfs-fsck [-n] [-v] <device_or_image>
   -n  dry-run (never write)
@@ -25,11 +28,22 @@ import binascii
 # ── Constants from ocsfs.h ────────────────────────────────────────────────────
 OCSFS_MAGIC             = 0x4F435346
 OCSFS_AG_MAGIC          = 0x4F434147
+OCSFS_INODE_MAGIC       = 0x494E4F44   # 'INOD'
 OCSFS_JOURNAL_MAGIC     = 0x4F434A4C
+OCSFS_HEARTBEAT_MAGIC   = 0x48425454   # 'HBTT'
+OCSFS_LOCK_MAGIC        = 0x4C4F434B   # 'LOCK'
 OCSFS_REFCOUNT_MAGIC    = 0x52454643
 DEFAULT_BLOCK_SIZE      = 4096
 OCSFS_VERSION_MAJOR     = 1
 OCSFS_SUPERBLOCK_SIZE   = 512
+OCSFS_INODE_SIZE        = 512
+OCSFS_HEARTBEAT_OFF     = 73728
+OCSFS_HEARTBEAT_ENTRY   = 1024
+OCSFS_LOCK_TABLE_OFF    = 335872
+OCSFS_LOCK_ENTRY_SIZE   = 256
+
+# Lock modes
+LOCK_MODES = {0: "NL", 1: "SH", 2: "EX", 3: "CW"}
 
 # Superblock layout (little-endian)
 SB_FMT = "<IHHQQQIQQI64s32sI"  # covers up to s_checksum
@@ -217,6 +231,141 @@ class Fsck:
                 if blk == 0 and cnt > 0:
                     self.warn(f"Refcount block {block_idx} entry {i}: "
                               f"block=0 but refcount={cnt}")
+
+        # ── 6–8. Extended checks ──────────────────────────────────────────────
+        self._check_inodes(f, ags, bs)
+        self._check_heartbeat(f, bs, fields["s_max_nodes"])
+        self._check_lock_table(f, bs)
+
+    def _check_inodes(self, f, ags, bs):
+        """Check every inode slot in each AG's inode table."""
+        print("Checking inode tables...")
+        total_valid = total_bad = total_orphan = 0
+
+        for ag in ags:
+            ag_no       = ag["ag_no"]
+            itable_off  = ag["inode_table_off"]
+            inode_count = ag["inode_count"]
+
+            if itable_off == 0 or inode_count == 0:
+                self.log(f"AG {ag_no}: inode table not initialised, skipping")
+                continue
+
+            valid = bad = orphan = 0
+            for idx in range(inode_count):
+                byte_off = itable_off + idx * OCSFS_INODE_SIZE
+                try:
+                    raw = read_at(f, byte_off, OCSFS_INODE_SIZE)
+                except OSError as e:
+                    self.error(f"AG {ag_no} inode {idx}: read error: {e}")
+                    break
+
+                magic, = struct.unpack_from("<I", raw, 0)
+                if magic != OCSFS_INODE_MAGIC:
+                    continue  # unallocated slot
+
+                # CRC over everything except the last 4 bytes
+                stored_crc, = struct.unpack_from("<I", raw, OCSFS_INODE_SIZE - 4)
+                computed    = crc32c(raw[:OCSFS_INODE_SIZE - 4])
+                if stored_crc != computed:
+                    self.error(f"AG {ag_no} inode {idx}: CRC mismatch "
+                               f"(stored={stored_crc:08X} computed={computed:08X})")
+                    bad += 1
+                    continue
+
+                ino, mode, nlink = struct.unpack_from("<QHH", raw, 4)
+                if nlink == 0 and ino != 0:
+                    self.warn(f"AG {ag_no} inode {idx}: ino={ino} mode=0o{mode:06o} "
+                              f"nlink=0 — possible orphan (run repair)")
+                    orphan += 1
+                else:
+                    valid += 1
+                    self.log(f"AG {ag_no} inode {idx}: ino={ino} mode=0o{mode:06o} "
+                             f"nlink={nlink} OK")
+
+            total_valid  += valid
+            total_bad    += bad
+            total_orphan += orphan
+            self.log(f"AG {ag_no}: {valid} OK, {bad} bad CRC, {orphan} orphan")
+
+        print(f"  Inodes: {total_valid} OK, {total_bad} bad CRC, "
+              f"{total_orphan} orphaned")
+
+    def _check_heartbeat(self, f, bs, max_nodes):
+        """Check heartbeat entries for all node slots."""
+        print("Checking heartbeat area...")
+        active = stale_crc = unused = 0
+        HB_STATE_ACTIVE = 1
+
+        for slot in range(max_nodes):
+            byte_off = OCSFS_HEARTBEAT_OFF + slot * OCSFS_HEARTBEAT_ENTRY
+            try:
+                raw = read_at(f, byte_off, OCSFS_HEARTBEAT_ENTRY)
+            except OSError:
+                break
+
+            magic, = struct.unpack_from("<I", raw, 0)
+            if magic != OCSFS_HEARTBEAT_MAGIC:
+                unused += 1
+                continue
+
+            stored_crc, = struct.unpack_from("<I", raw, OCSFS_HEARTBEAT_ENTRY - 4)
+            computed    = crc32c(raw[:OCSFS_HEARTBEAT_ENTRY - 4])
+            if stored_crc != computed:
+                self.error(f"Heartbeat slot {slot}: CRC mismatch "
+                           f"(stored={stored_crc:08X} computed={computed:08X}) "
+                           f"— entry may be corrupted")
+                stale_crc += 1
+                continue
+
+            node_slot, state = struct.unpack_from("<HH", raw, 4)
+            timestamp, sequence, mount_gen = struct.unpack_from("<QQI", raw, 8)
+            state_str = "ACTIVE" if state == HB_STATE_ACTIVE else f"state={state}"
+            self.log(f"Heartbeat slot {slot}: node={node_slot} {state_str} "
+                     f"seq={sequence} mount_gen={mount_gen}")
+            active += 1
+
+        print(f"  Heartbeat: {active} active, {stale_crc} bad CRC, "
+              f"{unused} unused slots")
+
+    def _check_lock_table(self, f, bs):
+        """Scan lock table; report stale held locks (EX/SH after crash)."""
+        print("Checking lock table...")
+        total = held = bad_crc = 0
+        lock_table_size = 1048576  # OCSFS_LOCK_TABLE_SIZE
+        n_entries = lock_table_size // OCSFS_LOCK_ENTRY_SIZE
+
+        for idx in range(n_entries):
+            byte_off = OCSFS_LOCK_TABLE_OFF + idx * OCSFS_LOCK_ENTRY_SIZE
+            try:
+                raw = read_at(f, byte_off, OCSFS_LOCK_ENTRY_SIZE)
+            except OSError:
+                break
+
+            magic, = struct.unpack_from("<I", raw, 0)
+            if magic != OCSFS_LOCK_MAGIC:
+                continue
+
+            total += 1
+            stored_crc, = struct.unpack_from("<I", raw, OCSFS_LOCK_ENTRY_SIZE - 4)
+            computed    = crc32c(raw[:OCSFS_LOCK_ENTRY_SIZE - 4])
+            if stored_crc != computed:
+                self.error(f"Lock entry {idx}: CRC mismatch — entry corrupt")
+                bad_crc += 1
+                continue
+
+            res_id, res_type, mode, holder_slot = struct.unpack_from("<QIHH", raw, 4)
+            mode_str = LOCK_MODES.get(mode, f"?{mode}")
+            if mode >= 1:  # SH, CW, or EX
+                held += 1
+                self.warn(f"Lock entry {idx}: resource={res_id:#x} type={res_type} "
+                          f"mode={mode_str} holder_slot={holder_slot} "
+                          f"— may be stale after crash")
+            else:
+                self.log(f"Lock entry {idx}: resource={res_id:#x} NL (free)")
+
+        print(f"  Lock table: {total} initialised entries, "
+              f"{held} held (EX/SH/CW), {bad_crc} bad CRC")
 
 
 def main():
