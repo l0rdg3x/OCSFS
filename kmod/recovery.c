@@ -213,8 +213,24 @@ int ocsfs_recovery_run(struct super_block *sb, u16 failed_slot)
 
 	ret = ocsfs_pr_preempt_abort(sb, failed_pr_key,
 				     OCSFS_PR_TYPE_WRITE_EXCL_REG);
+	if (ret && ret != -EOPNOTSUPP && sbi->s_pr_capable) {
+		/*
+		 * We registered PR successfully at mount (s_pr_capable) but
+		 * fencing of the dead node failed now.  The node may still be
+		 * alive and writing — proceeding with journal replay would risk
+		 * split-brain corruption.  Force read-only and bail.
+		 */
+		pr_err("ocsfs: PR fencing failed (ret=%d) on PR-capable device — "
+		       "forcing read-only to prevent split-brain\n", ret);
+		sb->s_flags |= SB_RDONLY;
+		ocsfs_recovery_leader_release(sb, failed_slot, leader_epoch);
+		sbi->s_recovery_in_progress = false;
+		mutex_unlock(&sbi->s_recovery_lock);
+		return ret;
+	}
 	if (ret)
-		pr_warn("ocsfs: PR fencing failed (ret=%d), continuing\n", ret);
+		pr_warn("ocsfs: PR fencing unavailable (ret=%d), "
+			"continuing without hardware isolation\n", ret);
 
 	/*
 	 * Phase 3 — Journal Replay

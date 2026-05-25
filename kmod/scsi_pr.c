@@ -138,7 +138,7 @@ int ocsfs_pr_preempt_abort(struct super_block *sb, u64 victim_key, u8 type)
 	pr_warn("ocsfs: PR PREEMPT AND ABORT — fencing node with "
 		"key 0x%016llx\n", victim_key);
 	if (!ops || !ops->pr_preempt)
-		return 0;
+		return -EOPNOTSUPP;
 	return ops->pr_preempt(sb->s_bdev, sbi->s_pr.pr_key, victim_key,
 				ocsfs_to_pr_type(type), true);
 }
