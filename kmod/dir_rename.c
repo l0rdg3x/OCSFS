@@ -235,6 +235,99 @@ static int ocsfs_rename_update_dotdot(struct inode *inode, u64 new_parent_ino)
 	return -ENOENT;
 }
 
+/*
+ * Atomically replace new_dir[new_name] in-place (de_ino=old_ino, de_ft=old_ft)
+ * and zero old_dir[old_name] — all in one WAL transaction.
+ *
+ * Returns -ENOENT if either entry lacks a btree index; caller must fall back
+ * to the three-step del+add+del path.  Does NOT touch nlink or dotdot.
+ */
+static int rename_replace_atomic(struct inode *old_dir, const struct qstr *old_name,
+				  struct inode *new_dir, const struct qstr *new_name,
+				  u64 old_ino, u8 old_ft)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(old_dir->i_sb);
+	u64 old_block, new_block;
+	u32 old_off, new_off;
+	struct buffer_head *old_bh, *new_bh;
+	struct ocsfs_disk_dirent *old_de, *new_de;
+	struct ocsfs_txn *txn;
+	int ret;
+
+	if (ocsfs_dir_btree_locate(old_dir, old_name, &old_block, &old_off))
+		return -ENOENT;
+	if (ocsfs_dir_btree_locate(new_dir, new_name, &new_block, &new_off))
+		return -ENOENT;
+
+	if (sbi->s_clustered) {
+		old_bh = sb_getblk(old_dir->i_sb, old_block);
+		if (!old_bh)
+			return -EIO;
+		clear_buffer_uptodate(old_bh);
+		if (bh_read(old_bh, 0) < 0) { brelse(old_bh); return -EIO; }
+	} else {
+		old_bh = sb_bread(old_dir->i_sb, old_block);
+		if (!old_bh)
+			return -EIO;
+	}
+
+	if (new_block == old_block) {
+		new_bh = old_bh;
+		get_bh(new_bh);
+	} else if (sbi->s_clustered) {
+		new_bh = sb_getblk(new_dir->i_sb, new_block);
+		if (!new_bh) { brelse(old_bh); return -EIO; }
+		clear_buffer_uptodate(new_bh);
+		if (bh_read(new_bh, 0) < 0) { brelse(new_bh); brelse(old_bh); return -EIO; }
+	} else {
+		new_bh = sb_bread(new_dir->i_sb, new_block);
+		if (!new_bh) { brelse(old_bh); return -EIO; }
+	}
+
+	txn = ocsfs_txn_begin(old_dir->i_sb);
+	if (IS_ERR(txn)) {
+		ret = PTR_ERR(txn);
+		goto out_bh;
+	}
+
+	ret = ocsfs_txn_add_bh(txn, old_bh);
+	if (ret) { ocsfs_txn_abort(txn); goto out_bh; }
+
+	ret = ocsfs_txn_add_bh(txn, new_bh);	/* idempotent when same block */
+	if (ret) { ocsfs_txn_abort(txn); goto out_bh; }
+
+	/* Update new_dir entry in-place; name and de_magic are unchanged */
+	new_de = (struct ocsfs_disk_dirent *)(new_bh->b_data + new_off);
+	new_de->de_ino       = cpu_to_le64(old_ino);
+	new_de->de_file_type = old_ft;
+
+	/* Zero the old_dir entry */
+	old_de = (struct ocsfs_disk_dirent *)(old_bh->b_data + old_off);
+	old_de->de_magic    = 0;
+	old_de->de_name_len = 0;
+	old_de->de_ino      = 0;
+
+	mark_buffer_dirty(old_bh);
+	if (new_bh != old_bh)
+		mark_buffer_dirty(new_bh);
+
+	ret = ocsfs_txn_commit(txn);
+	if (ret)
+		goto out_bh;
+
+	ocsfs_dir_btree_delete(old_dir, old_name);
+	OCSFS_I(old_dir)->i_dirent_count--;
+	inode_set_mtime_to_ts(old_dir, inode_set_ctime_current(old_dir));
+	mark_inode_dirty(old_dir);
+	inode_set_mtime_to_ts(new_dir, inode_set_ctime_current(new_dir));
+	mark_inode_dirty(new_dir);
+
+out_bh:
+	brelse(new_bh);
+	brelse(old_bh);
+	return ret;
+}
+
 static int ocsfs_rename(struct mnt_idmap *idmap,
 			struct inode *old_dir, struct dentry *old_dentry,
 			struct inode *new_dir, struct dentry *new_dentry,
@@ -363,22 +456,47 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 		goto out_unlock;
 	}
 
-	/* Remove target if it exists */
+	/* Remove or replace target if it exists */
 	if (new_inode) {
-		if (S_ISDIR(new_inode->i_mode)) {
-			if (!__ocsfs_empty_dir(new_inode)) {
-				ret = -ENOTEMPTY;
-				goto out_unlock;
+		bool dir_target = S_ISDIR(new_inode->i_mode);
+
+		if (dir_target && !__ocsfs_empty_dir(new_inode)) {
+			ret = -ENOTEMPTY;
+			goto out_unlock;
+		}
+
+		/*
+		 * Fast path: single-txn atomic replace — update new_dir's dirent
+		 * in-place (de_ino/de_ft) and zero old_dir's dirent atomically.
+		 * Eliminates the del+add window where the target is transiently
+		 * absent and the add+del window where the inode appears in both dirs.
+		 */
+		ret = rename_replace_atomic(old_dir, &old_dentry->d_name,
+					    new_dir, &new_dentry->d_name,
+					    OCSFS_I(old_inode)->i_disk_ino,
+					    ocsfs_mode_to_ft(old_inode->i_mode));
+		if (ret == 0) {
+			/* Atomic replace succeeded — update nlinks and skip add+del */
+			if (dir_target) {
+				clear_nlink(new_inode);
+				drop_nlink(new_dir);
+			} else {
+				inode_dec_link_count(new_inode);
 			}
-			ret = __ocsfs_del_dirent(new_dir, &new_dentry->d_name);
-			if (ret)
-				goto out_unlock;
+			mark_inode_dirty(new_inode);
+			goto post_dirent;
+		}
+		if (ret != -ENOENT)
+			goto out_unlock;
+
+		/* Slow path: no btree index — fall through to del+add+del */
+		ret = __ocsfs_del_dirent(new_dir, &new_dentry->d_name);
+		if (ret)
+			goto out_unlock;
+		if (dir_target) {
 			clear_nlink(new_inode);
 			drop_nlink(new_dir);
 		} else {
-			ret = __ocsfs_del_dirent(new_dir, &new_dentry->d_name);
-			if (ret)
-				goto out_unlock;
 			inode_dec_link_count(new_inode);
 		}
 		mark_inode_dirty(new_inode);
@@ -404,6 +522,7 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 		goto out_unlock;
 	}
 
+post_dirent:
 	/* Update ".." in moved directory — single in-place txn */
 	if (S_ISDIR(old_inode->i_mode) && old_dir != new_dir) {
 		ret = ocsfs_rename_update_dotdot(old_inode, new_oi->i_disk_ino);

@@ -176,6 +176,15 @@ int ocsfs_heartbeat_check_peers(struct super_block *sb)
 		if (le32_to_cpu(dhb->hb_magic) != OCSFS_HEARTBEAT_MAGIC)
 			continue;
 
+		{
+			u32 crc = ocsfs_crc32c(~0U, dhb,
+					       OCSFS_HEARTBEAT_ENTRY_SIZE -
+					       sizeof(__le32));
+
+			if (le32_to_cpu(dhb->hb_checksum) != crc)
+				continue;
+		}
+
 		hb_ts = le64_to_cpu(dhb->hb_timestamp);
 
 		/* Update cached heartbeat info */

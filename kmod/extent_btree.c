@@ -174,7 +174,12 @@ int ocsfs_extent_btree_insert(struct inode *inode, u64 logical, u64 physical,
 	struct ocsfs_txn *txn;
 	struct ocsfs_btree bt;
 	struct ext_btree_ctx ec;
-	int ret = ext_btree_open(inode, &bt, &ec);
+	int ret;
+
+	if (physical > 0xFFFFFFFFFFULL || len > 0x3FFFFFU || (flags & ~0x3U))
+		return -EINVAL;
+
+	ret = ext_btree_open(inode, &bt, &ec);
 
 	if (ret)
 		return ret;
@@ -234,8 +239,16 @@ int ocsfs_extent_btree_migrate(struct inode *inode)
 
 	for (i = 0; i < oi->i_extent_count; i++) {
 		struct ocsfs_extent *e = &oi->i_extents[i];
-		u64 val = ext_encode(e->physical_block, e->length, e->flags);
+		u64 val;
 
+		if (e->physical_block > 0xFFFFFFFFFFULL ||
+		    e->length > 0x3FFFFFU || (e->flags & ~0x3U)) {
+			pr_err("ocsfs: inode %llu: extent %d overflows btree encoding\n",
+			       oi->i_disk_ino, i);
+			ret = -EINVAL;
+			goto abort;
+		}
+		val = ext_encode(e->physical_block, e->length, e->flags);
 		ret = ocsfs_btree_insert(&bt, e->logical_block, val);
 		if (ret) {
 			pr_err("ocsfs: inode %llu: migrate extent %d failed: %d\n",

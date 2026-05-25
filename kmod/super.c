@@ -266,8 +266,12 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		ret = ret < 0 ? ret : -EOPNOTSUPP;
 		goto fail_ags;
 	}
-	if (sbi->s_clustered && !sbi->s_pr_capable && !sbi->s_degraded)
-		pr_warn("ocsfs: no SCSI PR — zombie node risk; mount with degraded to silence\n");
+	if (sbi->s_clustered && !sbi->s_pr_capable && !sbi->s_degraded) {
+		pr_err("ocsfs: clustered mount requires SCSI PR for node fencing; "
+		       "use mount option 'degraded' to override (zombie node risk)\n");
+		ret = -EOPNOTSUPP;
+		goto fail_cluster;
+	}
 
 	/* Initialize journal at our node slot's region */
 	ret = ocsfs_journal_init(sb);
