@@ -316,22 +316,10 @@ static int ocsfs_fsync(struct file *file, loff_t start, loff_t end,
 	 */
 	return blkdev_issue_flush(inode->i_sb->s_bdev);
 }
-
-/* ═══════════════════════════════════════════════════════════════
- * REMAP FILE RANGE — extent sharing for cp --reflink / FICLONE
- *
- * Clones a block-aligned byte range from src to dst by sharing
- * physical extents and incrementing their reference counts.  The
- * caller (VFS) guarantees both files are on the same superblock.
- * DEDUP (REMAP_FILE_DEDUP) is not supported; return -EINVAL.
- * ═══════════════════════════════════════════════════════════════ */
-
-/* Callback for the btree iterator: clone each overlapping extent */
+/* REMAP FILE RANGE — extent sharing for cp --reflink / FICLONE (DEDUP not supported) */
 struct ocsfs_remap_ctx {
 	struct inode         *dst;
-	u64                   src_blk;  /* first src logical block */
-	u64                   dst_blk;  /* first dst logical block */
-	u64                   end_blk;  /* src_blk + len_blks (exclusive) */
+	u64                   src_blk, dst_blk, end_blk;
 	struct ocsfs_sb_info *sbi;
 	int                   ret;
 };
@@ -366,7 +354,6 @@ static int remap_extent_cb(u64 logical, u64 physical, u32 length,
 	rc->dst->i_blocks += (u64)clip * (rc->sbi->s_block_size / 512);
 	return 0;
 }
-
 static loff_t ocsfs_remap_file_range(struct file *src_file, loff_t pos_in,
 				     struct file *dst_file, loff_t pos_out,
 				     loff_t remap_len, unsigned int remap_flags)
@@ -469,14 +456,44 @@ out_unlock_vfs:
 	return ret ? ret : remap_len;
 }
 
+static long ocsfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	struct inode *inode = file_inode(file);
+	struct ocsfs_snap_arg sa;
+	struct inode *dir;
+	struct qstr qname;
+	int ret;
+
+	if (cmd == OCSFS_IOC_SNAP_DELETE)
+		return ocsfs_snapshot_delete(inode);
+
+	if (cmd != OCSFS_IOC_SNAP_CREATE)
+		return -ENOTTY;
+
+	if (copy_from_user(&sa, (void __user *)arg, sizeof(sa)))
+		return -EFAULT;
+	sa.name[OCSFS_SNAP_NAME_MAX] = '\0';
+	qname.len = strnlen(sa.name, OCSFS_SNAP_NAME_MAX);
+	if (!qname.len)
+		return -EINVAL;
+	qname.name = sa.name;
+	dir = ocsfs_iget(inode->i_sb, sa.dir_ino);
+	if (IS_ERR(dir))
+		return PTR_ERR(dir);
+	ret = S_ISDIR(dir->i_mode) ?
+	      ocsfs_snapshot_create(inode, dir, &qname) : -ENOTDIR;
+	iput(dir);
+	return ret;
+}
 const struct file_operations ocsfs_file_fops = {
-	.llseek          = ocsfs_file_llseek,
-	.read_iter       = ocsfs_file_read_iter,   /* iomap-based (iomap.c) */
-	.write_iter      = ocsfs_file_write_iter,  /* iomap-based (iomap.c) */
-	.mmap            = generic_file_mmap,
-	.open            = ocsfs_open,
-	.fsync           = ocsfs_fsync,
-	.fallocate       = ocsfs_fallocate,        /* thin.c */
-	.splice_read     = filemap_splice_read,
+	.llseek           = ocsfs_file_llseek,
+	.read_iter        = ocsfs_file_read_iter,   /* iomap-based (iomap.c) */
+	.write_iter       = ocsfs_file_write_iter,  /* iomap-based (iomap.c) */
+	.mmap             = generic_file_mmap,
+	.open             = ocsfs_open,
+	.fsync            = ocsfs_fsync,
+	.fallocate        = ocsfs_fallocate,         /* thin.c */
+	.splice_read      = filemap_splice_read,
 	.remap_file_range = ocsfs_remap_file_range,
+	.unlocked_ioctl   = ocsfs_ioctl,
 };

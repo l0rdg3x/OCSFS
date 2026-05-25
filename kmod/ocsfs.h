@@ -983,6 +983,17 @@ void ocsfs_thin_stats(struct inode *inode, u64 *written, u64 *unwritten);
 
 /* === Phase 4: Advanced Features + Proxmox Integration === */
 
+/* ioctl interface for snapshot management (OCSFS_IOC_SNAP_CREATE/DELETE) */
+#define OCSFS_SNAP_NAME_MAX  255
+
+struct ocsfs_snap_arg {
+	__u64 dir_ino;                     /* inode of the target directory */
+	char  name[OCSFS_SNAP_NAME_MAX + 1];
+};
+
+#define OCSFS_IOC_SNAP_CREATE  _IOW('O', 1, struct ocsfs_snap_arg)
+#define OCSFS_IOC_SNAP_DELETE  _IO ('O', 2)  /* invoked on the snap inode */
+
 /* snapshot.c — CoW file-level snapshots */
 int ocsfs_snapshot_create(struct inode *src, struct inode *dir,
 			  const struct qstr *name);
