@@ -407,6 +407,63 @@ int ocsfs_del_dirent(struct inode *dir, const struct qstr *name)
 }
 
 /* ═══════════════════════════════════════════════════════════════
+ * UPDATE DIRENT — in-place inode number / file-type swap (RENAME_EXCHANGE)
+ * ═══════════════════════════════════════════════════════════════ */
+
+int __ocsfs_update_dirent_ino(struct inode *dir, const struct qstr *name,
+			      u64 new_ino, u8 new_ft)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(dir->i_sb);
+	u64 dir_blocks = (dir->i_size + sbi->s_block_size - 1) /
+			 sbi->s_block_size;
+	u64 b;
+
+	for (b = 0; b < dir_blocks; b++) {
+		struct buffer_head *bh;
+		u32 off;
+
+		bh = ocsfs_dir_bread(dir, b);
+		if (!bh)
+			continue;
+
+		for (off = 0; off + OCSFS_DIRENT_SIZE <= sbi->s_block_size;
+		     off += OCSFS_DIRENT_SIZE) {
+			struct ocsfs_disk_dirent *de =
+				(struct ocsfs_disk_dirent *)(bh->b_data + off);
+
+			if (le32_to_cpu(de->de_magic) != OCSFS_DIRENT_MAGIC)
+				continue;
+			if (de->de_name_len != name->len)
+				continue;
+			if (memcmp(de->de_name, name->name, name->len) != 0)
+				continue;
+
+			{
+				struct ocsfs_txn *txn;
+				int tr;
+
+				txn = ocsfs_txn_begin(dir->i_sb);
+				if (IS_ERR(txn)) { brelse(bh); return PTR_ERR(txn); }
+				tr = ocsfs_txn_add_bh(txn, bh);
+				if (tr) { ocsfs_txn_abort(txn); brelse(bh); return tr; }
+				de->de_ino       = cpu_to_le64(new_ino);
+				de->de_file_type = new_ft;
+				brelse(bh);
+				tr = ocsfs_txn_commit(txn);
+				if (tr) return tr;
+			}
+			ocsfs_dir_btree_delete(dir, name);
+			ocsfs_dir_btree_insert(dir, name, new_ino, new_ft);
+			inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
+			mark_inode_dirty(dir);
+			return 0;
+		}
+		brelse(bh);
+	}
+	return -ENOENT;
+}
+
+/* ═══════════════════════════════════════════════════════════════
  * EMPTY DIR CHECK
  * ═══════════════════════════════════════════════════════════════ */
 

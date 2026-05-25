@@ -782,6 +782,8 @@ struct buffer_head *ocsfs_dir_bread(struct inode *dir, u64 logical_block);
 int __ocsfs_add_dirent(struct inode *dir, const struct qstr *name,
 		       u64 ino, u8 file_type);
 int __ocsfs_del_dirent(struct inode *dir, const struct qstr *name);
+int __ocsfs_update_dirent_ino(struct inode *dir, const struct qstr *name,
+			      u64 new_ino, u8 new_ft);
 int __ocsfs_empty_dir(struct inode *dir);
 struct dentry *ocsfs_lookup(struct inode *dir, struct dentry *dentry,
 			    unsigned int flags);

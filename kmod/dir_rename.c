@@ -251,7 +251,7 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 	int ret;
 	int i;
 
-	if (flags & ~RENAME_NOREPLACE)
+	if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE))
 		return -EINVAL;
 
 	/* RENAME_NOREPLACE: fail if target already exists */
@@ -270,10 +270,17 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 			if (ni != old_oi && ni != new_oi)
 				lock_arr[n_locks++] = ni;
 		}
-		if (S_ISDIR(old_inode->i_mode) && old_dir != new_dir) {
-			struct ocsfs_inode_info *mi = OCSFS_I(old_inode);
-			if (mi != old_oi && mi != new_oi)
-				lock_arr[n_locks++] = mi;
+		/* Lock old_inode: ".." update (dir crossing) or RENAME_EXCHANGE ctime */
+		{
+			bool need = (S_ISDIR(old_inode->i_mode) && old_dir != new_dir) ||
+				    (flags & RENAME_EXCHANGE);
+			if (need) {
+				struct ocsfs_inode_info *mi = OCSFS_I(old_inode);
+
+				if (mi != old_oi && mi != new_oi &&
+				    !(new_inode && OCSFS_I(new_inode) == mi))
+					lock_arr[n_locks++] = mi;
+			}
 		}
 
 		/* Insertion sort by i_disk_ino — at most 4 elements */
@@ -297,6 +304,63 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 				return ret;
 			}
 		}
+	}
+
+	/* RENAME_EXCHANGE: swap the two directory entries in-place */
+	if (flags & RENAME_EXCHANGE) {
+		bool old_is_dir = S_ISDIR(old_inode->i_mode);
+		bool new_is_dir = S_ISDIR(new_inode->i_mode);
+
+		ret = __ocsfs_update_dirent_ino(old_dir, &old_dentry->d_name,
+						OCSFS_I(new_inode)->i_disk_ino,
+						ocsfs_mode_to_ft(new_inode->i_mode));
+		if (ret)
+			goto out_unlock;
+
+		ret = __ocsfs_update_dirent_ino(new_dir, &new_dentry->d_name,
+						OCSFS_I(old_inode)->i_disk_ino,
+						ocsfs_mode_to_ft(old_inode->i_mode));
+		if (ret) {
+			int comp = __ocsfs_update_dirent_ino(
+					old_dir, &old_dentry->d_name,
+					OCSFS_I(old_inode)->i_disk_ino,
+					ocsfs_mode_to_ft(old_inode->i_mode));
+			if (comp)
+				pr_err("ocsfs: exchange rollback failed (%d) — "
+				       "inode %llu may be orphaned, run fsck\n",
+				       comp, OCSFS_I(old_inode)->i_disk_ino);
+			goto out_unlock;
+		}
+
+		if (old_dir != new_dir) {
+			if (old_is_dir) {
+				ret = ocsfs_rename_update_dotdot(old_inode,
+								 new_oi->i_disk_ino);
+				if (ret)
+					goto out_unlock;
+				drop_nlink(old_dir);
+				inc_nlink(new_dir);
+			}
+			if (new_is_dir) {
+				ret = ocsfs_rename_update_dotdot(new_inode,
+								 old_oi->i_disk_ino);
+				if (ret)
+					goto out_unlock;
+				drop_nlink(new_dir);
+				inc_nlink(old_dir);
+			}
+			if (old_is_dir || new_is_dir) {
+				mark_inode_dirty(old_dir);
+				mark_inode_dirty(new_dir);
+			}
+		}
+
+		inode_set_ctime_current(old_inode);
+		inode_set_ctime_current(new_inode);
+		mark_inode_dirty(old_inode);
+		mark_inode_dirty(new_inode);
+		ret = 0;
+		goto out_unlock;
 	}
 
 	/* Remove target if it exists */
