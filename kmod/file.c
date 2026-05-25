@@ -247,6 +247,34 @@ static int ocsfs_open(struct inode *inode, struct file *file)
 	return generic_file_open(inode, file);
 }
 
+/*
+ * ocsfs_file_llseek — extent-aware SEEK_HOLE / SEEK_DATA.
+ *
+ * generic_file_llseek() uses the page cache for SEEK_HOLE/SEEK_DATA,
+ * which gives wrong results for sparse regions never faulted in.
+ * Use iomap_seek_{hole,data} instead — they walk the on-disk extent
+ * map directly, enabling cp --sparse / qemu-img convert to work correctly.
+ */
+static loff_t ocsfs_file_llseek(struct file *file, loff_t offset, int whence)
+{
+	struct inode *inode = file_inode(file);
+
+	switch (whence) {
+	case SEEK_HOLE:
+		offset = iomap_seek_hole(inode, offset, &ocsfs_iomap_ops);
+		break;
+	case SEEK_DATA:
+		offset = iomap_seek_data(inode, offset, &ocsfs_iomap_ops);
+		break;
+	default:
+		return generic_file_llseek(file, offset, whence);
+	}
+
+	if (offset < 0)
+		return offset;
+	return vfs_setpos(file, offset, inode->i_sb->s_maxbytes);
+}
+
 static int ocsfs_fsync(struct file *file, loff_t start, loff_t end,
 		       int datasync)
 {
@@ -290,7 +318,7 @@ static int ocsfs_fsync(struct file *file, loff_t start, loff_t end,
 }
 
 const struct file_operations ocsfs_file_fops = {
-	.llseek          = generic_file_llseek,
+	.llseek          = ocsfs_file_llseek,
 	.read_iter       = ocsfs_file_read_iter,   /* iomap-based (iomap.c) */
 	.write_iter      = ocsfs_file_write_iter,  /* iomap-based (iomap.c) */
 	.mmap            = generic_file_mmap,
