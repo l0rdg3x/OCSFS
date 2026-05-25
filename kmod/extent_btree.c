@@ -859,3 +859,49 @@ abort:
 	ocsfs_txn_abort(txn);
 	return ret;
 }
+
+/*
+ * Atomically replace one btree extent entry with a compressed version.
+ * Deletes the original entry and inserts a new one with new_phys/new_len/new_flags
+ * in a single journal transaction — no window where the logical range is absent.
+ * Caller must hold i_extent_lock.
+ */
+int ocsfs_extent_btree_compress_one(struct inode *inode,
+				    const struct ocsfs_extent *old_ext,
+				    u64 new_phys, u32 new_len, u16 new_flags)
+{
+	struct ocsfs_inode_info *oi = OCSFS_I(inode);
+	struct ocsfs_txn *txn;
+	struct ocsfs_btree bt;
+	struct ext_btree_ctx ec;
+	int ret;
+
+	ret = ext_btree_open(inode, &bt, &ec);
+	if (ret)
+		return ret;
+
+	txn = ocsfs_txn_begin(inode->i_sb);
+	if (IS_ERR(txn))
+		return PTR_ERR(txn);
+	ec.txn = txn;
+
+	ret = ocsfs_btree_delete(&bt, old_ext->logical_block);
+	if (ret)
+		goto abort_cmp;
+	oi->i_extent_tree_root = bt.root_block;
+
+	ret = ocsfs_btree_insert(&bt, old_ext->logical_block,
+				 ext_encode(new_phys, new_len, new_flags));
+	if (ret)
+		goto abort_cmp;
+	oi->i_extent_tree_root = bt.root_block;
+
+	ret = ocsfs_txn_commit(txn);
+	if (!ret)
+		mark_inode_dirty(inode);
+	return ret;
+
+abort_cmp:
+	ocsfs_txn_abort(txn);
+	return ret;
+}

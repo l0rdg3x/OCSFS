@@ -486,13 +486,38 @@ void ocsfs_compress_stats(struct inode *inode, u64 *disk_size,
 	*logical_size = logical;
 }
 
+/* ── btree collect helper (used by ocsfs_compress_file btree path) ────────── */
+
+struct compress_collect_ctx {
+	struct ocsfs_extent *arr;
+	u32 max;
+	u32 idx;
+};
+
+static int compress_collect_cb(u64 logical, u64 physical, u32 length,
+				u16 flags, void *ctx)
+{
+	struct compress_collect_ctx *cc = ctx;
+
+	if (cc->idx >= cc->max)
+		return 1; /* stop */
+	cc->arr[cc->idx].logical_block  = logical;
+	cc->arr[cc->idx].physical_block = physical;
+	cc->arr[cc->idx].length         = length;
+	cc->arr[cc->idx].flags          = flags;
+	cc->idx++;
+	return 0;
+}
+
 /*
  * ocsfs_compress_file() — Lazily compress all uncompressed extents of a file.
  *
  * Called from ocsfs_fsync(). First flushes dirty pages to disk (uncompressed),
  * then re-reads each extent, compresses in memory, allocates fewer blocks, and
- * updates the in-memory extent map. If compression does not reduce size the
- * extent is left as-is. Btree-backed inodes are skipped (not yet supported).
+ * updates the on-disk extent map. If compression does not reduce size the
+ * extent is left as-is.
+ *
+ * Both inline and btree-backed inodes are handled.
  */
 int ocsfs_compress_file(struct inode *inode)
 {
@@ -511,9 +536,130 @@ int ocsfs_compress_file(struct inode *inode)
 		return ret;
 
 	mutex_lock(&oi->i_extent_lock);
-	if (oi->i_extent_tree_root)
-		goto unlock;  /* btree-backed: skip; data on disk uncompressed */
 
+	/* ── btree-backed inodes: collect snapshot, then compress outside lock ── */
+	if (oi->i_extent_tree_root) {
+		struct compress_collect_ctx cc;
+		struct ocsfs_extent *exts;
+		u64 count64 = 0;
+		u32 cnt, k;
+
+		ocsfs_extent_btree_count(inode, &count64);
+		cnt = (u32)min_t(u64, count64, 4096);
+		if (!cnt) {
+			mutex_unlock(&oi->i_extent_lock);
+			return 0;
+		}
+
+		exts = kvmalloc_array(cnt, sizeof(*exts), GFP_NOFS);
+		if (!exts) {
+			mutex_unlock(&oi->i_extent_lock);
+			return -ENOMEM;
+		}
+
+		cc.arr = exts; cc.max = cnt; cc.idx = 0;
+		ocsfs_extent_btree_iterate(inode, compress_collect_cb, &cc);
+		mutex_unlock(&oi->i_extent_lock);
+
+		for (k = 0; k < cc.idx; k++) {
+			struct ocsfs_extent *e = &exts[k];
+			void *raw, *comp;
+			unsigned int raw_size, comp_size;
+			u32 comp_blocks, j;
+			u64 new_phys, old_phys;
+			u32 old_len;
+			u16 new_flags;
+
+			if ((e->flags & (OCSFS_EXT_COMPRESSED | OCSFS_EXT_UNWRITTEN)) ||
+			    !e->physical_block)
+				continue;
+
+			raw_size = (unsigned int)e->length * sbi->s_block_size;
+			if (raw_size > (1u << 20))
+				continue;
+
+			raw = kvmalloc(raw_size, GFP_NOFS);
+			if (!raw) { ret = -ENOMEM; break; }
+
+			for (j = 0; j < e->length; j++) {
+				struct buffer_head *bh =
+					sb_bread(sb, e->physical_block + j);
+
+				if (!bh) { kvfree(raw); ret = -EIO; break; }
+				memcpy(raw + (size_t)j * sbi->s_block_size,
+				       bh->b_data, sbi->s_block_size);
+				brelse(bh);
+			}
+			if (ret) break;
+
+			comp = kvmalloc(raw_size, GFP_NOFS);
+			if (!comp) { kvfree(raw); ret = -ENOMEM; break; }
+
+			comp_size = raw_size;
+			if (ocsfs_compress_data(algo, raw, raw_size, comp,
+						&comp_size) ||
+			    comp_size >= raw_size) {
+				kvfree(raw); kvfree(comp);
+				continue;
+			}
+			kvfree(raw);
+
+			comp_blocks = (comp_size + sbi->s_block_size - 1) /
+				      sbi->s_block_size;
+			if (ocsfs_alloc_blocks(sb, 0, comp_blocks, &new_phys)) {
+				kvfree(comp); continue;
+			}
+
+			for (j = 0; j < comp_blocks; j++) {
+				struct buffer_head *bh =
+					sb_getblk(sb, new_phys + j);
+				unsigned int off   = j * sbi->s_block_size;
+				unsigned int chunk = min_t(unsigned int,
+							   comp_size - off,
+							   sbi->s_block_size);
+
+				if (!bh) {
+					kvfree(comp);
+					ocsfs_free_blocks(sb, new_phys, comp_blocks);
+					ret = -EIO; break;
+				}
+				lock_buffer(bh);
+				memcpy(bh->b_data, comp + off, chunk);
+				if (chunk < sbi->s_block_size)
+					memset(bh->b_data + chunk, 0,
+					       sbi->s_block_size - chunk);
+				set_buffer_uptodate(bh);
+				mark_buffer_dirty(bh);
+				unlock_buffer(bh);
+				sync_dirty_buffer(bh);
+				brelse(bh);
+			}
+			kvfree(comp);
+			if (ret) break;
+
+			new_flags = ocsfs_ext_set_comp_algo(
+					e->flags | OCSFS_EXT_COMPRESSED, algo);
+			old_phys = e->physical_block;
+			old_len  = e->length;
+
+			mutex_lock(&oi->i_extent_lock);
+			ret = ocsfs_extent_btree_compress_one(inode, e,
+							      new_phys,
+							      comp_blocks,
+							      new_flags);
+			mutex_unlock(&oi->i_extent_lock);
+
+			if (!ret)
+				ocsfs_free_blocks(sb, old_phys, old_len);
+			else
+				ocsfs_free_blocks(sb, new_phys, comp_blocks);
+		}
+
+		kvfree(exts);
+		return ret;
+	}
+
+	/* ── inline extents ── */
 	for (i = 0; i < oi->i_extent_count; i++) {
 		struct ocsfs_extent *e = &oi->i_extents[i];
 		void *raw, *comp;

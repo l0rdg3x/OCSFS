@@ -810,6 +810,9 @@ int ocsfs_extent_btree_punch_hole(struct inode *inode,
 				  u64 start_block, u64 end_block);
 int ocsfs_extent_btree_zero_range(struct inode *inode,
 				  u64 start_block, u64 end_block);
+int ocsfs_extent_btree_compress_one(struct inode *inode,
+				    const struct ocsfs_extent *old_ext,
+				    u64 new_phys, u32 new_len, u16 new_flags);
 
 /* bitmap.c */
 int ocsfs_alloc_blocks(struct super_block *sb, u32 ag_hint, u32 count,
