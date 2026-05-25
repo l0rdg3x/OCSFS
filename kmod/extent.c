@@ -173,25 +173,53 @@ int ocsfs_extent_truncate(struct inode *inode, u64 from_block)
 		struct ocsfs_extent *e = &oi->i_extents[i];
 
 		if (e->logical_block >= from_block) {
+			/*
+			 * Whole extent beyond from_block: free physical blocks.
+			 * For compressed extents, the on-disk block count is
+			 * phys_length (< e->length); freeing e->length would
+			 * corrupt other files' blocks.
+			 */
+			u32 phys = (e->flags & OCSFS_EXT_COMPRESSED &&
+				    e->phys_length)
+				   ? (u32)e->phys_length : e->length;
+
 			ret = ocsfs_free_blocks_txn(txn, e->physical_block,
-						    e->length);
+						    phys);
 			if (ret)
 				goto abort;
-			inode->i_blocks -= (u64)e->length *
-					   (sbi->s_block_size / 512);
+			inode->i_blocks -= (u64)phys * (sbi->s_block_size / 512);
 			oi->i_extent_count--;
 		} else if (e->logical_block + e->length > from_block) {
-			u32 keep = (u32)(from_block - e->logical_block);
-			u32 freed = e->length - keep;
+			/*
+			 * Extent straddles from_block.  Compressed data cannot
+			 * be sliced at an arbitrary logical boundary: decompress
+			 * the extent first so the tail is addressable as plain
+			 * physical blocks, then free the unwanted tail blocks.
+			 */
+			if (e->flags & OCSFS_EXT_COMPRESSED) {
+				int dr = ocsfs_extent_decompress_for_write(
+					inode, e->logical_block);
+				if (dr) {
+					ret = dr;
+					goto abort;
+				}
+				i++; /* re-visit this index, now uncompressed */
+				continue;
+			}
 
-			ret = ocsfs_free_blocks_txn(txn,
-						    e->physical_block + keep,
-						    freed);
-			if (ret)
-				goto abort;
-			inode->i_blocks -= (u64)freed *
-					   (sbi->s_block_size / 512);
-			e->length = keep;
+			{
+				u32 keep  = (u32)(from_block - e->logical_block);
+				u32 freed = e->length - keep;
+
+				ret = ocsfs_free_blocks_txn(txn,
+							    e->physical_block +
+							    keep, freed);
+				if (ret)
+					goto abort;
+				inode->i_blocks -= (u64)freed *
+						   (sbi->s_block_size / 512);
+				e->length = keep;
+			}
 		}
 	}
 
