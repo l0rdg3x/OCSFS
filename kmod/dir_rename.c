@@ -733,6 +733,43 @@ static int ocsfs_link(struct dentry *old_dentry, struct inode *dir,
 }
 
 /* ═══════════════════════════════════════════════════════════════
+ * TMPFILE — O_TMPFILE support (vim, make, gcc, etc.)
+ *
+ * Creates a nameless inode.  OCSFS_IFLAG_ORPHAN is kept set — the inode
+ * has no directory entry and is freed by evict_inode when the last fd
+ * closes (i_nlink == 0).  On crash the orphan scan at next mount reports
+ * it; fsck reclaims the blocks.
+ * ═══════════════════════════════════════════════════════════════ */
+
+static int ocsfs_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
+			 struct file *file, umode_t mode)
+{
+	struct inode *inode;
+	int ret;
+
+	inode = ocsfs_new_inode(dir, mode);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
+
+	ret = security_inode_init_security(inode, dir, NULL,
+					   ocsfs_initxattrs, NULL);
+	if (ret && ret != -EOPNOTSUPP)
+		goto fail;
+
+	ret = ocsfs_init_acl(idmap, inode, dir);
+	if (ret)
+		goto fail;
+
+	mark_inode_dirty(inode);
+	d_tmpfile(file, inode);   /* decrements i_nlink to 0, instantiates */
+	return finish_open_simple(file, 0);
+fail:
+	inode_dec_link_count(inode);
+	discard_new_inode(inode);
+	return ret;
+}
+
+/* ═══════════════════════════════════════════════════════════════
  * OPERATIONS TABLES
  * ═══════════════════════════════════════════════════════════════ */
 
@@ -753,6 +790,7 @@ const struct inode_operations ocsfs_dir_inode_ops = {
 	.fileattr_set   = ocsfs_fileattr_set,
 	.get_inode_acl  = ocsfs_get_inode_acl,
 	.set_acl        = ocsfs_set_acl,
+	.tmpfile        = ocsfs_tmpfile,
 };
 
 const struct file_operations ocsfs_dir_fops = {
