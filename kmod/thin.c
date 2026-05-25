@@ -68,10 +68,10 @@ int ocsfs_punch_hole(struct inode *inode, loff_t offset, loff_t len)
 
 		if (ext_start >= start_block && ext_end <= end_block) {
 			/* Case 1: Entire extent is punched */
-			ocsfs_free_blocks(inode->i_sb,
-					  e->physical_block, e->length);
-			inode->i_blocks -= (u64)e->length *
-					   (sbi->s_block_size / 512);
+			u32 phys = ocsfs_ext_phys_blocks(e);
+
+			ocsfs_free_blocks(inode->i_sb, e->physical_block, phys);
+			inode->i_blocks -= (u64)phys * (sbi->s_block_size / 512);
 
 			/* Remove from array */
 			if (i + 1 < oi->i_extent_count) {
@@ -81,6 +81,20 @@ int ocsfs_punch_hole(struct inode *inode, loff_t offset, loff_t len)
 					sizeof(struct ocsfs_extent));
 			}
 			oi->i_extent_count--;
+		} else if (e->flags & OCSFS_EXT_COMPRESSED) {
+			/*
+			 * Partial punch on a compressed extent: physical blocks
+			 * cannot be sliced at an arbitrary logical boundary.
+			 * Decompress in-place first, then re-visit this index.
+			 */
+			int dr = ocsfs_extent_decompress_for_write(
+					inode, e->logical_block);
+			if (dr) {
+				ret = dr;
+				break;
+			}
+			i++; /* re-visit after loop decrements i */
+			continue;
 		} else if (ext_start >= start_block && ext_start < end_block) {
 			/* Case 2: Punch head of extent */
 			u32 removed = (u32)(end_block - ext_start);
