@@ -235,9 +235,10 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	mutex_init(&sbi->s_decompress_lock);
 
 	/* Set up super_block fields */
-	sb->s_magic = OCSFS_MAGIC;
-	sb->s_op = &ocsfs_sops;
-	sb->s_xattr = ocsfs_xattr_handlers;
+	sb->s_magic  = OCSFS_MAGIC;
+	sb->s_flags |= SB_POSIXACL;
+	sb->s_op     = &ocsfs_sops;
+	sb->s_xattr  = ocsfs_xattr_handlers;
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 	sb->s_time_gran = 1;  /* nanosecond timestamps */
 

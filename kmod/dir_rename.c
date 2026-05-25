@@ -6,6 +6,7 @@
 
 #include <linux/security.h>
 #include <linux/xattr.h>
+#include <linux/posix_acl.h>
 #include "ocsfs.h"
 
 /* ═══════════════════════════════════════════════════════════════
@@ -463,6 +464,10 @@ int ocsfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	if (ret && ret != -EOPNOTSUPP)
 		goto fail;
 
+	ret = ocsfs_init_acl(idmap, inode, dir);
+	if (ret)
+		goto fail;
+
 	ret = ocsfs_add_dirent(dir, &dentry->d_name,
 			       OCSFS_I(inode)->i_disk_ino,
 			       ocsfs_mode_to_ft(mode));
@@ -493,6 +498,10 @@ struct dentry *ocsfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	ret = security_inode_init_security(inode, dir, &dentry->d_name,
 					   ocsfs_initxattrs, NULL);
 	if (ret && ret != -EOPNOTSUPP)
+		goto fail;
+
+	ret = ocsfs_init_acl(idmap, inode, dir);
+	if (ret)
 		goto fail;
 
 	ret = ocsfs_add_dirent(inode, &(struct qstr)QSTR_INIT(".", 1),
@@ -591,6 +600,8 @@ const struct inode_operations ocsfs_dir_inode_ops = {
 	.listxattr      = ocsfs_listxattr,
 	.setattr        = ocsfs_setattr,
 	.getattr        = ocsfs_getattr,
+	.get_inode_acl  = ocsfs_get_inode_acl,
+	.set_acl        = ocsfs_set_acl,
 };
 
 const struct file_operations ocsfs_dir_fops = {

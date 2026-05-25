@@ -457,9 +457,17 @@ static const struct xattr_handler ocsfs_xattr_security_handler = {
 	.set    = handler_set,
 };
 
+static const struct xattr_handler ocsfs_xattr_system_handler = {
+	.prefix = XATTR_SYSTEM_PREFIX,
+	.flags  = OCSFS_XATTR_NS_SYSTEM,
+	.get    = handler_get,
+	.set    = handler_set,
+};
+
 const struct xattr_handler * const ocsfs_xattr_handlers[] = {
 	&ocsfs_xattr_user_handler,
 	&ocsfs_xattr_trusted_handler,
 	&ocsfs_xattr_security_handler,
+	&ocsfs_xattr_system_handler,
 	NULL,
 };

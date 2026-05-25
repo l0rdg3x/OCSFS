@@ -751,6 +751,14 @@ int ocsfs_xattr_get_internal(struct inode *inode, u8 ns, const char *name,
 int ocsfs_xattr_set_internal(struct inode *inode, u8 ns, const char *name,
 			     const void *value, size_t size, int flags);
 ssize_t ocsfs_listxattr(struct dentry *dentry, char *buffer, size_t size);
+
+/* acl.c */
+struct posix_acl *ocsfs_get_inode_acl(struct inode *inode, int type, bool rcu);
+int ocsfs_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
+		  struct posix_acl *acl, int type);
+int ocsfs_init_acl(struct mnt_idmap *idmap, struct inode *inode,
+		   struct inode *dir);
+
 struct inode *ocsfs_iget(struct super_block *sb, u64 ino);
 int ocsfs_flush_inode_locked(struct inode *inode, bool force_sync);
 int ocsfs_inode_refresh(struct inode *inode);

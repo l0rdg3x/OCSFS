@@ -7,6 +7,7 @@
  */
 
 #include <linux/security.h>
+#include <linux/posix_acl.h>
 #include "ocsfs.h"
 
 /* ═══════════════════════════════════════════════════════════════
@@ -597,6 +598,8 @@ const struct inode_operations ocsfs_file_inode_ops = {
 	.setattr        = ocsfs_setattr,
 	.getattr        = ocsfs_getattr,
 	.listxattr      = ocsfs_listxattr,
+	.get_inode_acl  = ocsfs_get_inode_acl,
+	.set_acl        = ocsfs_set_acl,
 };
 
 const struct inode_operations ocsfs_special_inode_ops = {
@@ -619,4 +622,6 @@ const struct inode_operations ocsfs_symlink_inode_ops = {
 	.setattr        = ocsfs_setattr,
 	.getattr        = ocsfs_getattr,
 	.listxattr      = ocsfs_listxattr,
+	.get_inode_acl  = ocsfs_get_inode_acl,
+	.set_acl        = ocsfs_set_acl,
 };
