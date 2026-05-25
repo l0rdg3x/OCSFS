@@ -598,6 +598,7 @@ const struct inode_operations ocsfs_file_inode_ops = {
 	.setattr        = ocsfs_setattr,
 	.getattr        = ocsfs_getattr,
 	.listxattr      = ocsfs_listxattr,
+	.fiemap         = ocsfs_fiemap,
 	.get_inode_acl  = ocsfs_get_inode_acl,
 	.set_acl        = ocsfs_set_acl,
 };

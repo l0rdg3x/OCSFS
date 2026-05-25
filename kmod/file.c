@@ -15,6 +15,7 @@
 
 #include "ocsfs.h"
 #include <linux/iomap.h>
+#include <linux/fiemap.h>
 
 /* ═══════════════════════════════════════════════════════════════
  * GET_BLOCK — maps logical file block → physical disk block
@@ -129,6 +130,99 @@ static sector_t ocsfs_bmap(struct address_space *mapping, sector_t block)
 	return generic_block_bmap(mapping, block, ocsfs_get_block);
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ * FIEMAP — physical extent layout for backup tools (vzdump, qemu-img)
+ * ═══════════════════════════════════════════════════════════════ */
+
+struct ocsfs_fiemap_ctx {
+	struct fiemap_extent_info *fieinfo;
+	u32  blksize;
+	u64  start_b;   /* requested range in bytes */
+	u64  end_b;
+	bool pending;
+	u64  p_log, p_phys, p_len;
+	u32  p_flags;
+	int  ret;
+};
+
+static int ocsfs_fiemap_cb(u64 logical, u64 physical, u32 length,
+			   u16 flags, void *priv)
+{
+	struct ocsfs_fiemap_ctx *c = priv;
+	u64 log_b  = (u64)logical  * c->blksize;
+	u64 phys_b = (u64)physical * c->blksize;
+	u64 len_b  = (u64)length   * c->blksize;
+	u32 fflags = 0;
+
+	if (log_b + len_b <= c->start_b || log_b >= c->end_b)
+		return 0;
+
+	if (flags & OCSFS_EXT_UNWRITTEN)
+		fflags |= FIEMAP_EXTENT_UNWRITTEN;
+	if (flags & OCSFS_EXT_COMPRESSED)
+		fflags |= FIEMAP_EXTENT_ENCODED;
+
+	if (c->pending) {
+		c->ret = fiemap_fill_next_extent(c->fieinfo,
+						 c->p_log, c->p_phys,
+						 c->p_len, c->p_flags);
+		if (c->ret)
+			return c->ret;
+	}
+	c->p_log   = log_b;
+	c->p_phys  = phys_b;
+	c->p_len   = len_b;
+	c->p_flags = fflags;
+	c->pending = true;
+	return 0;
+}
+
+int ocsfs_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
+		 u64 start, u64 len)
+{
+	struct ocsfs_inode_info *oi = OCSFS_I(inode);
+	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
+	struct ocsfs_fiemap_ctx c = {
+		.fieinfo  = fieinfo,
+		.blksize  = sbi->s_block_size,
+		.start_b  = start,
+		.end_b    = start + len,
+	};
+	int ret;
+	u16 i;
+
+	ret = fiemap_prep(inode, fieinfo, start, &len, FIEMAP_FLAG_SYNC);
+	if (ret)
+		return ret;
+
+	mutex_lock(&oi->i_extent_lock);
+
+	if (oi->i_extent_tree_root) {
+		ret = ocsfs_extent_btree_iterate(inode, ocsfs_fiemap_cb, &c);
+		if (ret > 0) ret = 0;
+	} else {
+		for (i = 0; i < oi->i_extent_count; i++) {
+			ocsfs_fiemap_cb(oi->i_extents[i].logical_block,
+					oi->i_extents[i].physical_block,
+					oi->i_extents[i].length,
+					oi->i_extents[i].flags, &c);
+			if (c.ret) break;
+		}
+		ret = (c.ret > 0) ? 0 : c.ret;
+	}
+
+	if (!ret && c.pending) {
+		c.p_flags |= FIEMAP_EXTENT_LAST;
+		ret = fiemap_fill_next_extent(fieinfo,
+					      c.p_log, c.p_phys,
+					      c.p_len, c.p_flags);
+		if (ret > 0) ret = 0;
+	}
+
+	mutex_unlock(&oi->i_extent_lock);
+	return ret;
+}
+
 const struct address_space_operations ocsfs_aops = {
 	.dirty_folio    = block_dirty_folio,
 	.invalidate_folio = block_invalidate_folio,
@@ -196,12 +290,12 @@ static int ocsfs_fsync(struct file *file, loff_t start, loff_t end,
 }
 
 const struct file_operations ocsfs_file_fops = {
-	.llseek         = generic_file_llseek,
-	.read_iter      = ocsfs_file_read_iter,   /* iomap-based (iomap.c) */
-	.write_iter     = ocsfs_file_write_iter,  /* iomap-based (iomap.c) */
-	.mmap           = generic_file_mmap,
-	.open           = ocsfs_open,
-	.fsync          = ocsfs_fsync,
-	.fallocate      = ocsfs_fallocate,        /* thin.c */
-	.splice_read    = filemap_splice_read,
+	.llseek          = generic_file_llseek,
+	.read_iter       = ocsfs_file_read_iter,   /* iomap-based (iomap.c) */
+	.write_iter      = ocsfs_file_write_iter,  /* iomap-based (iomap.c) */
+	.mmap            = generic_file_mmap,
+	.open            = ocsfs_open,
+	.fsync           = ocsfs_fsync,
+	.fallocate       = ocsfs_fallocate,        /* thin.c */
+	.splice_read     = filemap_splice_read,
 };
