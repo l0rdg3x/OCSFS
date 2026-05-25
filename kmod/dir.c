@@ -318,60 +318,83 @@ int ocsfs_add_dirent(struct inode *dir, const struct qstr *name,
  * DEL DIRENT — remove a directory entry by name
  * ═══════════════════════════════════════════════════════════════ */
 
+static int del_dirent_at(struct inode *dir, struct buffer_head *bh, u32 off,
+			 const struct qstr *name)
+{
+	struct ocsfs_disk_dirent *de = (struct ocsfs_disk_dirent *)(bh->b_data + off);
+	struct ocsfs_txn *txn;
+	int ret;
+
+	txn = ocsfs_txn_begin(dir->i_sb);
+	if (IS_ERR(txn)) { brelse(bh); return PTR_ERR(txn); }
+	ret = ocsfs_txn_add_bh(txn, bh);
+	if (ret) { ocsfs_txn_abort(txn); brelse(bh); return ret; }
+	de->de_name_len = 0;
+	de->de_ino      = 0;
+	de->de_magic    = 0;
+	brelse(bh);
+	ret = ocsfs_txn_commit(txn);
+	if (ret)
+		return ret;
+	OCSFS_I(dir)->i_dirent_count--;
+	ocsfs_dir_btree_delete(dir, name);
+	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
+	mark_inode_dirty(dir);
+	return 0;
+}
+
 int __ocsfs_del_dirent(struct inode *dir, const struct qstr *name)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(dir->i_sb);
-	u64 dir_blocks = (dir->i_size + sbi->s_block_size - 1) /
-			 sbi->s_block_size;
-	u64 b;
+	u64 phys_block;
+	u32 phys_off;
 
-	/*
-	 * We can't use ocsfs_dir_foreach here because we need to modify
-	 * the buffer and mark it dirty. Walk manually.
-	 */
-	for (b = 0; b < dir_blocks; b++) {
+	/* Fast path: B+ tree index → O(log N) */
+	if (!ocsfs_dir_btree_locate(dir, name, &phys_block, &phys_off)) {
 		struct buffer_head *bh;
-		u32 off;
 
-		bh = ocsfs_dir_bread(dir, b);
-		if (!bh)
-			continue;
-
-		for (off = 0; off + OCSFS_DIRENT_SIZE <= sbi->s_block_size;
-		     off += OCSFS_DIRENT_SIZE) {
-			struct ocsfs_disk_dirent *de =
-				(struct ocsfs_disk_dirent *)(bh->b_data + off);
-
-			if (le32_to_cpu(de->de_magic) != OCSFS_DIRENT_MAGIC)
-				continue;
-			if (de->de_name_len != name->len)
-				continue;
-			if (memcmp(de->de_name, name->name, name->len) != 0)
-				continue;
-
-			/* Found — journal before zeroing */
-			{
-				struct ocsfs_txn *txn;
-				int tr;
-				txn = ocsfs_txn_begin(dir->i_sb);
-				if (IS_ERR(txn)) { brelse(bh); return PTR_ERR(txn); }
-				tr = ocsfs_txn_add_bh(txn, bh);
-				if (tr) { ocsfs_txn_abort(txn); brelse(bh); return tr; }
-				de->de_name_len = 0;
-				de->de_ino = 0;
-				de->de_magic = 0;
-				brelse(bh);
-				tr = ocsfs_txn_commit(txn);
-				if (tr) return tr;
-			}
-			OCSFS_I(dir)->i_dirent_count--;
-			ocsfs_dir_btree_delete(dir, name);
-			inode_set_mtime_to_ts(dir,
-				inode_set_ctime_current(dir));
-			mark_inode_dirty(dir);
-			return 0;
+		if (sbi->s_clustered) {
+			bh = sb_getblk(dir->i_sb, phys_block);
+			if (!bh)
+				return -EIO;
+			clear_buffer_uptodate(bh);
+			if (bh_read(bh, 0) < 0) { brelse(bh); return -EIO; }
+		} else {
+			bh = sb_bread(dir->i_sb, phys_block);
+			if (!bh)
+				return -EIO;
 		}
-		brelse(bh);
+		return del_dirent_at(dir, bh, phys_off, name);
+	}
+
+	/* Slow path: linear scan (small dir or hash collision fallback) */
+	{
+		u64 dir_blocks = (dir->i_size + sbi->s_block_size - 1) /
+				 sbi->s_block_size;
+		u64 b;
+
+		for (b = 0; b < dir_blocks; b++) {
+			struct buffer_head *bh;
+			u32 off;
+
+			bh = ocsfs_dir_bread(dir, b);
+			if (!bh)
+				continue;
+			for (off = 0; off + OCSFS_DIRENT_SIZE <= sbi->s_block_size;
+			     off += OCSFS_DIRENT_SIZE) {
+				struct ocsfs_disk_dirent *de =
+					(struct ocsfs_disk_dirent *)(bh->b_data + off);
+
+				if (le32_to_cpu(de->de_magic) != OCSFS_DIRENT_MAGIC)
+					continue;
+				if (de->de_name_len != name->len)
+					continue;
+				if (memcmp(de->de_name, name->name, name->len) != 0)
+					continue;
+				return del_dirent_at(dir, bh, off, name);
+			}
+			brelse(bh);
+		}
 	}
 	return -ENOENT;
 }

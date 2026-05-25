@@ -404,7 +404,7 @@ struct ocsfs_disk_node_slot {
 	__le64  ns_mount_time;
 	__le64  ns_last_heartbeat;
 	__le64  ns_pr_key;
-	__u8    ns_auth_token[32];  /* crc32c(secret,32) LE; 0 if no auth */
+	__u8    ns_auth_token[32];  /* HMAC-SHA256(secret,"ocsfs-v1"); 0 if no auth */
 	__le32  ns_version;       /* CAS version per slot claim race-free */
 	__u8    ns_reserved2[104];
 	__le32  ns_checksum;
@@ -517,6 +517,7 @@ struct ocsfs_txn_buf {
 	struct list_head        list;
 	struct buffer_head      *bh;
 	u64                     block_num;
+	u8                      *before_buf;    /* snapshot for rollback on abort */
 	u8                      *after_buf;     /* shadow copy for AFTER-image */
 };
 
@@ -536,6 +537,7 @@ struct ocsfs_node_info {
 /* Heartbeat thread state */
 struct ocsfs_heartbeat_info {
 	struct task_struct      *hb_thread;
+	wait_queue_head_t        hb_waitq;
 	bool                    hb_running;
 	atomic64_t              hb_sequence;     /* our monotonic counter */
 };
@@ -800,6 +802,8 @@ extern const struct file_operations ocsfs_dir_fops;
 /* dir_btree.c */
 u64  ocsfs_dir_btree_lookup(struct inode *dir, const struct qstr *name,
 			    u8 *ft_out);
+int  ocsfs_dir_btree_locate(struct inode *dir, const struct qstr *name,
+			    u64 *phys_block, u32 *phys_off);
 int  ocsfs_dir_btree_insert(struct inode *dir, const struct qstr *name,
 			    u64 phys_block, u32 offset);
 int  ocsfs_dir_btree_delete(struct inode *dir, const struct qstr *name);

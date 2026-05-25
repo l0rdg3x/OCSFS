@@ -322,12 +322,19 @@ int ocsfs_txn_add_bh(struct ocsfs_txn *txn, struct buffer_head *bh)
 	if (!tb)
 		return -ENOMEM;
 
+	tb->before_buf = kmalloc(bh->b_size, GFP_KERNEL);
+	if (!tb->before_buf) {
+		kfree(tb);
+		return -ENOMEM;
+	}
 	tb->after_buf = kmalloc(bh->b_size, GFP_KERNEL);
 	if (!tb->after_buf) {
+		kfree(tb->before_buf);
 		kfree(tb);
 		return -ENOMEM;
 	}
 
+	memcpy(tb->before_buf, bh->b_data, bh->b_size);
 	tb->bh        = bh;
 	tb->block_num = bh->b_blocknr;
 	get_bh(bh);
@@ -478,6 +485,7 @@ out:
 	list_for_each_entry_safe(tb, tmp, &txn->t_buffers, list) {
 		list_del(&tb->list);
 		brelse(tb->bh);
+		kfree(tb->before_buf);
 		kfree(tb->after_buf);
 		kfree(tb);
 	}
@@ -493,9 +501,20 @@ void ocsfs_txn_abort(struct ocsfs_txn *txn)
 	struct ocsfs_journal *j = txn->t_journal;
 	struct ocsfs_txn_buf *tb, *tmp;
 
+	/*
+	 * Restore each buffer to its pre-txn state so that in-memory bitmap
+	 * bits (and other metadata) are not left in a partially-modified state
+	 * when the txn is abandoned without a COMMIT record.
+	 */
 	list_for_each_entry_safe(tb, tmp, &txn->t_buffers, list) {
+		lock_buffer(tb->bh);
+		memcpy(tb->bh->b_data, tb->before_buf, tb->bh->b_size);
+		clear_buffer_dirty(tb->bh);
+		set_buffer_uptodate(tb->bh);
+		unlock_buffer(tb->bh);
 		list_del(&tb->list);
 		brelse(tb->bh);
+		kfree(tb->before_buf);
 		kfree(tb->after_buf);
 		kfree(tb);
 	}

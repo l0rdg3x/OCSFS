@@ -358,16 +358,34 @@ static const char * const ns_pfx[4] = {
 ssize_t ocsfs_listxattr(struct dentry *dentry, char *buffer, size_t size)
 {
 	struct inode *inode = d_inode(dentry);
+	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
 	struct ocsfs_disk_xattr_block *xb;
 	struct buffer_head *bh;
 	u32 data_len, off;
 	ssize_t total = 0;
 
-	if (!oi->i_xattr_block)
+	if (sbi->s_clustered) {
+		int r = ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
+					   OCSFS_LOCK_SH);
+		if (r)
+			return r;
+		r = ocsfs_inode_refresh(inode);
+		if (r) {
+			ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
+			return r;
+		}
+	}
+
+	if (!oi->i_xattr_block) {
+		if (sbi->s_clustered)
+			ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
 		return 0;
+	}
 
 	bh = xattr_read_bh(inode);
+	if (sbi->s_clustered)
+		ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
 	if (IS_ERR(bh))
 		return PTR_ERR(bh);
 

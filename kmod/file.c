@@ -458,14 +458,18 @@ out_unlock_vfs:
 
 static long ocsfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
+	struct mnt_idmap *idmap = file_mnt_idmap(file);
 	struct inode *inode = file_inode(file);
 	struct ocsfs_snap_arg sa;
 	struct inode *dir;
 	struct qstr qname;
 	int ret;
 
-	if (cmd == OCSFS_IOC_SNAP_DELETE)
+	if (cmd == OCSFS_IOC_SNAP_DELETE) {
+		if (!inode_owner_or_capable(idmap, inode))
+			return -EPERM;
 		return ocsfs_snapshot_delete(inode);
+	}
 
 	if (cmd != OCSFS_IOC_SNAP_CREATE)
 		return -ENOTTY;
@@ -480,16 +484,39 @@ static long ocsfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	dir = ocsfs_iget(inode->i_sb, sa.dir_ino);
 	if (IS_ERR(dir))
 		return PTR_ERR(dir);
-	ret = S_ISDIR(dir->i_mode) ?
-	      ocsfs_snapshot_create(inode, dir, &qname) : -ENOTDIR;
+	if (!S_ISDIR(dir->i_mode)) {
+		iput(dir);
+		return -ENOTDIR;
+	}
+	ret = inode_permission(idmap, dir, MAY_WRITE | MAY_EXEC);
+	if (ret) {
+		iput(dir);
+		return ret;
+	}
+	ret = ocsfs_snapshot_create(inode, dir, &qname);
 	iput(dir);
 	return ret;
 }
+static int ocsfs_file_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	/*
+	 * In cluster mode, writable mmap requires DLM EX on every page fault
+	 * (page_mkwrite), which is not yet implemented. Shared writable
+	 * mappings would silently bypass inter-node coherence; disallow them.
+	 * Read-only and private mappings are safe: COW semantics mean dirty
+	 * pages never propagate back to the shared SAN block.
+	 */
+	if (OCSFS_SB(file_inode(file)->i_sb)->s_clustered &&
+	    (vma->vm_flags & VM_SHARED) && (vma->vm_flags & VM_WRITE))
+		return -EOPNOTSUPP;
+	return generic_file_mmap(file, vma);
+}
+
 const struct file_operations ocsfs_file_fops = {
 	.llseek           = ocsfs_file_llseek,
 	.read_iter        = ocsfs_file_read_iter,   /* iomap-based (iomap.c) */
 	.write_iter       = ocsfs_file_write_iter,  /* iomap-based (iomap.c) */
-	.mmap             = generic_file_mmap,
+	.mmap             = ocsfs_file_mmap,
 	.open             = ocsfs_open,
 	.fsync            = ocsfs_fsync,
 	.fallocate        = ocsfs_fallocate,         /* thin.c */

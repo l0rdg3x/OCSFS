@@ -11,7 +11,28 @@
  */
 
 #include <linux/utsname.h>
+#include <linux/crypto.h>
+#include <crypto/hash.h>
 #include "ocsfs.h"
+
+static int ocsfs_hmac_sha256(const u8 *key, const u8 *msg, size_t msg_len,
+			      u8 *out)
+{
+	struct crypto_shash *tfm;
+	SHASH_DESC_ON_STACK(desc, tfm);
+	int ret;
+
+	tfm = crypto_alloc_shash("hmac(sha256)", 0, 0);
+	if (IS_ERR(tfm))
+		return PTR_ERR(tfm);
+	ret = crypto_shash_setkey(tfm, key, 32);
+	if (!ret) {
+		desc->tfm = tfm;
+		ret = crypto_shash_digest(desc, msg, msg_len, out);
+	}
+	crypto_free_shash(tfm);
+	return ret;
+}
 
 /* ═══════════════════════════════════════════════════════════════
  * READ NODE TABLE — load all node slots into memory
@@ -83,12 +104,13 @@ int ocsfs_node_read_table(struct super_block *sb)
  * ocsfs_build_new_slot — riempie `new_dns` con lo stato che vogliamo scrivere.
  * `expected_dns` è lo stato letto da disco; `ns_version` viene incrementato.
  */
-static void ocsfs_build_new_slot(struct super_block *sb, u16 slot,
-				 const struct ocsfs_disk_node_slot *expected_dns,
-				 struct ocsfs_disk_node_slot *new_dns)
+static int ocsfs_build_new_slot(struct super_block *sb, u16 slot,
+				const struct ocsfs_disk_node_slot *expected_dns,
+				struct ocsfs_disk_node_slot *new_dns)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	struct ocsfs_node_info *ni = &sbi->s_nodes[slot];
+	int ret = 0;
 
 	memcpy(new_dns, expected_dns, sizeof(*new_dns));
 
@@ -104,17 +126,18 @@ static void ocsfs_build_new_slot(struct super_block *sb, u16 slot,
 		le32_to_cpu(expected_dns->ns_version) + 1);
 
 	if (sbi->s_auth_required) {
-		__le32 tok = cpu_to_le32(ocsfs_crc32c(0, sbi->s_cluster_secret, 32));
-
-		memcpy(new_dns->ns_auth_token, &tok, sizeof(tok));
-		memset(new_dns->ns_auth_token + sizeof(tok), 0,
-		       sizeof(new_dns->ns_auth_token) - sizeof(tok));
+		ret = ocsfs_hmac_sha256(sbi->s_cluster_secret,
+					"ocsfs-v1", 8,
+					new_dns->ns_auth_token);
+		if (ret)
+			return ret;
 	} else {
 		memset(new_dns->ns_auth_token, 0, sizeof(new_dns->ns_auth_token));
 	}
 
 	new_dns->ns_checksum = cpu_to_le32(
 		ocsfs_crc32c(~0U, new_dns, sizeof(*new_dns) - sizeof(__le32)));
+	return 0;
 }
 
 /*
@@ -147,7 +170,9 @@ static int ocsfs_node_write_slot(struct super_block *sb, u16 slot)
 	memcpy(&expected_dns, bh->b_data + boff, sizeof(expected_dns));
 	brelse(bh);
 
-	ocsfs_build_new_slot(sb, slot, &expected_dns, &new_dns);
+	ret = ocsfs_build_new_slot(sb, slot, &expected_dns, &new_dns);
+	if (ret)
+		return ret;
 
 	ret = ocsfs_atomic_cas(sb, block, boff,
 			       sizeof(struct ocsfs_disk_node_slot),
@@ -158,21 +183,24 @@ static int ocsfs_node_write_slot(struct super_block *sb, u16 slot)
 /* ═══════════════════════════════════════════════════════════════
  * AUTH VERIFICATION — compare a slot's token against our secret
  * Protects against stray nodes joining the wrong cluster.
- * Token is CRC32C(secret,32) stored as LE32 in ns_auth_token[0..3].
+ * Token is HMAC-SHA256(secret, "ocsfs-v1") in ns_auth_token[0..31].
  * ═══════════════════════════════════════════════════════════════ */
 
 int ocsfs_node_verify_auth(struct super_block *sb,
 			    const struct ocsfs_disk_node_slot *dns)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
-	__le32 expected, got;
+	u8 expected[32];
+	int ret;
 
 	if (!sbi->s_auth_required)
 		return 0;
 
-	expected = cpu_to_le32(ocsfs_crc32c(0, sbi->s_cluster_secret, 32));
-	memcpy(&got, dns->ns_auth_token, sizeof(got));
-	if (got != expected) {
+	ret = ocsfs_hmac_sha256(sbi->s_cluster_secret, "ocsfs-v1", 8, expected);
+	if (ret)
+		return ret;
+
+	if (memcmp(expected, dns->ns_auth_token, 32) != 0) {
 		pr_warn("ocsfs: node slot %u auth mismatch — wrong cluster secret?\n",
 			le16_to_cpu(dns->ns_slot_id));
 		return -EACCES;

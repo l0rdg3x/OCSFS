@@ -303,7 +303,9 @@ static int ocsfs_heartbeat_thread(void *data)
 				      (long)(next_write - jiffies),
 				      (long)(next_check - jiffies));
 		if (sleep_jiffies > 0)
-			schedule_timeout_interruptible(sleep_jiffies);
+			wait_event_interruptible_timeout(sbi->s_hb.hb_waitq,
+							 kthread_should_stop(),
+							 sleep_jiffies);
 	}
 
 	pr_info("ocsfs: heartbeat thread stopped\n");
@@ -320,6 +322,7 @@ int ocsfs_heartbeat_start(struct super_block *sb)
 	int ret;
 
 	atomic64_set(&sbi->s_hb.hb_sequence, 0);
+	init_waitqueue_head(&sbi->s_hb.hb_waitq);
 
 	/* Write initial heartbeat */
 	ret = ocsfs_heartbeat_write(sb);
@@ -344,6 +347,7 @@ void ocsfs_heartbeat_stop(struct super_block *sb)
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 
 	if (sbi->s_hb.hb_thread) {
+		wake_up(&sbi->s_hb.hb_waitq);
 		kthread_stop(sbi->s_hb.hb_thread);
 		sbi->s_hb.hb_thread = NULL;
 		sbi->s_hb.hb_running = false;

@@ -206,6 +206,7 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 
 		if (ctx->fc_has_secret) {
 			memcpy(sbi->s_cluster_secret, ctx->fc_secret, 32);
+			memzero_explicit(ctx->fc_secret, 32);
 			sbi->s_auth_required = true;
 		}
 		sbi->s_degraded = ctx->fc_degraded;
@@ -455,7 +456,11 @@ static int ocsfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 
 static void ocsfs_free_fc(struct fs_context *fc)
 {
-	kfree(fc->fs_private);
+	struct ocsfs_fs_context *ctx = fc->fs_private;
+
+	if (ctx)
+		memzero_explicit(ctx->fc_secret, 32);
+	kfree(ctx);
 }
 
 static int ocsfs_get_tree(struct fs_context *fc)

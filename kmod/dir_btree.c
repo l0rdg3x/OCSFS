@@ -233,6 +233,65 @@ u64 ocsfs_dir_btree_lookup(struct inode *dir, const struct qstr *name,
 }
 
 /*
+ * Locate a dirent by name using the B+ tree index.
+ * Returns 0 with *phys_block/*phys_off set if found; -ENOENT on miss or
+ * hash collision (caller must fall back to linear scan in that case).
+ */
+int ocsfs_dir_btree_locate(struct inode *dir, const struct qstr *name,
+			    u64 *phys_block, u32 *phys_off)
+{
+	struct ocsfs_inode_info *oi  = OCSFS_I(dir);
+	struct ocsfs_sb_info    *sbi = OCSFS_SB(dir->i_sb);
+	struct ocsfs_btree bt;
+	struct dir_btree_ctx dc;
+	struct buffer_head *bh;
+	struct ocsfs_disk_dirent *de;
+	u64 hash, encoded, block;
+	u32 offset;
+	int ret;
+
+	if (!oi->i_dir_btree_root)
+		return -ENOENT;
+
+	ret = dir_btree_open(dir, &bt, &dc, NULL);
+	if (ret)
+		return -ENOENT;
+
+	hash = dir_name_hash(name->name, name->len);
+	ret  = ocsfs_btree_search(&bt, hash, &encoded);
+	if (ret)
+		return -ENOENT;
+
+	dir_decode_val(encoded, &block, &offset);
+
+	if (sbi->s_clustered) {
+		bh = sb_getblk(dir->i_sb, block);
+		if (!bh)
+			return -EIO;
+		clear_buffer_uptodate(bh);
+		if (bh_read(bh, 0) < 0) { brelse(bh); return -EIO; }
+	} else {
+		bh = sb_bread(dir->i_sb, block);
+		if (!bh)
+			return -EIO;
+	}
+
+	if (offset + sizeof(*de) > sbi->s_block_size) { brelse(bh); return -ENOENT; }
+
+	de = (struct ocsfs_disk_dirent *)(bh->b_data + offset);
+	if (le32_to_cpu(de->de_magic) != OCSFS_DIRENT_MAGIC ||
+	    de->de_name_len != name->len ||
+	    memcmp(de->de_name, name->name, name->len) != 0) {
+		brelse(bh);
+		return -ENOENT;  /* hash collision — caller falls back to linear */
+	}
+	brelse(bh);
+	*phys_block = block;
+	*phys_off   = offset;
+	return 0;
+}
+
+/*
  * Insert or update a name→dirent mapping in the B+ tree.
  * phys_block and offset identify the dirent's location on disk.
  */
