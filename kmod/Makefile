@@ -21,7 +21,7 @@ ocsfs-y := super.o inode.o dir.o dir_rename.o file.o \
            lock.o lock_io.o \
            heartbeat.o node.o recovery.o \
            iomap.o thin.o \
-           snapshot.o refcount.o compress.o \
+           snapshot.o refcount.o compress.o compress_file.o \
            scsi_pr.o xattr.o cas.o \
            test_lock.o test_cas.o
 
