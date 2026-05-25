@@ -473,6 +473,133 @@ void ocsfs_compress_stats(struct inode *inode, u64 *disk_size,
 }
 
 /*
+ * ocsfs_extent_decompress_for_write() — Decompress a compressed extent before write.
+ *
+ * When a write targets a compressed extent, we must decompress it first.
+ * Otherwise the VFS would write raw (uncompressed) data to the compressed
+ * physical blocks while keeping the COMPRESSED flag set, making the extent
+ * unreadable.
+ *
+ * Caller holds oi->i_extent_lock.  The extent is updated in-place in
+ * oi->i_extents[]; old compressed blocks are freed.  Returns 0 on success.
+ * On failure the extent is left unchanged (still compressed).
+ */
+int ocsfs_extent_decompress_for_write(struct inode *inode, u64 logical_block)
+{
+	struct ocsfs_inode_info *oi = OCSFS_I(inode);
+	struct super_block *sb = inode->i_sb;
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	struct ocsfs_extent *e = NULL;
+	u8 algo;
+	u32 phys_blks;
+	size_t comp_size, decomp_size;
+	void *comp_buf, *decomp_buf;
+	struct buffer_head *bh;
+	u64 new_phys, old_phys;
+	u32 old_phys_blks;
+	u32 i, j;
+	size_t copied;
+	int ret;
+
+	/* btree-backed inodes don't use compression — nothing to do */
+	if (oi->i_extent_tree_root)
+		return 0;
+
+	/* Find the extent in the inline array */
+	for (i = 0; i < oi->i_extent_count; i++) {
+		struct ocsfs_extent *cur = &oi->i_extents[i];
+
+		if (logical_block >= cur->logical_block &&
+		    logical_block < cur->logical_block + cur->length) {
+			e = cur;
+			break;
+		}
+	}
+	if (!e || !(e->flags & OCSFS_EXT_COMPRESSED))
+		return 0; /* nothing to decompress */
+
+	algo      = ocsfs_ext_comp_algo(e->flags);
+	phys_blks = e->phys_length ? (u32)e->phys_length : e->length;
+	comp_size   = (size_t)phys_blks  * sbi->s_block_size;
+	decomp_size = (size_t)e->length  * sbi->s_block_size;
+
+	if (comp_size > (1u << 20) || decomp_size > (1u << 20))
+		return -EFBIG;
+
+	comp_buf = kvmalloc(comp_size, GFP_NOFS);
+	if (!comp_buf)
+		return -ENOMEM;
+
+	decomp_buf = kvmalloc(decomp_size, GFP_NOFS);
+	if (!decomp_buf) {
+		kvfree(comp_buf);
+		return -ENOMEM;
+	}
+
+	/* Read compressed blocks from disk */
+	copied = 0;
+	for (j = 0; j < phys_blks && copied < comp_size; j++) {
+		bh = sb_bread(sb, e->physical_block + j);
+		if (!bh) {
+			ret = -EIO;
+			goto out;
+		}
+		memcpy(comp_buf + copied, bh->b_data,
+		       min_t(size_t, sbi->s_block_size, comp_size - copied));
+		copied += sbi->s_block_size;
+		brelse(bh);
+	}
+
+	ret = ocsfs_decompress_data(sb, algo, comp_buf, comp_size,
+				    decomp_buf, decomp_size);
+	if (ret)
+		goto out;
+
+	/* Allocate blocks for the full uncompressed extent */
+	ret = ocsfs_alloc_blocks(sb, 0, e->length, &new_phys);
+	if (ret)
+		goto out;
+
+	/* Write uncompressed data to new blocks */
+	for (j = 0; j < e->length; j++) {
+		unsigned int off   = j * sbi->s_block_size;
+		unsigned int chunk = min_t(unsigned int,
+					   sbi->s_block_size, decomp_size - off);
+
+		bh = sb_getblk(sb, new_phys + j);
+		if (!bh) {
+			ocsfs_free_blocks(sb, new_phys, e->length);
+			ret = -EIO;
+			goto out;
+		}
+		lock_buffer(bh);
+		memcpy(bh->b_data, decomp_buf + off, chunk);
+		if (chunk < sbi->s_block_size)
+			memset(bh->b_data + chunk, 0, sbi->s_block_size - chunk);
+		set_buffer_uptodate(bh);
+		mark_buffer_dirty(bh);
+		unlock_buffer(bh);
+		sync_dirty_buffer(bh);
+		brelse(bh);
+	}
+
+	/* Update extent in-place: uncompressed, new physical blocks */
+	old_phys      = e->physical_block;
+	old_phys_blks = phys_blks;
+	e->physical_block = new_phys;
+	e->flags &= ~(OCSFS_EXT_COMPRESSED | OCSFS_EXT_COMP_ALGO_MASK);
+	e->phys_length    = 0;
+	mark_inode_dirty(inode);
+
+	ocsfs_free_blocks(sb, old_phys, old_phys_blks);
+	ret = 0;
+out:
+	kvfree(decomp_buf);
+	kvfree(comp_buf);
+	return ret;
+}
+
+/*
  * ocsfs_compress_file() — Lazily compress all uncompressed inline extents.
  *
  * Called from ocsfs_fsync(). First flushes dirty pages to disk (uncompressed),

@@ -987,6 +987,7 @@ int ocsfs_compress_extent_read(struct inode *inode,
 u8 ocsfs_get_compression_algo(struct inode *inode);
 int ocsfs_set_compression(struct inode *inode, u8 algo);
 int ocsfs_compress_file(struct inode *inode);
+int ocsfs_extent_decompress_for_write(struct inode *inode, u64 logical_block);
 void ocsfs_compress_stats(struct inode *inode, u64 *disk_size,
 			  u64 *logical_size);
 

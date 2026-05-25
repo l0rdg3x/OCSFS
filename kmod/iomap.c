@@ -47,6 +47,29 @@ static int ocsfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 		loff_t mapped_len;
 
 		/*
+		 * Decompress before write: writing raw data into a compressed
+		 * extent would leave the COMPRESSED flag set with uncompressed
+		 * data on disk, corrupting subsequent reads.  Decompress in
+		 * place so the caller sees a plain WRITTEN extent.
+		 */
+		if ((flags & IOMAP_WRITE) &&
+		    (ext.flags & OCSFS_EXT_COMPRESSED)) {
+			ret = ocsfs_extent_decompress_for_write(inode,
+								logical_block);
+			if (ret) {
+				mutex_unlock(&oi->i_extent_lock);
+				return ret;
+			}
+			ret = ocsfs_extent_lookup(inode, logical_block, &ext);
+			if (ret || ext.physical_block == 0) {
+				mutex_unlock(&oi->i_extent_lock);
+				return ret ? ret : -EIO;
+			}
+			offset_in_ext    = logical_block - ext.logical_block;
+			remaining_blocks = ext.length - offset_in_ext;
+		}
+
+		/*
 		 * CoW: if writing to a shared extent (refcount > 1 from a
 		 * snapshot), copy the blocks before mapping them for write.
 		 * Caller (ocsfs_file_write_iter) holds DLM EX; we hold
