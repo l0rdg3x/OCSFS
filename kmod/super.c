@@ -377,10 +377,12 @@ int ocsfs_sync_fs(struct super_block *sb, int wait)
 
 	down_write(&sbi->s_global_lock);
 
-	/* Persist global free block count in superblock */
+	/* Persist global free block count in superblock + recompute checksum */
 	spin_lock(&sbi->s_free_lock);
 	sbi->s_ds->s_free_blocks = cpu_to_le64(sbi->s_free_blocks);
 	spin_unlock(&sbi->s_free_lock);
+	sbi->s_ds->s_checksum = cpu_to_le32(
+		ocsfs_crc32c(~0U, sbi->s_ds, OCSFS_SUPERBLOCK_SIZE - 4));
 	mark_buffer_dirty(sbi->s_sbh);
 	sync_dirty_buffer(sbi->s_sbh);
 
