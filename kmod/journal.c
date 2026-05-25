@@ -445,9 +445,20 @@ int ocsfs_txn_commit(struct ocsfs_txn *txn)
 	{
 		int ckpt_ret = 0;
 
+		/*
+		 * Checkpoint: write all modified blocks to their final disk
+		 * locations.  Submit all writes in parallel (one round-trip on
+		 * SAN regardless of transaction size), then wait for completion.
+		 * This replaces the previous serial sync_dirty_buffer() loop which
+		 * incurred one SAN round-trip per block.
+		 */
 		list_for_each_entry(tb, &txn->t_buffers, list) {
 			mark_buffer_dirty(tb->bh);
-			if (sync_dirty_buffer(tb->bh) && !ckpt_ret)
+			write_dirty_buffer(tb->bh, REQ_SYNC);
+		}
+		list_for_each_entry(tb, &txn->t_buffers, list) {
+			wait_on_buffer(tb->bh);
+			if (!buffer_uptodate(tb->bh) && !ckpt_ret)
 				ckpt_ret = -EIO;
 		}
 		if (!ckpt_ret)
