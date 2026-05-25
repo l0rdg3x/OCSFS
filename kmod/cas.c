@@ -2,12 +2,16 @@
 /*
  * cas.c — Atomic Compare-And-Swap engine per OCSFS cluster.
  *
- * Backend PR-lease: per ogni target block si acquisisce un "lease entry"
- * on-disk (write → flush → reread), si fa il RMW, si rilascia il lease.
- * SCSI CAW è un fast-path opzionale (CAS_BACKEND_SCSI_CAW) non ancora usato.
+ * Backend hierarchy (probed at mount by ocsfs_cas_probe):
+ *   CAS_BACKEND_SCSI_CAW  — SCSI opcode 0x89 via kprobe-resolved
+ *                           scsi_device_from_queue + scsi_execute_cmd.
+ *                           Hardware-atomic; no patch kernel required.
+ *   CAS_BACKEND_PR_LEASE  — software lease on SAN-shared block; used when
+ *                           device is not SCSI or CAW probe fails.
+ *   CAS_BACKEND_NONE      — single-node RMW (no cluster coordination).
  *
- * Il lease area è layout-compatibile con blocksize 4096: ogni blocco ospita
- * 128 entry da 32 byte. Con OCSFS_CAS_LEASE_ENTRIES=256, servono 2 blocchi.
+ * Lease area: 128 entry × 32 byte per block (4 KiB blocksize).
+ * With OCSFS_CAS_LEASE_ENTRIES=256, two blocks are reserved.
  */
 #include <linux/module.h>
 #include <linux/fs.h>
@@ -232,7 +236,7 @@ int ocsfs_atomic_cas(struct super_block *sb, u64 block, u32 boff,
 	if (sbi->s_cas_backend == CAS_BACKEND_NONE)
 		return cas_single_node(sb, block, boff, len, expected, new_data);
 
-	if (sbi->s_cas_backend == CAS_BACKEND_SCSI_CAW) {
+	if (sbi->s_cas_backend == CAS_BACKEND_SCSI_CAW) { /* hardware atomic path */
 		unsigned int bs = sb->s_blocksize;
 
 		if (boff == 0 && len == bs) {

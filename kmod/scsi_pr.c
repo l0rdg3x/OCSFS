@@ -8,10 +8,10 @@
  * SCSI symbols.
  *
  * CAW (Compare-And-Write, opcode 0x89) uses scsi_execute_cmd() via
- * scsi_device_from_queue() — both are EXPORT_SYMBOL_GPL and available to
- * GPL modules on kernel >= 5.16. On non-SCSI devices (loop, virtio) CAW
- * is probed at mount time and disabled gracefully, falling back to the
- * software version-check path in lock.c.
+ * scsi_device_from_queue(), resolved at probe time via kprobe (present in
+ * vmlinux but not exported — no kernel patch required). On non-SCSI devices
+ * (loop, virtio) CAW probe fails gracefully; ocsfs_atomic_cas() falls back
+ * to the PR-lease software path.
  */
 
 #include "ocsfs.h"
