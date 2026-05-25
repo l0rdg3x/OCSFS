@@ -132,6 +132,9 @@ int ocsfs_extent_decompress_for_write(struct inode *inode, u64 logical_block)
 	e->physical_block = new_phys;
 	e->flags &= ~(OCSFS_EXT_COMPRESSED | OCSFS_EXT_COMP_ALGO_MASK);
 	e->phys_length    = 0;
+	/* st_blocks: physical blocks grew from old_phys_blks to e->length */
+	inode->i_blocks += (u64)(e->length - old_phys_blks) *
+			   (sbi->s_block_size / 512);
 	mark_inode_dirty(inode);
 
 	ocsfs_free_blocks(sb, old_phys, old_phys_blks);
@@ -261,6 +264,9 @@ int ocsfs_compress_file(struct inode *inode)
 		/* e->length remains old_len: logical block count for range checks */
 		e->flags = ocsfs_ext_set_comp_algo(
 				e->flags | OCSFS_EXT_COMPRESSED, algo);
+		/* st_blocks: physical blocks shrank from old_len to comp_blocks */
+		inode->i_blocks -= (u64)(old_len - comp_blocks) *
+				   (sbi->s_block_size / 512);
 		mark_inode_dirty(inode);
 		ocsfs_free_blocks(sb, old_phys, old_len);
 	}

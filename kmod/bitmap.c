@@ -527,9 +527,15 @@ void ocsfs_free_inode_num(struct super_block *sb, u64 ino)
 int ocsfs_orphan_scan(struct super_block *sb)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
-	int total = 0;
-	u32 ag_no;
+	u64 *inos = NULL;
+	u32 total = 0, cap = 0;
+	u32 ag_no, j;
 
+	/*
+	 * Pass 1 — collect orphan inode numbers while holding ag_lock.
+	 * We cannot call ocsfs_iget (which blocks) under ag_lock, so we
+	 * stash the numbers and clean up in a second pass.
+	 */
 	for (ag_no = 0; ag_no < sbi->s_ag_count; ag_no++) {
 		struct ocsfs_ag_info *ag = &sbi->s_ags[ag_no];
 		u64 i;
@@ -555,22 +561,68 @@ int ocsfs_orphan_scan(struct super_block *sb)
 				u64 ino = (u64)ag_no * sbi->s_ag_size + i;
 
 				pr_warn("ocsfs: orphan inode %llu "
-					"(mode=%04o size=%llu) — run fsck\n",
+					"(mode=%04o size=%llu)\n",
 					ino,
 					le16_to_cpu(di->i_mode),
 					le64_to_cpu(di->i_size));
+
+				if (total == cap) {
+					u32 new_cap = max(cap * 2u, 16u);
+					u64 *tmp = krealloc(inos,
+						    new_cap * sizeof(u64),
+						    GFP_NOFS);
+					if (tmp) {
+						inos = tmp;
+						cap  = new_cap;
+					}
+				}
+				if (total < cap)
+					inos[total] = ino;
 				total++;
 			}
-
 			brelse(bh);
 		}
 
 		mutex_unlock(&ag->ag_lock);
 	}
 
-	if (total)
-		pr_warn("ocsfs: %d orphan inode(s) — filesystem needs fsck\n",
-			total);
+	if (!total)
+		return 0;
 
-	return total;
+	/*
+	 * Pass 2 — reclaim (single-node only).
+	 *
+	 * In cluster mode a peer may legitimately hold the orphan inode open
+	 * (e.g. tmpfile across mount cycle).  Leave cleanup to fsck; only warn.
+	 * In single-node mode at mount time no process has the inode open, so
+	 * clear_nlink + iput safely triggers evict_inode → frees blocks.
+	 */
+	if (sbi->s_clustered) {
+		pr_warn("ocsfs: %u orphan inode(s) — run fsck to reclaim\n",
+			total);
+		goto out;
+	}
+
+	for (j = 0; j < min(total, cap); j++) {
+		struct inode *inode = ocsfs_iget(sb, inos[j]);
+
+		if (IS_ERR(inode)) {
+			pr_warn_ratelimited(
+				"ocsfs: orphan_scan: iget %llu failed (%ld)\n",
+				inos[j], PTR_ERR(inode));
+			continue;
+		}
+		if (OCSFS_I(inode)->i_flags & OCSFS_IFLAG_ORPHAN) {
+			clear_nlink(inode);
+			mark_inode_dirty(inode);
+		}
+		iput(inode);
+	}
+	pr_info("ocsfs: recovered %u orphan inode(s)\n", min(total, cap));
+	if (total > cap)
+		pr_warn("ocsfs: %u orphan(s) not recovered (list truncated) — run fsck\n",
+			total - cap);
+out:
+	kfree(inos);
+	return (int)total;
 }
