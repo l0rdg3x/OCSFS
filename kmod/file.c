@@ -317,6 +317,158 @@ static int ocsfs_fsync(struct file *file, loff_t start, loff_t end,
 	return blkdev_issue_flush(inode->i_sb->s_bdev);
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ * REMAP FILE RANGE — extent sharing for cp --reflink / FICLONE
+ *
+ * Clones a block-aligned byte range from src to dst by sharing
+ * physical extents and incrementing their reference counts.  The
+ * caller (VFS) guarantees both files are on the same superblock.
+ * DEDUP (REMAP_FILE_DEDUP) is not supported; return -EINVAL.
+ * ═══════════════════════════════════════════════════════════════ */
+
+/* Callback for the btree iterator: clone each overlapping extent */
+struct ocsfs_remap_ctx {
+	struct inode         *dst;
+	u64                   src_blk;  /* first src logical block */
+	u64                   dst_blk;  /* first dst logical block */
+	u64                   end_blk;  /* src_blk + len_blks (exclusive) */
+	struct ocsfs_sb_info *sbi;
+	int                   ret;
+};
+
+static int remap_extent_cb(u64 logical, u64 physical, u32 length,
+			    u16 flags, void *priv)
+{
+	struct ocsfs_remap_ctx *rc = priv;
+	u64 ov_s = max(logical, rc->src_blk);
+	u64 ov_e = min(logical + (u64)length, rc->end_blk);
+	u64 phys, log_dst;
+	u32 clip;
+	int ret;
+
+	if (ov_s >= ov_e || !physical || (flags & OCSFS_EXT_UNWRITTEN))
+		return 0;
+
+	phys    = physical + (ov_s - logical);
+	log_dst = rc->dst_blk + (ov_s - rc->src_blk);
+	clip    = (u32)(ov_e - ov_s);
+
+	ret = ocsfs_refcount_inc(rc->dst->i_sb, phys, clip);
+	if (ret) { rc->ret = ret; return ret; }
+
+	ret = ocsfs_extent_insert(rc->dst, log_dst, phys, clip,
+				  OCSFS_EXT_WRITTEN);
+	if (ret) {
+		ocsfs_refcount_dec(rc->dst->i_sb, phys, clip, NULL);
+		rc->ret = ret;
+		return ret;
+	}
+	rc->dst->i_blocks += (u64)clip * (rc->sbi->s_block_size / 512);
+	return 0;
+}
+
+static loff_t ocsfs_remap_file_range(struct file *src_file, loff_t pos_in,
+				     struct file *dst_file, loff_t pos_out,
+				     loff_t remap_len, unsigned int remap_flags)
+{
+	struct inode *src = file_inode(src_file);
+	struct inode *dst = file_inode(dst_file);
+	struct ocsfs_inode_info *src_oi = OCSFS_I(src);
+	struct ocsfs_inode_info *dst_oi = OCSFS_I(dst);
+	struct ocsfs_sb_info *sbi = OCSFS_SB(src->i_sb);
+	u64 src_blk, dst_blk, len_blks;
+	loff_t ret;
+	u16 i;
+
+	if (remap_flags & ~REMAP_FILE_CAN_SHORTEN)
+		return -EINVAL;
+
+	lock_two_nondirectories(src, dst);
+
+	ret = generic_remap_file_range_prep(src_file, pos_in, dst_file, pos_out,
+					    &remap_len, remap_flags);
+	if (ret || remap_len == 0)
+		goto out_unlock_vfs;
+
+	if (!IS_ALIGNED(pos_in,    sbi->s_block_size) ||
+	    !IS_ALIGNED(pos_out,   sbi->s_block_size) ||
+	    !IS_ALIGNED(remap_len, sbi->s_block_size)) {
+		ret = -EINVAL;
+		goto out_unlock_vfs;
+	}
+
+	src_blk  = (u64)pos_in  / sbi->s_block_size;
+	dst_blk  = (u64)pos_out / sbi->s_block_size;
+	len_blks = (u64)remap_len / sbi->s_block_size;
+
+	if (src_oi->i_disk_ino < dst_oi->i_disk_ino || src == dst) {
+		mutex_lock(&src_oi->i_extent_lock);
+		if (src != dst)
+			mutex_lock_nested(&dst_oi->i_extent_lock,
+					  SINGLE_DEPTH_NESTING);
+	} else {
+		mutex_lock(&dst_oi->i_extent_lock);
+		mutex_lock_nested(&src_oi->i_extent_lock, SINGLE_DEPTH_NESTING);
+	}
+
+	if (src_oi->i_extent_tree_root) {
+		struct ocsfs_remap_ctx rc = {
+			dst, src_blk, dst_blk, src_blk + len_blks, sbi, 0
+		};
+		ocsfs_extent_btree_iterate(src, remap_extent_cb, &rc);
+		ret = rc.ret;
+	} else {
+		ret = 0;
+		for (i = 0; i < src_oi->i_extent_count && !ret; i++) {
+			struct ocsfs_extent *e = &src_oi->i_extents[i];
+			u64 ov_s = max(e->logical_block, src_blk);
+			u64 ov_e = min(e->logical_block + (u64)e->length,
+				       src_blk + len_blks);
+			u64 phys, log_dst;
+			u32 clip;
+
+			if (ov_s >= ov_e || !e->physical_block ||
+			    (e->flags & (OCSFS_EXT_UNWRITTEN |
+					 OCSFS_EXT_COMPRESSED)))
+				continue;
+
+			phys    = e->physical_block + (ov_s - e->logical_block);
+			log_dst = dst_blk + (ov_s - src_blk);
+			clip    = (u32)(ov_e - ov_s);
+
+			ret = ocsfs_refcount_inc(src->i_sb, phys, clip);
+			if (ret) break;
+			ret = ocsfs_extent_insert(dst, log_dst, phys, clip,
+						  OCSFS_EXT_WRITTEN);
+			if (ret) {
+				ocsfs_refcount_dec(src->i_sb, phys, clip, NULL);
+				break;
+			}
+			dst->i_blocks += (u64)clip * (sbi->s_block_size / 512);
+		}
+	}
+
+	if (!ret) {
+		if (pos_out + remap_len > i_size_read(dst))
+			i_size_write(dst, pos_out + remap_len);
+		mark_inode_dirty(dst);
+	}
+
+	if (src == dst) {
+		mutex_unlock(&src_oi->i_extent_lock);
+	} else if (src_oi->i_disk_ino < dst_oi->i_disk_ino) {
+		mutex_unlock(&dst_oi->i_extent_lock);
+		mutex_unlock(&src_oi->i_extent_lock);
+	} else {
+		mutex_unlock(&src_oi->i_extent_lock);
+		mutex_unlock(&dst_oi->i_extent_lock);
+	}
+
+out_unlock_vfs:
+	unlock_two_nondirectories(src, dst);
+	return ret ? ret : remap_len;
+}
+
 const struct file_operations ocsfs_file_fops = {
 	.llseek          = ocsfs_file_llseek,
 	.read_iter       = ocsfs_file_read_iter,   /* iomap-based (iomap.c) */
@@ -326,4 +478,5 @@ const struct file_operations ocsfs_file_fops = {
 	.fsync           = ocsfs_fsync,
 	.fallocate       = ocsfs_fallocate,        /* thin.c */
 	.splice_read     = filemap_splice_read,
+	.remap_file_range = ocsfs_remap_file_range,
 };
