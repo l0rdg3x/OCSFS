@@ -370,15 +370,41 @@ int ocsfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 int ocsfs_sync_fs(struct super_block *sb, int wait)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
-	if (wait) {
-		down_write(&sbi->s_global_lock);
-		spin_lock(&sbi->s_free_lock);
-		sbi->s_ds->s_free_blocks = cpu_to_le64(sbi->s_free_blocks);
-		spin_unlock(&sbi->s_free_lock);
-		mark_buffer_dirty(sbi->s_sbh);
-		sync_dirty_buffer(sbi->s_sbh);
-		up_write(&sbi->s_global_lock);
+	u32 i;
+
+	if (!wait)
+		return 0;
+
+	down_write(&sbi->s_global_lock);
+
+	/* Persist global free block count in superblock */
+	spin_lock(&sbi->s_free_lock);
+	sbi->s_ds->s_free_blocks = cpu_to_le64(sbi->s_free_blocks);
+	spin_unlock(&sbi->s_free_lock);
+	mark_buffer_dirty(sbi->s_sbh);
+	sync_dirty_buffer(sbi->s_sbh);
+
+	/* Persist per-AG free counts to AG descriptor blocks */
+	for (i = 0; i < sbi->s_ag_count; i++) {
+		struct ocsfs_ag_info *ag = &sbi->s_ags[i];
+		u64 off  = sbi->s_ag_desc_off + (u64)i * sizeof(struct ocsfs_disk_ag);
+		u64 blk  = ocsfs_byte_to_block(sbi, off);
+		struct buffer_head *bh = sb_getblk(sb, blk);
+		struct ocsfs_disk_ag *dag;
+
+		if (!bh)
+			continue;
+		dag = (struct ocsfs_disk_ag *)bh->b_data;
+		mutex_lock(&ag->ag_lock);
+		dag->ag_free_blocks = cpu_to_le64(ag->free_blocks);
+		dag->ag_free_inodes = cpu_to_le64(ag->free_inodes);
+		mutex_unlock(&ag->ag_lock);
+		mark_buffer_dirty(bh);
+		sync_dirty_buffer(bh);
+		brelse(bh);
 	}
+
+	up_write(&sbi->s_global_lock);
 	return 0;
 }
 
