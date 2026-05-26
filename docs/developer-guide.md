@@ -1,157 +1,180 @@
 # OCSFS — Developer Guide
 
-**Versione:** 0.1 — Maggio 2026  
-**Stato:** Alpha — non per produzione
-
-## Indice
-
-1. [Panoramica architetturale](#1-panoramica-architetturale)
-2. [Layout on-disk](#2-layout-on-disk)
-3. [Strutture dati principali](#3-strutture-dati-principali)
-4. [Sottosistemi del kernel module](#4-sottosistemi-del-kernel-module)
-5. [Protocollo di locking distribuito](#5-protocollo-di-locking-distribuito)
-6. [Heartbeat e rilevamento guasti](#6-heartbeat-e-rilevamento-guasti)
-7. [Recovery a 5 fasi](#7-recovery-a-5-fasi)
-8. [Journal e crash recovery](#8-journal-e-crash-recovery)
-9. [Path I/O](#9-path-io)
-10. [Build e sviluppo](#10-build-e-sviluppo)
-11. [Bug noti e limitazioni](#11-bug-noti-e-limitazioni)
+**Version:** 0.1 — May 2026
+**Status:** Alpha — research / development
 
 ---
 
-## 1. Panoramica architetturale
+## Table of Contents
 
-OCSFS è un filesystem cluster-aware per Linux, progettato per SAN Fibre Channel condivise in ambienti Proxmox VE. La differenza fondamentale rispetto a GFS2/OCFS2: **tutto il locking è on-disk** tramite SCSI Compare-And-Write, senza DLM esterno né dipendenza dalla rete di management.
+1. [Architectural Overview](#1-architectural-overview)
+2. [On-Disk Layout](#2-on-disk-layout)
+3. [Key Data Structures](#3-key-data-structures)
+4. [Kernel Module Subsystems](#4-kernel-module-subsystems)
+5. [Distributed Locking Protocol](#5-distributed-locking-protocol)
+6. [Heartbeat and Failure Detection](#6-heartbeat-and-failure-detection)
+7. [5-Phase Recovery](#7-5-phase-recovery)
+8. [Journal and Crash Recovery](#8-journal-and-crash-recovery)
+9. [I/O Path](#9-io-path)
+10. [Extent Management](#10-extent-management)
+11. [Testbed Setup](#11-testbed-setup)
+12. [Build and Development](#12-build-and-development)
+13. [Open Issues and Limitations](#13-open-issues-and-limitations)
+
+---
+
+## 1. Architectural Overview
+
+OCSFS is a cluster-aware filesystem for Linux targeting shared block storage
+(FC SAN / iSCSI) in Proxmox VE environments. The fundamental design
+difference from GFS2 and OCFS2 is that **all lock state lives on disk** using
+versioned CAS entries, with no external DLM daemon and no dependency on the
+management network.
 
 ```
 ┌────────────────────────────────────────────────────────────┐
-│  Proxmox VE (PVE::Storage::OCSFSPlugin)                    │
+│  Proxmox VE  (PVE::Storage::OCSFSPlugin)                   │
 ├────────────────────────────────────────────────────────────┤
-│  VFS Linux (inode_operations, file_operations, aops)       │
-├───────────┬───────────┬──────────┬─────────────────────────┤
-│ super.c   │ inode.c   │ dir.c    │ file.c + iomap.c        │
-│ (mount)   │ (VFS ops) │ (dir ops)│ (I/O path)              │
-├───────────┴───────────┴──────────┴─────────────────────────┤
-│ extent.c   bitmap.c   alloc.c   thin.c   journal.c         │
-│ (spazio)   (bitmap)   (allocat.) (thin)   (WAL)            │
-├───────────────────────────────────────────────────────────-┤
-│ lock.c    heartbeat.c  node.c   recovery.c  scsi_pr.c      │
-│ (DLM)     (heartbeat)  (slot)   (recovery)  (SCSI PR)      │
+│  Linux VFS  (inode_operations, file_operations, aops)      │
+├───────────┬───────────┬────────────────┬───────────────────┤
+│ super.c   │ inode.c   │ dir.c          │ file.c + iomap.c  │
+│ (mount)   │ (VFS ops) │ (dir ops)      │ (I/O path)        │
+├───────────┴───────────┴────────────────┴───────────────────┤
+│ extent.c  extent_btree.c  bitmap.c  alloc.c  thin.c        │
+│ journal.c  journal_replay.c  snapshot.c  refcount.c        │
 ├────────────────────────────────────────────────────────────┤
-│  Block layer Linux — FC LUN / loopback / iSCSI             │
+│ lock.c  lock_io.c  heartbeat.c  node.c  recovery.c         │
+│ scsi_pr.c  dedup.c  compress.c  xattr.c  acl.c             │
+├────────────────────────────────────────────────────────────┤
+│  Linux block layer — FC LUN / iSCSI / loopback             │
 └────────────────────────────────────────────────────────────┘
 ```
 
-### File sorgenti
+### Source file responsibilities
 
-| File | Responsabilità |
-|------|---------------|
-| `kmod/super.c` | Module init/exit, mount, fill_super, statfs, sync_fs |
-| `kmod/inode.c` | VFS inode ops (iget, write_inode, evict, new_inode, setattr) |
-| `kmod/dir.c` | Directory ops (lookup, create, mkdir, rmdir, rename, readdir) |
-| `kmod/file.c` | File ops + get_block callback (buffer_head fallback) |
-| `kmod/iomap.c` | iomap-based I/O — direct I/O (O_DIRECT), buffered, readahead |
-| `kmod/extent.c` | Inline extent manager (lookup, insert, truncate, UNWRITTEN) |
-| `kmod/alloc.c` | Smart allocator con prealloc e AG affinity |
-| `kmod/bitmap.c` | Block bitmap e inode number allocator per-AG |
-| `kmod/journal.c` | Write-ahead log, txn begin/commit/abort, replay |
-| `kmod/lock.c` | DLM on-disk: acquire, release, downgrade, recover |
-| `kmod/heartbeat.c` | kthread heartbeat writer + peer monitoring |
-| `kmod/node.c` | Node slot table: claim, release, auth |
-| `kmod/recovery.c` | 5-phase recovery orchestration |
-| `kmod/scsi_pr.c` | SCSI-3 PR via block-layer `pr_ops` |
-| `kmod/thin.c` | Thin provisioning: fallocate, punch_hole, DISCARD |
-| `kmod/snapshot.c` | CoW file-level snapshots |
-| `kmod/refcount.c` | Extent reference counting per-AG |
-| `kmod/compress.c` | Inline compression LZ4/ZSTD |
+| File | Responsibility |
+|---|---|
+| `super.c` | Module init/exit, mount, fill_super, statfs, sync_fs |
+| `inode.c` | VFS inode ops: iget, write_inode, evict, new_inode, setattr |
+| `dir.c` | Directory ops: lookup, create, mkdir, rmdir, readdir, link, mknod |
+| `dir_btree.c` | B+ tree-backed directory index: O(log N) lookup and delete |
+| `dir_rename.c` | rename, RENAME_NOREPLACE, RENAME_EXCHANGE (atomic single-txn) |
+| `file.c` | File ops: read/write iter, fsync, FIEMAP, reflink (FICLONE), ioctl |
+| `iomap.c` | iomap I/O: O_DIRECT, buffered, readahead, UNWRITTEN conversion |
+| `extent.c` | Inline extent manager: lookup, insert, truncate, merge |
+| `extent_btree.c` | B+ tree overflow for files with more than 16 extents |
+| `alloc.c` | Smart allocator: prealloc, goal-oriented, AG affinity |
+| `bitmap.c` | Per-AG block and inode bitmap; two-phase lockless allocation |
+| `thin.c` | Thin provisioning: fallocate, PUNCH_HOLE, ZERO_RANGE, DISCARD |
+| `journal.c` | WAL: txn begin/commit/abort, ordered checkpoint, before-image rollback |
+| `journal_replay.c` | Forward-scan replay: CRC-gated COMMIT detection, redo on mount |
+| `lock.c` | On-disk DLM: EX/SH acquire, release, downgrade, epoch invalidation |
+| `lock_io.c` | Forced disk read/write for lock table (bypasses page cache) |
+| `scsi_pr.c` | SCSI-3 PR: register, preempt-and-abort, SHA-256 key, CAW mempool |
+| `heartbeat.c` | Storage-path heartbeat kthread; CRC-validated entries |
+| `node.c` | Node slot table: claim, release, stable UUID via SHA-256(hostname) |
+| `recovery.c` | 5-phase recovery orchestration |
+| `snapshot.c` | CoW file snapshots: create, delete, CoW-on-write trigger |
+| `refcount.c` | Per-AG extent reference counting for CoW and dedup |
+| `compress.c` | Inline LZ4/ZSTD compression (read path + fsync write path) |
+| `compress_file.c` | Compress-on-fsync for buffered files |
+| `dedup.c` | Content-based deduplication via OCSFS_IOC_DEDUP ioctl |
+| `xattr.c` | Extended attributes with DLM SH protection in cluster mode |
+| `acl.c` | POSIX ACL (getfacl/setfacl) |
+| `btree.c` | Generic B+ tree: search, insert, delete, range scan |
+| `btree_mod.c` | B+ tree structural modifications: split, merge, rebalance |
+| `test_lock.c` | KUnit tests: B+ tree search, dir btree threshold |
+| `test_cas.c` | KUnit tests: CAS lock protocol |
 
 ---
 
-## 2. Layout on-disk
+## 2. On-Disk Layout
 
-Il volume occupa un intero block device. Le regioni sono sequenziali dall'offset 0.
+The volume occupies an entire block device. Regions are sequential from offset 0.
 
 ```
-Offset 0       : Superblock            (4 KB)
-Offset 4 KB    : Superblock mirror     (4 KB)
-Offset 8 KB    : Node Slot Table       (64 KB — 256 slot × 256 byte)
-Offset 72 KB   : Heartbeat Region      (256 KB — 256 entry × 1 KB)
-Offset 328 KB  : Lock Table            (1 MB — 4096 entry × 256 byte)
-Offset ~1.3 MB : Journal Region        (N × 32 MB, N = max_nodes)
-After journals : AG Descriptors        (ag_count × 4 KB)
-After descs    : Data Region           (Allocation Groups)
+Offset 0        Superblock              (4 KB)
+Offset 4 KB     Superblock mirror       (4 KB)
+Offset 8 KB     Node Slot Table         (64 KB — 256 slots × 256 bytes)
+Offset 72 KB    Heartbeat Region        (256 KB — 256 entries × 1 KB)
+Offset 328 KB   Lock Table              (1 MB — 4096 entries × 256 bytes)
+Offset ~1.3 MB  Journal Region          (N × 32 MB, N = max_nodes)
+After journals  AG Descriptors          (ag_count × 4 KB)
+After descs     Data Region             (Allocation Groups)
 ```
 
-Tutti i campi multi-byte sono **little-endian** su disco.
+All multi-byte fields are **little-endian** on disk.
 
-### Superblock (offset 0 e 4 KB)
+### Superblock (offsets 0 and 4 KB)
 
 ```c
 struct ocsfs_disk_super {
-    __le32 s_magic;           // 0x4F435346 'OCSF'
-    __le16 s_version_major;   // 0
-    __le16 s_version_minor;   // 1
+    __le32 s_magic;           /* 0x4F435346 'OCSF' */
+    __le16 s_version_major;   /* 0 */
+    __le16 s_version_minor;   /* 1 */
     __u8   s_uuid[16];
     __u8   s_label[64];
-    __le32 s_block_size;      // 4096 (unico supportato)
-    __le32 s_extent_size;     // default 1 MB
+    __le32 s_block_size;      /* 4096 (only supported value) */
+    __le32 s_extent_size;     /* default 1 MB */
     __le64 s_total_blocks;
-    __le64 s_free_blocks;     // approssimativo; per-AG è autoritativo
+    __le64 s_free_blocks;     /* approximate; per-AG is authoritative */
     __le32 s_ag_count;
-    __le64 s_ag_size;         // blocchi per AG
-    __le16 s_max_nodes;       // default 64, max 256
-    __le64 s_feature_flags;   // OCSFS_FEAT_*
-    __le32 s_journal_size;    // byte per journal per nodo
-    // ... offsets e timestamps
-    __le32 s_checksum;        // CRC32C dei byte 0..4091
+    __le64 s_ag_size;         /* blocks per AG */
+    __le16 s_max_nodes;       /* default 64, max 256 */
+    __le64 s_feature_flags;   /* OCSFS_FEAT_* */
+    __le32 s_journal_size;    /* bytes per per-node journal */
+    /* ... offsets, timestamps ... */
+    __le32 s_checksum;        /* CRC32C of bytes 0..4091 */
 };
 ```
 
-Il CRC32C copre tutto il superblock tranne gli ultimi 4 byte (il campo checksum stesso).
+CRC32C covers the entire superblock except the last 4 bytes (the checksum
+field itself). The mirror superblock at 4 KB is written identically.
 
-### Inode (512 byte)
+### Inode (512 bytes)
 
-Ogni inode contiene fino a **16 extent inline** (16 × 24 = 384 byte). Quando servono più extent, `i_extent_tree_root` punta alla radice di un B+ tree — **non ancora implementato nel kernel module** (vedi §11).
+Each inode holds up to **16 inline extents** (16 × 24 = 384 bytes).
+When more extents are needed, `i_extent_tree_root` holds the physical block
+number of the B+ tree root, managed by `extent_btree.c`.
 
-### Lock Table Entry (256 byte)
+### Lock Table Entry (256 bytes)
 
 ```c
 struct ocsfs_disk_lock {
-    __le32 le_magic;          // OCSFS_LOCK_MAGIC
-    __le64 le_resource_id;    // hash della risorsa
-    __le32 le_resource_type;  // INODE, AG, JOURNAL, ...
-    __le16 le_mode;           // NL/SH/EX/CW
-    __le16 le_holder_slot;    // slot del nodo holder EX
-    __le32 le_holder_gen;     // mount generation holder
+    __le32 le_magic;           /* OCSFS_LOCK_MAGIC */
+    __le64 le_resource_id;     /* resource hash */
+    __le32 le_resource_type;   /* INODE, AG, JOURNAL, ... */
+    __le16 le_mode;            /* NL / SH / EX / CW */
+    __le16 le_holder_slot;     /* slot of the EX holder */
+    __le32 le_holder_gen;      /* mount generation of the holder */
     __le64 le_grant_time;
-    __le32 le_sh_holders;     // bitmask nodi 0-31 con SH
-    __u8   le_sh_holders_ext[32]; // nodi 32-255
-    __u8   le_waiters[32];    // bitmask waiting nodes
+    __le32 le_sh_holders;      /* bitmask: nodes 0-31 holding SH */
+    __u8   le_sh_holders_ext[32]; /* nodes 32-255 */
+    __u8   le_waiters[32];     /* bitmask: waiting nodes */
     __u8   le_waiter_modes[64];
-    __le32 le_version;        // versione CAS
-    // ... reserved + checksum
+    __le32 le_version;         /* CAS version counter */
+    /* ... reserved + CRC32c checksum ... */
 };
 ```
 
 ---
 
-## 3. Strutture dati principali
+## 3. Key Data Structures
 
-### `ocsfs_sb_info` — superblock in-memory (`sb->s_fs_info`)
+### `ocsfs_sb_info` — in-memory superblock (`sb->s_fs_info`)
 
-Campi chiave:
-
-| Campo | Tipo | Descrizione |
-|-------|------|-------------|
-| `s_ags` | `ocsfs_ag_info[]` | Array degli AG (kvmalloc al mount) |
-| `s_journal` | `ocsfs_journal` | Journal del nodo corrente |
-| `s_node_slot` | `u16` | Slot acquisito al mount |
-| `s_mount_gen` | `u32` | Generazione del mount corrente |
-| `s_clustered` | `bool` | True se multi-nodo attivo |
-| `s_nodes[]` | `ocsfs_node_info[256]` | Stato in-memory dei peer |
-| `s_hb` | `ocsfs_heartbeat_info` | Thread e stato heartbeat |
-| `s_pr` | `ocsfs_pr_info` | Chiave SCSI PR registrata |
-| `s_recovery_work` | `work_struct` | Recovery asincrono |
+| Field | Type | Description |
+|---|---|---|
+| `s_ags` | `ocsfs_ag_info[]` | AG array (kvmalloc at mount) |
+| `s_journal` | `ocsfs_journal` | Current node's journal |
+| `s_node_slot` | `u16` | Slot claimed at mount |
+| `s_mount_gen` | `u32` | Current mount generation |
+| `s_clustered` | `bool` | True when multi-node mode is active |
+| `s_nodes[]` | `ocsfs_node_info[256]` | In-memory state of all peers |
+| `s_hb` | `ocsfs_heartbeat_info` | Heartbeat kthread and state |
+| `s_pr` | `ocsfs_pr_info` | Registered SCSI PR key |
+| `s_lock_epoch` | `atomic_t` | Incremented on each recovery; invalidates SH cache |
+| `s_recovery_work` | `work_struct` | Async recovery work item |
 
 ### `ocsfs_inode_info` — per-inode (`container_of(inode, ...)`)
 
@@ -159,68 +182,86 @@ Campi chiave:
 struct ocsfs_inode_info {
     u64                  i_disk_ino;
     u32                  i_ag;
-    u32                  i_flags;          // OCSFS_IFLAG_*
+    u32                  i_flags;            /* OCSFS_IFLAG_* */
     u16                  i_extent_count;
-    struct ocsfs_extent  i_extents[16];    // extent inline
-    u64                  i_extent_tree_root;
+    struct ocsfs_extent  i_extents[16];      /* inline extents */
+    u64                  i_extent_tree_root; /* B+ tree root block, or 0 */
     struct mutex         i_extent_lock;
-    struct ocsfs_lock_res i_lock_res;      // DLM cross-nodo
-    struct inode         vfs_inode;        // DEVE essere ultimo
+    struct ocsfs_lock_res i_lock_res;        /* cross-node DLM resource */
+    struct inode         vfs_inode;          /* MUST be last */
 };
 ```
 
-Accesso: `OCSFS_I(inode)` → `container_of(inode, struct ocsfs_inode_info, vfs_inode)`
+Access pattern: `OCSFS_I(inode)` → `container_of(inode, struct ocsfs_inode_info, vfs_inode)`
 
-### `ocsfs_lock_res` — risorsa di lock
+### `ocsfs_extent`
+
+```c
+struct ocsfs_extent {
+    __le64 logical_block;
+    __le64 physical_block;
+    __le32 length;       /* logical block count */
+    __le16 phys_length;  /* physical block count (compressed extents only; 0 = same as length) */
+    __le16 flags;        /* OCSFS_EXT_WRITTEN / UNWRITTEN / COMPRESSED */
+};
+```
+
+`ocsfs_ext_phys_blocks(e)` is the inline helper that returns `phys_length` if
+non-zero (compressed), otherwise `length`. Always use this helper when
+computing physical block counts — never use `e->length` directly for
+compressed extents.
+
+### `ocsfs_lock_res` — lock resource
 
 ```c
 struct ocsfs_lock_res {
     u64          lr_resource_id;
     u32          lr_resource_type;
-    u16          lr_mode;          // lock attualmente tenuto
-    u16          lr_slot;          // slot nella lock table
-    bool         lr_cached;        // cache 500ms attiva
+    u16          lr_mode;         /* currently held mode */
+    u16          lr_slot;         /* slot in the lock table */
+    bool         lr_cached;       /* SH cache active */
     u64          lr_cache_expires;
-    struct mutex lr_mutex;         // serializzazione locale
+    u64          lr_cache_epoch;  /* epoch when cache was populated */
+    struct mutex lr_mutex;        /* local serialization */
     struct list_head lr_list;
 };
 ```
 
 ---
 
-## 4. Sottosistemi del kernel module
+## 4. Kernel Module Subsystems
 
-### Sequenza di mount (`super.c`)
+### Mount sequence (`super.c`)
 
 ```
 ocsfs_fill_super()
-  ├── sb_read(block 0) → validate superblock (magic, version, CRC32C)
-  ├── ocsfs_load_ags()     → legge tutti gli AG descriptor
-  ├── ocsfs_cluster_init() → node.c: claim slot + scsi_pr: register
-  │     ├── ocsfs_node_claim_slot()
-  │     ├── ocsfs_pr_register()
-  │     └── ocsfs_heartbeat_start()  → avvia kthread
-  ├── ocsfs_journal_init()  → trova la regione journal del nodo
-  ├── ocsfs_journal_replay() → crash recovery del nodo corrente
-  └── ocsfs_iget(OCSFS_ROOT_INO) → monta root inode
+  ├── forced read of block 0 → validate superblock (magic, version, CRC32c)
+  ├── ocsfs_load_ags()         → reads all AG descriptors
+  ├── ocsfs_cluster_init()     → node.c: claim slot + scsi_pr: register
+  │     ├── ocsfs_node_claim_slot()   → writes ACTIVE entry, derives UUID
+  │     ├── ocsfs_pr_register()       → SCSI-3 PR REGISTER
+  │     └── ocsfs_heartbeat_start()   → spawns heartbeat kthread
+  ├── ocsfs_journal_init()     → locates this node's journal region
+  ├── ocsfs_journal_replay()   → crash recovery for this node
+  └── ocsfs_iget(OCSFS_ROOT_INO) → mounts root inode
 ```
 
-### Sequenza di unmount (`super.c`)
+### Unmount sequence (`super.c`)
 
 ```
 ocsfs_put_super()
-  ├── ocsfs_journal_exit()   → flush journal
+  ├── ocsfs_journal_exit()     → drains in-flight checkpoints, writes header
   └── ocsfs_cluster_exit()
-        ├── ocsfs_heartbeat_stop()
-        ├── ocsfs_node_release_slot()
-        └── ocsfs_pr_unregister()
+        ├── ocsfs_heartbeat_stop()     → wakes kthread, waits for exit
+        ├── ocsfs_node_release_slot()  → marks slot INACTIVE on disk
+        └── ocsfs_pr_unregister()      → SCSI-3 PR RELEASE
 ```
 
 ---
 
-## 5. Protocollo di locking distribuito
+## 5. Distributed Locking Protocol
 
-### Compatibilità lock
+### Lock compatibility matrix
 
 | Held \ Requested | NL | SH | EX | CW |
 |---|---|---|---|---|
@@ -229,245 +270,405 @@ ocsfs_put_super()
 | EX | ✅ | ❌ | ❌ | ❌ |
 | CW | ✅ | ❌ | ❌ | ✅ |
 
-### Acquisizione lock (`lock.c:ocsfs_lock_acquire`)
+### Lock acquire (`lock.c:ocsfs_lock_acquire`)
 
 ```
-1. Cache fast-path: se lr_cached && non scaduto → return 0
-2. ocsfs_lock_probe_slot() → trova slot fisico (linear probing)
-3. lock_read_entry() → legge entry dal disco
-4. Compatibile? → aggiorna entry via lock_write_entry() con version check
-5. Conflitto? → set_waiter_bit() + exponential backoff (1ms → 100ms, max 50 retry)
+1. SH cache fast-path: if lr_cached && epoch unchanged && not expired → return 0
+2. ocsfs_lock_probe_slot()  → find physical slot (linear probing, max 16)
+3. lock_read_entry()        → forced disk read (bypasses page cache)
+4. Compatible?              → update entry via lock_write_entry() with version check
+5. Conflict?                → set_waiter_bit() + exponential backoff (1ms → 100ms, max 50 retries)
 ```
 
-**Atomicità:** Attualmente basata su versioning software (read-version → check-version → write). La vera atomicità richiederebbe SCSI CAW — vedi §11.
+**Atomicity:** Currently uses software versioning (read-version → check → write).
+True hardware atomicity requires SCSI CAW (opcode 0x89), which is the next
+implementation priority. See §13.
 
-### Hashing risorse
+**DLM EX invariant:** All B+ tree write functions (`extent_btree_insert`,
+`extent_btree_truncate`, `extent_btree_replace`, `dir_btree_insert`,
+`dir_btree_delete`) assert `OCSFS_WARN_NO_EX(inode)` at entry. In cluster
+mode this fires `WARN_ON` if EX is not held, catching callers that bypass
+the protocol.
+
+### Resource hashing
 
 ```c
-// Inode: FNV-1a mixing sul numero inode
+/* Inode: FNV-1a mixing on inode number */
 ocsfs_lock_hash_inode(ino)
 
-// AG: mixing con prefisso 0xA6...
+/* AG: mixing with 0xA6... prefix */
 ocsfs_lock_hash_ag(ag_num)
 
-// Slot nella lock table
-slot = resource_id % OCSFS_LOCK_ENTRY_COUNT  // 4096 entry
+/* Slot in lock table (4096 entries) */
+slot = resource_id % OCSFS_LOCK_ENTRY_COUNT
 ```
 
-Collisioni gestite via linear probing (max `OCSFS_LOCK_PROBE_MAX = 16` slot).
+Collisions are handled by linear probing (max `OCSFS_LOCK_PROBE_MAX = 16` slots).
+
+### Epoch-based SH cache invalidation
+
+Each call to `ocsfs_lock_recover_node()` atomically increments
+`sbi->s_lock_epoch`. Cached SH grants that were obtained in an earlier epoch
+are silently invalidated at next access, forcing a fresh disk read.
 
 ### Single-node mode
 
-Se `sbi->s_clustered == false` (device senza supporto PR), tutte le funzioni di lock retornano immediatamente senza I/O su disco. Il filesystem funziona come single-node standard.
+When `sbi->s_clustered == false` (device does not support PR), all lock
+functions return immediately without disk I/O. The filesystem behaves as a
+standard single-node filesystem.
 
 ---
 
-## 6. Heartbeat e rilevamento guasti
+## 6. Heartbeat and Failure Detection
 
-Il kthread `ocsfs-hb/<slot>` esegue due compiti su timer:
+The `ocsfs-hb/<slot>` kthread runs two operations on a timer:
 
-| Operazione | Intervallo | Azione |
+| Operation | Interval | Action |
 |---|---|---|
-| Write heartbeat | `HB_INTERVAL_MS` = 5s | Scrive timestamp + sequenza monotona nel proprio settore |
-| Check peers | `HB_CHECK_MS` = 2s | Legge heartbeat di tutti i nodi ACTIVE |
+| Write heartbeat | `HB_INTERVAL_MS` = 5 s | Writes timestamp and monotone sequence to own sector |
+| Check peers | `HB_CHECK_MS` = 2 s | Reads heartbeat of all ACTIVE nodes (batched by block) |
 
-### Rilevamento a 2 fasi (`heartbeat.c`)
+Heartbeat reads are batched: if multiple node slots share the same disk block,
+a single forced read covers all of them, reducing I/O to up to 4× less than
+one read per node.
+
+### Two-phase failure detection (`heartbeat.c`)
 
 ```
-Heartbeat stale (> 15s)  → ni_state = SUSPECTED, record ni_suspect_time
-Ancora stale dopo 10s    → ocsfs_recovery_trigger(sb, slot)
-Heartbeat fresco         → torna ACTIVE (falso allarme)
+Heartbeat stale (> 15 s)   → ni_state = SUSPECTED, record ni_suspect_time
+Still stale after 10 s     → ocsfs_recovery_trigger(sb, slot)
+Heartbeat refreshed        → back to ACTIVE (transient slowdown)
 ```
 
-La doppia finestra riduce i falsi positivi da rallentamenti transitori del path di storage.
+The double window reduces false positives from transient storage path
+congestion. CRC32c is validated on every heartbeat entry before accepting the
+timestamp.
+
+`kthread_stop()` triggers immediate wakeup via `wake_up(&hb_waitq)` rather
+than waiting for the next timer expiry.
 
 ---
 
-## 7. Recovery a 5 fasi
+## 7. 5-Phase Recovery
 
-Orchestrato da `recovery.c`. Solo il nodo con lo slot più basso tra quelli ACTIVE diventa leader.
+Orchestrated by `recovery.c`. Only the surviving node with the lowest slot
+number becomes the recovery leader.
 
-| Fase | Azione | File |
+| Phase | Action | Location |
 |---|---|---|
 | 1 — Leader election | Lowest-slot surviving node wins | `recovery.c:ocsfs_is_recovery_leader()` |
-| 2 — SCSI PR fencing | `PREEMPT_AND_ABORT` con la PR key del nodo morto | `scsi_pr.c:ocsfs_pr_preempt_abort()` |
-| 3 — Journal replay | Replay del journal del nodo fallito | `journal.c:ocsfs_journal_replay_node()` |
-| 4 — Lock recovery | Scan dell'intera lock table, rilascio lock del nodo morto | `lock.c:ocsfs_lock_recover_node()` |
-| 5 — Slot cleanup | Marca lo slot come DEAD | `node.c:ocsfs_node_mark_dead()` |
+| 2 — SCSI PR fencing | `PREEMPT_AND_ABORT` using the dead node's PR key | `scsi_pr.c:ocsfs_pr_preempt_abort()` |
+| 3 — Journal replay | Replay the dead node's journal | `journal_replay.c:ocsfs_journal_replay_node()` |
+| 4 — Lock recovery | Scan entire lock table; release locks owned by dead node | `lock.c:ocsfs_lock_recover_node()` |
+| 5 — Slot cleanup | Mark slot as DEAD on disk | `node.c:ocsfs_node_mark_dead()` |
 
-Il recovery è asincrono (`schedule_work`) e serializzato da `s_recovery_lock`.
+Recovery is asynchronous (`schedule_work`) and serialized by `s_recovery_lock`.
 
-**Limitazione attuale:** un solo recovery alla volta (`s_recovery_target` è un singolo `u16`).
+If fencing fails and the device is PR-capable, `recovery.c` forces `SB_RDONLY`
+and aborts rather than proceeding with potentially split-brain state. On
+non-PR devices (degraded mode), a warning is logged and recovery continues.
+
+**Current limitation:** Only one recovery target at a time (`s_recovery_target`
+is a single `u16`). If two nodes fail simultaneously, the second is not
+recovered until the first recovery completes.
 
 ---
 
-## 8. Journal e crash recovery
+## 8. Journal and Crash Recovery
 
-Journal circolare per-nodo a 32 MB (configurabile). Struttura:
+Per-node circular journal, 32 MB by default. Structure:
 
 ```
-[Journal Header 4KB][TXN Begin][Block Ref][Block Data]...[TXN Commit][...]
+[Journal Header 4 KB][TXN Begin][Block Ref][Block Data]...[TXN Commit][...]
 ```
 
-### Ciclo di vita transazione
+### Transaction lifecycle
 
 ```c
 txn = ocsfs_txn_begin(sb);
-ocsfs_txn_add_bh(txn, bh);  // aggiunge before-image
-// ... modifica bh ...
-ocsfs_txn_commit(txn);       // scrive after-image + commit record
+ocsfs_txn_add_bh(txn, bh);    /* snapshots before-image into txn->bufs[i].before_buf */
+/* ... modify bh ... */
+ocsfs_txn_commit(txn);         /* writes after-image + COMMIT record; waits for flush */
 ```
 
-Il replay al mount è **idempotente**: transazioni senza commit record vengono scartate.
+`ocsfs_txn_abort()` restores all modified buffers from their `before_buf`
+snapshots and clears `buffer_dirty`, ensuring that partial in-memory changes
+do not survive an abort.
+
+### Replay (`journal_replay.c`)
+
+- Forward scan from journal tail to head.
+- A `TXN_BEGIN` record without a matching `TXN_COMMIT` (CRC-validated) is
+  discarded — uncommitted transactions are not replayed.
+- AFTER-images are applied only when the on-disk BEFORE-image CRC matches the
+  saved before-image CRC, preventing replay from overwriting concurrent writes
+  from surviving nodes.
+
+### Ordered checkpoint
+
+`journal.c` uses a ticket-based checkpoint system (`j_ckpt_ticket`,
+`j_ckpt_now`, `j_ckpt_waitq`). The journal lock is released after the
+`COMMIT` record is durable; checkpoint I/O runs outside the lock. FIFO
+ordering via `wait_event(j_ckpt_waitq, j_ckpt_now == my_ticket)` ensures the
+journal tail advances monotonically.
 
 ---
 
-## 9. Path I/O
+## 9. I/O Path
 
-### Dati (file regolari) — iomap path
+### Data (regular files) — iomap path
 
 ```
 write_iter → ocsfs_file_write_iter()
-  ├── O_DIRECT: iomap_dio_rw() → ocsfs_iomap_ops → extent_lookup/alloc
-  └── Buffered: iomap_file_buffered_write() → pagecache → writepages
+  ├── Cluster mode: acquire DLM EX (before inode_lock to avoid ABBA)
+  ├── O_DIRECT:  iomap_dio_rw() → ocsfs_iomap_ops → extent_lookup / alloc
+  └── Buffered:  iomap_file_buffered_write() → page cache → writepages
+                 iomap_end() converts UNWRITTEN → WRITTEN after bytes are written
 ```
 
 ### Metadata (directory, inode) — buffer_head path
 
 ```
-dir lookup → ocsfs_dir_bread() → ocsfs_extent_lookup() → sb_bread()
+dir lookup → ocsfs_dir_bread() → ocsfs_extent_lookup() → sb_getblk() + bh_read()
 ```
 
-### Extent lookup (inline)
+In cluster mode, directory block reads use forced I/O (bypasses page cache)
+to avoid stale data from peer writes.
 
-```c
-ocsfs_extent_lookup(inode, logical_block, &ext)
-  → scansiona oi->i_extents[0..i_extent_count-1]
-  → ritorna estensione che contiene logical_block
+### Preallocation and UNWRITTEN extents
+
+`alloc.c` uses goal-oriented block allocation with AG affinity. New blocks
+are initially marked `OCSFS_EXT_UNWRITTEN`; reads from unwritten ranges
+return zeroes without I/O. `iomap_end()` converts the range to `WRITTEN`
+after the write completes successfully.
+
+### Two-phase block allocation (`bitmap.c`)
+
+```
+Phase 1 (lockless):
+  READ_ONCE(ag.free_blocks) for each AG — no txn, no lock
+  Select the first AG with enough free blocks
+
+Phase 2 (locked):
+  ocsfs_txn_begin() + DLM EX only for the chosen AG
+  Actual bitmap scan and allocation
+  Fallback: if chosen AG was stale, try remaining AGs
 ```
 
-Complessità: O(16) per extent inline. B+ tree per overflow **non implementato nel kmod**.
+This avoids holding the journal lock (`j_lock`) during a full multi-AG scan.
 
 ---
 
-## 10. Build e sviluppo
+## 10. Extent Management
 
-### Dipendenze
+### Inline extents (`extent.c`)
+
+Up to 16 extents are stored directly in the inode, sorted by `logical_block`.
+Adjacent extents with compatible flags are merged on insert. The
+`try_merge_next` label handles the three-way merge case (extend-at-end →
+absorb-next).
+
+### B+ tree overflow (`extent_btree.c`)
+
+When the 16-slot inline array is full, `ocsfs_extent_btree_migrate()` is
+called before the 17th insert. It:
+1. Opens a txn
+2. Decompresses any compressed extents first (btree encoding has no
+   `phys_length` field)
+3. Inserts all inline extents into the B+ tree
+4. Sets `i_extent_tree_root` and clears `i_extent_count`
+
+All B+ tree write operations assert `OCSFS_WARN_NO_EX(inode)` in cluster
+mode (see §5).
+
+### Compressed extents
+
+`e->phys_length` stores the actual number of physical blocks consumed by a
+compressed extent. `e->length` always stores the logical block count.
+Always use `ocsfs_ext_phys_blocks(e)` for any calculation that involves
+freeing or allocating physical blocks.
+
+When truncating or punching a hole into a compressed extent, the extent is
+decompressed in-place first so that the tail is addressable as plain blocks.
+
+---
+
+## 11. Testbed Setup
+
+The minimum viable cluster testbed for testing OCSFS:
+
+### KVM + LIO iSCSI (zero additional hardware)
+
+```
+Host (any Linux machine with 16+ GB RAM and KVM)
+├── LIO iSCSI target  ─────────────────────────┐
+│   1 × 50 GB zvol or file                      │ SCSI-3 PR
+├── VM ocsfs-node1 (4 GB RAM, 4 vCPU)  ─────────┤
+├── VM ocsfs-node2 (4 GB RAM, 4 vCPU)  ─────────┤
+└── VM ocsfs-node3 (4 GB RAM, 4 vCPU)  ─────────┘
+    (all VMs connect to the LUN directly via open-iscsi)
+```
+
+Install targetcli on the host:
 
 ```bash
-# Debian/Ubuntu/Proxmox
+pip install targetcli-fb
+modprobe target_core_mod configfs
+mount -t configfs configfs /sys/kernel/config 2>/dev/null || true
+```
+
+Configure the target:
+
+```bash
+targetcli
+
+/backstores/fileio create name=ocsfs-lun file_or_dev=/srv/ocsfs-shared.img size=50G
+/backstores/fileio/ocsfs-lun set attribute emulate_pr=1
+/iscsi create iqn.2026-05.example:ocsfs-storage
+/iscsi/iqn.2026-05.example:ocsfs-storage/tpg1/luns create /backstores/fileio/ocsfs-lun
+/iscsi/iqn.2026-05.example:ocsfs-storage/tpg1/acls create iqn.2026-05.example:node1
+/iscsi/iqn.2026-05.example:ocsfs-storage/tpg1/acls create iqn.2026-05.example:node2
+/iscsi/iqn.2026-05.example:ocsfs-storage/tpg1/acls create iqn.2026-05.example:node3
+/iscsi/iqn.2026-05.example:ocsfs-storage/tpg1 set attribute authentication=0
+saveconfig
+exit
+```
+
+Inside each VM:
+
+```bash
+echo "InitiatorName=iqn.2026-05.example:node1" > /etc/iscsi/initiatorname.iscsi
+systemctl restart iscsid
+iscsiadm -m discovery -t sendtargets -p <host-ip>:3260
+iscsiadm -m node --targetname iqn.2026-05.example:ocsfs-storage --login
+# shared disk now appears as /dev/sdb (or similar)
+```
+
+### TrueNAS SCALE (external NAS)
+
+TrueNAS SCALE uses LIO as its iSCSI backend and supports SCSI-3 PR natively.
+Configure the iSCSI target and extent in the TrueNAS UI, then connect from
+each VM using `open-iscsi` as above.
+
+### Deploy the module to all nodes
+
+From the development machine:
+
+```bash
+cd /path/to/OCSFS/kmod && make -j$(nproc)
+
+for IP in 10.0.0.11 10.0.0.12 10.0.0.13; do
+  rsync -az kmod/ user@$IP:/opt/ocsfs/kmod/
+  ssh user@$IP "cd /opt/ocsfs/kmod && make -j\$(nproc) \
+    && sudo rmmod ocsfs 2>/dev/null; sudo insmod ocsfs.ko"
+done
+```
+
+---
+
+## 12. Build and Development
+
+### Dependencies
+
+```bash
+# Debian / Ubuntu / Proxmox VE
 apt install build-essential uuid-dev linux-headers-$(uname -r)
 
-# Per il prototipo FUSE
+# For the FUSE prototype
 apt install libfuse3-dev
 ```
 
-### Build
+### Build targets
 
 ```bash
-# Userspace tools + test suite
-make all && make test
+make all          # userspace tools + FUSE prototype
+make test         # run userspace test suite (36 tests)
+make kmod         # kernel module (alias for: cd kmod && make)
+make demo         # format a 1 GiB loopback image and inspect it
 
-# Kernel module
-cd kmod && make
-# oppure via DKMS:
-sudo dkms add kmod/
-sudo dkms build ocsfs/0.1.0 && sudo dkms install ocsfs/0.1.0
-
-# Test su immagine loopback
-make demo
+sudo dkms add kmod/ && sudo dkms build ocsfs/0.1.0 && sudo dkms install ocsfs/0.1.0
+dpkg-buildpackage -us -uc -b   # build Debian packages
 ```
 
-### Test rapido single-node
+### Recommended kernel config for development VMs
+
+```
+CONFIG_KASAN=y             # AddressSanitizer — catches use-after-free
+CONFIG_LOCKDEP=y           # Lock ordering validator
+CONFIG_LOCK_STAT=y         # Lock contention statistics
+CONFIG_DEBUG_PAGEALLOC=y   # Page use-after-free detection
+CONFIG_FAULT_INJECTION=y   # Simulate allocation failures
+CONFIG_FAILSLAB=y          # Simulate slab allocation failures
+CONFIG_KUNIT=y             # KUnit test harness
+CONFIG_CRASH_DUMP=y        # kdump support
+CONFIG_KEXEC=y             # Required for kdump
+```
+
+### Running KUnit tests
 
 ```bash
-# Crea immagine 2 GiB
-dd if=/dev/zero of=/tmp/test.img bs=1M count=2048
+# Load the module with KUnit enabled (built into the module)
+sudo insmod kmod/ocsfs.ko
 
-# Formatta
+# Results appear in dmesg
+dmesg | grep -E "KTAP|PASS|FAIL|ocsfs"
+```
+
+### Quick single-node test
+
+```bash
+dd if=/dev/zero of=/tmp/test.img bs=1M count=2048
 ./mkfs.ocsfs -L test -N 4 -f /tmp/test.img
 
-# Monta
 sudo losetup /dev/loop0 /tmp/test.img
 sudo insmod kmod/ocsfs.ko
 sudo mount -t ocsfs /dev/loop0 /mnt/ocsfs
 
-# Verifica
 ls /mnt/ocsfs && df /mnt/ocsfs
 
-# Smonta
-sudo umount /mnt/ocsfs && sudo rmmod ocsfs && sudo losetup -d /dev/loop0
-```
-
-### Struttura del repository
-
-```
-include/     # Header on-disk condiviso userspace/kernel
-src/         # Prototipo FUSE + librerie userspace
-kmod/        # Kernel module
-tools/       # mkfs.ocsfs, ocsfs-tool, ocsfs-defrag
-tests/       # test_ocsfs.c (userspace), xfstests-ocsfs.conf
-proxmox/     # OCSFSPlugin.pm, mount.ocsfs, install.sh
-conf/        # Systemd units, udev rules
-man/         # Man pages
-debian/      # Packaging Debian
-docs/        # Questa documentazione
+sudo umount /mnt/ocsfs
+sudo rmmod ocsfs
+sudo losetup -d /dev/loop0
 ```
 
 ---
 
-## 11. Bug noti e limitazioni
+## 13. Open Issues and Limitations
 
-### CRITICO — Da risolvere prima del testing multi-nodo
+### Blocking for multi-node production use
 
-**BUG-001: Mismatch dimensione struct inode tra header**
+**SCSI CAW via BSG not implemented**
 
-- `include/ocsfs.h`: `i_reserved[32]` → sizeof = 512 (con _Static_assert ✅)
-- `kmod/ocsfs.h`: `i_reserved[12]` → sizeof = 492 ❌ (senza _Static_assert)
-- Il kernel legge 512 byte ma il campo `i_checksum` è a offset 492 anziché 508
-- **Fix:** aggiungere `i_reserved[32]` in `kmod/ocsfs.h` + `_Static_assert`
+The current locking protocol reads a lock entry, checks the version field, and
+writes back only if the version still matches. This reduces (but does not
+eliminate) the TOCTOU race window between two concurrent acquirers.
 
-**BUG-002: Deadlock in `ocsfs_lock_downgrade()` quando `new_mode == NL`**
+True hardware atomicity requires SCSI Compare-And-Write (opcode 0x89). The
+implementation plan:
 
-- `lock.c:523-554`: la funzione tiene `lr_mutex`, poi chiama `ocsfs_lock_release()` che tenta di acquisire lo stesso `lr_mutex`
-- **Fix:** rilasciare `lr_mutex` prima di chiamare `ocsfs_lock_release()`, o ristrutturare per un'implementazione inline del release
+1. `ocsfs_bsg_execute_cdb()` in `scsi_pr.c` — send a raw CDB via the BSG
+   (`/dev/bsg/...`) interface using `blk_execute_rq()`.
+2. Use CAW for lock entry updates in `lock_write_entry()`.
+3. Optional upstream path: the kernel patch in `docs/kernel-patches/` exports
+   `scsi_device_from_queue()` which would allow using `scsi_execute_cmd()`
+   directly without BSG.
 
-**BUG-003: TOCTOU race nel locking multi-nodo**
+**No integration test suite**
 
-- `lock.c:63-119`: il commento stesso documenta il problema
-- L'approccio attuale (read-version → check-version → write) riduce ma non elimina la race window
-- **Fix:** implementare SCSI Compare-And-Write (CAW, opcode 0x89) tramite `sg` layer
-- Priorità: bloccante per qualsiasi test multi-nodo reale
+No xfstests run has been performed. The minimum testbed (2 nodes + LIO
+iSCSI) is sufficient to run `xfstests quick` and `xfstests auto`. This
+should be the next step after CAW.
 
-### MEDIA priorità
+### Architectural limitations
 
-**BUG-004: Recovery limitato a singolo target**
-
-- `recovery.c`: `s_recovery_target` è un `u16`; se due nodi falliscono contemporaneamente, il secondo non viene recuperato
-- **Fix:** cambiare in bitmask + queue di recovery
-
-**LIMIT-001: Directory come lista piatta O(n)**
-
-- `dir.c:8`: "Future phases will add a B+ tree index"
-- Impatto su directory con molti file (ISO library, template repository)
-- **Fix:** implementare `src/btree.c` nel kmod
-
-**LIMIT-002: Extent B+ tree non implementato nel kmod**
-
-- File con più di 16 extent non supportati nel kernel module
-- `i_extent_tree_root` nel disco è previsto ma non gestito nel kmod
-- Impatto: file molto frammentati o molto grandi con extent piccoli
-
-### BASSA priorità / Feature mancanti
-
-| Feature | Stato | Note |
-|---------|-------|------|
-| SCSI CAW vero | Non implementato | Richiesto per multi-nodo production |
-| B+ tree directory | Solo userspace | `src/btree.c` pronto |
-| Multi-LUN spanning | Non implementato | Sezione 8.4 arch doc |
-| Cifratura per-file AES-256-XTS | Non implementato | Flag `OCSFS_FEAT_ENCRYPTION` definito |
-| Deduplicazione | Non implementato | Flag `OCSFS_FEAT_DEDUP` definito |
-| Proxmox HA inode→VM mapping | Non collegato | `OCSFSPlugin.pm` esiste |
-| fsck offline completo | Solo check base | `ocsfs-tool check` |
-| Online grow multi-LUN | Non implementato | Menzionato arch doc §8.4 |
-| KUnit kernel tests | Non esistono | Solo userspace test_ocsfs.c |
+| Gap | Impact | Path to fix |
+|---|---|---|
+| Single recovery target | Second node death during recovery is not handled | Change `s_recovery_target` to a bitmask and process the queue serially |
+| Snapshot for btree-backed inodes | `OCSFS_IOC_SNAP_CREATE` returns `-EOPNOTSUPP` for files with >16 extents | Implement `ocsfs_extent_btree_iterate` with refcount tracking |
+| Compression write path (O_DIRECT) | O_DIRECT writes are never compressed | Architectural: O_DIRECT bypasses the page cache where compression hooks live |
+| Shared mmap in cluster mode | `MAP_SHARED|PROT_WRITE` returns `-EOPNOTSUPP` | Would require distributed cache coherence — out of scope for v0.1 |
+| POSIX distributed file locking | `fcntl` advisory locks are local to the node | Requires integration with the DLM and `posix_lock_file` VFS hooks |
+| Encryption | Zero implementation | Would require `fscrypt` integration |
+| Quota | Zero implementation | Would require `dquot` integration |
+| No out-of-band STONITH | Fencing relies solely on SCSI PR | Wire Proxmox API or iDRAC as a fallback fencing agent |
+| Node table TOCTOU | Without CAW, two nodes can claim the same slot | Fixed by SCSI CAW implementation |

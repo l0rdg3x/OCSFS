@@ -1,138 +1,149 @@
-# OCSFS — Guida Amministratore
+# OCSFS — Administrator Guide
 
-**Versione:** 0.1 — Maggio 2026  
-**Piattaforma:** Proxmox VE 8.x, Linux kernel 6.6+ LTS  
-**Stato:** Alpha — non per produzione
-
-## Indice
-
-1. [Prerequisiti](#1-prerequisiti)
-2. [Installazione](#2-installazione)
-3. [Formattazione del LUN](#3-formattazione-del-lun)
-4. [Configurazione Proxmox VE](#4-configurazione-proxmox-ve)
-5. [Mount e operazioni base](#5-mount-e-operazioni-base)
-6. [Monitoraggio](#6-monitoraggio)
-7. [Operazioni di manutenzione](#7-operazioni-di-manutenzione)
-8. [Troubleshooting](#8-troubleshooting)
-9. [Limitazioni note](#9-limitazioni-note)
+**Version:** 0.1 — May 2026
+**Platform:** Proxmox VE 8.x, Linux kernel 6.6+ LTS
+**Status:** Alpha — do not use with production data
 
 ---
 
-## 1. Prerequisiti
+## Table of Contents
 
-### Infrastruttura
+1. [Prerequisites](#1-prerequisites)
+2. [Installation](#2-installation)
+3. [Formatting the LUN](#3-formatting-the-lun)
+4. [Proxmox VE Configuration](#4-proxmox-ve-configuration)
+5. [Mount and Basic Operations](#5-mount-and-basic-operations)
+6. [Monitoring](#6-monitoring)
+7. [Maintenance Operations](#7-maintenance-operations)
+8. [Troubleshooting](#8-troubleshooting)
+9. [Known Limitations](#9-known-limitations)
 
-- **Storage:** FC SAN LUN (o iSCSI con supporto SCSI-3 PR) condiviso e accessibile da tutti i nodi Proxmox
-- **Multipath:** `multipathd` configurato e i device mapper `/dev/mapper/mpath*` visibili su tutti i nodi
-- **SCSI PR:** Il target SAN deve supportare Persistent Reservations (tutti gli array enterprise FC supportano PR)
-- **Kernel:** 6.6 LTS o superiore
-- **Proxmox VE:** 8.0 o superiore
+---
 
-### Verifica compatibilità SCSI PR
+## 1. Prerequisites
+
+### Storage Infrastructure
+
+- **Shared block device:** FC SAN LUN or iSCSI target with SCSI-3 Persistent
+  Reservations support, accessible from all cluster nodes simultaneously.
+- **Multipath (recommended):** `multipathd` configured so that
+  `/dev/mapper/mpath*` devices are visible on all nodes. Not strictly required
+  for single-node or lab setups.
+- **SCSI-3 PR:** The storage target must support SCSI-3 Persistent
+  Reservations. All enterprise FC arrays do. For iSCSI, LIO (Linux) and
+  TrueNAS SCALE support PR natively; check your target's documentation.
+
+### Kernel and OS
+
+- Linux kernel 6.6 LTS or newer
+- Proxmox VE 8.0 or newer (for PVE integration)
+
+### Verify SCSI PR support
 
 ```bash
-# Verifica che il LUN supporti SCSI PR
+# Run on the node that will connect to the shared device
 sg_persist -i -k /dev/mapper/mpathX
-# Output atteso: "PR generation=0x0" (anche se vuoto, indica supporto)
+# Expected: "PR generation=0x0" (empty is fine; any response means PR works)
+
+# If sg_persist is not installed:
+apt install sg3-utils
 ```
 
-### Pacchetti richiesti su ogni nodo
+### Required packages on each node
 
 ```bash
 apt install build-essential dkms linux-headers-$(uname -r) \
-            multipath-tools sg3-utils uuid-runtime
+            multipath-tools sg3-utils uuid-runtime open-iscsi
 ```
 
 ---
 
-## 2. Installazione
+## 2. Installation
 
-### Opzione A — Pacchetti Debian (raccomandato)
+### Option A — Debian packages (recommended)
 
 ```bash
-# Clona il repository
-git clone https://github.com/ocsfs/ocsfs /opt/ocsfs
+git clone https://github.com/l0rdg3x/OCSFS /opt/ocsfs
 cd /opt/ocsfs
 
-# Costruisci i pacchetti
+# Build packages
 dpkg-buildpackage -us -uc -b
 
-# Installa su tutti i nodi Proxmox
+# Install on every Proxmox node
 dpkg -i ../ocsfs-tools_0.1.0-1_amd64.deb \
         ../ocsfs-dkms_0.1.0-1_all.deb \
         ../ocsfs-proxmox_0.1.0-1_all.deb
 ```
 
-### Opzione B — Installazione manuale
+### Option B — Manual installation
 
 ```bash
 cd /opt/ocsfs
 
 # Userspace tools
 make all
-make install   # installa in /usr/local/bin
+sudo make install        # installs to /usr/local/bin
 
 # Kernel module via DKMS
 sudo dkms add kmod/
 sudo dkms build ocsfs/0.1.0
 sudo dkms install ocsfs/0.1.0
 
-# Plugin Proxmox
+# Proxmox VE plugin
 sudo proxmox/install.sh
 ```
 
-### Verifica installazione
+### Verify installation
 
 ```bash
-# Il modulo deve caricarsi senza errori
 sudo modprobe ocsfs
 dmesg | grep ocsfs
-# Atteso: "ocsfs: Open Cluster Shared FileSystem v0.1 loaded"
+# Expected: "ocsfs: Open Cluster Shared FileSystem v0.1 loaded"
 
-# Tools disponibili
 mkfs.ocsfs --version
 ocsfs-tool --help
 ```
 
 ---
 
-## 3. Formattazione del LUN
+## 3. Formatting the LUN
 
-**ATTENZIONE:** `mkfs.ocsfs` distrugge tutti i dati sul device. Esegui solo su LUN dedicati.
+> **Warning:** `mkfs.ocsfs` destroys all existing data on the device.
+> Run this only on a dedicated LUN.
 
 ```bash
-# Identifica il LUN multipath
+# Identify the multipath device
 multipath -ll
-# Esempio: mpath0 (3600508b1001c89480e7b8b1d7dc00f2) dm-3 DGC,RAID 5
 
-# Formatta (esegui su UN SOLO nodo)
+# Format — run on ONE node only
 mkfs.ocsfs \
-  -L nome-datastore \    # label del volume (max 64 char)
-  -N 16 \                # max nodi concorrenti (default 64, max 256)
-  -E 4M \                # extent size (default 1M, range 64K-64M)
-  -f \                   # force (sovrascrive dati esistenti)
-  -v \                   # verbose
+  -L my-datastore \   # volume label (max 64 chars)
+  -N 16 \             # max concurrent nodes (default 64, max 256)
+  -E 4M \             # extent size (default 1M, range 64K–64M)
+  -f \                # force (overwrite existing data)
+  -v \                # verbose output
   /dev/mapper/mpath0
 
-# Verifica il risultato
+# Verify
 ocsfs-tool info /dev/mapper/mpath0
 ```
 
-### Parametri mkfs consigliati per Proxmox
+### Recommended mkfs parameters for Proxmox clusters
 
-| Scenario | max nodi (`-N`) | extent size (`-E`) |
+| Cluster size | Max nodes (`-N`) | Extent size (`-E`) |
 |---|---|---|
-| Cluster piccolo (2-4 nodi) | 8 | 1M |
-| Cluster medio (5-16 nodi) | 32 | 4M |
-| Cluster grande (17-64 nodi) | 64 | 8M |
+| Small (2–4 nodes) | 8 | 1M |
+| Medium (5–16 nodes) | 32 | 4M |
+| Large (17–64 nodes) | 64 | 8M |
 
-> **Nota:** `max_nodes` è fisso al formato e non cambiabile dopo. Sovradimensiona leggermente.
+> `max_nodes` is fixed at format time and cannot be changed afterwards.
+> Oversize slightly to allow for future growth.
 
 ---
 
-## 4. Configurazione Proxmox VE
+## 4. Proxmox VE Configuration
 
-### Aggiunta storage via CLI (da un nodo, si replica automaticamente)
+### Add storage via CLI (runs on one node, replicates automatically)
 
 ```bash
 pvesm add ocsfs fc-shared \
@@ -144,7 +155,7 @@ pvesm add ocsfs fc-shared \
   --shared 1
 ```
 
-### Configurazione manuale in `/etc/pve/storage.cfg`
+### Manual configuration in `/etc/pve/storage.cfg`
 
 ```
 ocsfs: fc-shared
@@ -156,43 +167,42 @@ ocsfs: fc-shared
     shared 1
 ```
 
-### Opzioni configurazione storage
+### Storage options reference
 
-| Opzione | Descrizione | Default |
-|---------|-------------|---------|
-| `path` | Mount point locale | (richiesto) |
-| `device` | Block device (preferire multipath) | (richiesto) |
-| `content` | Tipi di contenuto supportati | images |
-| `maxnodes` | Max nodi contemporanei | 64 |
-| `thin` | Thin provisioning VM disks | 0 |
-| `shared` | Storage condiviso tra nodi | 0 |
+| Option | Description | Default |
+|---|---|---|
+| `path` | Local mount point | (required) |
+| `device` | Block device (use multipath path) | (required) |
+| `content` | Supported content types | images |
+| `maxnodes` | Max concurrent nodes | 64 |
+| `thin` | Enable thin provisioning for VM disks | 0 |
+| `shared` | Mark storage as shared between nodes | 0 |
 
-### Abilitazione su tutti i nodi
+### Enable on all nodes
 
-Il plugin Proxmox monta automaticamente lo storage su tutti i nodi tramite il servizio `ocsfs-mount@.service`:
+The Proxmox plugin mounts the storage automatically via `ocsfs-mount@.service`:
 
 ```bash
-# Verifica che il servizio sia attivo su ogni nodo
+# Verify the service is active on each node
 systemctl status ocsfs-mount@fc-shared.service
 
-# Mount manuale se necessario
+# Manual mount if needed
 mount -t ocsfs /dev/mapper/mpath0 /mnt/pve/fc-shared
 ```
 
 ---
 
-## 5. Mount e operazioni base
+## 5. Mount and Basic Operations
 
-### Mount manuale
+### Manual mount
 
 ```bash
-# Carica il modulo
 sudo modprobe ocsfs
 
-# Mount
+# Standard mount
 sudo mount -t ocsfs /dev/mapper/mpath0 /mnt/ocsfs
 
-# Con autenticazione cluster (se il volume ha FEAT_AUTH)
+# With cluster authentication (if the volume has FEAT_AUTH)
 sudo mount -t ocsfs -o cluster_secret=<64-hex-chars> \
   /dev/mapper/mpath0 /mnt/ocsfs
 ```
@@ -200,14 +210,13 @@ sudo mount -t ocsfs -o cluster_secret=<64-hex-chars> \
 ### Unmount
 
 ```bash
-# Verifica che nessun processo acceda al filesystem
+# Check that no process is using the filesystem
 lsof /mnt/ocsfs
 
-# Unmount
 sudo umount /mnt/ocsfs
 ```
 
-### Mount via `/etc/fstab`
+### Persistent mount via `/etc/fstab`
 
 ```
 /dev/mapper/mpath0  /mnt/ocsfs  ocsfs  defaults,_netdev  0 0
@@ -215,25 +224,23 @@ sudo umount /mnt/ocsfs
 
 ---
 
-## 6. Monitoraggio
+## 6. Monitoring
 
-### Stato cluster
+### Cluster status
 
 ```bash
-# Panoramica completa
 ocsfs-tool status /mnt/ocsfs
 
-# Esempio output:
-# Volume: shared-vm-store (UUID: a1b2c3...)
-# Block size: 4096, Extent size: 4194304
-# Total: 4.8 TiB, Free: 2.7 TiB, Used: 2.1 TiB
+# Example output:
+# Volume: shared-vm-store  UUID: a1b2c3...
+# Block size: 4096  Total: 4.8 TiB  Free: 2.7 TiB
 #
-# Node 0 [pve1] ACTIVE  HB: 2s ago  Locks: 0
-# Node 1 [pve2] ACTIVE  HB: 3s ago  Locks: 5
-# Node 2 [pve3] ACTIVE  HB: 1s ago  Locks: 3
+# Node 0 [pve1]  ACTIVE  HB: 2s ago  Locks: 0
+# Node 1 [pve2]  ACTIVE  HB: 3s ago  Locks: 5
+# Node 2 [pve3]  ACTIVE  HB: 1s ago  Locks: 3
 ```
 
-### Lista nodi attivi
+### Active nodes
 
 ```bash
 ocsfs-tool nodes /mnt/ocsfs
@@ -242,167 +249,189 @@ ocsfs-tool nodes /mnt/ocsfs
 ### Lock table
 
 ```bash
-# Mostra tutti i lock attivi
+# Show all active locks (useful for diagnosing stalls or orphan locks)
 ocsfs-tool locks /mnt/ocsfs
-
-# Utile per diagnosticare blocchi o lock orfani
 ```
 
-### Utilizzo spazio
+### Space usage
 
 ```bash
 ocsfs-tool df /mnt/ocsfs
-
-# Output include:
-# - Spazio totale / usato / libero
-# - Spazio thin-allocated vs effettivamente scritto
-# - Inodes per AG
+# Reports: total/used/free, thin-allocated vs. written, inodes per AG
 ```
 
-### Log kernel
+### Kernel log
 
 ```bash
-# Messaggi OCSFS in tempo reale
+# Live OCSFS messages
 dmesg -w | grep ocsfs
 
-# Messaggi di heartbeat e recovery
+# Heartbeat and recovery events
 journalctl -k | grep ocsfs
 ```
 
 ---
 
-## 7. Operazioni di manutenzione
+## 7. Maintenance Operations
 
-### Defragmentazione online
+### Online defragmentation
 
 ```bash
-# Avvia defrag in background (limitato a 50 MB/s)
+# Start defrag in background, limited to 50 MB/s
 ocsfs-defrag /mnt/ocsfs -b 50
 
-# Dry run (solo report, non modifica nulla)
+# Dry run — report only, no changes
 ocsfs-defrag /mnt/ocsfs -n
 
-# Verbose con soglia di frammentazione personalizzata
+# Verbose with custom fragmentation threshold
 ocsfs-defrag /mnt/ocsfs -v -t 4 -b 100
 
-# Pausa / Ripresa
-kill -USR1 <pid-defrag>   # pausa
-kill -USR2 <pid-defrag>   # ripresa
+# Pause / Resume via signals
+kill -USR1 <defrag-pid>   # pause
+kill -USR2 <defrag-pid>   # resume
 ```
 
-Il defrag daemon usa il lock table per garantire che giri su un solo nodo alla volta.
+The defrag daemon uses the lock table to ensure only one instance runs
+cluster-wide at a time.
 
-### Verifica integrità (offline)
+### Offline filesystem check
 
 ```bash
-# ATTENZIONE: il device NON deve essere montato
+# The device MUST NOT be mounted
 umount /mnt/ocsfs
 
-ocsfs-tool check /dev/mapper/mpath0
+# Run all 9 checks (read-only)
+python3 /opt/ocsfs/tools/ocsfs-fsck /dev/mapper/mpath0
 
-# Controlla: magic, checksum CRC32C, AG consistency,
-#            lock table entries, heartbeat staleness
+# Run with repair mode (patches orphans, stale locks, node slots)
+python3 /opt/ocsfs/tools/ocsfs-fsck --repair /dev/mapper/mpath0
 ```
 
-### Recovery manuale di un nodo morto
+Checks performed:
+
+| # | Check |
+|---|---|
+| 1 | Superblock magic and CRC32c |
+| 2 | AG descriptor consistency |
+| 3 | Journal header validity |
+| 3b | Free block cross-check: bitmap popcount vs. AG descriptors vs. superblock |
+| 4 | Inode table: orphan detection and repair |
+| 5 | Extent consistency within each inode |
+| 6 | Heartbeat region: stale entries |
+| 7 | Lock table: stale or orphaned locks |
+| 8 | Refcount table: unreferenced entries |
+| 9 | Node slot table: stale ACTIVE entries |
+
+### Thin provisioning — reclaiming space
+
+Space is reclaimed automatically when guest OSes issue TRIM/DISCARD. To force it:
 
 ```bash
-# Se il recovery automatico non parte (es. timeout heartbeat troppo corto)
-ocsfs-tool recover /mnt/ocsfs --node <slot-number>
-
-# Fencing di emergenza
-ocsfs-tool fence /mnt/ocsfs --node <slot-number>
-```
-
-### Thin provisioning — recupero spazio
-
-Il recupero avviene automaticamente quando il guest OS esegue TRIM/DISCARD. Per forzarlo:
-
-```bash
-# Dal guest Linux
+# From inside the guest Linux VM
 fstrim -v /
 
-# Verifica spazio recuperato
+# Verify reclaimed space on the host
 ocsfs-tool df /mnt/ocsfs
+```
+
+### Manual recovery of a dead node
+
+Recovery is automatic when heartbeat timeout expires. If it does not start:
+
+```bash
+# Force recovery of a specific slot
+ocsfs-tool recover /mnt/ocsfs --node <slot-number>
+
+# Emergency fencing
+ocsfs-tool fence /mnt/ocsfs --node <slot-number>
 ```
 
 ---
 
 ## 8. Troubleshooting
 
-### Il modulo non si carica
+### Module fails to load
 
 ```bash
 dmesg | grep ocsfs
-modinfo ocsfs   # verifica che il modulo sia compilato per il kernel corrente
-dkms status     # verifica stato DKMS
+modinfo ocsfs        # verify module is compiled for the running kernel
+dkms status          # verify DKMS state
 ```
 
-**Causa comune:** il kernel è stato aggiornato senza ricompilare il modulo. Soluzione:
+**Common cause:** kernel was updated without rebuilding the module.
+
 ```bash
 dkms autoinstall
 ```
 
-### Mount fallisce con "bad magic"
+### Mount fails with "bad magic"
 
 ```bash
 ocsfs-tool info /dev/mapper/mpath0
-# Se ritorna errore → il device non è formattato come OCSFS
-# Verifica device multipath corretto con: multipath -ll
+# Error → device is not formatted as OCSFS
+# Verify the correct multipath device: multipath -ll
 ```
 
-### Mount fallisce con "superblock checksum mismatch"
+### Mount fails with "superblock checksum mismatch"
 
-Il superblock principale è corrotto. Prova il mirror:
+The primary superblock is corrupted. OCSFS automatically tries the mirror
+superblock at offset 4 KB. If both fail, run offline fsck:
+
 ```bash
-# Internamente ocsfs tenta il mirror automaticamente
-# Se fallisce entrambi, il volume richiede fsck offline:
-ocsfs-tool check /dev/mapper/mpath0
+python3 /opt/ocsfs/tools/ocsfs-fsck --repair /dev/mapper/mpath0
 ```
 
-### Nodo non si unisce al cluster (heartbeat timeout)
+### Node fails to join the cluster (heartbeat timeout)
 
 ```bash
-# Verifica che il device multipath sia accessibile in lettura/scrittura
+# Verify the multipath device is accessible for read/write
 dd if=/dev/mapper/mpath0 of=/dev/null bs=4096 count=100
 
-# Verifica che il path di storage non sia saturato
+# Check if the storage path is saturated
 iostat -x 1 5 dm-3
 
-# Aumenta temporaneamente il timeout (richiede rimount)
-# mount -t ocsfs -o heartbeat_timeout=30000 ...
+# Temporarily increase the timeout (requires remount)
+mount -t ocsfs -o heartbeat_timeout=30000 /dev/mapper/mpath0 /mnt/ocsfs
 ```
 
-### Lock timeout su operazione
+### Lock timeout on an operation
 
 ```bash
-# Identifica chi tiene il lock
+# Identify who holds the lock
 ocsfs-tool locks /mnt/ocsfs
 
-# Se il holder node è DEAD ma non recuperato:
+# If the holder node is DEAD but not recovered:
 ocsfs-tool recover /mnt/ocsfs --node <slot>
 ```
 
-### SCSI PR non supportato (loop, iSCSI economico)
+### SCSI PR not supported (loopback, basic iSCSI)
 
-OCSFS rileva automaticamente se il device non supporta PR e opera in **single-node mode** (nessun locking on-disk attivo). I log mostrano:
+OCSFS detects automatically when the device does not support PR and operates
+in **degraded single-node mode**. The kernel log shows:
 
 ```
-ocsfs: PR not supported by device, skipping
+ocsfs: device does not support SCSI PR; cluster safety depends on exclusive SAN zoning
 ```
 
-In questo caso il mount su più nodi contemporaneamente è **non sicuro**.
+In this mode, mounting on multiple nodes simultaneously is **unsafe**.
+Use only FC SAN or LIO/TrueNAS SCALE iSCSI for multi-node deployments.
 
 ---
 
-## 9. Limitazioni note
+## 9. Known Limitations
 
-| Limitazione | Impatto | Workaround |
-|------------|---------|------------|
-| Single-node mode su device senza PR | No protezione multi-nodo | Usa solo FC SAN con PR |
-| Directory con >~1000 file lente | Performance degradata | Evita directory molto grandi in questa versione |
-| File con >16 extent non supportati nel kmod | File molto frammentati possono non essere accessibili | Esegui defrag regolarmente |
-| Recovery di un solo nodo fallito per volta | Se due nodi muoiono insieme, il secondo non viene recuperato | Contatta il team per recovery manuale |
-| Nessun fsck offline completo | Errori di consistenza non riparabili automaticamente | `ocsfs-tool check` per diagnosi |
+| Limitation | Impact | Notes |
+|---|---|---|
+| SCSI CAW via BSG not yet implemented | Node slot TOCTOU possible without hardware atomicity | BSG implementation is the next priority; kprobe shim is active |
+| No xfstests coverage yet | Unknown edge cases in VFS layer | Requires a 2-node testbed; KVM + LIO is sufficient |
+| No encryption | Data at rest is unencrypted | fscrypt integration not implemented |
+| No quota | Disk quotas not enforced | No dquot support |
+| Snapshot for large files (-EOPNOTSUPP) | Files with >16 extents cannot be snapshotted | Requires refcount B+ tree iterator |
+| Shared mmap unsupported in cluster mode | `MAP_SHARED|PROT_WRITE` returns EOPNOTSUPP | Private and read-only mappings work |
+| Single recovery at a time | If two nodes die simultaneously, the second is not recovered | `s_recovery_target` is a single u16; bitmask queue is the fix |
+| No out-of-band STONITH | SCSI PR fencing works; hardware PDU/iDRAC not wired | Proxmox API can serve as soft STONITH in lab environments |
 
-> **Stato Alpha:** OCSFS è in fase di sviluppo attivo. Non usare per dati di produzione critici senza un piano di backup e test approfonditi nel proprio ambiente.
+> **Alpha status:** OCSFS is under active development. Do not deploy with
+> critical data without a tested backup plan and thorough evaluation in your
+> own environment. The cluster protocol has not yet been validated against a
+> real multi-node testbed.
