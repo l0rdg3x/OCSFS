@@ -364,6 +364,53 @@ out_abort:
 	return ret;
 }
 
+/*
+ * Join the inode block to an already-open txn and update both btree root
+ * fields atomically.  The caller holds DLM EX on the inode and owns txn.
+ * On failure the txn is NOT aborted — caller decides.
+ */
+int ocsfs_inode_journal_root(struct ocsfs_txn *txn, struct inode *inode)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
+	struct ocsfs_inode_info *oi = OCSFS_I(inode);
+	struct buffer_head *bh;
+	struct ocsfs_disk_inode *di;
+	u64 off   = ocsfs_inode_disk_off(sbi, oi->i_disk_ino);
+	u64 block = off / sbi->s_block_size;
+	u32 boff  = off % sbi->s_block_size;
+	int ret;
+
+	if (sbi->s_clustered) {
+		bh = sb_getblk(inode->i_sb, block);
+		if (!bh)
+			return -EIO;
+		clear_buffer_uptodate(bh);
+		if (bh_read(bh, 0) < 0) {
+			brelse(bh);
+			return -EIO;
+		}
+	} else {
+		bh = sb_bread(inode->i_sb, block);
+		if (!bh)
+			return -EIO;
+	}
+
+	ret = ocsfs_txn_add_bh(txn, bh);
+	if (ret) {
+		brelse(bh);
+		return ret;
+	}
+
+	di = (struct ocsfs_disk_inode *)(bh->b_data + boff);
+	di->i_dir_btree_root   = cpu_to_le64(oi->i_dir_btree_root);
+	di->i_extent_tree_root = cpu_to_le64(oi->i_extent_tree_root);
+	di->i_checksum = cpu_to_le32(
+		ocsfs_crc32c(~0U, di, OCSFS_INODE_SIZE - 4));
+
+	brelse(bh);
+	return 0;
+}
+
 int ocsfs_write_inode(struct inode *inode, struct writeback_control *wbc)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);

@@ -224,6 +224,7 @@ int ocsfs_recovery_run(struct super_block *sb, u16 failed_slot)
 		pr_err("ocsfs: PR fencing failed (ret=%d) on PR-capable device — "
 		       "forcing read-only to prevent split-brain\n", ret);
 		sb->s_flags |= SB_RDONLY;
+		ocsfs_node_mark_dead(sb, failed_slot);
 		ocsfs_recovery_leader_release(sb, failed_slot, leader_epoch);
 		sbi->s_recovery_in_progress = false;
 		mutex_unlock(&sbi->s_recovery_lock);
@@ -235,11 +236,19 @@ int ocsfs_recovery_run(struct super_block *sb, u16 failed_slot)
 
 	/*
 	 * Phase 3 — Journal Replay
+	 *
+	 * Set s_recovery_barrier while replaying AFTER-images so that survivor
+	 * nodes cannot acquire EX locks on the blocks being replayed (CRIT-B).
+	 * This is a local barrier only; cross-node quiescence would require
+	 * writing a fence flag to the shared recovery leader block.
 	 */
 	pr_info("ocsfs: recovery phase 3: journal replay for node %u\n",
 		failed_slot);
 
+	atomic_set(&sbi->s_recovery_barrier, 1);
 	ret = ocsfs_journal_replay_node(sb, failed_slot);
+	atomic_set(&sbi->s_recovery_barrier, 0);
+
 	if (ret) {
 		pr_err("ocsfs: journal replay for node %u failed: %d — "
 		       "forcing read-only\n", failed_slot, ret);

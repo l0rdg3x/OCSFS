@@ -282,6 +282,17 @@ void ocsfs_dlm_exit(struct super_block *sb)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	struct ocsfs_lock_res *lr, *tmp;
+	u32 i;
+
+	/* Release per-AG static locks (not in s_lock_list, lr_dynamic=false). */
+	if (sbi->s_ags) {
+		for (i = 0; i < sbi->s_ag_count; i++) {
+			if (sbi->s_ags[i].ag_lock_res.lr_mode != OCSFS_LOCK_NL)
+				ocsfs_lock_release(sb, &sbi->s_ags[i].ag_lock_res);
+			if (sbi->s_ags[i].ag_rc_lock_res.lr_mode != OCSFS_LOCK_NL)
+				ocsfs_lock_release(sb, &sbi->s_ags[i].ag_rc_lock_res);
+		}
+	}
 
 	spin_lock(&sbi->s_lock_list_lock);
 	list_for_each_entry_safe(lr, tmp, &sbi->s_lock_list, lr_list) {

@@ -194,6 +194,7 @@ static int journal_replay_j(struct super_block *sb, struct ocsfs_journal *j)
 							if (actual == expected_crc) {
 								mark_buffer_dirty(bh);
 								sync_dirty_buffer(bh);
+								clear_buffer_uptodate(bh);
 								this_replayed++;
 								replayed++;
 							} else {
@@ -329,6 +330,7 @@ static int journal_replay_j(struct super_block *sb, struct ocsfs_journal *j)
 								if (actual == exp_crc) {
 									mark_buffer_dirty(bh);
 									sync_dirty_buffer(bh);
+									clear_buffer_uptodate(bh);
 									this_replayed++;
 									replayed++;
 								} else {

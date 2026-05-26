@@ -319,8 +319,10 @@ int ocsfs_dir_btree_insert(struct inode *dir, const struct qstr *name,
 
 	hash = dir_name_hash(name->name, name->len);
 	ret = ocsfs_btree_insert(&bt, hash, dir_encode_val(phys_block, offset));
-	if (!ret)
+	if (!ret) {
 		oi->i_dir_btree_root = bt.root_block;
+		ret = ocsfs_inode_journal_root(txn, dir);
+	}
 
 	if (ret)
 		ocsfs_txn_abort(txn);
@@ -353,8 +355,10 @@ int ocsfs_dir_btree_delete(struct inode *dir, const struct qstr *name)
 
 	hash = dir_name_hash(name->name, name->len);
 	ret = ocsfs_btree_delete(&bt, hash);
-	if (!ret)
+	if (!ret) {
 		oi->i_dir_btree_root = bt.root_block;
+		ret = ocsfs_inode_journal_root(txn, dir);
+	}
 
 	if (ret)
 		ocsfs_txn_abort(txn);

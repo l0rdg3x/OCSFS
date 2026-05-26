@@ -622,6 +622,7 @@ struct ocsfs_sb_info {
 	DECLARE_BITMAP(s_recovery_pending, OCSFS_MAX_NODES); /* one bit per failed slot */
 	bool                    s_recovery_in_progress;
 	struct mutex            s_recovery_lock;
+	atomic_t                s_recovery_barrier; /* non-zero during Phase 3 replay; EX acquires must wait */
 
 	/* Cluster auth */
 	u8              s_cluster_secret[32];   /* raw secret from mount option */
@@ -778,6 +779,7 @@ int ocsfs_init_acl(struct mnt_idmap *idmap, struct inode *inode,
 
 struct inode *ocsfs_iget(struct super_block *sb, u64 ino);
 int ocsfs_flush_inode_locked(struct inode *inode, bool force_sync);
+int ocsfs_inode_journal_root(struct ocsfs_txn *txn, struct inode *inode);
 int ocsfs_inode_refresh(struct inode *inode);
 int ocsfs_orphan_scan(struct super_block *sb);
 int ocsfs_write_inode(struct inode *inode, struct writeback_control *wbc);

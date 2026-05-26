@@ -193,6 +193,11 @@ int ocsfs_extent_btree_insert(struct inode *inode, u64 logical, u64 physical,
 		return ret;
 	}
 	oi->i_extent_tree_root = bt.root_block;
+	ret = ocsfs_inode_journal_root(txn, inode);
+	if (ret) {
+		ocsfs_txn_abort(txn);
+		return ret;
+	}
 	ret = ocsfs_txn_commit(txn);
 	if (!ret)
 		mark_inode_dirty(inode);
@@ -259,6 +264,9 @@ int ocsfs_extent_btree_migrate(struct inode *inode)
 
 	oi->i_extent_tree_root = bt.root_block;
 	oi->i_extent_count     = 0;
+	ret = ocsfs_inode_journal_root(txn, inode);
+	if (ret)
+		goto abort;
 	return ocsfs_txn_commit(txn);
 
 abort:
@@ -367,6 +375,9 @@ int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block)
 		} while (tc.count > 0);
 	}
 
+	ret = ocsfs_inode_journal_root(txn, inode);
+	if (ret)
+		goto abort;
 	ret = ocsfs_txn_commit(txn);
 	if (!ret)
 		mark_inode_dirty(inode);
@@ -457,6 +468,9 @@ int ocsfs_extent_btree_convert_unwritten(struct inode *inode, u64 logical, u32 l
 		oi->i_extent_tree_root = bt.root_block;
 	}
 
+	ret = ocsfs_inode_journal_root(txn, inode);
+	if (ret)
+		goto abort;
 	ret = ocsfs_txn_commit(txn);
 	if (!ret)
 		mark_inode_dirty(inode);
@@ -520,6 +534,9 @@ int ocsfs_extent_btree_replace(struct inode *inode,
 		oi->i_extent_tree_root = bt.root_block;
 	}
 
+	ret = ocsfs_inode_journal_root(txn, inode);
+	if (ret)
+		goto abort;
 	ret = ocsfs_txn_commit(txn);
 	if (!ret)
 		mark_inode_dirty(inode);
@@ -562,6 +579,9 @@ int ocsfs_extent_btree_clear(struct inode *inode)
 	} while (tc.count > 0);
 
 	oi->i_extent_tree_root = 0;
+	ret = ocsfs_inode_journal_root(txn, inode);
+	if (ret)
+		goto abort;
 	ret = ocsfs_txn_commit(txn);
 	if (!ret)
 		mark_inode_dirty(inode);
@@ -598,6 +618,11 @@ int ocsfs_extent_btree_init_empty(struct inode *inode)
 	}
 
 	oi->i_extent_tree_root = bt.root_block;
+	ret = ocsfs_inode_journal_root(txn, inode);
+	if (ret) {
+		ocsfs_txn_abort(txn);
+		return ret;
+	}
 	ret = ocsfs_txn_commit(txn);
 	if (!ret)
 		mark_inode_dirty(inode);

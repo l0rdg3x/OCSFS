@@ -461,5 +461,6 @@ void ocsfs_cluster_exit(struct super_block *sb)
 		ocsfs_node_exit(sb);
 	} else {
 		ocsfs_recovery_exit(sb);
+		ocsfs_dlm_exit(sb);
 	}
 }

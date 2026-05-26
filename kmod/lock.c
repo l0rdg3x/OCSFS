@@ -40,23 +40,23 @@ int ocsfs_lock_acquire(struct super_block *sb, struct ocsfs_lock_res *lr,
 		return 0;
 	}
 
+	/*
+	 * Recovery barrier: while the leader is replaying journal AFTER-images
+	 * (Phase 3), block any local EX acquisition to avoid overwriting data
+	 * that the replay is about to restore.  Return -EAGAIN so callers retry
+	 * after recovery completes.
+	 */
+	if (mode == OCSFS_LOCK_EX &&
+	    atomic_read(&sbi->s_recovery_barrier))
+		return -EAGAIN;
+
 	mutex_lock(&lr->lr_mutex);
 
 	/*
-	 * Single-node fast-path: if no other node exists, a cached lock is
-	 * always coherent — skip the disk round-trip.
-	 *
-	 * In clustered mode the cache is DISABLED because s_lock_epoch is
-	 * only bumped on node recovery, not on every EX release from a peer.
-	 * A node holding cached SH would not see a peer's EX acquisition,
-	 * creating split-brain on any mmap or write workload.  Always go to
-	 * disk in cluster mode.
+	 * Lock cache is DISABLED in cluster mode: s_lock_epoch is bumped only
+	 * on node recovery, not on EX release from a peer.  Always round-trip
+	 * to disk so every acquisition sees the current holder.
 	 */
-	if (!sbi->s_clustered && lr->lr_cached && lr->lr_mode >= mode) {
-		mutex_unlock(&lr->lr_mutex);
-		return 0;
-	}
-	lr->lr_cached = false;
 
 	ret = lock_probe_slot(sb, lr);
 	if (ret) {
@@ -102,11 +102,8 @@ retry:
 		if (ret == -EAGAIN)
 			goto retry;
 
-		if (ret == 0) {
-			lr->lr_mode   = mode;
-			lr->lr_cached = true;
-			lr->lr_epoch  = (u32)atomic_read(&sbi->s_lock_epoch);
-		}
+		if (ret == 0)
+			lr->lr_mode = mode;
 
 		mutex_unlock(&lr->lr_mutex);
 		return ret;
