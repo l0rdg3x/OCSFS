@@ -1,5 +1,11 @@
 # OCSFS — Open Cluster Shared FileSystem
 
+> **This project is entirely AI-generated.**
+> Every line of code, documentation, and tooling was written by
+> [Claude](https://claude.ai) (Anthropic) through an iterative conversation
+> with a human operator. No human has written or reviewed the source code
+> directly. Treat it accordingly.
+
 An open-source cluster filesystem for Linux, designed for shared block storage
 (iSCSI / Fibre Channel SAN) in virtualized environments. Primary target:
 Proxmox VE as an open alternative to VMware VMFS.
