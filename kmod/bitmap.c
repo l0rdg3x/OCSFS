@@ -630,8 +630,14 @@ int ocsfs_orphan_scan(struct super_block *sb)
 	/*
 	 * Pass 2 — reclaim (single-node only).
 	 *
-	 * In cluster mode a peer may legitimately hold the orphan inode open
-	 * (e.g. tmpfile across mount cycle).  Leave cleanup to fsck; only warn.
+	 * In cluster mode, a peer may legitimately hold the orphan inode open
+	 * (e.g. tmpfile across a mount cycle, or an open file descriptor on
+	 * another node that has not yet triggered evict_inode).  Querying each
+	 * peer via DLM SH would add O(N·orphans) round-trips at every mount;
+	 * the safer approach is to leave cleanup to offline fsck, which can
+	 * compare the inode refcount on disk (should be 0 for a true orphan)
+	 * after all nodes have unmounted.
+	 *
 	 * In single-node mode at mount time no process has the inode open, so
 	 * clear_nlink + iput safely triggers evict_inode → frees blocks.
 	 */

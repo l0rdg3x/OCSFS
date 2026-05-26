@@ -51,6 +51,12 @@ int ocsfs_extent_lookup(struct inode *inode, u64 logical_block,
  * Insert a new extent [logical, logical+len) → [physical, physical+len).
  * Attempts to merge with adjacent extents.
  * Caller must hold i_extent_lock.
+ *
+ * Invariant (MEDIO-8): in cluster mode, callers must also hold DLM EX on
+ * this inode BEFORE the iomap_begin that triggered block allocation, so that
+ * the inode flush at iomap_end (ocsfs_flush_inode_locked) is visible to
+ * peers before we return.  Current callers satisfy this via iomap_begin →
+ * ocsfs_write_begin → DLM EX acquired in ocsfs_file_write_iter.
  * ═══════════════════════════════════════════════════════════════ */
 
 int ocsfs_extent_insert(struct inode *inode, u64 logical, u64 physical,

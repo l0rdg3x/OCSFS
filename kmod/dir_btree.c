@@ -307,6 +307,8 @@ int ocsfs_dir_btree_insert(struct inode *dir, const struct qstr *name,
 	u64 hash;
 	int ret;
 
+	OCSFS_WARN_NO_EX(dir);
+
 	if (!oi->i_dir_btree_root)
 		return -ENOENT;
 
@@ -342,6 +344,8 @@ int ocsfs_dir_btree_delete(struct inode *dir, const struct qstr *name)
 	struct ocsfs_txn *txn;
 	u64 hash;
 	int ret;
+
+	OCSFS_WARN_NO_EX(dir);
 
 	if (!oi->i_dir_btree_root)
 		return 0;

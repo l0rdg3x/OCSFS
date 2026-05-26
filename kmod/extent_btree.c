@@ -179,6 +179,8 @@ int ocsfs_extent_btree_insert(struct inode *inode, u64 logical, u64 physical,
 	struct ext_btree_ctx ec;
 	int ret;
 
+	OCSFS_WARN_NO_EX(inode);
+
 	if (physical > 0xFFFFFFFFFFULL || len > 0x3FFFFFU || (flags & ~0x3U))
 		return -EINVAL;
 
@@ -304,6 +306,8 @@ int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block)
 	struct ext_trunc_ctx tc;
 	struct ocsfs_txn *txn;
 	u64 key, val;
+
+	OCSFS_WARN_NO_EX(inode);
 	u32 i;
 	int ret;
 
@@ -496,6 +500,8 @@ int ocsfs_extent_btree_replace(struct inode *inode,
 	struct ocsfs_btree bt;
 	struct ext_btree_ctx ec;
 	int ret;
+
+	OCSFS_WARN_NO_EX(inode);
 
 	ret = ext_btree_open(inode, &bt, &ec);
 	if (ret)

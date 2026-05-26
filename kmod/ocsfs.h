@@ -677,6 +677,16 @@ static inline struct ocsfs_inode_info *OCSFS_I(struct inode *inode)
 	return container_of(inode, struct ocsfs_inode_info, vfs_inode);
 }
 
+/*
+ * Assert that the caller holds DLM EX on this inode in cluster mode.
+ * Fires WARN_ON when a btree write function is entered without the required
+ * exclusive lock — catches missing lock acquisitions during development.
+ * Silent in single-node mode (DLM not used).
+ */
+#define OCSFS_WARN_NO_EX(inode) \
+	WARN_ON(OCSFS_SB((inode)->i_sb)->s_clustered && \
+		OCSFS_I(inode)->i_lock_res.lr_mode != OCSFS_LOCK_EX)
+
 /* ═══════════════════════════════════════════════════════════════
  * UTILITY HELPERS
  * ═══════════════════════════════════════════════════════════════ */
