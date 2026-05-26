@@ -583,12 +583,26 @@ static int ocsfs_readdir(struct file *file, struct dir_context *ctx)
 {
 	struct inode *dir = file_inode(file);
 	struct ocsfs_sb_info *sbi = OCSFS_SB(dir->i_sb);
-	u64 dir_blocks = (dir->i_size + sbi->s_block_size - 1) /
-			 sbi->s_block_size;
+	u64 dir_blocks;
 	u64 b;
 	u32 off;
 	loff_t pos = ctx->pos;
 	u64 entry_idx = 0;
+	int ret;
+
+	if (sbi->s_clustered) {
+		ret = ocsfs_lock_acquire(dir->i_sb, &OCSFS_I(dir)->i_lock_res,
+					 OCSFS_LOCK_SH);
+		if (ret)
+			return ret;
+		ret = ocsfs_inode_refresh(dir);
+		if (ret) {
+			ocsfs_lock_release(dir->i_sb, &OCSFS_I(dir)->i_lock_res);
+			return ret;
+		}
+	}
+
+	dir_blocks = (dir->i_size + sbi->s_block_size - 1) / sbi->s_block_size;
 
 	for (b = 0; b < dir_blocks; b++) {
 		struct buffer_head *bh;
@@ -615,7 +629,7 @@ static int ocsfs_readdir(struct file *file, struct dir_context *ctx)
 				      le64_to_cpu(de->de_ino),
 				      ocsfs_type_to_dt(de->de_file_type))) {
 				brelse(bh);
-				return 0;
+				goto out;
 			}
 
 			ctx->pos = entry_idx + 1;
@@ -625,6 +639,9 @@ static int ocsfs_readdir(struct file *file, struct dir_context *ctx)
 	}
 
 	ctx->pos = entry_idx;
+out:
+	if (sbi->s_clustered)
+		ocsfs_lock_release(dir->i_sb, &OCSFS_I(dir)->i_lock_res);
 	return 0;
 }
 

@@ -204,11 +204,11 @@ struct inode *ocsfs_iget(struct super_block *sb, u64 ino)
 				   inode->i_rdev);
 	}
 
-	/* Release SH after all VFS fields are set; window to unlock_new_inode. */
+	unlock_new_inode(inode);
+	/* Release SH only after unlock_new_inode so no reader sees the inode
+	 * before VFS fields are fully initialized (MEDIO-3). */
 	if (sbi->s_clustered)
 		ocsfs_lock_release(sb, &oi->i_lock_res);
-
-	unlock_new_inode(inode);
 	return inode;
 }
 

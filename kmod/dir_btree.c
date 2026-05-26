@@ -47,6 +47,7 @@ static u64 dir_name_hash(const char *name, unsigned int len)
 struct dir_btree_ctx {
 	struct super_block *sb;
 	struct ocsfs_txn   *txn;  /* NULL for read-only operations */
+	u32                 ag_hint; /* prefer inode's AG for locality */
 };
 
 static int dir_btree_read(void *ctx, u64 block, void *buf, u32 size)
@@ -124,9 +125,9 @@ static int dir_btree_alloc(void *ctx, u64 *out_block)
 	int ret;
 
 	if (dc->txn)
-		ret = ocsfs_alloc_blocks_txn(dc->txn, dc->sb, 0, 1, &block);
+		ret = ocsfs_alloc_blocks_txn(dc->txn, dc->sb, dc->ag_hint, 1, &block);
 	else
-		ret = ocsfs_alloc_blocks(dc->sb, 0, 1, &block);
+		ret = ocsfs_alloc_blocks(dc->sb, dc->ag_hint, 1, &block);
 
 	if (!ret)
 		*out_block = block;
@@ -154,8 +155,9 @@ static int dir_btree_open(struct inode *dir, struct ocsfs_btree *bt,
 	if (!oi->i_dir_btree_root)
 		return -ENOENT;
 
-	dc->sb  = dir->i_sb;
-	dc->txn = txn;
+	dc->sb      = dir->i_sb;
+	dc->txn     = txn;
+	dc->ag_hint = oi->i_ag;
 	return ocsfs_btree_open(bt, oi->i_dir_btree_root, sbi->s_block_size,
 				dir_btree_read, dir_btree_write,
 				dir_btree_alloc, dir_btree_free, dc);

@@ -39,17 +39,26 @@ struct dedup_ctx {
 	struct dedup_entry **ht;    /* kzalloc'd: DEDUP_HT_SIZE pointers */
 	struct dedup_pair   *pairs; /* singly-linked, newest first */
 	u32                 n_pairs;
+	u32                 io_errs;
 };
 
 /* ── Helpers ─────────────────────────────────────────────────────────────── */
 
-static u64 dedup_hash_block(struct super_block *sb, u64 phys_block)
+static u64 dedup_hash_block(struct super_block *sb, u64 phys_block,
+			    u32 *io_errs)
 {
 	struct buffer_head *bh = sb_bread(sb, phys_block);
 	u64 hash;
 
-	if (!bh)
+	if (!bh) {
+		if (io_errs) {
+			(*io_errs)++;
+			if (*io_errs <= 5)
+				pr_warn_ratelimited("ocsfs: dedup: I/O error on block %llu\n",
+						    phys_block);
+		}
 		return 0;
+	}
 	hash = xxh64(bh->b_data, bh->b_size, 0xDE0DC45EULL);
 	brelse(bh);
 	return hash;
@@ -123,7 +132,7 @@ static int dedup_scan_extent(u64 logical, u64 physical, u32 length,
 
 	for (i = 0; i < length; i++) {
 		u64 phys = physical + i;
-		u64 hash = dedup_hash_block(sb, phys);
+		u64 hash = dedup_hash_block(sb, phys, &dc->io_errs);
 		u32 slot;
 		struct dedup_entry *e;
 
@@ -237,6 +246,9 @@ int ocsfs_dedup_file(struct inode *inode, u64 *bytes_deduped)
 
 	/* Phase 1: read-only scan */
 	ret = ocsfs_extent_btree_iterate(inode, dedup_scan_extent, &dc);
+	if (dc.io_errs)
+		pr_warn_ratelimited("ocsfs: dedup ino=%llu: %u I/O error(s) during scan\n",
+				    oi->i_disk_ino, dc.io_errs);
 	if (ret)
 		goto out_unlock;
 
@@ -257,6 +269,8 @@ int ocsfs_dedup_file(struct inode *inode, u64 *bytes_deduped)
 	mark_inode_dirty(inode);
 
 out_unlock:
+	if (sbi->s_clustered)
+		ocsfs_flush_inode_locked(inode, true);
 	inode_unlock(inode);
 
 	if (sbi->s_clustered)

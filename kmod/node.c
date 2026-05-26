@@ -13,6 +13,7 @@
 #include <linux/utsname.h>
 #include <linux/crypto.h>
 #include <crypto/hash.h>
+#include <crypto/sha2.h>
 #include "ocsfs.h"
 
 static int ocsfs_hmac_sha256(const u8 *key, const u8 *msg, size_t msg_len,
@@ -44,9 +45,6 @@ int ocsfs_node_read_table(struct super_block *sb)
 	struct buffer_head *bh;
 	u64 table_off = OCSFS_NODE_SLOT_TABLE_OFF;
 	u16 i;
-	u32 slots_per_block;
-
-	slots_per_block = sbi->s_block_size / sizeof(struct ocsfs_disk_node_slot);
 
 	/*
 	 * sb_bread can sleep (I/O); must NOT hold s_node_lock across it.
@@ -351,20 +349,41 @@ int ocsfs_node_mark_dead(struct super_block *sb, u16 slot)
  * INIT / EXIT
  * ═══════════════════════════════════════════════════════════════ */
 
+/*
+ * Derive a stable 16-byte node UUID from the system hostname.
+ * Unlike generate_random_uuid(), this produces the same UUID across mounts
+ * so that after a crash the recovering node can recognise its own orphan slot.
+ */
+static void ocsfs_node_derive_uuid(u8 *uuid)
+{
+	static const u8 label[] = "ocsfs-node-uuid-v1";
+	u8 input[sizeof(init_uts_ns.name.nodename) + sizeof(label)];
+	u8 digest[SHA256_DIGEST_SIZE];
+	size_t hlen;
+
+	hlen = strnlen(init_uts_ns.name.nodename,
+		       sizeof(init_uts_ns.name.nodename));
+	memcpy(input, init_uts_ns.name.nodename, hlen);
+	memcpy(input + hlen, label, sizeof(label));
+	sha256(input, hlen + sizeof(label), digest);
+	memcpy(uuid, digest, 16);
+	/* RFC 4122 variant bits: version 5 (SHA-1 namespace, repurposed) */
+	uuid[6] = (uuid[6] & 0x0f) | 0x50;
+	uuid[8] = (uuid[8] & 0x3f) | 0x80;
+}
+
 int ocsfs_node_init(struct super_block *sb)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
-	char hostname[64];
 	int ret;
 
 	spin_lock_init(&sbi->s_node_lock);
 
-	/* Get machine identity */
+	/* Derive stable UUID from hostname (same across mounts/reboots) */
 	memset(sbi->s_node_uuid, 0, 16);
-	generate_random_uuid(sbi->s_node_uuid);
+	ocsfs_node_derive_uuid(sbi->s_node_uuid);
 
-	memset(hostname, 0, sizeof(hostname));
-	/* Use the init_uts_ns for hostname */
+	memset(sbi->s_node_name, 0, sizeof(sbi->s_node_name));
 	memcpy(sbi->s_node_name, init_uts_ns.name.nodename,
 	       min(sizeof(sbi->s_node_name),
 		   sizeof(init_uts_ns.name.nodename)));

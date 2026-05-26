@@ -138,7 +138,8 @@ int ocsfs_heartbeat_check_peers(struct super_block *sb)
 
 		spin_lock(&sbi->s_node_lock);
 		ni = &sbi->s_nodes[i];
-		if (ni->ni_state != OCSFS_NODE_ACTIVE) {
+		if (ni->ni_state != OCSFS_NODE_ACTIVE &&
+		    ni->ni_state != OCSFS_NODE_EVICTING) {
 			spin_unlock(&sbi->s_node_lock);
 			continue;
 		}

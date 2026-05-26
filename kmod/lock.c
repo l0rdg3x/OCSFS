@@ -229,6 +229,12 @@ int ocsfs_lock_downgrade(struct super_block *sb, struct ocsfs_lock_res *lr,
 		brelse(bh);
 		mutex_unlock(&lr->lr_mutex);
 		return ocsfs_lock_release(sb, lr);
+	} else {
+		/* Unsupported mode combination — indicates a caller bug */
+		WARN_ON(1);
+		brelse(bh);
+		mutex_unlock(&lr->lr_mutex);
+		return -EINVAL;
 	}
 
 	ret = lock_write_entry(sb, lr->lr_slot, &dl, bh);

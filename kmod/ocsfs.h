@@ -72,7 +72,8 @@
 #define OCSFS_CAS_LEASE_ENTRIES     256
 #define OCSFS_CAS_LEASE_MAGIC       0x4F43414CU  /* "OCAL" */
 #define OCSFS_CAS_LEASE_SIZE        8192ULL      /* 256 × 32 byte */
-#define CAS_MAX_ATTEMPTS            32
+#define CAS_MAX_ATTEMPTS            128
+#define CAS_MAX_BACKOFF_US          32000 /* 32 ms — covers SAN RTTs up to ~10 ms */
 #define CAS_LEASE_TIMEOUT_NS        (10ULL * NSEC_PER_SEC)
 
 /* Recovery leader election block — dopo l'area CAS lease */
@@ -908,6 +909,8 @@ bool ocsfs_scsi_caw_probe(struct super_block *sb);
 int  ocsfs_scsi_caw(struct super_block *sb, u64 lba,
 		    const void *expected, const void *new_data,
 		    unsigned int lbs);
+int  ocsfs_scsi_pool_init(void);
+void ocsfs_scsi_pool_destroy(void);
 
 /* lock.c — Distributed on-disk lock manager */
 bool lock_modes_compatible(u16 held, u16 requested);

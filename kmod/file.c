@@ -195,6 +195,18 @@ int ocsfs_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
 	if (ret)
 		return ret;
 
+	if (sbi->s_clustered) {
+		ret = ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
+					 OCSFS_LOCK_SH);
+		if (ret)
+			return ret;
+		ret = ocsfs_inode_refresh(inode);
+		if (ret) {
+			ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
+			return ret;
+		}
+	}
+
 	mutex_lock(&oi->i_extent_lock);
 
 	if (oi->i_extent_tree_root) {
@@ -220,6 +232,8 @@ int ocsfs_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
 	}
 
 	mutex_unlock(&oi->i_extent_lock);
+	if (sbi->s_clustered)
+		ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
 	return ret;
 }
 
@@ -372,16 +386,48 @@ static loff_t ocsfs_remap_file_range(struct file *src_file, loff_t pos_in,
 
 	lock_two_nondirectories(src, dst);
 
+	if (sbi->s_clustered) {
+		/* Acquire EX in ino order to avoid deadlock with concurrent remaps. */
+		struct ocsfs_lock_res *lr_lo, *lr_hi;
+
+		if (src_oi->i_disk_ino <= dst_oi->i_disk_ino) {
+			lr_lo = &src_oi->i_lock_res;
+			lr_hi = &dst_oi->i_lock_res;
+		} else {
+			lr_lo = &dst_oi->i_lock_res;
+			lr_hi = &src_oi->i_lock_res;
+		}
+		ret = ocsfs_lock_acquire(src->i_sb, lr_lo, OCSFS_LOCK_EX);
+		if (ret)
+			goto out_unlock_vfs;
+		if (src != dst) {
+			ret = ocsfs_lock_acquire(src->i_sb, lr_hi, OCSFS_LOCK_EX);
+			if (ret) {
+				ocsfs_lock_release(src->i_sb, lr_lo);
+				goto out_unlock_vfs;
+			}
+		}
+		ret = ocsfs_inode_refresh(src);
+		if (!ret && src != dst)
+			ret = ocsfs_inode_refresh(dst);
+		if (ret) {
+			if (src != dst)
+				ocsfs_lock_release(src->i_sb, lr_hi);
+			ocsfs_lock_release(src->i_sb, lr_lo);
+			goto out_unlock_vfs;
+		}
+	}
+
 	ret = generic_remap_file_range_prep(src_file, pos_in, dst_file, pos_out,
 					    &remap_len, remap_flags);
 	if (ret || remap_len == 0)
-		goto out_unlock_vfs;
+		goto out_unlock_dlm;
 
 	if (!IS_ALIGNED(pos_in,    sbi->s_block_size) ||
 	    !IS_ALIGNED(pos_out,   sbi->s_block_size) ||
 	    !IS_ALIGNED(remap_len, sbi->s_block_size)) {
 		ret = -EINVAL;
-		goto out_unlock_vfs;
+		goto out_unlock_dlm;
 	}
 
 	src_blk  = (u64)pos_in  / sbi->s_block_size;
@@ -439,6 +485,11 @@ static loff_t ocsfs_remap_file_range(struct file *src_file, loff_t pos_in,
 		if (pos_out + remap_len > i_size_read(dst))
 			i_size_write(dst, pos_out + remap_len);
 		mark_inode_dirty(dst);
+		if (sbi->s_clustered) {
+			ocsfs_flush_inode_locked(dst, true);
+			if (src != dst)
+				ocsfs_flush_inode_locked(src, true);
+		}
 	}
 
 	if (src == dst) {
@@ -449,6 +500,22 @@ static loff_t ocsfs_remap_file_range(struct file *src_file, loff_t pos_in,
 	} else {
 		mutex_unlock(&src_oi->i_extent_lock);
 		mutex_unlock(&dst_oi->i_extent_lock);
+	}
+
+out_unlock_dlm:
+	if (sbi->s_clustered) {
+		struct ocsfs_lock_res *lr_lo, *lr_hi;
+
+		if (src_oi->i_disk_ino <= dst_oi->i_disk_ino) {
+			lr_lo = &src_oi->i_lock_res;
+			lr_hi = &dst_oi->i_lock_res;
+		} else {
+			lr_lo = &dst_oi->i_lock_res;
+			lr_hi = &src_oi->i_lock_res;
+		}
+		if (src != dst)
+			ocsfs_lock_release(src->i_sb, lr_hi);
+		ocsfs_lock_release(src->i_sb, lr_lo);
 	}
 
 out_unlock_vfs:

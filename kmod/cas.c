@@ -28,7 +28,7 @@
 
 static u32 cas_lease_crc(const struct ocsfs_disk_cas_lease *cl)
 {
-	return crc32c(0, cl, offsetof(struct ocsfs_disk_cas_lease, cl_checksum));
+	return crc32c(~0U, cl, offsetof(struct ocsfs_disk_cas_lease, cl_checksum));
 }
 
 /* Blocco logico che ospita il lease per `block` */
@@ -286,7 +286,9 @@ int ocsfs_atomic_cas(struct super_block *sb, u64 block, u32 boff,
 	for (attempt = 0; attempt < CAS_MAX_ATTEMPTS; attempt++) {
 		ret = cas_acquire_lease(sb, block, &lease_bh, &lease_eidx);
 		if (ret == -EAGAIN) {
-			udelay(1 << min(attempt, 8));
+			u32 delay_us = min_t(u32, 1U << min(attempt, 15U),
+					     CAS_MAX_BACKOFF_US);
+			usleep_range(delay_us, delay_us + delay_us / 4);
 			continue;
 		}
 		if (ret < 0)

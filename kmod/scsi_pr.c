@@ -18,22 +18,61 @@
 #include <linux/pr.h>
 #include <linux/unaligned.h>
 #include <linux/kprobes.h>
+#include <linux/mempool.h>
+#include <linux/slab.h>
+#include <crypto/sha2.h>
 #include <scsi/scsi_proto.h>
 #include <scsi/scsi_device.h>
 #include <scsi/scsi_cmnd.h>
 
+/* Pre-allocated CAW buffer pool — avoids GFP_NOIO kmalloc in the hot CAS path.
+ * Sized for 2 × max sector (4096): expected block || new-data block. */
+#define OCSFS_CAW_BUF_SIZE  8192U   /* 2 × 4096-byte max sector */
+#define OCSFS_CAW_POOL_MIN  4       /* guaranteed elements under memory pressure */
+
+static struct kmem_cache *ocsfs_caw_cache;
+static mempool_t         *ocsfs_caw_pool;
+
+int ocsfs_scsi_pool_init(void)
+{
+	ocsfs_caw_cache = kmem_cache_create("ocsfs_caw_buf", OCSFS_CAW_BUF_SIZE,
+					    0, SLAB_HWCACHE_ALIGN, NULL);
+	if (!ocsfs_caw_cache)
+		return -ENOMEM;
+
+	ocsfs_caw_pool = mempool_create_slab_pool(OCSFS_CAW_POOL_MIN,
+						   ocsfs_caw_cache);
+	if (!ocsfs_caw_pool) {
+		kmem_cache_destroy(ocsfs_caw_cache);
+		ocsfs_caw_cache = NULL;
+		return -ENOMEM;
+	}
+	return 0;
+}
+
+void ocsfs_scsi_pool_destroy(void)
+{
+	mempool_destroy(ocsfs_caw_pool);
+	ocsfs_caw_pool = NULL;
+	kmem_cache_destroy(ocsfs_caw_cache);
+	ocsfs_caw_cache = NULL;
+}
+
 /*
- * Derive a unique, hard-to-predict PR key from the full 16-byte UUID
- * and mount generation. Uses two independent CRC32C passes so that
- * the upper and lower 32 bits are both UUID-dependent.
- * Previous version used only 4 bytes of UUID, making keys guessable.
+ * Derive a unique PR key from uuid (16 B) + mount_gen (4 B) via SHA-256.
+ * Takes the first 8 bytes of the digest as a little-endian u64.
+ * SHA-256 provides full avalanche: any single-bit change in uuid or
+ * mount_gen produces an unpredictable key, preventing reservation hijack.
  */
 u64 ocsfs_pr_make_key(const u8 *uuid, u32 mount_gen)
 {
-	u32 hi = crc32c(mount_gen,       uuid, 16);
-	u32 lo = crc32c(~hi ^ mount_gen, uuid, 16);
+	u8 input[20];
+	u8 digest[SHA256_DIGEST_SIZE];
 
-	return ((u64)hi << 32) | lo;
+	memcpy(input, uuid, 16);
+	put_unaligned_le32(mount_gen, input + 16);
+	sha256(input, sizeof(input), digest);
+	return get_unaligned_le64(digest);
 }
 
 /* Map OCSFS SCSI-CDB type encoding to block-layer enum pr_type. */
@@ -44,7 +83,9 @@ static enum pr_type ocsfs_to_pr_type(u8 t)
 	case OCSFS_PR_TYPE_EXCL_ACCESS:     return PR_EXCLUSIVE_ACCESS;
 	case OCSFS_PR_TYPE_WRITE_EXCL_REG:  return PR_WRITE_EXCLUSIVE_REG_ONLY;
 	case OCSFS_PR_TYPE_EXCL_ACCESS_REG: return PR_EXCLUSIVE_ACCESS_REG_ONLY;
-	default:                            return PR_WRITE_EXCLUSIVE_REG_ONLY;
+	default:
+		WARN_ON(1);
+		return PR_WRITE_EXCLUSIVE_REG_ONLY;
 	}
 }
 
@@ -255,7 +296,11 @@ int ocsfs_scsi_caw(struct super_block *sb, u64 lba,
 		return -EINVAL;
 	num_blocks = lbs / lbs_dev;
 
-	buf = kmalloc(2 * lbs, GFP_NOIO);
+	if (2 * lbs <= OCSFS_CAW_BUF_SIZE && ocsfs_caw_pool) {
+		buf = mempool_alloc(ocsfs_caw_pool, GFP_NOIO);
+	} else {
+		buf = kmalloc(2 * lbs, GFP_NOIO);
+	}
 	if (!buf)
 		return -ENOMEM;
 
@@ -266,7 +311,11 @@ int ocsfs_scsi_caw(struct super_block *sb, u64 lba,
 
 	ret = scsi_execute_cmd(sdev, cdb, REQ_OP_DRV_OUT, buf, 2 * lbs,
 			       HZ * 5, 3, &args);
-	kfree(buf);
+
+	if (2 * lbs <= OCSFS_CAW_BUF_SIZE && ocsfs_caw_pool)
+		mempool_free(buf, ocsfs_caw_pool);
+	else
+		kfree(buf);
 
 	if (ret < 0)
 		return ret;

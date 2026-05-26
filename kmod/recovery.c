@@ -104,7 +104,10 @@ static int ocsfs_recovery_leader_acquire(struct super_block *sb,
 		if (ret != -EAGAIN)
 			return ret;
 
-		udelay(1 << min(attempt, 8));
+		{
+			u32 delay_us = min_t(u32, 1U << min(attempt, 15U), 50000U);
+			usleep_range(delay_us, delay_us + delay_us / 4);
+		}
 	}
 	return -EBUSY;
 }

@@ -513,8 +513,15 @@ static int __init ocsfs_init(void)
 	if (!ocsfs_inode_cachep)
 		return -ENOMEM;
 
+	ret = ocsfs_scsi_pool_init();
+	if (ret) {
+		kmem_cache_destroy(ocsfs_inode_cachep);
+		return ret;
+	}
+
 	ret = register_filesystem(&ocsfs_fs_type);
 	if (ret) {
+		ocsfs_scsi_pool_destroy();
 		kmem_cache_destroy(ocsfs_inode_cachep);
 		return ret;
 	}
@@ -528,6 +535,7 @@ static void __exit ocsfs_exit(void)
 {
 	unregister_filesystem(&ocsfs_fs_type);
 	rcu_barrier();
+	ocsfs_scsi_pool_destroy();
 	kmem_cache_destroy(ocsfs_inode_cachep);
 }
 

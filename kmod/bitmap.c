@@ -221,35 +221,63 @@ int ocsfs_alloc_blocks(struct super_block *sb, u32 ag_hint, u32 count,
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	struct ocsfs_txn *txn;
-	u32 i;
+	u32 i, chosen;
 	int ret;
 
+	/*
+	 * Phase 1 (lockless): read free_blocks counters to pick a candidate AG.
+	 * The read may be slightly stale — phase 2 confirms under DLM-EX.
+	 * This avoids holding j_lock across a full multi-AG bitmap scan.
+	 */
+	chosen = sbi->s_ag_count; /* sentinel: none chosen yet */
+	if (ag_hint < sbi->s_ag_count &&
+	    READ_ONCE(sbi->s_ags[ag_hint].free_blocks) >= count) {
+		chosen = ag_hint;
+	} else {
+		for (i = 0; i < sbi->s_ag_count; i++) {
+			if (i == ag_hint)
+				continue;
+			if (READ_ONCE(sbi->s_ags[i].free_blocks) >= count) {
+				chosen = i;
+				break;
+			}
+		}
+	}
+
+	if (chosen == sbi->s_ag_count)
+		return -ENOSPC;
+
+	/* Phase 2: open txn only for the chosen AG. */
 	txn = ocsfs_txn_begin(sb);
 	if (IS_ERR(txn))
 		return PTR_ERR(txn);
 
-	/* Try preferred AG first */
-	if (ag_hint < sbi->s_ag_count) {
-		ret = ocsfs_ag_alloc_blocks(sb, ag_hint, count, block_out, txn);
-		if (ret == 0)
-			goto commit;
-	}
+	ret = ocsfs_ag_alloc_blocks(sb, chosen, count, block_out, txn);
+	if (ret == 0)
+		return ocsfs_txn_commit(txn);
 
-	/* Fall back to any AG with space */
+	ocsfs_txn_abort(txn);
+	if (ret != -ENOSPC)
+		return ret; /* hard I/O or DLM error — do not retry */
+
+	/* Stale lockless read — fall back to remaining AGs. */
 	for (i = 0; i < sbi->s_ag_count; i++) {
-		if (i == ag_hint)
+		if (i == chosen)
 			continue;
+		if (READ_ONCE(sbi->s_ags[i].free_blocks) < count)
+			continue;
+		txn = ocsfs_txn_begin(sb);
+		if (IS_ERR(txn))
+			return PTR_ERR(txn);
 		ret = ocsfs_ag_alloc_blocks(sb, i, count, block_out, txn);
 		if (ret == 0)
-			goto commit;
+			return ocsfs_txn_commit(txn);
+		ocsfs_txn_abort(txn);
+		if (ret != -ENOSPC)
+			return ret;
 	}
 
-	ret = -ENOSPC;
-	ocsfs_txn_abort(txn);
-	return ret;
-
-commit:
-	return ocsfs_txn_commit(txn);
+	return -ENOSPC;
 }
 
 /*
@@ -439,7 +467,17 @@ int ocsfs_alloc_inode_num(struct super_block *sb, u32 ag_hint, u64 *ino_out)
 					mutex_unlock(&ag->ag_lock);
 					if (sbi->s_clustered)
 						ocsfs_lock_release(sb, &ag->ag_lock_res);
-					return ocsfs_txn_commit(txn);
+					{
+						int cr = ocsfs_txn_commit(txn);
+
+						if (cr) {
+							/* Undo the counter decrement (BASSO-10). */
+							mutex_lock(&ag->ag_lock);
+							ag->free_inodes++;
+							mutex_unlock(&ag->ag_lock);
+						}
+						return cr;
+					}
 				}
 
 				brelse(bh);

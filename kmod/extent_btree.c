@@ -24,6 +24,7 @@ static inline u16  ext_flags(u64 v) { return (u16)((v >> 62) & 0x3U); }
 struct ext_btree_ctx {
 	struct super_block *sb;
 	struct ocsfs_txn   *txn;
+	u32                 ag_hint;
 };
 
 static int ext_btree_read(void *ctx, u64 block, void *buf, u32 size)
@@ -108,8 +109,8 @@ static int ext_btree_alloc(void *ctx, u64 *out)
 	struct ext_btree_ctx *ec = ctx;
 
 	if (ec->txn)
-		return ocsfs_alloc_blocks_txn(ec->txn, ec->sb, 0, 1, out);
-	return ocsfs_alloc_blocks(ec->sb, 0, 1, out);
+		return ocsfs_alloc_blocks_txn(ec->txn, ec->sb, ec->ag_hint, 1, out);
+	return ocsfs_alloc_blocks(ec->sb, ec->ag_hint, 1, out);
 }
 
 static int ext_btree_free(void *ctx, u64 block)
@@ -128,8 +129,9 @@ static int ext_btree_open(struct inode *inode, struct ocsfs_btree *bt,
 			  struct ext_btree_ctx *ec)
 {
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
-	ec->sb  = inode->i_sb;
-	ec->txn = NULL;
+	ec->sb      = inode->i_sb;
+	ec->txn     = NULL;
+	ec->ag_hint = oi->i_ag;
 	return ocsfs_btree_open(bt, oi->i_extent_tree_root,
 				OCSFS_SB(inode->i_sb)->s_block_size,
 				ext_btree_read, ext_btree_write,
@@ -139,7 +141,8 @@ static int ext_btree_open(struct inode *inode, struct ocsfs_btree *bt,
 static int ext_btree_create(struct inode *inode, struct ocsfs_btree *bt,
 			    struct ext_btree_ctx *ec)
 {
-	ec->sb = inode->i_sb;
+	ec->sb      = inode->i_sb;
+	ec->ag_hint = OCSFS_I(inode)->i_ag;
 	return ocsfs_btree_create(bt, OCSFS_SB(inode->i_sb)->s_block_size,
 				  ext_btree_read, ext_btree_write,
 				  ext_btree_alloc, ext_btree_free, ec);
@@ -342,7 +345,7 @@ int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block)
 
 	/* Delete all extents fully beyond from_block */
 	{
-		int safety = 1000;
+		int safety = 65536;
 
 		do {
 			tc.count = 0;
@@ -366,6 +369,7 @@ int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block)
 				}
 			}
 			if (tc.count > 0 && --safety <= 0) {
+				WARN_ON(1);
 				pr_err("ocsfs: extent_btree_truncate: loop limit reached "
 				       "(inode %llu) — btree may be corrupt, run fsck\n",
 				       oi->i_disk_ino);
@@ -701,7 +705,7 @@ int ocsfs_extent_btree_punch_hole(struct inode *inode,
 	struct ext_trunc_ctx tc;
 	struct ocsfs_txn *txn;
 	u64 search_from;
-	int safety = 1000;
+	int safety = 65536;
 	u32 i;
 	int ret;
 
@@ -792,6 +796,7 @@ int ocsfs_extent_btree_punch_hole(struct inode *inode,
 			}
 		}
 		if (--safety <= 0) {
+			WARN_ON(1);
 			ret = -EUCLEAN;
 			goto abort;
 		}
@@ -818,7 +823,7 @@ int ocsfs_extent_btree_zero_range(struct inode *inode,
 	struct ext_btree_ctx ec;
 	struct ext_trunc_ctx tc;
 	struct ocsfs_txn *txn;
-	int safety = 1000;
+	int safety = 65536;
 	u32 i;
 	int ret;
 
@@ -899,6 +904,7 @@ int ocsfs_extent_btree_zero_range(struct inode *inode,
 			}
 		}
 		if (--safety <= 0) {
+			WARN_ON(1);
 			ret = -EUCLEAN;
 			goto abort;
 		}
