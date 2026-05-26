@@ -33,8 +33,8 @@ static u64 ocsfs_rl_block(struct super_block *sb)
 
 static u32 ocsfs_rl_crc(const struct ocsfs_disk_recovery_leader *rl)
 {
-	return ocsfs_crc32c(0, rl, offsetof(struct ocsfs_disk_recovery_leader,
-					    rl_checksum));
+	return ocsfs_crc32c(~0U, rl, offsetof(struct ocsfs_disk_recovery_leader,
+					      rl_checksum));
 }
 
 /*
