@@ -919,6 +919,9 @@ bool ocsfs_scsi_caw_probe(struct super_block *sb);
 int  ocsfs_scsi_caw(struct super_block *sb, u64 lba,
 		    const void *expected, const void *new_data,
 		    unsigned int lbs);
+int  ocsfs_bsg_execute_cdb(struct super_block *sb,
+			    const u8 cdb[16], void *buf, unsigned int buf_len,
+			    enum dma_data_direction data_dir);
 int  ocsfs_scsi_pool_init(void);
 void ocsfs_scsi_pool_destroy(void);
 

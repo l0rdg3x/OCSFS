@@ -422,7 +422,7 @@ Use only FC SAN or LIO/TrueNAS SCALE iSCSI for multi-node deployments.
 
 | Limitation | Impact | Notes |
 |---|---|---|
-| SCSI CAW via BSG not yet implemented | Node slot TOCTOU possible without hardware atomicity | BSG implementation is the next priority; kprobe shim is active |
+| Node slot TOCTOU (mitigated) | Hardware atomicity requires SCSI CAW — now implemented via BSG-direct path | CAW is active; kprobe shim kept as fallback for patched kernels |
 | No xfstests coverage yet | Unknown edge cases in VFS layer | Requires a 2-node testbed; KVM + LIO is sufficient |
 | No encryption | Data at rest is unencrypted | fscrypt integration not implemented |
 | No quota | Disk quotas not enforced | No dquot support |

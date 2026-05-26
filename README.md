@@ -22,13 +22,13 @@ Proxmox VE as an open alternative to VMware VMFS.
 | Scenario | Score |
 |---|---|
 | Single-node read/write | ~88% |
-| Multi-node — no crashes | ~80% |
-| Multi-node — crash + recovery | ~55% |
-| VMFS feature parity | ~55% |
+| Multi-node — no crashes | ~85% |
+| Multi-node — crash + recovery | ~70% |
+| VMFS feature parity | ~58% |
 
-The two main gaps keeping the cluster score below 90% are the absence of
-real-hardware integration testing (xfstests on a multi-node testbed) and the
-SCSI CAW path (currently a kprobe shim; BSG implementation pending).
+The main gap keeping the cluster score below 90% is the absence of
+real-hardware integration testing (xfstests on a multi-node testbed).
+SCSI CAW is now implemented via BSG-direct path — no kprobe required.
 
 ---
 
@@ -85,7 +85,7 @@ SCSI CAW path (currently a kprobe shim; BSG implementation pending).
 | `journal_replay.c` | Forward-scan replay; CRC-gated COMMIT detection; redo on mount |
 | `lock.c` | On-disk DLM: EX/SH acquire/release, downgrade, epoch invalidation |
 | `lock_io.c` | Forced disk read/write for lock table (bypasses page cache) |
-| `scsi_pr.c` | SCSI-3 PR: register, preempt-and-abort, SHA-256 key, CAW mempool |
+| `scsi_pr.c` | SCSI-3 PR: register, preempt-and-abort, SHA-256 key; CAW via BSG-direct + kprobe fallback |
 | `heartbeat.c` | Storage-path heartbeat kthread, CRC-validated entries, wakeup on stop |
 | `node.c` | Node slot table: claim, release, stable UUID via SHA-256(hostname) |
 | `recovery.c` | 5-phase recovery: elect leader, fence via PR, replay journal, cleanup |
@@ -131,9 +131,8 @@ SCSI CAW path (currently a kprobe shim; BSG implementation pending).
 
 | Gap | Notes |
 |---|---|
-| **SCSI CAW via BSG** | Current path uses a kprobe shim for `scsi_device_from_queue`. Real implementation via BSG is the next priority (~40h). The kernel patch in `docs/kernel-patches/` is the upstream path. |
 | **Integration test suite** | No xfstests run yet. Needs a 2-node testbed (KVM + LIO iSCSI is sufficient). |
-| **Node table TOCTOU** | Two nodes can claim the same slot without hardware atomicity. Mitigated by SCSI CAS; the real fix requires CAW. |
+| **Node table TOCTOU** | Two nodes can claim the same slot without hardware atomicity. Mitigated by SCSI CAW (now implemented via BSG-direct). |
 
 ### Architectural limitations
 
@@ -266,6 +265,6 @@ The project is looking for:
 - Proxmox / PVE integration developers
 - QA engineers who can run xfstests on a real cluster
 
-The most impactful open task right now is implementing `ocsfs_bsg_execute_cdb()`
-in `kmod/scsi_pr.c` to replace the kprobe shim for SCSI CAW, and running
-xfstests quick+auto on a 2-node KVM testbed.
+The most impactful open task right now is running xfstests quick+auto on a
+2-node KVM testbed with LIO iSCSI. SCSI CAW is implemented (`ocsfs_bsg_execute_cdb()`
+uses the BSG-direct path; no kprobe required).

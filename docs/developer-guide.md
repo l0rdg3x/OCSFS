@@ -70,7 +70,7 @@ management network.
 | `journal_replay.c` | Forward-scan replay: CRC-gated COMMIT detection, redo on mount |
 | `lock.c` | On-disk DLM: EX/SH acquire, release, downgrade, epoch invalidation |
 | `lock_io.c` | Forced disk read/write for lock table (bypasses page cache) |
-| `scsi_pr.c` | SCSI-3 PR: register, preempt-and-abort, SHA-256 key, CAW mempool |
+| `scsi_pr.c` | SCSI-3 PR: register, preempt-and-abort, SHA-256 key; `ocsfs_bsg_execute_cdb()` BSG-direct CAW |
 | `heartbeat.c` | Storage-path heartbeat kthread; CRC-validated entries |
 | `node.c` | Node slot table: claim, release, stable UUID via SHA-256(hostname) |
 | `recovery.c` | 5-phase recovery orchestration |
@@ -280,9 +280,9 @@ ocsfs_put_super()
 5. Conflict?                → set_waiter_bit() + exponential backoff (1ms → 100ms, max 50 retries)
 ```
 
-**Atomicity:** Currently uses software versioning (read-version → check → write).
-True hardware atomicity requires SCSI CAW (opcode 0x89), which is the next
-implementation priority. See §13.
+**Atomicity:** Software versioning (read-version → check → write) as the CAS
+layer; hardware atomicity via SCSI CAW (opcode 0x89) is used when a SCSI
+device is detected. `ocsfs_bsg_execute_cdb()` is the entry point — see §13.
 
 **DLM EX invariant:** All B+ tree write functions (`extent_btree_insert`,
 `extent_btree_truncate`, `extent_btree_replace`, `dir_btree_insert`,
@@ -637,27 +637,31 @@ sudo losetup -d /dev/loop0
 
 ### Blocking for multi-node production use
 
-**SCSI CAW via BSG not implemented**
+**SCSI CAW — implemented via BSG-direct**
 
-The current locking protocol reads a lock entry, checks the version field, and
-writes back only if the version still matches. This reduces (but does not
-eliminate) the TOCTOU race window between two concurrent acquirers.
+`ocsfs_bsg_execute_cdb()` in `scsi_pr.c` is the unified entry point for
+sending raw CDBs. It uses a two-path design:
 
-True hardware atomicity requires SCSI Compare-And-Write (opcode 0x89). The
-implementation plan:
+1. **BSG-direct (primary):** reads `scsi_device *` from `q->queuedata` — the
+   pointer placed there by `scsi_mq_setup_tags()`. Works on hardened kernels
+   where `CONFIG_KPROBES=n`. Validated with `sdev->host != NULL`.
+2. **kprobe shim (fallback):** resolves the unexported
+   `scsi_device_from_queue()` via `register_kprobe()`. Kept for compatibility
+   with unpatched kernels that cannot use the BSG-direct path.
 
-1. `ocsfs_bsg_execute_cdb()` in `scsi_pr.c` — send a raw CDB via the BSG
-   (`/dev/bsg/...`) interface using `blk_execute_rq()`.
-2. Use CAW for lock entry updates in `lock_write_entry()`.
-3. Optional upstream path: the kernel patch in `docs/kernel-patches/` exports
-   `scsi_device_from_queue()` which would allow using `scsi_execute_cmd()`
-   directly without BSG.
+`ocsfs_scsi_caw()` calls `ocsfs_bsg_execute_cdb()` with a pre-built CAW CDB
+(opcode 0x89, SBC-4 §5.3): `expected || new_data` in a mempool-backed buffer.
+`lock_write_entry()` uses CAW when `s_caw_supported` is set.
+
+The kernel patch in `docs/kernel-patches/` exports `scsi_device_from_queue()`
+unconditionally — that is the upstream path if the BSG-direct workaround is
+ever rejected.
 
 **No integration test suite**
 
 No xfstests run has been performed. The minimum testbed (2 nodes + LIO
 iSCSI) is sufficient to run `xfstests quick` and `xfstests auto`. This
-should be the next step after CAW.
+is now the top priority.
 
 ### Architectural limitations
 
@@ -671,4 +675,4 @@ should be the next step after CAW.
 | Encryption | Zero implementation | Would require `fscrypt` integration |
 | Quota | Zero implementation | Would require `dquot` integration |
 | No out-of-band STONITH | Fencing relies solely on SCSI PR | Wire Proxmox API or iDRAC as a fallback fencing agent |
-| Node table TOCTOU | Without CAW, two nodes can claim the same slot | Fixed by SCSI CAW implementation |
+| Node table TOCTOU | Mitigated by SCSI CAW (BSG-direct, now implemented) | Full fix requires per-device PR-scoped reservation on slot claim |
