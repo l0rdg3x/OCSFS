@@ -1,396 +1,265 @@
 # OCSFS — Open Cluster Shared FileSystem
 
-**A VMFS-class open-source cluster filesystem for Linux**
+An open-source cluster filesystem for Linux, designed for shared block storage
+(iSCSI / Fibre Channel SAN) in virtualized environments. Primary target:
+Proxmox VE as an open alternative to VMware VMFS.
 
-OCSFS is a purpose-built, cluster-aware filesystem designed for shared block
-storage (Fibre Channel SAN) in virtualized environments. It targets Proxmox VE
-as its primary integration platform, providing a true open-source alternative
-to VMware's VMFS.
+> **Status: Alpha / Research.**
+> The kernel module builds and runs. Single-node I/O is stable.
+> Multi-node clustering has been extensively hardened but has not yet been
+> validated against a real testbed. Do not use with data that matters.
 
-## Key Differentiators
+---
 
-- **On-disk distributed locking** — No DLM daemon, no network dependency.
-  All lock state lives on the shared LUN using SCSI Compare-And-Write.
-- **Storage-path heartbeat** — Node liveness is validated via I/O to the
-  shared device, not through the management network.
-- **SCSI-3 Persistent Reservations** — Hardware-level fencing prevents
-  split-brain without external stonith devices.
-- **Extent-based allocation** — Optimized for large VM disk images with
-  minimal metadata contention via per-AG allocation.
-- **Thin provisioning** — Lazy allocation with UNMAP/DISCARD support.
-- **Proxmox VE integration** — First-class storage plugin supporting all
-  content types (images, ISO, templates, backups).
+## Production Readiness (as of 2026-05-26)
 
-## Current Status: All Phases Complete
+| Scenario | Score |
+|---|---|
+| Single-node read/write | ~88% |
+| Multi-node — no crashes | ~80% |
+| Multi-node — crash + recovery | ~55% |
+| VMFS feature parity | ~55% |
 
-### Phase 0 — Prototype (complete)
+The two main gaps keeping the cluster score below 90% are the absence of
+real-hardware integration testing (xfstests on a multi-node testbed) and the
+SCSI CAW path (currently a kprobe shim; BSG implementation pending).
 
-| Component | Status | Description |
-|-----------|--------|-------------|
-| `include/ocsfs.h` | Complete | On-disk format specification (all structures) |
-| `include/ocsfs_btree.h` | Complete | B+ tree header |
-| `src/crc32c.c` | Complete | CRC32C checksum (Castagnoli polynomial) |
-| `src/bitmap.c` | Complete | Block bitmap allocator with extent search |
-| `src/extent.c` | Complete | Extent map (insert, lookup, merge, punch hole) |
-| `src/lock.c` | Complete | On-disk lock manager (CAS protocol) |
-| `src/heartbeat.c` | Complete | Heartbeat writer/reader with failure detection |
-| `src/btree.c` | Complete | B+ tree (insert, search, delete, range scan) |
-| `src/inode.c` | Complete | Inode allocator (userspace prototype) |
-| `src/journal.c` | Complete | Journal / WAL (userspace prototype) |
-| `src/dir.c` | Complete | Directory operations (userspace prototype) |
-| `src/fuse_main.c` | Complete | FUSE3 filesystem (requires libfuse3-dev) |
-| `tools/mkfs_ocsfs.c` | Complete | Volume formatter |
-| `tools/ocsfs_tool.c` | Complete | Admin CLI (info, nodes, locks, df, check) |
-| `tests/test_ocsfs.c` | 36/36 pass | Comprehensive test suite (1770 assertions) |
+---
 
-### Phase 1 — Kernel Module (complete)
+## Architecture
 
-| Component | Status | Description |
-|-----------|--------|-------------|
-| `kmod/ocsfs.h` | Complete | Internal kernel header (on-disk + in-memory structs) |
-| `kmod/super.c` | Complete | Module init/exit, mount/unmount, fill_super, statfs |
-| `kmod/inode.c` | Complete | Inode read/write, alloc/free, setattr/getattr |
-| `kmod/dir.c` | Complete | Directory ops (lookup, create, mkdir, rmdir, rename, readdir) |
-| `kmod/file.c` | Complete | File ops + address_space ops (buffer_head I/O) |
-| `kmod/extent.c` | Complete | Inline extent manager (lookup, insert, truncate, merge) |
-| `kmod/journal.c` | Complete | WAL journal with crash recovery (replay on mount) |
-| `kmod/bitmap.c` | Complete | Block bitmap + inode number allocator per-AG |
+```
+┌─────────────────────────────────────────────────────┐
+│                 Shared block device                  │
+│         (iSCSI LUN / FC LUN / loopback)              │
+│                                                      │
+│  SB │ AGs │ Inode table │ Lock table │ Journal │ HB  │
+└─────┬───────────────────────────────────────────────┘
+      │  SCSI-3 PR (fencing)  │  CAS (on-disk locking)
+      │
+┌─────▼──────┐  ┌────────────┐  ┌────────────┐
+│  node-1    │  │  node-2    │  │  node-3    │
+│  ocsfs.ko  │  │  ocsfs.ko  │  │  ocsfs.ko  │
+└────────────┘  └────────────┘  └────────────┘
+```
 
-**Milestone:** Single-node read/write with crash recovery.
+**Key design choices:**
 
-### Phase 2 — Multi-Node Clustering (complete)
+- **No DLM daemon.** All lock state lives on the shared LUN as versioned
+  on-disk entries; acquire/release use Compare-And-Write (CAS) via SCSI.
+- **Storage-path heartbeat.** Node liveness is proven by writes to the shared
+  device — not through the management network — so a network partition does
+  not cause false positives.
+- **SCSI-3 Persistent Reservations.** Hardware fencing: the SAN fabric rejects
+  I/O from a fenced node's HBA before recovery begins.
+- **WAL journal with redo.** AFTER-images in the commit record; replay on
+  mount reconstructs any committed-but-not-flushed transaction.
 
-| Component | Status | Description |
-|-----------|--------|-------------|
-| `kmod/scsi_pr.c` | Complete | SCSI-3 Persistent Reservations (register, preempt, fencing) |
-| `kmod/lock.c` | Complete | On-disk distributed lock manager (CAS-based acquire/release) |
-| `kmod/heartbeat.c` | Complete | Storage-path heartbeat writer + failure detection kthread |
-| `kmod/node.c` | Complete | Node slot table management (claim, release, state machine) |
-| `kmod/recovery.c` | Complete | 5-phase crash recovery (elect, fence, replay, locks, cleanup) |
+---
 
-**Milestone:** 2-node concurrent mount and I/O.
+## What is implemented
 
-#### Clustering Architecture
+### Kernel module (`kmod/`)
 
-- **On-disk locking:** All lock state in the 1 MB Lock Table on the shared LUN.
-  No external lock manager, no network dependency. Uses CAS-style versioned entries.
-- **Heartbeat:** Background kthread writes timestamp to shared LUN every 5s.
-  Detects failures after 15s (3 missed intervals). Tests actual I/O path, not network.
-- **SCSI-3 PR fencing:** Hardware-level fencing via PREEMPT AND ABORT.
-  SAN fabric rejects I/O from fenced node's HBA — eliminates zombie nodes.
-- **Recovery protocol:** Leader election (lowest slot), PR fencing, journal replay,
-  lock table scan, slot cleanup. Fully automated, no manual intervention.
-- **Graceful fallback:** Non-SCSI devices (loopback, files) skip PR commands
-  and operate in single-node mode.
+| File | Description |
+|---|---|
+| `super.c` | Mount/unmount, fill_super, statfs, module init/exit |
+| `inode.c` | Inode read/write/alloc/free, setattr, CRC32c verification |
+| `dir.c` | lookup, create, mkdir, rmdir, readdir, hard link, mknod |
+| `dir_btree.c` | B+ tree-backed directory index (O(log N) lookup/delete) |
+| `dir_rename.c` | rename, RENAME_NOREPLACE, RENAME_EXCHANGE |
+| `file.c` | read/write iter, fsync, FIEMAP, reflink (FICLONE), ioctl |
+| `iomap.c` | iomap I/O path: O_DIRECT, buffered, readahead, UNWRITTEN conversion |
+| `extent.c` | Inline extent manager (up to 16 extents): lookup, insert, truncate, merge |
+| `extent_btree.c` | B+ tree overflow for files with >16 extents |
+| `alloc.c` | Block allocator: goal-oriented, prealloc, AG affinity |
+| `bitmap.c` | Per-AG block/inode bitmap; two-phase lockless allocation |
+| `thin.c` | fallocate, PUNCH_HOLE, ZERO_RANGE, DISCARD |
+| `journal.c` | WAL with ordered checkpoint; BEFORE/AFTER images; txn abort rollback |
+| `journal_replay.c` | Forward-scan replay; CRC-gated COMMIT detection; redo on mount |
+| `lock.c` | On-disk DLM: EX/SH acquire/release, downgrade, epoch invalidation |
+| `lock_io.c` | Forced disk read/write for lock table (bypasses page cache) |
+| `scsi_pr.c` | SCSI-3 PR: register, preempt-and-abort, SHA-256 key, CAW mempool |
+| `heartbeat.c` | Storage-path heartbeat kthread, CRC-validated entries, wakeup on stop |
+| `node.c` | Node slot table: claim, release, stable UUID via SHA-256(hostname) |
+| `recovery.c` | 5-phase recovery: elect leader, fence via PR, replay journal, cleanup |
+| `snapshot.c` | CoW file snapshots: create, delete, CoW-on-write trigger |
+| `refcount.c` | Per-AG extent reference counting for CoW/dedup |
+| `compress.c` | Inline LZ4/ZSTD compression (read path); decompression on demand |
+| `compress_file.c` | Compress-on-fsync for buffered files |
+| `dedup.c` | Content-based deduplication via `OCSFS_IOC_DEDUP` ioctl (btree-backed inodes) |
+| `xattr.c` | Extended attributes with DLM SH protection in cluster mode |
+| `acl.c` | POSIX ACL (getfacl/setfacl) |
+| `btree.c` | Generic B+ tree (search, insert, delete, range scan) |
+| `btree_mod.c` | B+ tree structural modifications (split, merge, rebalance) |
+| `test_lock.c` | KUnit tests: B+ tree search, dir btree threshold |
+| `test_cas.c` | KUnit tests: CAS lock protocol |
 
-### Phase 3 — Performance Optimization (complete)
+### Userspace tools (`tools/`, `src/`)
 
-| Component | Status | Description |
-|-----------|--------|-------------|
-| `kmod/iomap.c` | Complete | iomap-based I/O: direct I/O (O_DIRECT), buffered I/O, readahead |
-| `kmod/alloc.c` | Complete | Smart allocator: goal-oriented, preallocation, AG affinity |
-| `kmod/thin.c` | Complete | Thin provisioning: fallocate, punch hole, zero range, DISCARD |
-| `kmod/file.c` | Updated | iomap read/write iter, fallocate integration, O_DIRECT support |
-| `kmod/extent.c` | Updated | UNWRITTEN extent conversion (split on partial write) |
-| `kmod/ocsfs.h` | Updated | Phase 3 function declarations (iomap, alloc, thin) |
+| Tool | Description |
+|---|---|
+| `tools/mkfs_ocsfs.c` | Volume formatter |
+| `tools/ocsfs_tool.c` | Admin CLI: info, nodes, locks, df, check |
+| `tools/ocsfs_defrag.c` | Online defragmentation daemon (FIEMAP-based, bandwidth-limited) |
+| `tools/ocsfs-fsck` | Offline fsck (Python): 9 checks + repair mode |
+| `src/` | FUSE3 prototype — validates on-disk format; not for production use |
 
-**Milestone:** Direct I/O, thin provisioning, and preallocation for VM workloads.
+### Platform integration
 
-#### Performance Architecture
+| Component | Description |
+|---|---|
+| `proxmox/OCSFSPlugin.pm` | Proxmox VE storage plugin (all content types) |
+| `proxmox/mount.ocsfs` | Mount helper called by `mount -t ocsfs` |
+| `proxmox/install.sh` | One-step installer (DKMS + plugin + tools) |
+| `conf/` | systemd template units + udev rules for SAN auto-detection |
+| `debian/` | Debian packaging: ocsfs-tools, ocsfs-dkms, ocsfs-proxmox |
+| `man/` | Man pages for all CLI tools |
+| `docs/kernel-patches/` | Patch to export `scsi_device_from_queue` (upstream path for CAW) |
 
-- **iomap I/O path:** Modern Linux I/O framework (used by XFS, ext4, btrfs).
-  Maps file logical offsets to physical device offsets; VFS handles I/O submission.
-  Replaces buffer_head-based I/O for data files.
-- **Direct I/O (O_DIRECT):** Zero-copy between userspace and block device via
-  `iomap_dio_rw()`. Critical for VM disk image I/O (QEMU raw format).
-- **Extent preallocation:** Speculative multi-block allocation reduces fragmentation.
-  8-256 blocks per allocation, scaled by file size. Goal-oriented placement
-  keeps files physically contiguous.
-- **Thin provisioning:** UNWRITTEN extents for `fallocate()` preallocation.
-  `FALLOC_FL_PUNCH_HOLE` returns blocks to pool. `DISCARD` passthrough to
-  SAN/SSD for physical space reclaim.
-- **UNWRITTEN conversion:** 4-way split on partial write (head/middle/tail/full).
-  Reads from UNWRITTEN extents return zeroes without I/O.
+---
 
-### Phase 4 — Advanced Features + Proxmox VE Integration (complete)
+## What is missing / known limitations
 
-| Component | Status | Description |
-|-----------|--------|-------------|
-| `proxmox/OCSFSPlugin.pm` | Complete | Proxmox VE storage plugin (all content types) |
-| `proxmox/mount.ocsfs` | Complete | Mount helper for Proxmox (modprobe + validation) |
-| `proxmox/install.sh` | Complete | One-step PVE plugin installer (DKMS + Perl + tools) |
-| `kmod/snapshot.c` | Complete | CoW file-level snapshots (create, delete, CoW on write) |
-| `kmod/refcount.c` | Complete | Extent reference counting (per-AG hash table) |
-| `kmod/compress.c` | Complete | Inline compression (LZ4 fast, ZSTD high-ratio) |
-| `tools/ocsfs_defrag.c` | Complete | Online defragmentation daemon (FIEMAP, bandwidth-limited) |
-| `kmod/ocsfs.h` | Updated | Phase 4 declarations (snapshot, refcount, compression) |
+### Blocking for cluster production use
 
-**Milestone:** VMFS-6 feature parity + Proxmox VE integration.
+| Gap | Notes |
+|---|---|
+| **SCSI CAW via BSG** | Current path uses a kprobe shim for `scsi_device_from_queue`. Real implementation via BSG is the next priority (~40h). The kernel patch in `docs/kernel-patches/` is the upstream path. |
+| **Integration test suite** | No xfstests run yet. Needs a 2-node testbed (KVM + LIO iSCSI is sufficient). |
+| **Node table TOCTOU** | Two nodes can claim the same slot without hardware atomicity. Mitigated by SCSI CAS; the real fix requires CAW. |
 
-#### Proxmox VE Integration
+### Architectural limitations
 
-- **Storage plugin:** Full PVE::Storage::Plugin implementation. Supports all
-  content types: images, iso, vztmpl, backup, rootdir, snippets.
-- **Configuration:** `storage.cfg` format with thin provisioning, compression,
-  and extent size options. Shared storage for multi-node PVE clusters.
-- **Thin provisioning:** New VM disks are thin-provisioned by default. Guest
-  TRIM/DISCARD reclaims space via `fallocate(PUNCH_HOLE)` → DISCARD passthrough.
-- **Mount helper:** `mount.ocsfs` validates superblock, loads kernel module,
-  and mounts. Called automatically by `mount -t ocsfs`.
+| Gap | Notes |
+|---|---|
+| **Encryption** | Zero code. Would require fscrypt integration. |
+| **Quota** | No dquot support. |
+| **Snapshot for large files** | Snapshots return `-EOPNOTSUPP` for btree-backed inodes (>16 extents). Requires refcount btree iterator. |
+| **Compression write path** | Compression is applied on fsync for buffered files only. No inline compression during O_DIRECT writes. |
+| **Shared mmap** | `MAP_SHARED|PROT_WRITE` returns `-EOPNOTSUPP` in cluster mode. Read-only and private (COW) mappings work. |
+| **POSIX distributed file locking** | `fcntl` locks are local only. |
+| **VAAI XCOPY/WRITE_SAME** | Not implemented. |
+| **STONITH** | Fencing via SCSI PR works; out-of-band STONITH (PDU, iDRAC) not wired. For Proxmox labs, the Proxmox API can serve as soft STONITH. |
 
-#### CoW Snapshots
-
-- **File-level snapshots:** Superior to VMFS's VMDK-only snapshots.
-  O(n) creation (n = number of extents, typically <16 for inline).
-- **Copy-on-Write:** Shared extents (refcount > 1) trigger CoW on write.
-  New blocks allocated, old data copied, extent map updated atomically.
-- **Refcount table:** Per-AG hash table (16 blocks). Blocks with refcount=1
-  have no entry (space-efficient). Supports 100+ snapshot layers.
-
-#### Inline Compression
-
-- **LZ4:** Default algorithm, optimized for speed. Uses kernel LZ4 library.
-- **ZSTD:** Higher compression ratio for archival content (ISOs, backups).
-- **Per-file control:** Compression enabled/disabled via inode flags.
-- **O_DIRECT bypass:** VM data path (O_DIRECT) completely bypasses compression.
-  Only buffered I/O is compressed — zero overhead for VM workloads.
-
-#### Online Defragmentation
-
-- **FIEMAP-based analysis:** Detects fragmented files via FIEMAP ioctl.
-- **Non-disruptive:** Bandwidth-limited background operation (configurable MB/s).
-- **Single-instance:** Lock file coordination — one defrag daemon per mount.
-- **Pause/resume:** SIGUSR1/SIGUSR2 signals for live control.
-
-### Phase 5 — Production Readiness (complete)
-
-| Component | Status | Description |
-|-----------|--------|-------------|
-| `debian/` | Complete | Debian packaging (ocsfs-tools, ocsfs-dkms, ocsfs-proxmox) |
-| `conf/ocsfs-defrag@.service` | Complete | Systemd template unit for defrag daemon |
-| `conf/ocsfs-mount@.service` | Complete | Systemd template unit for auto-mount |
-| `conf/99-ocsfs.rules` | Complete | udev rules for SAN/multipath auto-detection |
-| `man/*.8` | Complete | Man pages for all 4 CLI tools |
-| `kmod/dkms.conf` | Updated | DKMS config with autoinstall for kernel upgrades |
-| `tests/xfstests-ocsfs.conf` | Complete | xfstests (fstests) integration config |
-
-**Milestone:** Production-ready out-of-tree deployment.
-
-#### Deployment Options
-
-- **Debian packages:** `dpkg-buildpackage` produces 3 .deb packages:
-  `ocsfs-tools` (CLI), `ocsfs-dkms` (kernel module), `ocsfs-proxmox` (PVE plugin).
-- **DKMS:** Kernel module auto-rebuilds on kernel upgrades.
-- **systemd:** Template units for mount and defrag. IO-limited, nice 19, memory-capped.
-- **udev:** Auto-symlinks for OCSFS devices in `/dev/disk/by-ocsfs/<label>`.
-  Multipath SAN tagging. UDISKS_IGNORE to prevent desktop automounting.
+---
 
 ## Building
 
 ```bash
-# Dependencies (Debian/Ubuntu/Proxmox)
-apt install build-essential uuid-dev
-
-# Build userspace tools + tests
+# Userspace tools and FUSE prototype
 make all
 
-# Run tests
+# Tests (userspace only)
 make test
 
-# Build FUSE prototype (requires libfuse3-dev)
-make fuse
+# Kernel module (requires linux-headers for the running kernel)
+cd kmod && make -j$(nproc)
 
-# Build kernel module (requires linux-headers-$(uname -r))
-make kmod
-# or directly:
-cd kmod && make
-
-# DKMS install
+# DKMS
 sudo dkms add kmod/
 sudo dkms build ocsfs/0.1.0
 sudo dkms install ocsfs/0.1.0
 
-# Demo: create a 1 GiB test image and inspect it
-make demo
-
-# Install Proxmox VE storage plugin (on PVE host)
-sudo proxmox/install.sh
-
-# Build Debian packages
+# Debian packages
 dpkg-buildpackage -us -uc -b
-# Produces: ocsfs-tools_0.1.0-1_amd64.deb
-#           ocsfs-dkms_0.1.0-1_all.deb
-#           ocsfs-proxmox_0.1.0-1_all.deb
 ```
 
-## Quick Start (on a test image)
+---
+
+## Quick start (single node, loopback)
 
 ```bash
-# Create a test image
+# Format a test image
 dd if=/dev/zero of=/tmp/test.img bs=1M count=2048
-
-# Format
-./mkfs.ocsfs -L my-datastore -N 16 -f -v /tmp/test.img
+./mkfs.ocsfs -L my-datastore -v /tmp/test.img
 
 # Inspect
 ./ocsfs-tool info /tmp/test.img
-./ocsfs-tool df /tmp/test.img
-./ocsfs-tool check /tmp/test.img
-./ocsfs-tool nodes /tmp/test.img
-./ocsfs-tool locks /tmp/test.img
-```
 
-### Kernel Module Usage (Phase 1)
-
-```bash
-# Load module
-sudo insmod kmod/ocsfs.ko
-
-# Mount (requires a formatted block device or loopback)
+# Mount
+sudo modprobe loop
 sudo losetup /dev/loop0 /tmp/test.img
+sudo insmod kmod/ocsfs.ko
 sudo mount -t ocsfs /dev/loop0 /mnt/ocsfs
 
-# Use as a normal filesystem
-ls /mnt/ocsfs
-echo "hello" > /mnt/ocsfs/test.txt
-
-# Unmount
+# Use
+echo "hello" | sudo tee /mnt/ocsfs/test.txt
 sudo umount /mnt/ocsfs
 sudo losetup -d /dev/loop0
 sudo rmmod ocsfs
 ```
 
-### Proxmox VE Usage (Phase 4)
+---
+
+## Testbed setup (multi-node, KVM + LIO iSCSI)
+
+See [`docs/developer-guide.md`](docs/developer-guide.md) for the full
+step-by-step guide. The minimum viable testbed:
+
+- 1 host with KVM + 3 VMs (4 GB RAM each is enough)
+- `targetcli-fb` on the host, exporting one LIO iSCSI LUN (~50 GB)
+- `open-iscsi` inside each VM; each VM connects directly to the LUN
+- SCSI-3 PR is supported natively by LIO (`emulate_pr=1`)
+
+TrueNAS SCALE (LIO backend) works as an external iSCSI target and is the
+recommended option when a NAS is available.
+
+---
+
+## Proxmox VE usage
 
 ```bash
-# Add OCSFS storage via CLI
+# Install plugin and module on each PVE node
+sudo proxmox/install.sh
+
+# Add storage
 pvesm add ocsfs fc-shared \
-  --path /mnt/pve/fc-shared \
-  --device /dev/mapper/mpath-3600508b... \
-  --content images,iso,vztmpl,backup,rootdir,snippets \
-  --maxnodes 16 --thin 1 --shared 1
+  --device /dev/disk/by-path/<your-lun> \
+  --content images,iso,vztmpl,backup \
+  --maxnodes 16 --shared 1
 
-# Or edit /etc/pve/storage.cfg directly:
-# ocsfs: fc-shared
-#   path /mnt/pve/fc-shared
-#   device /dev/mapper/mpath-3600508b...
-#   content images,iso,vztmpl,backup,rootdir,snippets
-#   maxnodes 16
-#   thin 1
-#   shared 1
+# Run fsck offline (unmounted)
+sudo python3 tools/ocsfs-fsck /dev/sdb
 
-# Online defragmentation
-./ocsfs-defrag /mnt/pve/fc-shared -v -b 50 -t 4
-./ocsfs-defrag /mnt/pve/fc-shared -n  # dry run (report only)
+# Run fsck with repair
+sudo python3 tools/ocsfs-fsck --repair /dev/sdb
 ```
 
-## Architecture
+---
 
-See `OCSFS_Technical_Architecture_v0.1.md` for the full technical
-specification covering:
-
-- VMFS deep analysis and feature mapping
-- On-disk layout (superblock, AGs, inodes, extents)
-- Distributed locking protocol (SCSI CAW)
-- Journaling and crash recovery
-- I/O path optimization for VM workloads
-- Proxmox VE integration design
-- Development roadmap (36-month plan)
-
-## Project Structure
+## Project structure
 
 ```
 ocsfs/
-├── include/
-│   ├── ocsfs.h              # On-disk format (shared kernel/userspace)
-│   └── ocsfs_btree.h        # B+ tree interface
-├── src/
-│   ├── crc32c.c             # CRC32C implementation
-│   ├── bitmap.c             # Block bitmap allocator (userspace)
-│   ├── extent.c             # Extent manager (userspace)
-│   ├── lock.c               # On-disk distributed lock manager
-│   ├── heartbeat.c          # Heartbeat subsystem
-│   ├── btree.c              # B+ tree implementation
-│   ├── inode.c              # Inode allocator (userspace)
-│   ├── journal.c            # Journal / WAL (userspace)
-│   ├── dir.c                # Directory operations (userspace)
-│   └── fuse_main.c          # FUSE3 filesystem prototype
-├── kmod/
-│   ├── ocsfs.h              # Internal kernel header
-│   ├── super.c              # Superblock, mount, module init, cluster init
-│   ├── inode.c              # VFS inode operations
-│   ├── dir.c                # VFS directory operations
-│   ├── file.c               # VFS file + address_space operations (iomap)
-│   ├── extent.c             # Inline extent manager + UNWRITTEN conversion
-│   ├── journal.c            # WAL journaling + crash recovery
-│   ├── bitmap.c             # Block/inode bitmap allocator
-│   ├── iomap.c              # iomap-based I/O (direct I/O, buffered, readahead)
-│   ├── alloc.c              # Smart allocator (prealloc, goal-oriented, AG affinity)
-│   ├── thin.c               # Thin provisioning (fallocate, punch hole, DISCARD)
-│   ├── scsi_pr.c            # SCSI-3 Persistent Reservations
-│   ├── lock.c               # On-disk distributed lock manager
-│   ├── heartbeat.c          # Storage-path heartbeat kthread
-│   ├── node.c               # Node slot table management
-│   ├── recovery.c           # 5-phase crash recovery protocol
-│   ├── snapshot.c           # CoW file-level snapshots
-│   ├── refcount.c           # Extent reference counting for CoW
-│   ├── compress.c           # Inline compression (LZ4/ZSTD)
-│   ├── Kbuild               # In-tree build rules
-│   ├── Makefile             # Out-of-tree build
-│   └── dkms.conf            # DKMS configuration
-├── proxmox/
-│   ├── OCSFSPlugin.pm       # Proxmox VE storage plugin (Perl)
-│   ├── mount.ocsfs          # Mount helper
-│   └── install.sh           # PVE plugin installer
-├── tools/
-│   ├── mkfs_ocsfs.c         # mkfs.ocsfs formatter
-│   ├── ocsfs_tool.c         # ocsfs-tool admin CLI
-│   └── ocsfs_defrag.c       # Online defragmentation daemon
-├── tests/
-│   ├── test_ocsfs.c         # Test suite (36 tests, 1770 assertions)
-│   └── xfstests-ocsfs.conf  # xfstests integration config
-├── conf/
-│   ├── ocsfs-defrag@.service # Systemd defrag template unit
-│   ├── ocsfs-mount@.service  # Systemd mount template unit
-│   └── 99-ocsfs.rules       # udev rules for SAN auto-detection
-├── man/
-│   ├── mkfs.ocsfs.8         # Man page: mkfs.ocsfs
-│   ├── ocsfs-tool.8         # Man page: ocsfs-tool
-│   ├── ocsfs-defrag.8       # Man page: ocsfs-defrag
-│   └── mount.ocsfs.8        # Man page: mount.ocsfs
-├── debian/
-│   ├── control              # Package definitions (tools, dkms, proxmox)
-│   ├── rules                # Build rules
-│   ├── changelog            # Package changelog
-│   └── copyright            # License info
-├── Makefile
-├── .gitignore
-└── README.md
+├── kmod/           Kernel module (C, GPL-2.0)
+├── src/            FUSE3 prototype (format validation only)
+├── tools/          mkfs, admin CLI, defrag daemon, fsck
+├── proxmox/        Proxmox VE storage plugin (Perl)
+├── tests/          KUnit tests + xfstests config
+├── conf/           systemd units + udev rules
+├── man/            Man pages
+├── docs/           Admin guide, developer guide, kernel patch
+├── debian/         Debian packaging
+├── include/        Shared headers (on-disk format)
+└── LICENSE         GPL-2.0-only
 ```
 
-## Development Roadmap
-
-| Phase | Description | Status |
-|-------|-------------|--------|
-| Phase 0 | FUSE prototype — validate on-disk format | Complete |
-| Phase 1 | Kernel module — single-node read/write + crash recovery | Complete |
-| Phase 2 | Multi-node — distributed locking, heartbeat, recovery | Complete |
-| Phase 3 | Performance — direct I/O, iomap, readahead, prealloc | Complete |
-| Phase 4 | Advanced features + Proxmox VE integration | Complete |
-| Phase 5 | Production readiness — packaging, systemd, man pages | Complete |
+---
 
 ## License
 
-GPL-2.0-only (compatible with Linux kernel inclusion)
+GPL-2.0-only — compatible with Linux kernel inclusion.
 
 ## Contributing
 
-This project needs:
-- Kernel filesystem developers (C, VFS, block layer)
-- SCSI/FC storage experts (PR, CAW, multipath)
-- Proxmox integration developers (Perl, PVE API)
-- QA engineers (fio, fault injection, multi-node testing)
-- Technical writers
+The project is looking for:
 
-If you're interested in contributing, especially if you're affected by the
-VMware/Broadcom license changes, please reach out.
+- Kernel filesystem developers (VFS, block layer, crash safety)
+- SCSI/FC storage engineers (PR, CAW, multipath)
+- Proxmox / PVE integration developers
+- QA engineers who can run xfstests on a real cluster
+
+The most impactful open task right now is implementing `ocsfs_bsg_execute_cdb()`
+in `kmod/scsi_pr.c` to replace the kprobe shim for SCSI CAW, and running
+xfstests quick+auto on a 2-node KVM testbed.

@@ -16,8 +16,17 @@ test_ocsfs
 /tmp/ocsfs_*.img
 *.img
 
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
 # Tooling config
 .claude/
 .claude-flow/
 .mcp.json
 CLAUDE.md
+
+# Stray directories
+kmod/home/
+docs/superpowers/
