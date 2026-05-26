@@ -635,6 +635,7 @@ static int ocsfs_readdir(struct file *file, struct dir_context *ctx)
 int ocsfs_create(struct mnt_idmap *idmap, struct inode *dir,
 		 struct dentry *dentry, umode_t mode, bool excl)
 {
+	struct ocsfs_sb_info *sbi = OCSFS_SB(dir->i_sb);
 	struct inode *inode;
 	int ret;
 
@@ -647,7 +648,17 @@ int ocsfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	if (ret && ret != -EOPNOTSUPP)
 		goto fail;
 
+	/* Hold DLM SH on dir while reading its ACL to prevent concurrent chmod
+	 * on a peer from making us inherit stale permissions. */
+	if (sbi->s_clustered) {
+		ret = ocsfs_lock_acquire(dir->i_sb, &OCSFS_I(dir)->i_lock_res,
+					 OCSFS_LOCK_SH);
+		if (ret)
+			goto fail;
+	}
 	ret = ocsfs_init_acl(idmap, inode, dir);
+	if (sbi->s_clustered)
+		ocsfs_lock_release(dir->i_sb, &OCSFS_I(dir)->i_lock_res);
 	if (ret)
 		goto fail;
 
@@ -659,6 +670,16 @@ int ocsfs_create(struct mnt_idmap *idmap, struct inode *dir,
 
 	OCSFS_I(inode)->i_flags &= ~OCSFS_IFLAG_ORPHAN;
 	mark_inode_dirty(inode);
+	if (OCSFS_SB(inode->i_sb)->s_clustered) {
+		struct ocsfs_inode_info *oi = OCSFS_I(inode);
+
+		ret = ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
+					 OCSFS_LOCK_EX);
+		if (!ret) {
+			ocsfs_flush_inode_locked(inode, true);
+			ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
+		}
+	}
 	d_instantiate(dentry, inode);
 	return 0;
 
@@ -671,6 +692,7 @@ fail:
 struct dentry *ocsfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 			   struct dentry *dentry, umode_t mode)
 {
+	struct ocsfs_sb_info *sbi = OCSFS_SB(dir->i_sb);
 	struct inode *inode;
 	int ret;
 
@@ -683,7 +705,15 @@ struct dentry *ocsfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	if (ret && ret != -EOPNOTSUPP)
 		goto fail;
 
+	if (sbi->s_clustered) {
+		ret = ocsfs_lock_acquire(dir->i_sb, &OCSFS_I(dir)->i_lock_res,
+					 OCSFS_LOCK_SH);
+		if (ret)
+			goto fail;
+	}
 	ret = ocsfs_init_acl(idmap, inode, dir);
+	if (sbi->s_clustered)
+		ocsfs_lock_release(dir->i_sb, &OCSFS_I(dir)->i_lock_res);
 	if (ret)
 		goto fail;
 
@@ -703,6 +733,17 @@ struct dentry *ocsfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 		goto fail;
 	OCSFS_I(inode)->i_flags &= ~OCSFS_IFLAG_ORPHAN;
 	mark_inode_dirty(inode);
+	if (OCSFS_SB(inode->i_sb)->s_clustered) {
+		struct ocsfs_inode_info *oi = OCSFS_I(inode);
+		int fr;
+
+		fr = ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
+					OCSFS_LOCK_EX);
+		if (!fr) {
+			ocsfs_flush_inode_locked(inode, true);
+			ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
+		}
+	}
 	inc_nlink(dir);
 	mark_inode_dirty(dir);
 	d_instantiate(dentry, inode);
@@ -764,6 +805,14 @@ symlink_fail:
 
 	oi->i_flags &= ~OCSFS_IFLAG_ORPHAN;
 	mark_inode_dirty(inode);
+	if (OCSFS_SB(inode->i_sb)->s_clustered) {
+		int fr = ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
+					    OCSFS_LOCK_EX);
+		if (!fr) {
+			ocsfs_flush_inode_locked(inode, true);
+			ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
+		}
+	}
 	d_instantiate(dentry, inode);
 	return 0;
 }
@@ -775,6 +824,7 @@ symlink_fail:
 static int ocsfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 		       struct dentry *dentry, umode_t mode, dev_t rdev)
 {
+	struct ocsfs_sb_info *sbi = OCSFS_SB(dir->i_sb);
 	struct inode *inode;
 	int ret;
 
@@ -789,7 +839,15 @@ static int ocsfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	if (ret && ret != -EOPNOTSUPP)
 		goto fail;
 
+	if (sbi->s_clustered) {
+		ret = ocsfs_lock_acquire(dir->i_sb, &OCSFS_I(dir)->i_lock_res,
+					 OCSFS_LOCK_SH);
+		if (ret)
+			goto fail;
+	}
 	ret = ocsfs_init_acl(idmap, inode, dir);
+	if (sbi->s_clustered)
+		ocsfs_lock_release(dir->i_sb, &OCSFS_I(dir)->i_lock_res);
 	if (ret)
 		goto fail;
 
@@ -801,6 +859,15 @@ static int ocsfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 
 	OCSFS_I(inode)->i_flags &= ~OCSFS_IFLAG_ORPHAN;
 	mark_inode_dirty(inode);
+	if (OCSFS_SB(inode->i_sb)->s_clustered) {
+		struct ocsfs_inode_info *oi = OCSFS_I(inode);
+		int fr = ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
+					    OCSFS_LOCK_EX);
+		if (!fr) {
+			ocsfs_flush_inode_locked(inode, true);
+			ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
+		}
+	}
 	d_instantiate(dentry, inode);
 	return 0;
 fail:
@@ -843,6 +910,8 @@ static int ocsfs_link(struct dentry *old_dentry, struct inode *dir,
 		iput(inode);
 	} else {
 		mark_inode_dirty(inode);
+		if (sbi->s_clustered)
+			ocsfs_flush_inode_locked(inode, true);
 		d_instantiate(dentry, inode);
 	}
 

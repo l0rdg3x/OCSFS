@@ -107,6 +107,7 @@ void ocsfs_journal_exit(struct super_block *sb)
 		sync_dirty_buffer(j->j_header_bh);
 		brelse(j->j_header_bh);
 		j->j_header_bh = NULL;
+		blkdev_issue_flush(sb->s_bdev);
 	}
 }
 

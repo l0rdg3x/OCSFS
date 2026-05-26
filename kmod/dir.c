@@ -208,28 +208,32 @@ int __ocsfs_add_dirent(struct inode *dir, const struct qstr *name,
 		if (ret)
 			goto out;
 
+		/* Zero and flush the block BEFORE linking it into the extent tree
+		 * so a crash after extent_insert but before the dirent write does
+		 * not leave garbage in a reachable block (ALTO-2). */
+		bh = sb_getblk(dir->i_sb, phys);
+		if (!bh) {
+			ocsfs_free_blocks(dir->i_sb, phys, 1);
+			ret = -EIO;
+			goto out;
+		}
+		memset(bh->b_data, 0, sbi->s_block_size);
+		set_buffer_uptodate(bh);
+		mark_buffer_dirty(bh);
+		sync_dirty_buffer(bh);
+
 		mutex_lock(&dir_oi->i_extent_lock);
 		ret = ocsfs_extent_insert(dir, dir_blocks, phys, 1,
 					  OCSFS_EXT_WRITTEN);
 		if (ret) {
 			mutex_unlock(&dir_oi->i_extent_lock);
 			ocsfs_free_blocks(dir->i_sb, phys, 1);
+			brelse(bh);
+			bh = NULL;
 			goto out;
 		}
 		dir->i_size += sbi->s_block_size;
 		mutex_unlock(&dir_oi->i_extent_lock);
-
-		bh = sb_bread(dir->i_sb, phys);
-		if (!bh) {
-			/* Roll back extent and size: block exists but is unreadable */
-			mutex_lock(&dir_oi->i_extent_lock);
-			dir->i_size -= sbi->s_block_size;
-			ocsfs_extent_truncate(dir, dir_blocks);
-			mutex_unlock(&dir_oi->i_extent_lock);
-			ret = -EIO;
-			goto out;
-		}
-		memset(bh->b_data, 0, sbi->s_block_size);
 		off = 0;
 	}
 fill:
