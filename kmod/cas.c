@@ -294,7 +294,9 @@ int ocsfs_atomic_cas(struct super_block *sb, u64 block, u32 boff,
 	for (attempt = 0; attempt < CAS_MAX_ATTEMPTS; attempt++) {
 		ret = cas_acquire_lease(sb, block, &lease_bh, &lease_eidx);
 		if (ret == -EAGAIN) {
-			u32 delay_us = min_t(u32, 1U << min(attempt, 15U),
+			u32 delay_us = min_t(u32,
+					     1U << min_t(u32, attempt,
+							 CAS_BACKOFF_SHIFT_MAX),
 					     CAS_MAX_BACKOFF_US);
 			usleep_range(delay_us, delay_us + delay_us / 4);
 			continue;

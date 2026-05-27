@@ -78,6 +78,8 @@
 #define CAS_MAX_ATTEMPTS            128
 #define CAS_MAX_BACKOFF_US          32000 /* 32 ms — covers SAN RTTs up to ~10 ms */
 #define CAS_LEASE_TIMEOUT_NS        (10ULL * NSEC_PER_SEC)
+/* Exponential backoff shift cap: 2^CAS_BACKOFF_SHIFT_MAX >= CAS_MAX_BACKOFF_US */
+#define CAS_BACKOFF_SHIFT_MAX       15
 
 /* Recovery leader election block — dopo l'area CAS lease */
 #define OCSFS_RECOVERY_LEADER_OFF   (OCSFS_CAS_LEASE_OFF + OCSFS_CAS_LEASE_SIZE)
@@ -251,13 +253,15 @@ static inline u16 ocsfs_ext_set_comp_algo(u16 flags, u8 algo)
 #define OCSFS_LOCKRES_REFCOUNT  7
 
 /* Heartbeat constants */
-#define OCSFS_HB_INTERVAL_MS    5000   /* write every 5s */
-#define OCSFS_HB_TIMEOUT_MS     15000  /* 3 missed → suspected */
-#define OCSFS_HB_CONFIRM_MS     10000  /* 2 more missed → confirmed dead */
+#define OCSFS_HB_INTERVAL_MS        5000   /* write every 5s */
+#define OCSFS_HB_TIMEOUT_MS         15000  /* 3 missed → suspected */
+#define OCSFS_HB_CONFIRM_MS         10000  /* 2 more missed → confirmed dead */
 /* Total dead-node detection window: suspected + confirmation period */
-#define OCSFS_HB_DEAD_MS        (OCSFS_HB_TIMEOUT_MS + OCSFS_HB_CONFIRM_MS)
-#define OCSFS_HB_CHECK_MS       2000   /* check peers every 2s */
-#define OCSFS_HB_IO_TIMEOUT_MS  3000   /* heartbeat write I/O deadline */
+#define OCSFS_HB_DEAD_MS            (OCSFS_HB_TIMEOUT_MS + OCSFS_HB_CONFIRM_MS)
+#define OCSFS_HB_CHECK_MS           2000   /* check peers every 2s */
+#define OCSFS_HB_IO_TIMEOUT_MS      3000   /* heartbeat write I/O deadline */
+/* SUSPECTED nodes are still considered alive for this many × HB_TIMEOUT_MS */
+#define OCSFS_HB_SUSPECTED_MULT     2
 
 /* Lock acquisition retry */
 #define OCSFS_LOCK_RETRY_MIN_US 1000   /* 1 ms */
@@ -273,6 +277,8 @@ static inline u16 ocsfs_ext_set_comp_algo(u16 flags, u8 algo)
 
 /* Recovery backoff for transient errors in the recovery work function */
 #define OCSFS_RECOVERY_BACKOFF_MS   60000U  /* 60s before re-arming a failed recovery */
+/* Yield when another node is already running recovery for this slot */
+#define OCSFS_RECOVERY_YIELD_MS     50U
 
 /* Recovery phases */
 #define OCSFS_RECOVERY_ELECT    1

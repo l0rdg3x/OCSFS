@@ -333,7 +333,8 @@ int ocsfs_free_blocks_txn(struct ocsfs_txn *txn, u64 block, u32 count)
 	}
 
 	if (ag_no >= sbi->s_ag_count) {
-		pr_warn("ocsfs: free_blocks_txn: block %llu not in any AG\n", block);
+		pr_warn("ocsfs: free_blocks_txn: block %llu not found in any of %u AGs — possible double-free or fs corruption\n",
+			block, sbi->s_ag_count);
 		return -EINVAL;
 	}
 

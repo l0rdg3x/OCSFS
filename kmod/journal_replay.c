@@ -64,9 +64,8 @@ static int journal_replay_j(struct super_block *sb, struct ocsfs_journal *j)
 
 	/* Wrap-around sanity: tail must not exceed head */
 	if (j->tail > j->head || j->head > j->size) {
-		pr_err("ocsfs: journal corrupt (tail=%llu head=%llu size=%llu) — reset\n",
+		pr_err("ocsfs: journal corrupt (tail=%llu head=%llu size=%llu) — run fsck to repair\n",
 		       j->tail, j->head, j->size);
-		j->tail = j->head = sizeof(struct ocsfs_disk_journal_hdr);
 		return -EUCLEAN;
 	}
 

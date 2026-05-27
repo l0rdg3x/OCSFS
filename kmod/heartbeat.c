@@ -294,7 +294,7 @@ bool ocsfs_node_is_alive(struct super_block *sb, u16 slot)
 	/* SUSPECTED is still considered alive until confirmed dead */
 	alive = ((ni->ni_state == OCSFS_NODE_ACTIVE ||
 		  ni->ni_state == OCSFS_NODE_SUSPECTED) &&
-		 (now - ni->ni_last_hb) < timeout_ns * 2);
+		 (now - ni->ni_last_hb) < timeout_ns * OCSFS_HB_SUSPECTED_MULT);
 	spin_unlock(&sbi->s_node_lock);
 
 	return alive;

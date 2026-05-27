@@ -417,7 +417,7 @@ static void ocsfs_recovery_work_fn(struct work_struct *work)
 			/* Don't busy-spin: another node is running recovery.
 			 * If it finishes, we win the CAS next round.
 			 * If it dies, heartbeat fires a new trigger. */
-			msleep(50);
+			msleep(OCSFS_RECOVERY_YIELD_MS);
 		} else if (ret && ret != -EPERM && ret != -EUCLEAN) {
 			/* Transient error (I/O, ENOMEM, …): -EPERM means the
 			 * node is still alive (degraded cross-check), -EUCLEAN

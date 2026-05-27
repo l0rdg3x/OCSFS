@@ -124,7 +124,7 @@ static void dedup_free_pairs(struct dedup_ctx *dc)
 static int dedup_scan_extent(u64 logical, u64 physical, u32 length,
 			     u16 flags, void *ctx_)
 {
-	struct dedup_ctx *dc = ctx_;
+	struct dedup_ctx *dc = (struct dedup_ctx *)ctx_;
 	struct super_block *sb = dc->inode->i_sb;
 	u32 i;
 
