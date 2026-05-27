@@ -169,7 +169,7 @@ int ocsfs_compress_data(u8 algo, const void *src, unsigned int src_len,
 
 	/* Only use compressed version if it actually saves space */
 	if (*dst_len >= src_len)
-		return -EINVAL; /* compression didn't help */
+		return -ENODATA; /* compression didn't help — store uncompressed */
 
 	return 0;
 }

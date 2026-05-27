@@ -281,6 +281,8 @@ int ocsfs_lock_recover_node(struct super_block *sb, u16 node_slot,
 
 		if (le16_to_cpu(dl.le_mode) == OCSFS_LOCK_EX &&
 		    le16_to_cpu(dl.le_holder_slot) == node_slot &&
+		    /* le_holder_gen is 32-bit: wraps after 2^32 mounts — accepted
+		     * risk; upgrading to 64-bit requires an on-disk format change. */
 		    le32_to_cpu(dl.le_holder_gen) == mount_gen) {
 			dl.le_holder_slot = 0;
 			dl.le_holder_gen  = 0;

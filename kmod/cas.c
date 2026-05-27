@@ -220,7 +220,14 @@ static int cas_single_node(struct super_block *sb, u64 block, u32 boff,
  *
  * Single-node (CAS_BACKEND_NONE): RMW diretto senza lease.
  * PR-lease: acquisisce lease, verifica, scrive, rilascia.
- * SCSI CAW: non ancora implementato, fallback su PR-lease.
+ * SCSI CAW: full-block atomico hardware; partial-block via read-modify-CAW.
+ *
+ * TOCTOU note (PR-lease path): il lease garantisce accesso esclusivo alla
+ * *operazione* CAS su [boff..boff+len), non all'intero blocco.  Un altro
+ * nodo può scrivere regioni non sovrapposte dello stesso blocco mentre il
+ * lease è tenuto.  I caller devono assicurare che le regioni target di CAS
+ * concorrenti sullo stesso blocco fisico non si sovrappongano (il refcount
+ * table usa un bucket = un blocco intero, soddisfacendo questo invariante).
  */
 int ocsfs_atomic_cas(struct super_block *sb, u64 block, u32 boff,
 		     u32 len, const void *expected, const void *new_data)

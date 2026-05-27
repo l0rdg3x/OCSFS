@@ -10,6 +10,9 @@
 
 static inline u64 ext_encode(u64 phys, u32 len, u16 flags)
 {
+	/* btree encoding stores only 2 flag bits (WRITTEN/UNWRITTEN).
+	 * Callers must decompress/decrypt extents before btree round-trips. */
+	WARN_ON_ONCE(flags & ~0x3U);
 	return (phys & 0xFFFFFFFFFFULL) |
 	       ((u64)(len   & 0x3FFFFFU) << 40) |
 	       ((u64)(flags & 0x3U)      << 62);

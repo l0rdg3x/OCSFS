@@ -117,6 +117,16 @@ int ocsfs_xattr_get_internal(struct inode *inode, u8 ns, const char *name,
 	name_len = strlen(name);
 	if (!name_len || name_len > 255)
 		return -ERANGE;
+	{
+		u8 ci;
+
+		for (ci = 0; ci < name_len; ci++) {
+			unsigned char c = (unsigned char)name[ci];
+
+			if (c < 0x20 || c == 0x7F)
+				return -EINVAL; /* control chars not allowed in xattr names */
+		}
+	}
 
 	if (sbi->s_clustered) {
 		int r = ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
@@ -192,6 +202,16 @@ int ocsfs_xattr_set_internal(struct inode *inode, u8 ns, const char *name,
 	name_len = strlen(name);
 	if (!name_len || name_len > 255)
 		return -ERANGE;
+	{
+		u8 ci;
+
+		for (ci = 0; ci < name_len; ci++) {
+			unsigned char c = (unsigned char)name[ci];
+
+			if (c < 0x20 || c == 0x7F)
+				return -EINVAL; /* control chars not allowed in xattr names */
+		}
+	}
 
 	if (!remove) {
 		new_sz = sizeof(struct ocsfs_xattr_entry) + name_len + size;

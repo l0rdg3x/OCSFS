@@ -175,6 +175,13 @@ static int ocsfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 		 * written portion to WRITTEN only after confirmed I/O, preventing
 		 * reads of preallocated-but-unwritten blocks from returning stale
 		 * data from a previously freed file (information leak).
+		 *
+		 * Crash window: if the node crashes between this extent_insert
+		 * and iomap_end, the allocated blocks remain UNWRITTEN on disk.
+		 * i_size is never advanced until iomap_end → i_size_write, so no
+		 * data is exposed.  fsck identifies them as allocated-but-
+		 * unreferenced blocks (refcount=1, no inode extent points here)
+		 * and reclaims them during repair.
 		 */
 		ret = ocsfs_extent_insert(inode, logical_block, phys,
 					  alloc_blocks, OCSFS_EXT_UNWRITTEN);

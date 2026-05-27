@@ -124,7 +124,7 @@ enum ocsfs_cas_backend {
 
 #define OCSFS_INODE_SIZE            512
 #define OCSFS_INLINE_EXTENTS        16
-#define OCSFS_MAX_NAME_LEN          255
+#define OCSFS_MAX_NAME_LEN          255  /* must equal NAME_MAX (255 on Linux) */
 #define OCSFS_XATTR_MAGIC           0x4F435841  /* "OCXA" */
 #define OCSFS_XATTR_DATA_SIZE       (OCSFS_DEFAULT_BLOCK_SIZE - 16)
 #define OCSFS_DIR_BTREE_THRESHOLD   64u  /* entries before building dir index */
