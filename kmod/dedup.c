@@ -225,6 +225,80 @@ static int dedup_apply_pair(struct inode *inode, const struct dedup_pair *p)
 	return 0;
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ * ARCH-6: Background dedup scrub daemon (delayed_work)
+ * Enabled when OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB is set.
+ * Every 5 minutes: scans a batch of in-memory regular file inodes
+ * and calls ocsfs_dedup_file on each.
+ * ═══════════════════════════════════════════════════════════════ */
+
+#define OCSFS_DEDUP_SCRUB_INTERVAL_JIFFIES  (5 * 60 * HZ)
+#define OCSFS_DEDUP_SCRUB_BATCH             64
+
+static void ocsfs_dedup_scrub_fn(struct work_struct *work)
+{
+	struct ocsfs_sb_info *sbi = container_of(to_delayed_work(work),
+						  struct ocsfs_sb_info,
+						  s_dedup_scrub_work);
+	struct super_block *sb = sbi->s_sb;
+	struct inode *batch[OCSFS_DEDUP_SCRUB_BATCH];
+	struct inode *inode;
+	u64 bytes_total = 0;
+	int n = 0, i;
+
+	if (sb->s_flags & SB_RDONLY)
+		goto reschedule;
+
+	spin_lock(&sb->s_inode_list_lock);
+	list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
+		if (n >= OCSFS_DEDUP_SCRUB_BATCH)
+			break;
+		if (!S_ISREG(inode->i_mode) || inode->i_nlink == 0)
+			continue;
+		if (igrab(inode))
+			batch[n++] = inode;
+	}
+	spin_unlock(&sb->s_inode_list_lock);
+
+	for (i = 0; i < n; i++) {
+		u64 saved = 0;
+
+		ocsfs_dedup_file(batch[i], &saved);
+		bytes_total += saved;
+		iput(batch[i]);
+	}
+
+	if (bytes_total)
+		pr_debug("ocsfs: scrub pass freed %llu bytes via dedup\n",
+			 bytes_total);
+
+reschedule:
+	queue_delayed_work(system_wq, &sbi->s_dedup_scrub_work,
+			   OCSFS_DEDUP_SCRUB_INTERVAL_JIFFIES);
+}
+
+void ocsfs_dedup_scrub_start(struct super_block *sb)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+
+	if (!(sbi->s_feature_ro_compat & OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB))
+		return;
+
+	INIT_DELAYED_WORK(&sbi->s_dedup_scrub_work, ocsfs_dedup_scrub_fn);
+	queue_delayed_work(system_wq, &sbi->s_dedup_scrub_work,
+			   OCSFS_DEDUP_SCRUB_INTERVAL_JIFFIES);
+}
+
+void ocsfs_dedup_scrub_stop(struct super_block *sb)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+
+	if (!(sbi->s_feature_ro_compat & OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB))
+		return;
+
+	cancel_delayed_work_sync(&sbi->s_dedup_scrub_work);
+}
+
 /* ── Public entry point ─────────────────────────────────────────────────── */
 
 int ocsfs_dedup_file(struct inode *inode, u64 *bytes_deduped)

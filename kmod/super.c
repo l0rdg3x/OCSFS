@@ -414,6 +414,7 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		sbi->s_clustered ? " clustered" : "",
 		sbi->s_degraded  ? " degraded"  : "");
 
+	ocsfs_dedup_scrub_start(sb);
 	return 0;
 
 fail_journal:
@@ -438,6 +439,7 @@ void ocsfs_put_super(struct super_block *sb)
 	if (!sbi)
 		return;
 
+	ocsfs_dedup_scrub_stop(sb);
 	ocsfs_journal_exit(sb);   /* flush journal before releasing cluster slot */
 	ocsfs_cluster_exit(sb);
 	kvfree(sbi->s_decompress_wksp);

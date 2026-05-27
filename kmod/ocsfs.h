@@ -716,6 +716,9 @@ struct ocsfs_sb_info {
 
 	/* Refcount CAS buffer pool — avoids per-call kmalloc in hot path */
 	mempool_t      *s_rc_buf_pool;
+
+	/* ARCH-6: background dedup scrub daemon */
+	struct delayed_work s_dedup_scrub_work;
 };
 
 /*
@@ -1179,5 +1182,7 @@ struct ocsfs_dedup_result {
 #define OCSFS_IOC_DEDUP  _IOR('O', 3, struct ocsfs_dedup_result)
 
 int ocsfs_dedup_file(struct inode *inode, u64 *bytes_deduped);
+void ocsfs_dedup_scrub_start(struct super_block *sb);
+void ocsfs_dedup_scrub_stop(struct super_block *sb);
 
 #endif /* _OCSFS_KMOD_H */
