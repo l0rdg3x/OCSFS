@@ -146,6 +146,8 @@ SCSI CAW is now implemented via BSG-direct path — no kprobe required.
 | **POSIX distributed file locking** | `fcntl` locks are local only. |
 | **VAAI XCOPY/WRITE_SAME** | Not implemented. |
 | **STONITH** | Fencing via SCSI PR works; out-of-band STONITH (PDU, iDRAC) not wired. For Proxmox labs, the Proxmox API can serve as soft STONITH. |
+| **Lock acquire timeout** | Wall-clock deadline of 30 s (`OCSFS_LOCK_ACQUIRE_TIMEOUT_MS`). Exponential backoff 1 ms → 100 ms; fails with `-ETIMEDOUT` at deadline (commit `ffeb901`). |
+| **Refcount table fill-up** | Per-AG refcount table is fixed at 16 blocks; a CoW/snapshot-heavy workload can exhaust it independently of data space. Requires on-disk redesign. |
 
 ---
 

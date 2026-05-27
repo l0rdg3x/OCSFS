@@ -277,7 +277,7 @@ ocsfs_put_super()
 2. ocsfs_lock_probe_slot()  → find physical slot (linear probing, max 16)
 3. lock_read_entry()        → forced disk read (bypasses page cache)
 4. Compatible?              → update entry via lock_write_entry() with version check
-5. Conflict?                → set_waiter_bit() + exponential backoff (1ms → 100ms, max 50 retries)
+5. Conflict?                → set_waiter_bit() + exponential backoff (1ms → 100ms, wall-clock deadline 30s)
 ```
 
 **Atomicity:** Software versioning (read-version → check → write) as the CAS
@@ -310,6 +310,25 @@ Collisions are handled by linear probing (max `OCSFS_LOCK_PROBE_MAX = 16` slots)
 Each call to `ocsfs_lock_recover_node()` atomically increments
 `sbi->s_lock_epoch`. Cached SH grants that were obtained in an earlier epoch
 are silently invalidated at next access, forcing a fresh disk read.
+
+### Selective page cache invalidation (ARCH-7)
+
+When a node acquires a lock in either SH or EX mode, `lock_acquire` snapshots
+the previous EX holder's dirty byte range (`dl.le_inv_lo / dl.le_inv_hi`) into
+`lr->lr_inv_lo / lr->lr_inv_hi`.
+
+- **Read path (`ocsfs_file_read_iter`):** If the previous writer was a
+  different node and a valid range is recorded, `invalidate_mapping_pages()`
+  flushes only those pages.  Pages outside the dirty range are untouched.
+  Falls back to `invalidate_inode_pages2()` only when `lo == hi == 0` (no range
+  recorded) or when the writer was this node (cache is coherent).
+
+- **Write path (`ocsfs_file_write_iter`):** Same selective logic before the
+  write starts.  After invalidation, `lr_inv_lo/hi` are zeroed so `iomap_end`
+  records only this session's write range.
+
+- **Release path (`ocsfs_lock_release`):** Stores `lr_inv_lo/hi` into
+  `dl.le_inv_lo/hi` on disk and bumps `dl.le_inv_epoch` for future acquirers.
 
 ### Single-node mode
 
