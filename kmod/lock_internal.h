@@ -14,6 +14,13 @@ int  lock_read_entry(struct super_block *sb, u32 slot,
 int  lock_write_entry(struct super_block *sb, u32 slot,
 		      struct ocsfs_disk_lock *entry,
 		      struct buffer_head *bh);
+/* ARCH-2: address-based variants for overflow block entries */
+int  lock_read_entry_at_addr(struct super_block *sb, u64 byte_addr,
+			     struct ocsfs_disk_lock *out,
+			     struct buffer_head **bh_out);
+int  lock_write_entry_at_addr(struct super_block *sb, u64 byte_addr,
+			      struct ocsfs_disk_lock *entry,
+			      struct buffer_head *bh);
 int  lock_probe_slot(struct super_block *sb, struct ocsfs_lock_res *lr);
 
 /* lock_io.c — bitmask helpers */

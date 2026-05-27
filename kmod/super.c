@@ -316,6 +316,8 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sbi->s_feature_compat   = le64_to_cpu(ds->s_feature_compat);
 	sbi->s_feature_incompat = le64_to_cpu(ds->s_feature_incompat);
 	sbi->s_feature_ro_compat = le64_to_cpu(ds->s_feature_ro_compat);
+	sbi->s_lock_table_off_cached = le64_to_cpu(ds->s_lock_table_off);
+	sbi->s_lock_primary_count    = le32_to_cpu(ds->s_lock_primary_count);
 	sbi->s_data_off = le64_to_cpu(ds->s_data_off);
 	sbi->s_ag_desc_off = le64_to_cpu(ds->s_ag_desc_off);
 

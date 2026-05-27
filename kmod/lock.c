@@ -16,6 +16,28 @@
 #include "lock_internal.h"
 
 /* ═══════════════════════════════════════════════════════════════
+ * ARCH-2: per-lock-res dispatch helpers
+ * Overflow entries live in separately-allocated blocks (lr_overflow_addr != 0);
+ * primary entries live in the lock table (lr_overflow_addr == 0).
+ * ═══════════════════════════════════════════════════════════════ */
+
+static int lr_read_entry(struct super_block *sb, struct ocsfs_lock_res *lr,
+			 struct ocsfs_disk_lock *dl, struct buffer_head **bh_out)
+{
+	if (lr->lr_overflow_addr)
+		return lock_read_entry_at_addr(sb, lr->lr_overflow_addr, dl, bh_out);
+	return lock_read_entry(sb, lr->lr_slot, dl, bh_out);
+}
+
+static int lr_write_entry(struct super_block *sb, struct ocsfs_lock_res *lr,
+			  struct ocsfs_disk_lock *entry, struct buffer_head *bh)
+{
+	if (lr->lr_overflow_addr)
+		return lock_write_entry_at_addr(sb, lr->lr_overflow_addr, entry, bh);
+	return lock_write_entry(sb, lr->lr_slot, entry, bh);
+}
+
+/* ═══════════════════════════════════════════════════════════════
  * LOCK ACQUIRE
  *
  * Protocol:
@@ -66,7 +88,7 @@ int ocsfs_lock_acquire(struct super_block *sb, struct ocsfs_lock_res *lr,
 	}
 
 retry:
-	ret = lock_read_entry(sb, lr->lr_slot, &dl, &bh);
+	ret = lr_read_entry(sb, lr, &dl, &bh);
 	if (ret) {
 		mutex_unlock(&lr->lr_mutex);
 		return ret;
@@ -97,7 +119,7 @@ retry:
 		dl.le_grant_time = cpu_to_le64(ktime_get_real_ns());
 		clear_waiter_bit(&dl, sbi->s_node_slot);
 
-		ret = lock_write_entry(sb, lr->lr_slot, &dl, bh);
+		ret = lr_write_entry(sb, lr, &dl, bh);
 		brelse(bh);
 
 		if (ret == -EAGAIN)
@@ -119,7 +141,7 @@ retry:
 	}
 
 	set_waiter_bit(&dl, sbi->s_node_slot);
-	lock_write_entry(sb, lr->lr_slot, &dl, bh);
+	lr_write_entry(sb, lr, &dl, bh);
 	brelse(bh);
 
 	if (++retries > OCSFS_LOCK_MAX_RETRIES) {
@@ -156,7 +178,7 @@ int ocsfs_lock_release(struct super_block *sb, struct ocsfs_lock_res *lr)
 	mutex_lock(&lr->lr_mutex);
 
 retry_release:
-	ret = lock_read_entry(sb, lr->lr_slot, &dl, &bh);
+	ret = lr_read_entry(sb, lr, &dl, &bh);
 	if (ret) {
 		mutex_unlock(&lr->lr_mutex);
 		return ret;
@@ -187,7 +209,7 @@ retry_release:
 			dl.le_mode = cpu_to_le16(OCSFS_LOCK_NL);
 	}
 
-	ret = lock_write_entry(sb, lr->lr_slot, &dl, bh);
+	ret = lr_write_entry(sb, lr, &dl, bh);
 	brelse(bh);
 
 	if (ret == -EAGAIN && ++retries < OCSFS_LOCK_MAX_RETRIES)
@@ -229,7 +251,7 @@ int ocsfs_lock_downgrade(struct super_block *sb, struct ocsfs_lock_res *lr,
 
 	mutex_lock(&lr->lr_mutex);
 
-	ret = lock_read_entry(sb, lr->lr_slot, &dl, &bh);
+	ret = lr_read_entry(sb, lr, &dl, &bh);
 	if (ret) {
 		mutex_unlock(&lr->lr_mutex);
 		return ret;
@@ -257,7 +279,7 @@ int ocsfs_lock_downgrade(struct super_block *sb, struct ocsfs_lock_res *lr,
 		return -EINVAL;
 	}
 
-	ret = lock_write_entry(sb, lr->lr_slot, &dl, bh);
+	ret = lr_write_entry(sb, lr, &dl, bh);
 	brelse(bh);
 
 	if (ret == 0)
@@ -283,7 +305,7 @@ int ocsfs_lock_recover_node(struct super_block *sb, u16 node_slot,
 	pr_info("ocsfs: recovering locks for node slot %u (gen=%u)\n",
 		node_slot, mount_gen);
 
-	for (i = 0; i < OCSFS_LOCK_ENTRY_COUNT; i++) {
+	for (i = 0; i < ocsfs_lock_primary_count(OCSFS_SB(sb)); i++) {
 		ret = lock_read_entry(sb, i, &dl, &bh);
 		if (ret)
 			continue;

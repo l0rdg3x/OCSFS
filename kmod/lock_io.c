@@ -16,7 +16,7 @@ int lock_read_entry(struct super_block *sb, u32 slot,
 		    struct ocsfs_disk_lock *out, struct buffer_head **bh_out)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
-	u64 off   = OCSFS_LOCK_TABLE_OFF + (u64)slot * OCSFS_LOCK_ENTRY_SIZE;
+	u64 off   = ocsfs_lock_table_base(sbi) + (u64)slot * OCSFS_LOCK_ENTRY_SIZE;
 	u64 block = off / sbi->s_block_size;
 	u32 boff  = off % sbi->s_block_size;
 	struct buffer_head *bh;
@@ -54,7 +54,7 @@ int lock_write_entry(struct super_block *sb, u32 slot,
 		     struct ocsfs_disk_lock *entry, struct buffer_head *bh)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
-	u64 off   = OCSFS_LOCK_TABLE_OFF + (u64)slot * OCSFS_LOCK_ENTRY_SIZE;
+	u64 off   = ocsfs_lock_table_base(sbi) + (u64)slot * OCSFS_LOCK_ENTRY_SIZE;
 	u64 block = off / sbi->s_block_size;
 	u32 boff  = off % sbi->s_block_size;
 	u8 expected_buf[sizeof(struct ocsfs_disk_lock)];
@@ -124,18 +124,78 @@ int lock_write_entry(struct super_block *sb, u32 slot,
 				expected_buf, new_buf);
 }
 
+/* ARCH-2: read/write a lock entry at an absolute byte address on disk.
+ * Used for overflow block entries that live outside the primary lock table. */
+int lock_read_entry_at_addr(struct super_block *sb, u64 byte_addr,
+			    struct ocsfs_disk_lock *out,
+			    struct buffer_head **bh_out)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	u64 block = byte_addr / sbi->s_block_size;
+	u32 boff  = (u32)(byte_addr % sbi->s_block_size);
+	struct buffer_head *bh;
+
+	bh = sb_getblk(sb, block);
+	if (!bh)
+		return -EIO;
+	clear_buffer_uptodate(bh);
+	if (bh_read(bh, 0) < 0) {
+		brelse(bh);
+		return -EIO;
+	}
+	memcpy(out, bh->b_data + boff, sizeof(*out));
+	if (bh_out)
+		*bh_out = bh;
+	else
+		brelse(bh);
+	return 0;
+}
+
+int lock_write_entry_at_addr(struct super_block *sb, u64 byte_addr,
+			     struct ocsfs_disk_lock *entry,
+			     struct buffer_head *bh)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	u64 block = byte_addr / sbi->s_block_size;
+	u32 boff  = (u32)(byte_addr % sbi->s_block_size);
+	u8 expected_buf[sizeof(struct ocsfs_disk_lock)];
+	u8 new_buf[sizeof(struct ocsfs_disk_lock)];
+	struct ocsfs_disk_lock *new_entry = (struct ocsfs_disk_lock *)new_buf;
+	u32 expected_version;
+
+	memcpy(expected_buf, bh->b_data + boff, sizeof(*entry));
+	expected_version = le32_to_cpu(
+		((struct ocsfs_disk_lock *)expected_buf)->le_version);
+	memcpy(new_buf, entry, sizeof(*entry));
+	new_entry->le_version  = cpu_to_le32(expected_version + 1);
+	new_entry->le_checksum = cpu_to_le32(
+		ocsfs_crc32c(~0U, new_entry,
+			     OCSFS_LOCK_ENTRY_SIZE - sizeof(__le32)));
+
+	return ocsfs_atomic_cas(sb, block, boff,
+				sizeof(struct ocsfs_disk_lock),
+				expected_buf, new_buf);
+}
+
 /*
- * Find / claim the on-disk slot for a resource using open-addressing linear probe.
- * Returns 0 with lr->lr_slot set, or -ENOSPC if all probe slots are occupied.
+ * Find / claim the on-disk slot for a resource using open-addressing probe.
+ * ARCH-2: uses runtime primary count (from sbi); on exhaustion follows the
+ * le_overflow_block chain from the base slot, allocating a new overflow block
+ * if the chain is empty.
+ * Returns 0 with lr->lr_slot / lr->lr_overflow_addr set, or -ENOSPC / error.
  * Called with lr->lr_mutex held.
  */
 int lock_probe_slot(struct super_block *sb, struct ocsfs_lock_res *lr)
 {
-	u32 base = ocsfs_lock_table_slot(lr->lr_resource_id);
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	u32 count = ocsfs_lock_primary_count(sbi);
+	u32 base  = ocsfs_lock_table_slot(lr->lr_resource_id, count);
+	u32 last_slot = base; /* last primary slot in probe (chain anchor) */
 	int i;
 
+	/* ── Phase 1: quadratic probe through primary table ── */
 	for (i = 0; i < OCSFS_LOCK_PROBE_MAX; i++) {
-		u32 slot = (base + (u32)i * (u32)i) % OCSFS_LOCK_ENTRY_COUNT;
+		u32 slot = (base + (u32)i * (u32)i) % count;
 		struct ocsfs_disk_lock dl;
 		struct buffer_head *bh;
 		int ret;
@@ -145,19 +205,129 @@ int lock_probe_slot(struct super_block *sb, struct ocsfs_lock_res *lr)
 			return ret;
 		brelse(bh);
 
+		last_slot = slot;
+
 		if (le32_to_cpu(dl.le_magic) != OCSFS_LOCK_MAGIC) {
-			lr->lr_slot = slot;
+			lr->lr_slot           = slot;
+			lr->lr_overflow_addr  = 0;
 			return 0;
 		}
 		if (le64_to_cpu(dl.le_resource_id) == lr->lr_resource_id) {
-			lr->lr_slot = slot;
+			lr->lr_slot           = slot;
+			lr->lr_overflow_addr  = 0;
 			return 0;
 		}
 	}
 
-	pr_warn("ocsfs: lock table full (probe_max=%d), resource 0x%llx\n",
-		OCSFS_LOCK_PROBE_MAX, lr->lr_resource_id);
-	return -ENOSPC;
+	/* ── Phase 2: follow / build overflow chain from last_slot ── */
+	{
+		struct ocsfs_disk_lock anchor_dl;
+		struct buffer_head *anchor_bh;
+		u64 chain_block;
+		int ret;
+
+		ret = lock_read_entry(sb, last_slot, &anchor_dl, &anchor_bh);
+		if (ret)
+			return ret;
+
+		chain_block = le64_to_cpu(anchor_dl.le_overflow_block);
+
+		/* Walk the existing chain looking for a free or matching slot. */
+		while (chain_block) {
+			u64 addr = chain_block * sbi->s_block_size;
+			/* Up to OCSFS_BLOCK_SIZE/OCSFS_LOCK_ENTRY_SIZE entries per block */
+			u32 entries_per_block = sbi->s_block_size / OCSFS_LOCK_ENTRY_SIZE;
+			u32 j;
+
+			for (j = 0; j < entries_per_block; j++) {
+				u64 entry_addr = addr + (u64)j * OCSFS_LOCK_ENTRY_SIZE;
+				struct ocsfs_disk_lock dl;
+				struct buffer_head *bh;
+
+				ret = lock_read_entry_at_addr(sb, entry_addr, &dl, &bh);
+				if (ret) {
+					brelse(anchor_bh);
+					return ret;
+				}
+				brelse(bh);
+
+				if (le32_to_cpu(dl.le_magic) != OCSFS_LOCK_MAGIC) {
+					brelse(anchor_bh);
+					lr->lr_slot          = last_slot;
+					lr->lr_overflow_addr = entry_addr;
+					return 0;
+				}
+				if (le64_to_cpu(dl.le_resource_id) == lr->lr_resource_id) {
+					brelse(anchor_bh);
+					lr->lr_slot          = last_slot;
+					lr->lr_overflow_addr = entry_addr;
+					return 0;
+				}
+			}
+
+			/* Block full — follow its overflow chain link (stored at slot 0). */
+			{
+				u64 hdr_addr = addr;
+				struct ocsfs_disk_lock hdr_dl;
+				struct buffer_head *hdr_bh;
+
+				ret = lock_read_entry_at_addr(sb, hdr_addr, &hdr_dl, &hdr_bh);
+				if (ret) {
+					brelse(anchor_bh);
+					return ret;
+				}
+				brelse(hdr_bh);
+				chain_block = le64_to_cpu(hdr_dl.le_overflow_block);
+			}
+		}
+
+		/* Chain ends: allocate a new overflow block and CAS-link it. */
+		{
+			u64 new_block = 0;
+			struct ocsfs_disk_lock updated_anchor;
+
+			ret = ocsfs_alloc_blocks(sb, 0, 1, &new_block);
+			if (ret) {
+				brelse(anchor_bh);
+				pr_warn("ocsfs: cannot allocate overflow block for lock table\n");
+				return -ENOSPC;
+			}
+
+			/* Zero the new block. */
+			{
+				struct buffer_head *nbh = sb_getblk(sb, new_block);
+
+				if (!nbh) {
+					ocsfs_free_blocks(sb, new_block, 1);
+					brelse(anchor_bh);
+					return -EIO;
+				}
+				lock_buffer(nbh);
+				memset(nbh->b_data, 0, sbi->s_block_size);
+				set_buffer_uptodate(nbh);
+				mark_buffer_dirty(nbh);
+				unlock_buffer(nbh);
+				sync_dirty_buffer(nbh);
+				brelse(nbh);
+			}
+
+			/* CAS-set le_overflow_block in anchor to new_block. */
+			memcpy(&updated_anchor, &anchor_dl, sizeof(updated_anchor));
+			updated_anchor.le_overflow_block = cpu_to_le64(new_block);
+
+			ret = lock_write_entry(sb, last_slot, &updated_anchor, anchor_bh);
+			brelse(anchor_bh);
+			if (ret) {
+				ocsfs_free_blocks(sb, new_block, 1);
+				return ret; /* -EAGAIN: caller will retry from probe start */
+			}
+
+			/* The first entry in the new block is our slot. */
+			lr->lr_slot          = last_slot;
+			lr->lr_overflow_addr = new_block * sbi->s_block_size;
+			return 0;
+		}
+	}
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -262,7 +432,8 @@ void ocsfs_lock_init(struct ocsfs_lock_res *lr, u64 resource_id,
 	lr->lr_resource_id   = resource_id;
 	lr->lr_resource_type = resource_type;
 	lr->lr_mode          = OCSFS_LOCK_NL;
-	lr->lr_slot          = ocsfs_lock_table_slot(resource_id);
+	/* lr_slot is overwritten by lock_probe_slot; use legacy default here */
+	lr->lr_slot          = ocsfs_lock_table_slot(resource_id, OCSFS_LOCK_ENTRY_COUNT);
 	mutex_init(&lr->lr_mutex);
 	INIT_LIST_HEAD(&lr->lr_list);
 }
@@ -320,7 +491,8 @@ struct ocsfs_lock_res *ocsfs_lock_alloc(struct super_block *sb,
 	lr->lr_resource_id   = resource_id;
 	lr->lr_resource_type = resource_type;
 	lr->lr_mode          = OCSFS_LOCK_NL;
-	lr->lr_slot          = ocsfs_lock_table_slot(resource_id);
+	lr->lr_slot          = ocsfs_lock_table_slot(resource_id,
+					ocsfs_lock_primary_count(sbi));
 	lr->lr_dynamic       = true;
 	mutex_init(&lr->lr_mutex);
 

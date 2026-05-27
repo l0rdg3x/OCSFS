@@ -173,7 +173,7 @@ enum ocsfs_cas_backend {
 #define OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB     (1ULL << 2)  /* ARCH-6 */
 
 /* Masks of features this build understands.  Update as features land. */
-#define OCSFS_FEATURE_INCOMPAT_SUPP     0ULL   /* ARCH-2/5 not yet implemented */
+#define OCSFS_FEATURE_INCOMPAT_SUPP     OCSFS_FEATURE_INCOMPAT_LOCK_TABLE_V2
 #define OCSFS_FEATURE_RO_COMPAT_SUPP    0ULL   /* ARCH-3/6/7 not yet implemented */
 #define OCSFS_FEATURE_COMPAT_SUPP       0ULL
 
@@ -323,11 +323,14 @@ struct ocsfs_disk_super {
 	__le64  s_last_mount_time;
 	/* ARCH-1: on-disk format versioning — carved from s_reserved (28 bytes).
 	 * s_revision_level == 0 means legacy FS; compat enforcement is skipped. */
-	__le32  s_revision_level;   /* incremented on each on-disk format change */
-	__le64  s_feature_compat;   /* backward-compatible features (safely ignored) */
-	__le64  s_feature_incompat; /* incompatible features — mount fails if unknown */
-	__le64  s_feature_ro_compat;/* read-only-compat features — forces SB_RDONLY */
-	__u8    s_reserved[3862];   /* was 3890; reduced by 28 (4+8+8+8) */
+	__le32  s_revision_level;      /* incremented on each on-disk format change */
+	__le64  s_feature_compat;      /* backward-compatible features (safely ignored) */
+	__le64  s_feature_incompat;    /* incompatible features — mount fails if unknown */
+	__le64  s_feature_ro_compat;   /* read-only-compat features — forces SB_RDONLY */
+	/* ARCH-2: dynamic lock table — carved from s_reserved (4 bytes).
+	 * 0 means legacy (OCSFS_LOCK_ENTRY_COUNT entries); new FS default 65536. */
+	__le32  s_lock_primary_count;
+	__u8    s_reserved[3858];   /* was 3890; reduced by 32 total (ARCH-1: 28, ARCH-2: 4) */
 	__le32  s_checksum;
 } __packed;
 
@@ -487,7 +490,9 @@ struct ocsfs_disk_lock {
 	__le64  le_inv_lo;      /* dirty range start (bytes) */
 	__le64  le_inv_hi;      /* dirty range end (bytes); 0 == lo → full invalidation */
 	__le32  le_inv_epoch;   /* bumped on every EX release; wrap-around accepted */
-	__u8    le_reserved[64]; /* was 84; reduced by 20 (8+8+4) */
+	/* ARCH-2: overflow chain — 0 = no overflow; non-zero = phys block address */
+	__le64  le_overflow_block;
+	__u8    le_reserved[56]; /* was 84; reduced by 28 (ARCH-7: 20, ARCH-2: 8) */
 	__le32  le_checksum;
 } __packed;
 
@@ -517,7 +522,7 @@ struct ocsfs_lock_res {
 	u64             lr_resource_id;
 	u32             lr_resource_type;
 	u16             lr_mode;         /* currently held mode */
-	u16             lr_slot;         /* lock table slot index */
+	u32             lr_slot;         /* lock table slot index (u16→u32 for ARCH-2) */
 	bool            lr_dynamic;      /* allocated via kzalloc; safe to kfree */
 	struct mutex    lr_mutex;        /* local serialization */
 	struct list_head lr_list;        /* link in sb's active lock list */
@@ -525,6 +530,8 @@ struct ocsfs_lock_res {
 	u64             lr_inv_lo;
 	u64             lr_inv_hi;
 	u32             lr_inv_epoch;
+	/* ARCH-2: overflow chain — if non-zero, entry lives in this overflow block */
+	u64             lr_overflow_addr; /* absolute byte addr on disk; 0 = primary table */
 };
 
 /* Per-AG in-memory state */
@@ -638,6 +645,9 @@ struct ocsfs_sb_info {
 	u64             s_feature_compat;
 	u64             s_feature_incompat;
 	u64             s_feature_ro_compat;
+	/* ARCH-2: dynamic lock table */
+	u64             s_lock_table_off_cached; /* from ds->s_lock_table_off */
+	u32             s_lock_primary_count;    /* 0 = legacy (OCSFS_LOCK_ENTRY_COUNT) */
 	u64             s_data_off;             /* first data byte */
 	u64             s_ag_desc_off;
 
@@ -1043,9 +1053,22 @@ static inline u64 ocsfs_lock_hash_rc(u32 ag_num)
 	return ocsfs_lock_hash_inode((u64)ag_num | 0xAC00000000000000ULL);
 }
 
-static inline u32 ocsfs_lock_table_slot(u64 resource_id)
+/* ARCH-2: use runtime count (0 = legacy fallback to OCSFS_LOCK_ENTRY_COUNT). */
+static inline u32 ocsfs_lock_primary_count(struct ocsfs_sb_info *sbi)
 {
-	return (u32)(resource_id % OCSFS_LOCK_ENTRY_COUNT);
+	return sbi->s_lock_primary_count ? sbi->s_lock_primary_count
+					 : OCSFS_LOCK_ENTRY_COUNT;
+}
+
+static inline u64 ocsfs_lock_table_base(struct ocsfs_sb_info *sbi)
+{
+	return sbi->s_lock_table_off_cached ? sbi->s_lock_table_off_cached
+					    : OCSFS_LOCK_TABLE_OFF;
+}
+
+static inline u32 ocsfs_lock_table_slot(u64 resource_id, u32 count)
+{
+	return (u32)(resource_id % count);
 }
 
 /* heartbeat.c — Storage-path heartbeat */
