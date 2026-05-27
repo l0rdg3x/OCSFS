@@ -140,6 +140,31 @@ static int ocsfs_validate_super(struct ocsfs_disk_super *ds,
 			}
 		}
 	}
+
+	/* ARCH-1: compat / incompat / ro_compat enforcement.
+	 * s_revision_level == 0 means legacy FS — skip enforcement so that
+	 * old volumes still mount without upgrade. */
+	{
+		u32 rev       = le32_to_cpu(ds->s_revision_level);
+		u64 incompat  = le64_to_cpu(ds->s_feature_incompat);
+		u64 ro_compat = le64_to_cpu(ds->s_feature_ro_compat);
+
+		if (rev > 0) {
+			u64 unknown_incompat = incompat & ~OCSFS_FEATURE_INCOMPAT_SUPP;
+
+			if (unknown_incompat) {
+				pr_err("ocsfs: unsupported incompat features 0x%llx — cannot mount (upgrade kernel or run ocsfs-tool downgrade)\n",
+				       unknown_incompat);
+				return -EINVAL;
+			}
+
+			if (ro_compat & ~OCSFS_FEATURE_RO_COMPAT_SUPP) {
+				pr_warn("ocsfs: unsupported ro_compat features 0x%llx — mounting read-only\n",
+					ro_compat & ~OCSFS_FEATURE_RO_COMPAT_SUPP);
+				sb->s_flags |= SB_RDONLY;
+			}
+		}
+	}
 	return 0;
 }
 
@@ -285,7 +310,11 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sbi->s_ag_count = le32_to_cpu(ds->s_ag_count);
 	sbi->s_ag_size = le64_to_cpu(ds->s_ag_size);
 	sbi->s_max_nodes = le16_to_cpu(ds->s_max_nodes);
-	sbi->s_feature_flags = le64_to_cpu(ds->s_feature_flags);
+	sbi->s_feature_flags    = le64_to_cpu(ds->s_feature_flags);
+	sbi->s_revision_level   = le32_to_cpu(ds->s_revision_level);
+	sbi->s_feature_compat   = le64_to_cpu(ds->s_feature_compat);
+	sbi->s_feature_incompat = le64_to_cpu(ds->s_feature_incompat);
+	sbi->s_feature_ro_compat = le64_to_cpu(ds->s_feature_ro_compat);
 	sbi->s_data_off = le64_to_cpu(ds->s_data_off);
 	sbi->s_ag_desc_off = le64_to_cpu(ds->s_ag_desc_off);
 

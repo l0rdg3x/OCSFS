@@ -148,6 +148,33 @@ enum ocsfs_cas_backend {
 #define OCSFS_FEAT_MULTI_LUN    (1ULL << 5)
 #define OCSFS_FEAT_AUTH         (1ULL << 6)  /* cluster membership auth */
 
+/* ── ARCH-1: compat / incompat / ro_compat feature bits ─────────────────
+ *
+ * INCOMPAT: mount fails if this kernel doesn't understand the feature.
+ * RO_COMPAT: mount proceeds read-only if this kernel doesn't understand it.
+ * COMPAT: safely ignored by older kernels.
+ *
+ * Enforcement is skipped for legacy volumes (s_revision_level == 0).
+ *
+ * These bits are set by mkfs / ocsfs-tool when a feature is first enabled
+ * and cleared on downgrade.  The supported masks below must be updated
+ * each time a new feature is implemented in this kernel.
+ */
+
+/* INCOMPAT bits — layout-breaking features */
+#define OCSFS_FEATURE_INCOMPAT_LOCK_TABLE_V2    (1ULL << 0)  /* ARCH-2 */
+#define OCSFS_FEATURE_INCOMPAT_RC_BTREE_PER_AG  (1ULL << 1)  /* ARCH-5 */
+
+/* RO_COMPAT bits — read-write-semantic features */
+#define OCSFS_FEATURE_RO_COMPAT_SELECTIVE_INV   (1ULL << 0)  /* ARCH-7 */
+#define OCSFS_FEATURE_RO_COMPAT_HB_SUMMARY      (1ULL << 1)  /* ARCH-3 */
+#define OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB     (1ULL << 2)  /* ARCH-6 */
+
+/* Masks of features this build understands.  Update as features land. */
+#define OCSFS_FEATURE_INCOMPAT_SUPP     0ULL   /* ARCH-2/5 not yet implemented */
+#define OCSFS_FEATURE_RO_COMPAT_SUPP    0ULL   /* ARCH-3/6/7 not yet implemented */
+#define OCSFS_FEATURE_COMPAT_SUPP       0ULL
+
 /* Inode flags */
 #define OCSFS_IFLAG_THIN        0x0001
 #define OCSFS_IFLAG_COMPRESSED  0x0002
@@ -292,7 +319,13 @@ struct ocsfs_disk_super {
 	__le64  s_mkfs_time;
 	__le64  s_mount_count;
 	__le64  s_last_mount_time;
-	__u8    s_reserved[3890];
+	/* ARCH-1: on-disk format versioning — carved from s_reserved (28 bytes).
+	 * s_revision_level == 0 means legacy FS; compat enforcement is skipped. */
+	__le32  s_revision_level;   /* incremented on each on-disk format change */
+	__le64  s_feature_compat;   /* backward-compatible features (safely ignored) */
+	__le64  s_feature_incompat; /* incompatible features — mount fails if unknown */
+	__le64  s_feature_ro_compat;/* read-only-compat features — forces SB_RDONLY */
+	__u8    s_reserved[3862];   /* was 3890; reduced by 28 (4+8+8+8) */
 	__le32  s_checksum;
 } __packed;
 
@@ -590,6 +623,11 @@ struct ocsfs_sb_info {
 	u64             s_ag_size;
 	u16             s_max_nodes;
 	u64             s_feature_flags;
+	/* ARCH-1: format versioning */
+	u32             s_revision_level;
+	u64             s_feature_compat;
+	u64             s_feature_incompat;
+	u64             s_feature_ro_compat;
 	u64             s_data_off;             /* first data byte */
 	u64             s_ag_desc_off;
 
