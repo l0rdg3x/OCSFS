@@ -99,6 +99,7 @@
 #define OCSFS_FEATURE_INCOMPAT_LOCK_TABLE_V2    (1ULL << 0)
 #define OCSFS_FEATURE_INCOMPAT_RC_BTREE_PER_AG  (1ULL << 1)
 #define OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB     (1ULL << 0)
+#define OCSFS_FEATURE_RO_COMPAT_HB_SUMMARY      (1ULL << 1)  /* ARCH-3: HB O(1) summary block */
 
 /* ═══════════════════════════════════════════════════════════════
  * NODE SLOT STATES

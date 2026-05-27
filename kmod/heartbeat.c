@@ -45,32 +45,98 @@ static int heartbeat_write_timeout(struct buffer_head *bh)
 	return buffer_write_io_error(bh) ? -EIO : 0;
 }
 
-/* NUOV-ARCH-3: best-effort RMW of own slot in the HB summary block. */
+/* NUOV-ARCH-3: update own slot in the HB summary block.
+ *
+ * CRIT-V3-2 fix: a plain full-block RMW allows two nodes to clobber each
+ * other's entries — node A reads the 4 KiB block, node B reads the same
+ * block, both write back, one write survives, the other's entry is stale,
+ * leading to spurious fencing of healthy nodes.
+ *
+ * Fix: use SCSI CAW at sector granularity (512 B) so only nodes that share
+ * the same 512-byte sector can conflict (≤32 of the 256 slots), and even
+ * those conflicts are resolved by read-and-retry.  Falls back to the plain
+ * RMW if CAW is not available (degraded / no BSG path). */
 static void ocsfs_hb_summary_update(struct super_block *sb, u16 slot,
 				     u64 sequence, u64 timestamp)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
-	u64 block = OCSFS_HB_SUMMARY_OFF / sbi->s_block_size;
-	u32 boff  = (u32)(slot * sizeof(struct ocsfs_disk_hb_summary_entry));
-	struct buffer_head *bh;
+	u32 entry_off = (u32)(slot * sizeof(struct ocsfs_disk_hb_summary_entry));
 	struct ocsfs_disk_hb_summary_entry *hse;
+	struct buffer_head *bh;
+	u64 block;
+	u32 boff;
 
-	if (boff + sizeof(*hse) > sbi->s_block_size)
+	if (entry_off + sizeof(*hse) > sbi->s_block_size)
 		return;
 
+	/* ── CAW path: sector-level atomic update ── */
+	if (sbi->s_caw_supported) {
+		unsigned int lbs = bdev_logical_block_size(sb->s_bdev);
+
+		if (lbs > 0 && lbs <= sbi->s_block_size && is_power_of_2(lbs)) {
+			u64 abs_off    = OCSFS_HB_SUMMARY_OFF + entry_off;
+			u64 scsi_lba   = abs_off / lbs;
+			u32 sector_off = (u32)(abs_off % lbs);
+			u8 *exp_sec    = kmalloc(lbs, GFP_KERNEL);
+			u8 *new_sec    = kmalloc(lbs, GFP_KERNEL);
+			int attempts, ret = -ENOMEM;
+
+			if (!exp_sec || !new_sec) {
+				kfree(exp_sec);
+				kfree(new_sec);
+				return;
+			}
+
+			block = (scsi_lba * lbs) / sbi->s_block_size;
+			boff  = (u32)((scsi_lba * lbs) % sbi->s_block_size);
+			bh    = sb_getblk(sb, block);
+			if (!bh || heartbeat_read_timeout(bh) < 0) {
+				if (bh)
+					brelse(bh);
+				kfree(exp_sec);
+				kfree(new_sec);
+				return;
+			}
+
+			for (attempts = 0; attempts < 8; attempts++) {
+				memcpy(exp_sec, bh->b_data + boff, lbs);
+				memcpy(new_sec, exp_sec, lbs);
+				hse = (struct ocsfs_disk_hb_summary_entry *)
+				      (new_sec + sector_off);
+				hse->hse_sequence  = cpu_to_le64(sequence);
+				hse->hse_timestamp = cpu_to_le64(timestamp);
+				ret = ocsfs_scsi_caw(sb, scsi_lba,
+						     exp_sec, new_sec, lbs);
+				if (ret != -EAGAIN)
+					break;
+				/* Another node updated the sector — re-read */
+				if (heartbeat_read_timeout(bh) < 0) {
+					ret = -EIO;
+					break;
+				}
+			}
+			brelse(bh);
+			kfree(exp_sec);
+			kfree(new_sec);
+			/* -EOPNOTSUPP means device has no CAW; fall through */
+			if (ret != -EOPNOTSUPP)
+				return;
+		}
+	}
+
+	/* ── Fallback: plain RMW (best-effort; no cross-node atomicity) ── */
+	block = (OCSFS_HB_SUMMARY_OFF + entry_off) / sbi->s_block_size;
+	boff  = (u32)((OCSFS_HB_SUMMARY_OFF + entry_off) % sbi->s_block_size);
 	bh = sb_getblk(sb, block);
 	if (!bh)
 		return;
-
 	if (heartbeat_read_timeout(bh) < 0) {
 		brelse(bh);
 		return;
 	}
-
 	hse = (struct ocsfs_disk_hb_summary_entry *)(bh->b_data + boff);
 	hse->hse_sequence  = cpu_to_le64(sequence);
 	hse->hse_timestamp = cpu_to_le64(timestamp);
-
 	mark_buffer_dirty(bh);
 	heartbeat_write_timeout(bh);
 	brelse(bh);

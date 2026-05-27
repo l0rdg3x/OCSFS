@@ -354,6 +354,20 @@ Heartbeat reads are batched: if multiple node slots share the same disk block,
 a single forced read covers all of them, reducing I/O to up to 4× less than
 one read per node.
 
+**HB summary block (NUOV-ARCH-3, `OCSFS_FEATURE_RO_COMPAT_HB_SUMMARY`):** When
+the feature bit is set (default on V2 filesystems), `ocsfs_heartbeat_write()` also
+updates a 4 KiB summary block at `OCSFS_HB_SUMMARY_OFF` (one 16-byte entry per slot).
+`ocsfs_heartbeat_check_peers()` reads this single block for O(1) peer checks, then
+falls back to the slow batched path if the read fails.
+
+**Sprint B (CRIT-V3-2) — atomic summary entry update:** The former implementation
+used a plain full-block RMW, allowing two nodes to clobber each other's entries.
+`ocsfs_hb_summary_update()` now uses SCSI CAW at sector granularity (512 B, the
+same pattern as `lock_io.c`): it reads the 512-byte sector containing its 16-byte
+entry, builds expected/new buffers, and retries up to 8× on `EAGAIN`. At most 32
+nodes share a sector, so conflicts are rare and resolve quickly. Falls back to the
+plain RMW when CAW is not available.
+
 ### Two-phase failure detection (`heartbeat.c`)
 
 ```

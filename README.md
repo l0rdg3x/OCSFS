@@ -25,15 +25,16 @@ Proxmox VE as an open alternative to VMware VMFS.
 | Multi-node — no crashes | ~88% |
 | Multi-node — crash + recovery | ~78% |
 | Multi-node — with encryption (Sprint A) | ~78% |
+| Heartbeat cluster atomicity (Sprint B) | ~82% |
 | VMFS feature parity | ~72% |
 
-Sprint A (encryption cluster safety, Opus v3 review) addressed the main
-fscrypt correctness issues in cluster mode: async writeback without DLM
-EX, reflink/snapshot of encrypted files, symlinks in encrypted
-directories, and the create/mkdir ordering window. SCSI CAW is
-implemented via BSG-direct — no kprobe required. The remaining gap to
-90%+ is real-hardware integration testing (xfstests on a multi-node
-testbed).
+Sprint A (encryption cluster safety) and Sprint B (heartbeat hardening)
+from the Opus v3 review have been applied. Sprint A addressed fscrypt
+correctness in cluster mode; Sprint B replaces the HB summary block's
+full-block RMW with a sector-level SCSI CAW, eliminating the race where
+two nodes clobber each other's heartbeat entries. SCSI CAW is implemented
+via BSG-direct — no kprobe required. The remaining gap to 90%+ is
+real-hardware integration testing (xfstests on a multi-node testbed).
 
 ---
 
