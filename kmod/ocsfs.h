@@ -179,7 +179,8 @@ enum ocsfs_cas_backend {
 /* Masks of features this build understands.  Update as features land. */
 #define OCSFS_FEATURE_INCOMPAT_SUPP     (OCSFS_FEATURE_INCOMPAT_LOCK_TABLE_V2 | \
 					 OCSFS_FEATURE_INCOMPAT_RC_BTREE_PER_AG)
-#define OCSFS_FEATURE_RO_COMPAT_SUPP    OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB
+#define OCSFS_FEATURE_RO_COMPAT_SUPP    (OCSFS_FEATURE_RO_COMPAT_SELECTIVE_INV | \
+					 OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB)
 #define OCSFS_FEATURE_COMPAT_SUPP       0ULL
 
 /* Inode flags */
@@ -728,6 +729,9 @@ struct ocsfs_sb_info {
 
 	/* ARCH-6: background dedup scrub daemon */
 	struct delayed_work s_dedup_scrub_work;
+
+	/* debugfs directory entry for this mount */
+	struct dentry      *s_debugfs_dir;
 };
 
 /*
@@ -1195,5 +1199,37 @@ struct ocsfs_dedup_result {
 int ocsfs_dedup_file(struct inode *inode, u64 *bytes_deduped);
 void ocsfs_dedup_scrub_start(struct super_block *sb);
 void ocsfs_dedup_scrub_stop(struct super_block *sb);
+
+/* debugfs.c — /sys/kernel/debug/ocsfs/<dev>/ instrumentation */
+void ocsfs_debugfs_module_init(void);
+void ocsfs_debugfs_module_exit(void);
+void ocsfs_debugfs_init(struct super_block *sb);
+void ocsfs_debugfs_exit(struct super_block *sb);
+
+/* vaai.c — SCSI storage offload (WRITE SAME, UNMAP, XCOPY) */
+struct ocsfs_vaai_arg {
+	__u64 offset;   /* byte offset on the block device */
+	__u64 length;   /* byte length */
+};
+
+struct ocsfs_vaai_xcopy_arg {
+	__u64 src_offset;
+	__u64 dst_offset;
+	__u64 length;
+};
+
+#define OCSFS_IOC_WRITE_SAME  _IOW('O', 10, struct ocsfs_vaai_arg)
+#define OCSFS_IOC_UNMAP       _IOW('O', 11, struct ocsfs_vaai_arg)
+#define OCSFS_IOC_XCOPY       _IOW('O', 12, struct ocsfs_vaai_xcopy_arg)
+
+int ocsfs_vaai_write_same(struct super_block *sb,
+			   const struct ocsfs_vaai_arg __user *uarg);
+int ocsfs_vaai_unmap(struct super_block *sb,
+		      const struct ocsfs_vaai_arg __user *uarg);
+int ocsfs_vaai_xcopy(struct super_block *sb,
+		      const struct ocsfs_vaai_xcopy_arg __user *uarg);
+
+/* flock.c — POSIX distributed file locking via on-disk DLM */
+int ocsfs_file_lock(struct file *file, int cmd, struct file_lock *fl);
 
 #endif /* _OCSFS_KMOD_H */

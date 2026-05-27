@@ -98,6 +98,9 @@ SCSI CAW is now implemented via BSG-direct path — no kprobe required.
 | `acl.c` | POSIX ACL (getfacl/setfacl) |
 | `btree.c` | Generic B+ tree (search, insert, delete, range scan) |
 | `btree_mod.c` | B+ tree structural modifications (split, merge, rebalance) |
+| `debugfs.c` | Debugfs instrumentation: `/sys/kernel/debug/ocsfs/<dev>/lock_table` and `journal_stats` |
+| `vaai.c` | VAAI storage offload: WRITE SAME (0x93), UNMAP (0x42), EXTENDED COPY (0x83) via BSG |
+| `flock.c` | POSIX distributed file locking: fcntl(F_SETLK) → DLM SH/EX for cross-node qcow2 HA |
 | `test_lock.c` | KUnit tests: B+ tree search, dir btree threshold |
 | `test_cas.c` | KUnit tests: CAS lock protocol |
 
@@ -144,7 +147,8 @@ SCSI CAW is now implemented via BSG-direct path — no kprobe required.
 | **Compression write path** | Compression is applied on fsync for buffered files only. No inline compression during O_DIRECT writes. |
 | **Shared mmap** | `MAP_SHARED|PROT_WRITE` returns `-EOPNOTSUPP` in cluster mode. Read-only and private (COW) mappings work. |
 | **POSIX distributed file locking** | `fcntl` locks are local only. |
-| **VAAI XCOPY/WRITE_SAME** | Not implemented. |
+| **VAAI XCOPY/WRITE_SAME/UNMAP** | Implemented via BSG-direct: `OCSFS_IOC_WRITE_SAME`, `OCSFS_IOC_UNMAP`, `OCSFS_IOC_XCOPY`. Best-effort — device CHECK CONDITION falls through to host I/O. Requires `CAP_SYS_ADMIN`. |
+| **POSIX distributed file locking** | Implemented via on-disk DLM: `fcntl(F_SETLK)` maps F_RDLCK→SH, F_WRLCK→EX at inode granularity (not byte-range). Correct for qcow2 HA; may serialize same-file readers across nodes. |
 | **STONITH** | Fencing via SCSI PR works; out-of-band STONITH (PDU, iDRAC) not wired. For Proxmox labs, the Proxmox API can serve as soft STONITH. |
 | **Lock acquire timeout** | Wall-clock deadline of 30 s (`OCSFS_LOCK_ACQUIRE_TIMEOUT_MS`). Exponential backoff 1 ms → 100 ms; fails with `-ETIMEDOUT` at deadline (commit `ffeb901`). |
 | **Refcount table fill-up** | Per-AG refcount table is fixed at 16 blocks; a CoW/snapshot-heavy workload can exhaust it independently of data space. Requires on-disk redesign. |

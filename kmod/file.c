@@ -571,6 +571,28 @@ static long ocsfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return 0;
 	}
 
+	/* VAAI offload commands — require CAP_SYS_ADMIN or device owner */
+	if (cmd == OCSFS_IOC_WRITE_SAME) {
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+		return ocsfs_vaai_write_same(inode->i_sb,
+					     (const struct ocsfs_vaai_arg __user *)arg);
+	}
+
+	if (cmd == OCSFS_IOC_UNMAP) {
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+		return ocsfs_vaai_unmap(inode->i_sb,
+					(const struct ocsfs_vaai_arg __user *)arg);
+	}
+
+	if (cmd == OCSFS_IOC_XCOPY) {
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+		return ocsfs_vaai_xcopy(inode->i_sb,
+					(const struct ocsfs_vaai_xcopy_arg __user *)arg);
+	}
+
 	if (cmd != OCSFS_IOC_SNAP_CREATE)
 		return -ENOTTY;
 
@@ -629,4 +651,5 @@ const struct file_operations ocsfs_file_fops = {
 	.splice_read      = filemap_splice_read,
 	.remap_file_range = ocsfs_remap_file_range,
 	.unlocked_ioctl   = ocsfs_ioctl,
+	.lock             = ocsfs_file_lock,         /* POSIX distributed locking (flock.c) */
 };

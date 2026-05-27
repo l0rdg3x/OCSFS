@@ -19,7 +19,9 @@
 10. [Extent Management](#10-extent-management)
 11. [Testbed Setup](#11-testbed-setup)
 12. [Build and Development](#12-build-and-development)
-13. [Open Issues and Limitations](#13-open-issues-and-limitations)
+13. [Debugfs Instrumentation](#13-debugfs-instrumentation)
+14. [VAAI Storage Offload](#14-vaai-storage-offload)
+15. [Open Issues and Limitations](#15-open-issues-and-limitations)
 
 ---
 
@@ -652,7 +654,67 @@ sudo losetup -d /dev/loop0
 
 ---
 
-## 13. Open Issues and Limitations
+## 13. Debugfs Instrumentation
+
+OCSFS exposes runtime state via the kernel debugfs at
+`/sys/kernel/debug/ocsfs/<devname>/` (created by `debugfs.c`).
+
+| File | Content |
+|---|---|
+| `lock_table` | One line per active in-memory `ocsfs_lock_res`: resource_id, mode, type, slot, overflow address |
+| `journal_stats` | Journal head, tail, size, used bytes, sequence counter, checkpoint ticket/now counters |
+
+**Usage examples:**
+
+```bash
+# Show all cluster locks currently held or contested
+cat /sys/kernel/debug/ocsfs/sdb/lock_table
+
+# Monitor journal fill ratio
+watch -n1 cat /sys/kernel/debug/ocsfs/sdb/journal_stats
+```
+
+The directory is created in `fill_super` and removed in `put_super`.
+The root directory `/sys/kernel/debug/ocsfs/` is created at module load
+and removed at module unload.
+
+---
+
+## 14. VAAI Storage Offload
+
+`vaai.c` implements three SCSI offload operations via `ocsfs_bsg_execute_cdb()`
+(the same BSG-direct path used by CAW and PR). All are best-effort: a device
+CHECK CONDITION causes the ioctl to return an error and the caller falls back
+to normal host-side I/O (same behaviour as VMFS VAAI).
+
+| ioctl | SCSI opcode | Description |
+|---|---|---|
+| `OCSFS_IOC_WRITE_SAME` | 0x93 — WRITE SAME(16), NDOB bit | Zero-fill a block range without data transfer |
+| `OCSFS_IOC_UNMAP` | 0x42 — UNMAP(10) | TRIM/discard a block range (VM delete, thin reclaim) |
+| `OCSFS_IOC_XCOPY` | 0x83 — EXTENDED COPY | Server-side block copy within the same LUN (VM clone offload) |
+
+All three require `CAP_SYS_ADMIN`. Arguments are byte-aligned
+(`ocsfs_vaai_arg` / `ocsfs_vaai_xcopy_arg`); block-alignment is validated
+inside the kernel.
+
+**Usage (from userspace):**
+
+```c
+struct ocsfs_vaai_arg arg = { .offset = 0, .length = 512 * 1024 };
+ioctl(fd, OCSFS_IOC_WRITE_SAME, &arg);   /* zero first 512 KiB */
+ioctl(fd, OCSFS_IOC_UNMAP, &arg);        /* discard first 512 KiB */
+
+struct ocsfs_vaai_xcopy_arg xarg = {
+    .src_offset = 0,
+    .dst_offset = 512 * 1024,
+    .length     = 512 * 1024,
+};
+ioctl(fd, OCSFS_IOC_XCOPY, &xarg);       /* server-side copy */
+```
+
+---
+
+## 15. Open Issues and Limitations
 
 ### Blocking for multi-node production use
 
@@ -690,7 +752,7 @@ is now the top priority.
 | Snapshot for btree-backed inodes | Supported on V2 volumes (`INCOMPAT_RC_BTREE_PER_AG`). `snapshot_copy_btree_extents()` iterates the src B+ tree, calls `ocsfs_refcount_inc`, and inserts into the snap's tree. Returns `-EOPNOTSUPP` on V1 only. | Upgrade V1 volumes with `ocsfs-tool tune --upgrade` |
 | Compression write path (O_DIRECT) | O_DIRECT writes are never compressed | Architectural: O_DIRECT bypasses the page cache where compression hooks live |
 | Shared mmap in cluster mode | `MAP_SHARED|PROT_WRITE` returns `-EOPNOTSUPP` | Would require distributed cache coherence — out of scope for v0.1 |
-| POSIX distributed file locking | `fcntl` advisory locks are local to the node | Requires integration with the DLM and `posix_lock_file` VFS hooks |
+| POSIX distributed file locking | Implemented at inode granularity (`flock.c`): `F_RDLCK`→DLM SH, `F_WRLCK`→DLM EX. Same-node byte-range semantics via `posix_lock_file`; cross-node coherence via on-disk DLM. Multiple SH holders on the same inode will serialize if any node holds EX (DLM release/re-acquire path). | — implemented |
 | Encryption | Zero implementation | Would require `fscrypt` integration |
 | Quota | Implemented: `i_dquot[MAXQUOTAS]` in `ocsfs_inode_info`; inode quota via `dquot_alloc/free_inode`; block quota via `dquot_alloc/free_space_nodirty` in `ocsfs_iomap_begin` and `ocsfs_alloc_extent`. Block quota is not charged for CoW, snapshot creation, or directory/metadata blocks. | Commits `8bc4c38` (inode) + `58933a7` (block) |
 | No out-of-band STONITH | Fencing relies solely on SCSI PR | Wire Proxmox API or iDRAC as a fallback fencing agent |

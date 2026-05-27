@@ -425,6 +425,7 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		sbi->s_degraded  ? " degraded"  : "");
 
 	ocsfs_dedup_scrub_start(sb);
+	ocsfs_debugfs_init(sb);
 	return 0;
 
 fail_journal:
@@ -449,6 +450,7 @@ void ocsfs_put_super(struct super_block *sb)
 	if (!sbi)
 		return;
 
+	ocsfs_debugfs_exit(sb);
 	ocsfs_dedup_scrub_stop(sb);
 	ocsfs_journal_exit(sb);   /* flush journal before releasing cluster slot */
 	ocsfs_cluster_exit(sb);
@@ -656,8 +658,11 @@ static int __init ocsfs_init(void)
 		return ret;
 	}
 
+	ocsfs_debugfs_module_init();
+
 	ret = register_filesystem(&ocsfs_fs_type);
 	if (ret) {
+		ocsfs_debugfs_module_exit();
 		ocsfs_scsi_pool_destroy();
 		kmem_cache_destroy(ocsfs_inode_cachep);
 		return ret;
@@ -671,6 +676,7 @@ static int __init ocsfs_init(void)
 static void __exit ocsfs_exit(void)
 {
 	unregister_filesystem(&ocsfs_fs_type);
+	ocsfs_debugfs_module_exit();
 	rcu_barrier();
 	ocsfs_scsi_pool_destroy();
 	kmem_cache_destroy(ocsfs_inode_cachep);

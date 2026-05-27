@@ -23,6 +23,7 @@ ocsfs-y := super.o inode.o dir.o dir_rename.o file.o \
            iomap.o thin.o \
            snapshot.o refcount.o compress.o compress_file.o \
            scsi_pr.o xattr.o cas.o dedup.o \
+           debugfs.o vaai.o flock.o \
            test_lock.o test_cas.o
 
 all:
