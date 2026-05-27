@@ -284,7 +284,26 @@ ssize_t ocsfs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 			ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
 			return ret;
 		}
-		invalidate_inode_pages2(inode->i_mapping);
+		/*
+		 * ARCH-7: selective page cache invalidation.
+		 *
+		 * - Same writer (local fast-path): our cache is coherent,
+		 *   no invalidation needed.
+		 * - Known range (lo < hi): invalidate only the pages the last
+		 *   EX holder dirtied — avoids thrashing clean read-only pages.
+		 * - No range info (lo == hi == 0): fall back to full invalidation
+		 *   to guarantee correctness (epoch jumped >1 or first access).
+		 */
+		if (oi->i_last_writer_slot == sbi->s_node_slot) {
+			/* we were the last EX holder: cache is still valid */
+		} else if (oi->i_lock_res.lr_inv_lo < oi->i_lock_res.lr_inv_hi) {
+			pgoff_t lo_pg = oi->i_lock_res.lr_inv_lo >> PAGE_SHIFT;
+			pgoff_t hi_pg = (oi->i_lock_res.lr_inv_hi - 1) >> PAGE_SHIFT;
+
+			invalidate_mapping_pages(inode->i_mapping, lo_pg, hi_pg);
+		} else {
+			invalidate_inode_pages2(inode->i_mapping);
+		}
 	}
 
 	if (iocb->ki_flags & IOCB_DIRECT)
@@ -305,6 +324,7 @@ ssize_t ocsfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
 	ssize_t ret;
+	loff_t start_pos = 0; /* ARCH-7: write start for dirty range tracking */
 
 	/*
 	 * Lock ordering: inode_lock → DLM EX.
@@ -322,17 +342,19 @@ ssize_t ocsfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		if (ret)
 			goto out_unlock;
 		/*
-		 * Invalidate the page cache so we start with clean pages.
-		 * Another node may have written to this file since our last
-		 * access; dropping stale pages prevents us from writing
-		 * outdated data or exposing stale reads post-write.
+		 * ARCH-7 fast-path: if WE were the last EX holder (same node
+		 * slot), our page cache is still coherent — skip full flush.
+		 * If another node wrote last, full invalidation is required.
 		 */
-		invalidate_inode_pages2(inode->i_mapping);
+		if (oi->i_last_writer_slot != sbi->s_node_slot)
+			invalidate_inode_pages2(inode->i_mapping);
 	}
 
 	ret = generic_write_checks(iocb, from);
 	if (ret <= 0)
 		goto out;
+
+	start_pos = iocb->ki_pos; /* capture before write advances ki_pos */
 
 	if (iocb->ki_flags & IOCB_DIRECT) {
 		ret = iomap_dio_rw(iocb, from, &ocsfs_dio_iomap_ops,
@@ -380,6 +402,23 @@ out:
 				pr_warn_ratelimited(
 					"ocsfs: write_iter inode flush failed (%d)\n",
 					fr);
+
+			/* ARCH-7: update dirty range in lock_res so lock_release
+			 * can store it on disk for the next SH acquirer. */
+			{
+				u64 inv_lo = (u64)start_pos;
+				u64 inv_hi = (u64)(start_pos + ret);
+				struct ocsfs_lock_res *ilr = &oi->i_lock_res;
+
+				if (!ilr->lr_inv_lo && !ilr->lr_inv_hi) {
+					ilr->lr_inv_lo = inv_lo;
+					ilr->lr_inv_hi = inv_hi;
+				} else {
+					ilr->lr_inv_lo = min(ilr->lr_inv_lo, inv_lo);
+					ilr->lr_inv_hi = max(ilr->lr_inv_hi, inv_hi);
+				}
+				oi->i_last_writer_slot = sbi->s_node_slot;
+			}
 		}
 
 		ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);

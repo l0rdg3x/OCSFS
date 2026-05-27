@@ -103,8 +103,16 @@ retry:
 		if (ret == -EAGAIN)
 			goto retry;
 
-		if (ret == 0)
+		if (ret == 0) {
 			lr->lr_mode = mode;
+			/* ARCH-7: snapshot dirty range/epoch so read path can do
+			 * selective page cache invalidation instead of full flush. */
+			if (mode == OCSFS_LOCK_SH) {
+				lr->lr_inv_lo    = le64_to_cpu(dl.le_inv_lo);
+				lr->lr_inv_hi    = le64_to_cpu(dl.le_inv_hi);
+				lr->lr_inv_epoch = le32_to_cpu(dl.le_inv_epoch);
+			}
+		}
 
 		mutex_unlock(&lr->lr_mutex);
 		return ret;
@@ -155,6 +163,14 @@ retry_release:
 	}
 
 	if (lr->lr_mode == OCSFS_LOCK_EX) {
+		/* ARCH-7: record dirty range and bump epoch so the next SH
+		 * acquirer can do selective page cache invalidation instead of
+		 * always calling invalidate_inode_pages2 on the full file. */
+		dl.le_inv_lo    = cpu_to_le64(lr->lr_inv_lo);
+		dl.le_inv_hi    = cpu_to_le64(lr->lr_inv_hi);
+		dl.le_inv_epoch = cpu_to_le32(le32_to_cpu(dl.le_inv_epoch) + 1);
+		lr->lr_inv_lo   = 0;
+		lr->lr_inv_hi   = 0;
 		dl.le_holder_slot = 0;
 		dl.le_holder_gen  = 0;
 		/*

@@ -114,6 +114,8 @@ enum ocsfs_cas_backend {
 };
 
 #define OCSFS_MAX_NODES             256
+/* ARCH-7: sentinel for i_last_writer_slot — "no local write yet" */
+#define OCSFS_INVALID_WRITER_SLOT   ((u16)OCSFS_MAX_NODES)
 #define OCSFS_DEFAULT_MAX_NODES     64
 #define OCSFS_MAX_LABEL             64
 
@@ -481,7 +483,11 @@ struct ocsfs_disk_lock {
 	__u8    le_waiters[32];          /* waiting node bitmask */
 	__u8    le_waiter_modes[64];     /* 2 bits per waiter */
 	__le32  le_version;              /* CAS version */
-	__u8    le_reserved[84];
+	/* ARCH-7: dirty range written by EX holder at release; read by SH acquirer */
+	__le64  le_inv_lo;      /* dirty range start (bytes) */
+	__le64  le_inv_hi;      /* dirty range end (bytes); 0 == lo → full invalidation */
+	__le32  le_inv_epoch;   /* bumped on every EX release; wrap-around accepted */
+	__u8    le_reserved[64]; /* was 84; reduced by 20 (8+8+4) */
 	__le32  le_checksum;
 } __packed;
 
@@ -515,6 +521,10 @@ struct ocsfs_lock_res {
 	bool            lr_dynamic;      /* allocated via kzalloc; safe to kfree */
 	struct mutex    lr_mutex;        /* local serialization */
 	struct list_head lr_list;        /* link in sb's active lock list */
+	/* ARCH-7: dirty range captured at last SH acquire; used by read path */
+	u64             lr_inv_lo;
+	u64             lr_inv_hi;
+	u32             lr_inv_epoch;
 };
 
 /* Per-AG in-memory state */
@@ -711,6 +721,7 @@ struct ocsfs_inode_info {
 	u64                     i_extent_tree_root;
 	struct mutex            i_extent_lock;
 	struct ocsfs_lock_res   i_lock_res;     /* cross-node DLM inode lock */
+	u16                     i_last_writer_slot; /* ARCH-7: OCSFS_INVALID_WRITER_SLOT if none */
 	/* directory B+ tree index */
 	u64                     i_dir_btree_root; /* 0 = flat-list dir */
 	u32                     i_dirent_count;   /* live entry count */
