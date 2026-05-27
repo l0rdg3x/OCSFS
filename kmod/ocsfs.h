@@ -712,10 +712,18 @@ static inline u32 ocsfs_crc32c(u32 crc, const void *data, size_t len)
 	return crc32c(crc, data, len);
 }
 
-/* Convert on-disk inode number to AG + offset within AG */
+/*
+ * ocsfs_ino_to_ag — mappa un numero di inode al suo AG.
+ *
+ * Contratto:
+ *   - Richiede s_ag_size > 0; ritorna 0 se zero (guard anti-div-by-zero).
+ *   - Non valida il risultato contro s_ag_count: il caller deve controllare
+ *     che il valore ritornato sia < s_ag_count prima di accedere a s_ags[].
+ *   - Valori speciali: ino < OCSFS_FIRST_USER_INO appartengono ad AG 0.
+ */
 static inline u32 ocsfs_ino_to_ag(struct ocsfs_sb_info *sbi, u64 ino)
 {
-	u64 ag_size = sbi->s_ag_size;  /* 1 inode slot per block as max */
+	u64 ag_size = sbi->s_ag_size;
 
 	if (unlikely(!ag_size))
 		return 0;

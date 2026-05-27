@@ -202,6 +202,14 @@ static int ocsfs_load_ags(struct super_block *sb)
 		ag->inode_table_off = le64_to_cpu(dag->ag_inode_table_off);
 		ag->inode_count = le64_to_cpu(dag->ag_inode_count);
 		ag->free_inodes = le64_to_cpu(dag->ag_free_inodes);
+		if (unlikely(!ag->block_count || !ag->bitmap_size)) {
+			pr_warn("ocsfs: AG %u has zero block_count=%llu or bitmap_size=%llu — possibly corrupt descriptor\n",
+				i, ag->block_count, ag->bitmap_size);
+			brelse(bh);
+			kvfree(sbi->s_ags);
+			sbi->s_ags = NULL;
+			return -EINVAL;
+		}
 		mutex_init(&ag->ag_lock);
 		ocsfs_lock_init(&ag->ag_lock_res,
 				ocsfs_lock_hash_ag(i), OCSFS_LOCKRES_AG);

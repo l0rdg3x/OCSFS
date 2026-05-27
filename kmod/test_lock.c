@@ -494,6 +494,52 @@ static void test_node_slot_ns_version_sum(struct kunit *test)
 		108);
 }
 
+/* ─── MEDIO-3: ocsfs_ino_to_ag and inode_disk_off guards ──────── */
+
+static void test_ino_to_ag_zero_size_returns_zero(struct kunit *test)
+{
+	struct ocsfs_sb_info *sbi = kunit_kzalloc(test, sizeof(*sbi), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, sbi);
+	sbi->s_ag_size = 0;
+	KUNIT_EXPECT_EQ(test, ocsfs_ino_to_ag(sbi, 42ULL), 0U);
+}
+
+static void test_ino_to_ag_normal_division(struct kunit *test)
+{
+	struct ocsfs_sb_info *sbi = kunit_kzalloc(test, sizeof(*sbi), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, sbi);
+	sbi->s_ag_size = 1024;
+	KUNIT_EXPECT_EQ(test, ocsfs_ino_to_ag(sbi, 0ULL),    0U);
+	KUNIT_EXPECT_EQ(test, ocsfs_ino_to_ag(sbi, 1023ULL), 0U);
+	KUNIT_EXPECT_EQ(test, ocsfs_ino_to_ag(sbi, 1024ULL), 1U);
+	KUNIT_EXPECT_EQ(test, ocsfs_ino_to_ag(sbi, 2048ULL), 2U);
+}
+
+static void test_inode_disk_off_invalid_ag_returns_zero(struct kunit *test)
+{
+	struct ocsfs_sb_info *sbi = kunit_kzalloc(test, sizeof(*sbi), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, sbi);
+	sbi->s_ag_size  = 1024;
+	sbi->s_ag_count = 2;
+	sbi->s_ags      = NULL; /* guard fires before dereference */
+	/* ino 3072 → ag=3, >= s_ag_count=2 → guard → returns 0 */
+	KUNIT_EXPECT_EQ(test, ocsfs_inode_disk_off(sbi, 3072ULL), 0ULL);
+}
+
+static void test_inode_disk_off_zero_ag_size_returns_zero(struct kunit *test)
+{
+	struct ocsfs_sb_info *sbi = kunit_kzalloc(test, sizeof(*sbi), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, sbi);
+	sbi->s_ag_size  = 0;
+	sbi->s_ag_count = 4;
+	sbi->s_ags      = NULL;
+	KUNIT_EXPECT_EQ(test, ocsfs_inode_disk_off(sbi, 100ULL), 0ULL);
+}
+
 /* ─── test suite registration ─────────────────────────────────── */
 
 static struct kunit_case ocsfs_lock_test_cases[] = {
@@ -527,6 +573,10 @@ static struct kunit_case ocsfs_lock_test_cases[] = {
 	KUNIT_CASE(test_ex_release_with_waiter_yields_nl),
 	KUNIT_CASE(test_sh_release_last_holder_with_waiter_yields_nl),
 	KUNIT_CASE(test_node_slot_ns_version_sum),
+	KUNIT_CASE(test_ino_to_ag_zero_size_returns_zero),
+	KUNIT_CASE(test_ino_to_ag_normal_division),
+	KUNIT_CASE(test_inode_disk_off_invalid_ag_returns_zero),
+	KUNIT_CASE(test_inode_disk_off_zero_ag_size_returns_zero),
 	{},
 };
 
