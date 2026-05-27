@@ -425,8 +425,8 @@ Use only FC SAN or LIO/TrueNAS SCALE iSCSI for multi-node deployments.
 | Node slot TOCTOU (mitigated) | Hardware atomicity requires SCSI CAW — now implemented via BSG-direct path | CAW is active; kprobe shim kept as fallback for patched kernels |
 | No xfstests coverage yet | Unknown edge cases in VFS layer | Requires a 2-node testbed; KVM + LIO is sufficient |
 | No encryption | Data at rest is unencrypted | fscrypt integration not implemented |
-| No quota | Disk quotas not enforced | No dquot support |
-| Snapshot for large files (-EOPNOTSUPP) | Files with >16 extents cannot be snapshotted | Requires refcount B+ tree iterator |
+| Quota (partial) | inode and block quotas are enforced via VFS dquot | CoW, snapshot creation, and directory/metadata blocks are not charged against block quota |
+| Snapshot for large files | Supported on V2 volumes (requires `INCOMPAT_RC_BTREE_PER_AG`; format with `mkfs.ocsfs` or upgrade with `ocsfs-tool tune --upgrade`) | Returns `-EOPNOTSUPP` on V1 volumes only |
 | Shared mmap unsupported in cluster mode | `MAP_SHARED|PROT_WRITE` returns EOPNOTSUPP | Private and read-only mappings work |
 | Single recovery at a time | If two nodes die simultaneously, the second is not recovered | `s_recovery_target` is a single u16; bitmask queue is the fix |
 | No out-of-band STONITH | SCSI PR fencing works; hardware PDU/iDRAC not wired | Proxmox API can serve as soft STONITH in lab environments |

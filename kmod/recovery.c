@@ -124,45 +124,50 @@ static void ocsfs_recovery_leader_release(struct super_block *sb,
 	struct ocsfs_disk_recovery_leader cur, free;
 	struct buffer_head *bh;
 	u64 block = ocsfs_rl_block(sb);
-	int ret;
-
-	bh = sb_getblk(sb, block);
-	if (!bh)
-		return;
-	clear_buffer_uptodate(bh);
-	if (bh_read(bh, 0) < 0) {
-		brelse(bh);
-		return;
-	}
-	memcpy(&cur, bh->b_data, sizeof(cur));
-	brelse(bh);
-
-	/* Verify we still own the slot */
-	if (le16_to_cpu(cur.rl_leader_slot) != sbi->s_node_slot ||
-	    le32_to_cpu(cur.rl_epoch) != epoch)
-		return;
+	int attempt, ret;
 
 	memset(&free, 0, sizeof(free));
 	free.rl_magic       = cpu_to_le32(OCSFS_RECOVERY_LEADER_MAGIC);
 	free.rl_leader_slot = cpu_to_le16(OCSFS_RL_SLOT_FREE);
 	free.rl_target_slot = cpu_to_le16(OCSFS_RL_SLOT_FREE);
-	free.rl_epoch       = cur.rl_epoch;
-	free.rl_checksum    = cpu_to_le32(ocsfs_rl_crc(&free));
 
-	/* Retry the CAS up to 3 times to avoid leaving the leader slot occupied
-	 * until deadline expiry (RECOVERY_LEADER_TIMEOUT_NS = 60s) on a transient
-	 * CAS collision.  After 3 attempts, the deadline eventually frees the slot. */
-	{
-		int attempt;
-
-		for (attempt = 0; attempt < 3; attempt++) {
-			ret = ocsfs_atomic_cas(sb, block, 0, sizeof(cur),
-					       &cur, &free);
-			if (ret != -EAGAIN)
-				break;
-			msleep(100);
+	/*
+	 * Re-read the leader block on every attempt: after a -EAGAIN the
+	 * block content has changed (another node did a CAS), so the old
+	 * expected value is stale and the next attempt would fail again
+	 * without a re-read.  Up to 15 attempts × 10-20ms ≈ 150-300ms,
+	 * vs. the 60s deadline-expiry freeze of the old 3-attempt loop
+	 * (NUOV-MEDIO-11).
+	 */
+	for (attempt = 0; attempt < 15; attempt++) {
+		bh = sb_getblk(sb, block);
+		if (!bh)
+			return;
+		clear_buffer_uptodate(bh);
+		if (bh_read(bh, 0) < 0) {
+			brelse(bh);
+			return;
 		}
+		memcpy(&cur, bh->b_data, sizeof(cur));
+		brelse(bh);
+
+		/* Stop if we no longer own the slot (another node took over) */
+		if (le16_to_cpu(cur.rl_leader_slot) != sbi->s_node_slot ||
+		    le32_to_cpu(cur.rl_epoch) != epoch)
+			return;
+
+		free.rl_epoch    = cur.rl_epoch;
+		free.rl_checksum = cpu_to_le32(ocsfs_rl_crc(&free));
+
+		ret = ocsfs_atomic_cas(sb, block, 0, sizeof(cur), &cur, &free);
+		if (ret != -EAGAIN)
+			return;
+
+		usleep_range(10000, 20000);
 	}
+	pr_warn_ratelimited("ocsfs: recovery leader release: CAS failed "
+			    "after %d attempts — slot expires at deadline\n",
+			    15);
 }
 
 /* ═══════════════════════════════════════════════════════════════

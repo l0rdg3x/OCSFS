@@ -76,9 +76,15 @@ static int ocsfs_validate_super(struct ocsfs_disk_super *ds,
 		pr_err("ocsfs: superblock checksum mismatch\n");
 		return -EINVAL;
 	}
+	/*
+	 * NUOV-MEDIO-6: Only 4096-byte blocks are supported.  Logical Block
+	 * Size (LBS) support would require propagating s_block_size through
+	 * every bitmap, extent, and journal calculation — ~12h redesign.
+	 * Volumes formatted with a different block size are explicitly rejected.
+	 */
 	if (le32_to_cpu(ds->s_block_size) != OCSFS_DEFAULT_BLOCK_SIZE) {
-		pr_err("ocsfs: unsupported block size %u\n",
-		       le32_to_cpu(ds->s_block_size));
+		pr_err("ocsfs: unsupported block size %u (only %u supported)\n",
+		       le32_to_cpu(ds->s_block_size), OCSFS_DEFAULT_BLOCK_SIZE);
 		return -EINVAL;
 	}
 	if (le32_to_cpu(ds->s_ag_count) == 0 ||

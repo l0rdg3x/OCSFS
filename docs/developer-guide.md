@@ -668,11 +668,11 @@ is now the top priority.
 | Gap | Impact | Path to fix |
 |---|---|---|
 | Single recovery target | Second node death during recovery is not handled | Change `s_recovery_target` to a bitmask and process the queue serially |
-| Snapshot for btree-backed inodes | `OCSFS_IOC_SNAP_CREATE` returns `-EOPNOTSUPP` for files with >16 extents | Implement `ocsfs_extent_btree_iterate` with refcount tracking |
+| Snapshot for btree-backed inodes | Supported on V2 volumes (`INCOMPAT_RC_BTREE_PER_AG`). `snapshot_copy_btree_extents()` iterates the src B+ tree, calls `ocsfs_refcount_inc`, and inserts into the snap's tree. Returns `-EOPNOTSUPP` on V1 only. | Upgrade V1 volumes with `ocsfs-tool tune --upgrade` |
 | Compression write path (O_DIRECT) | O_DIRECT writes are never compressed | Architectural: O_DIRECT bypasses the page cache where compression hooks live |
 | Shared mmap in cluster mode | `MAP_SHARED|PROT_WRITE` returns `-EOPNOTSUPP` | Would require distributed cache coherence — out of scope for v0.1 |
 | POSIX distributed file locking | `fcntl` advisory locks are local to the node | Requires integration with the DLM and `posix_lock_file` VFS hooks |
 | Encryption | Zero implementation | Would require `fscrypt` integration |
-| Quota | Zero implementation | Would require `dquot` integration |
+| Quota | Implemented: `i_dquot[MAXQUOTAS]` in `ocsfs_inode_info`; inode quota via `dquot_alloc/free_inode`; block quota via `dquot_alloc/free_space_nodirty` in `ocsfs_iomap_begin` and `ocsfs_alloc_extent`. Block quota is not charged for CoW, snapshot creation, or directory/metadata blocks. | Commits `8bc4c38` (inode) + `58933a7` (block) |
 | No out-of-band STONITH | Fencing relies solely on SCSI PR | Wire Proxmox API or iDRAC as a fallback fencing agent |
 | Node table TOCTOU | Mitigated by SCSI CAW (BSG-direct, now implemented) | Full fix requires per-device PR-scoped reservation on slot claim |

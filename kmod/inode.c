@@ -474,7 +474,14 @@ void ocsfs_evict_inode(struct inode *inode)
 	 * dropped — leaving stale extent pointers on disk that could cross-link
 	 * with later allocations after the blocks are freed.
 	 */
-	if (!inode->i_nlink && oi->i_disk_ino >= OCSFS_FIRST_USER_INO) {
+	/*
+	 * Skip disk-resource cleanup for inodes that never finished loading
+	 * (iget_failed path): make_bad_inode marks them I_BAD, i_nlink is 0
+	 * because set_nlink was never called, and freeing the on-disk inode
+	 * number would silently delete a live file (NUOV-MEDIO-3).
+	 */
+	if (!inode->i_nlink && !is_bad_inode(inode) &&
+	    oi->i_disk_ino >= OCSFS_FIRST_USER_INO) {
 		dquot_initialize(inode);
 		int lr = 0;
 

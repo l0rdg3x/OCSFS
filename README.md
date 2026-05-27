@@ -17,7 +17,7 @@ Proxmox VE as an open alternative to VMware VMFS.
 
 ---
 
-## Production Readiness (as of 2026-05-26)
+## Production Readiness (as of 2026-05-27)
 
 | Scenario | Score |
 |---|---|
@@ -139,8 +139,8 @@ SCSI CAW is now implemented via BSG-direct path — no kprobe required.
 | Gap | Notes |
 |---|---|
 | **Encryption** | Zero code. Would require fscrypt integration. |
-| **Quota** | No dquot support. |
-| **Snapshot for large files** | Snapshots return `-EOPNOTSUPP` for btree-backed inodes (>16 extents). Requires refcount btree iterator. |
+| **Quota** | Implemented: VFS `dquot` inode quota (commit `8bc4c38`) and block quota (commit `58933a7`). CoW, snapshot, and directory/metadata blocks are not charged. |
+| **Snapshot for large files** | Resolved for V2 filesystems: `snapshot_copy_btree_extents` + per-AG refcount B+ tree (ARCH-5, commit `eb88eeb`). Returns `-EOPNOTSUPP` only on V1 volumes without `INCOMPAT_RC_BTREE_PER_AG`. |
 | **Compression write path** | Compression is applied on fsync for buffered files only. No inline compression during O_DIRECT writes. |
 | **Shared mmap** | `MAP_SHARED|PROT_WRITE` returns `-EOPNOTSUPP` in cluster mode. Read-only and private (COW) mappings work. |
 | **POSIX distributed file locking** | `fcntl` locks are local only. |
