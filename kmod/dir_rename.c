@@ -7,6 +7,7 @@
 #include <linux/security.h>
 #include <linux/xattr.h>
 #include <linux/posix_acl.h>
+#include <linux/quotaops.h>
 #include "ocsfs.h"
 
 /* ═══════════════════════════════════════════════════════════════
@@ -45,6 +46,9 @@ static int ocsfs_unlink(struct inode *dir, struct dentry *dentry)
 	struct ocsfs_inode_info *oi   = OCSFS_I(inode);
 	struct ocsfs_inode_info *d_oi = OCSFS_I(dir);
 	int ret;
+
+	dquot_initialize(dir);
+	dquot_initialize(inode);
 
 	/* Acquire EX on dir and child by ino order — prevents ABBA deadlock. */
 	if (sbi->s_clustered) {
@@ -120,6 +124,9 @@ static int ocsfs_rmdir(struct inode *dir, struct dentry *dentry)
 	struct ocsfs_inode_info *dir_oi  = OCSFS_I(dir);
 	struct inode *inode = d_inode(dentry);
 	struct ocsfs_inode_info *child_oi = OCSFS_I(inode);
+
+	dquot_initialize(dir);
+	dquot_initialize(inode);
 	int ret;
 
 	/* Acquire EX on dir and child by ino order — prevents ABBA deadlock. */
@@ -656,6 +663,8 @@ int ocsfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	struct inode *inode;
 	int ret;
 
+	dquot_initialize(dir);
+
 	inode = ocsfs_new_inode(dir, mode);
 	if (IS_ERR(inode))
 		return PTR_ERR(inode);
@@ -712,6 +721,8 @@ struct dentry *ocsfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	struct ocsfs_sb_info *sbi = OCSFS_SB(dir->i_sb);
 	struct inode *inode;
 	int ret;
+
+	dquot_initialize(dir);
 
 	inode = ocsfs_new_inode(dir, S_IFDIR | mode);
 	if (IS_ERR(inode))
@@ -787,6 +798,8 @@ static int ocsfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	if (slen > OCSFS_MAX_INLINE_SYMLINK)
 		return -ENAMETOOLONG;
 
+	dquot_initialize(dir);
+
 	inode = ocsfs_new_inode(dir, S_IFLNK | S_IRWXUGO);
 	if (IS_ERR(inode))
 		return PTR_ERR(inode);
@@ -844,6 +857,8 @@ static int ocsfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	struct ocsfs_sb_info *sbi = OCSFS_SB(dir->i_sb);
 	struct inode *inode;
 	int ret;
+
+	dquot_initialize(dir);
 
 	inode = ocsfs_new_inode(dir, mode);
 	if (IS_ERR(inode))

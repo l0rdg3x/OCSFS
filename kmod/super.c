@@ -52,6 +52,7 @@ static void ocsfs_inode_init_once(void *obj)
 {
 	struct ocsfs_inode_info *oi = obj;
 	inode_init_once(&oi->vfs_inode);
+	memset(oi->i_dquot, 0, sizeof(oi->i_dquot));
 }
 
 static int ocsfs_validate_super(struct ocsfs_disk_super *ds,
@@ -342,10 +343,13 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	/* Set up super_block fields */
 	sb->s_magic  = OCSFS_MAGIC;
 	sb->s_flags |= SB_POSIXACL;
-	sb->s_op     = &ocsfs_sops;
-	sb->s_xattr  = ocsfs_xattr_handlers;
+	sb->s_op      = &ocsfs_sops;
+	sb->s_xattr   = ocsfs_xattr_handlers;
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 	sb->s_time_gran = 1;  /* nanosecond timestamps */
+	sb->s_qcop    = &dquot_quotactl_sysfile_ops;
+	sb->dq_op     = &dquot_operations;
+	sb->s_quota_types = QTYPE_MASK_USR | QTYPE_MASK_GRP | QTYPE_MASK_PRJ;
 
 	/* Load allocation group descriptors */
 	ret = ocsfs_load_ags(sb);
@@ -526,6 +530,11 @@ int ocsfs_sync_fs(struct super_block *sb, int wait)
 	return 0;
 }
 
+static struct dquot **ocsfs_get_dquots(struct inode *inode)
+{
+	return OCSFS_I(inode)->i_dquot;
+}
+
 /* super_operations table */
 const struct super_operations ocsfs_sops = {
 	.alloc_inode    = ocsfs_alloc_inode,
@@ -535,6 +544,7 @@ const struct super_operations ocsfs_sops = {
 	.put_super      = ocsfs_put_super,
 	.statfs         = ocsfs_statfs,
 	.sync_fs        = ocsfs_sync_fs,
+	.get_dquots     = ocsfs_get_dquots,
 };
 
 /* mount / module init */

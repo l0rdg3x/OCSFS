@@ -9,6 +9,7 @@
 #include <linux/security.h>
 #include <linux/posix_acl.h>
 #include <linux/fileattr.h>
+#include <linux/quotaops.h>
 #include "ocsfs.h"
 
 /* ═══════════════════════════════════════════════════════════════
@@ -474,6 +475,7 @@ void ocsfs_evict_inode(struct inode *inode)
 	 * with later allocations after the blocks are freed.
 	 */
 	if (!inode->i_nlink && oi->i_disk_ino >= OCSFS_FIRST_USER_INO) {
+		dquot_initialize(inode);
 		int lr = 0;
 
 		if (sbi->s_clustered)
@@ -500,6 +502,7 @@ void ocsfs_evict_inode(struct inode *inode)
 							  oi->i_xattr_block, 1);
 				}
 			}
+			dquot_free_inode(inode);
 			ocsfs_free_inode_num(inode->i_sb, oi->i_disk_ino);
 			if (sbi->s_clustered)
 				ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
@@ -509,6 +512,7 @@ void ocsfs_evict_inode(struct inode *inode)
 		ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
 	}
 
+	dquot_drop(inode);
 	clear_inode(inode);
 
 	kfree(oi->i_symlink);
@@ -584,6 +588,16 @@ struct inode *ocsfs_new_inode(struct inode *dir, umode_t mode)
 	}
 
 	insert_inode_hash(inode);
+
+	ret = dquot_alloc_inode(inode);
+	if (ret) {
+		inode->i_flags |= S_NOQUOTA;
+		if (sbi->s_clustered)
+			ocsfs_lock_release(sb, &oi->i_lock_res);
+		discard_new_inode(inode);
+		return ERR_PTR(ret);
+	}
+
 	mark_inode_dirty(inode);
 
 	if (sbi->s_clustered) {
@@ -647,6 +661,15 @@ int ocsfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			mutex_unlock(&oi->i_extent_lock);
 		} else {
 			truncate_setsize(inode, attr->ia_size);
+		}
+	}
+
+	if (attr->ia_valid & (ATTR_UID | ATTR_GID)) {
+		ret = dquot_transfer(idmap, inode, attr);
+		if (ret) {
+			if (sbi->s_clustered)
+				ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
+			return ret;
 		}
 	}
 

@@ -38,6 +38,8 @@
 #include <linux/workqueue.h>
 #include <linux/timekeeping.h>
 #include <linux/mempool.h>
+#include <linux/quota.h>
+#include <linux/quotaops.h>
 
 /* ═══════════════════════════════════════════════════════════════
  * ON-DISK CONSTANTS (mirrored from userspace ocsfs.h)
@@ -175,7 +177,7 @@ enum ocsfs_cas_backend {
 /* Masks of features this build understands.  Update as features land. */
 #define OCSFS_FEATURE_INCOMPAT_SUPP     (OCSFS_FEATURE_INCOMPAT_LOCK_TABLE_V2 | \
 					 OCSFS_FEATURE_INCOMPAT_RC_BTREE_PER_AG)
-#define OCSFS_FEATURE_RO_COMPAT_SUPP    0ULL   /* ARCH-3/6/7 not yet implemented */
+#define OCSFS_FEATURE_RO_COMPAT_SUPP    OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB
 #define OCSFS_FEATURE_COMPAT_SUPP       0ULL
 
 /* Inode flags */
@@ -745,6 +747,8 @@ struct ocsfs_inode_info {
 	char                   *i_symlink;
 	/* xattr block (0 = no xattr block allocated yet) */
 	u64                     i_xattr_block;
+	/* VFS dquot pointers — user/group/project quota */
+	struct dquot           *i_dquot[MAXQUOTAS];
 	struct inode            vfs_inode;      /* must be last */
 };
 
