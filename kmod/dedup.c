@@ -128,7 +128,8 @@ static int dedup_scan_extent(u64 logical, u64 physical, u32 length,
 	struct super_block *sb = dc->inode->i_sb;
 	u32 i;
 
-	(void)flags; /* extent flags not relevant for dedup scanning */
+	if (flags & (OCSFS_EXT_COMPRESSED | OCSFS_EXT_ENCRYPTED))
+		return 0; /* compressed/encrypted extents cannot be content-deduplicated */
 
 	for (i = 0; i < length; i++) {
 		u64 phys = physical + i;

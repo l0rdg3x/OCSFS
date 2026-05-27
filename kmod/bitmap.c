@@ -370,6 +370,9 @@ int ocsfs_free_blocks_txn(struct ocsfs_txn *txn, u64 block, u32 count)
 		brelse(bh);
 	}
 
+	if (unlikely(ag->free_blocks + count > ag->block_count))
+		pr_warn_ratelimited("ocsfs: AG %u free_blocks overflow: cur=%llu count=%u cap=%llu\n",
+				    ag->ag_no, ag->free_blocks, count, ag->block_count);
 	ag->free_blocks += count;
 	spin_lock(&sbi->s_free_lock);
 	sbi->s_free_blocks += count;

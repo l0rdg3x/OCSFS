@@ -442,6 +442,10 @@ int ocsfs_journal_replay_node(struct super_block *sb, u16 node_slot)
 	tmp_j.j_header_bh = bh;
 	tmp_j.j_sb     = sb;
 
+	if (tmp_j.sequence == 0)
+		pr_info("ocsfs: node %u journal sequence is 0 — possibly freshly initialized\n",
+			node_slot);
+
 	if (tmp_j.tail == tmp_j.head) {
 		pr_info("ocsfs: node %u journal is clean\n", node_slot);
 		brelse(bh);

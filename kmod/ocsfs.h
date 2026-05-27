@@ -162,6 +162,7 @@ enum ocsfs_cas_backend {
 #define OCSFS_EXT_COMPRESSED     0x0004  /* data is LZ4/ZSTD compressed */
 #define OCSFS_EXT_COMP_ALGO_MASK  0x0018 /* bits 3-4: algorithm ID */
 #define OCSFS_EXT_COMP_ALGO_SHIFT 3
+#define OCSFS_EXT_ENCRYPTED      0x0020  /* data is encrypted — skip dedup/content inspection */
 
 static inline u8 ocsfs_ext_comp_algo(u16 flags)
 {
@@ -221,13 +222,15 @@ static inline u16 ocsfs_ext_set_comp_algo(u16 flags, u8 algo)
 #define OCSFS_HB_INTERVAL_MS    5000   /* write every 5s */
 #define OCSFS_HB_TIMEOUT_MS     15000  /* 3 missed → suspected */
 #define OCSFS_HB_CONFIRM_MS     10000  /* 2 more missed → confirmed dead */
+/* Total dead-node detection window: suspected + confirmation period */
+#define OCSFS_HB_DEAD_MS        (OCSFS_HB_TIMEOUT_MS + OCSFS_HB_CONFIRM_MS)
 #define OCSFS_HB_CHECK_MS       2000   /* check peers every 2s */
 #define OCSFS_HB_IO_TIMEOUT_MS  3000   /* heartbeat write I/O deadline */
 
 /* Lock acquisition retry */
 #define OCSFS_LOCK_RETRY_MIN_US 1000   /* 1 ms */
 #define OCSFS_LOCK_RETRY_MAX_US 100000 /* 100 ms */
-#define OCSFS_LOCK_MAX_RETRIES  50
+#define OCSFS_LOCK_MAX_RETRIES  200
 
 /* Open-addressing probe limit to resolve slot collisions */
 #define OCSFS_LOCK_PROBE_MAX    64
@@ -765,7 +768,11 @@ static inline u64 ocsfs_byte_to_block(struct ocsfs_sb_info *sbi, u64 byte)
 static inline u64 ocsfs_inode_disk_off(struct ocsfs_sb_info *sbi, u64 ino)
 {
 	u32 ag = ocsfs_ino_to_ag(sbi, ino);
-	u64 local = ino % sbi->s_ag_size;
+	u64 local;
+
+	if (unlikely(ag >= sbi->s_ag_count || !sbi->s_ag_size))
+		return 0;
+	local = ino % sbi->s_ag_size;
 	return sbi->s_ags[ag].inode_table_off + local * OCSFS_INODE_SIZE;
 }
 
