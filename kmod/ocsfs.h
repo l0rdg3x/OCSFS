@@ -81,6 +81,10 @@
 #define OCSFS_RECOVERY_LEADER_MAGIC 0x52454C44U  /* "RELD" */
 #define OCSFS_RL_SLOT_FREE          0xFFFFU
 #define RECOVERY_LEADER_TIMEOUT_NS  (60ULL * NSEC_PER_SEC)
+/* High bit of rl_epoch: set while the leader is replaying the failed journal.
+ * Survivor nodes see this via the heartbeat-driven leader-block probe and
+ * defer EX acquisitions, providing cross-node quiescence during replay. */
+#define OCSFS_RL_REPLAY_ACTIVE      (1U << 31)
 
 struct ocsfs_disk_recovery_leader {
 	__le32  rl_magic;
@@ -623,7 +627,8 @@ struct ocsfs_sb_info {
 	DECLARE_BITMAP(s_recovery_pending, OCSFS_MAX_NODES); /* one bit per failed slot */
 	bool                    s_recovery_in_progress;
 	struct mutex            s_recovery_lock;
-	atomic_t                s_recovery_barrier; /* non-zero during Phase 3 replay; EX acquires must wait */
+	atomic_t                s_recovery_barrier;        /* non-zero during Phase 3 replay (local); EX acquires must wait */
+	atomic_t                s_remote_recovery_barrier; /* non-zero when a peer leader has OCSFS_RL_REPLAY_ACTIVE set */
 
 	/* Cluster auth */
 	u8              s_cluster_secret[32];   /* raw secret from mount option */

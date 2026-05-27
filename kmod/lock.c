@@ -47,7 +47,8 @@ int ocsfs_lock_acquire(struct super_block *sb, struct ocsfs_lock_res *lr,
 	 * after recovery completes.
 	 */
 	if (mode == OCSFS_LOCK_EX &&
-	    atomic_read(&sbi->s_recovery_barrier))
+	    (atomic_read(&sbi->s_recovery_barrier) ||
+	     atomic_read(&sbi->s_remote_recovery_barrier)))
 		return -EAGAIN;
 
 	mutex_lock(&lr->lr_mutex);
@@ -176,13 +177,17 @@ retry_release:
 	if (ret == -EAGAIN && ++retries < OCSFS_LOCK_MAX_RETRIES)
 		goto retry_release;
 
-	if (ret)
+	if (ret) {
 		pr_warn_ratelimited("ocsfs: lock_release failed for resource "
 				    "0x%llx (%d) — lock may be stranded on disk\n",
 				    lr->lr_resource_id, ret);
-
-	lr->lr_mode          = OCSFS_LOCK_NL;
-	lr->lr_cached = false;
+		/* Do NOT clear lr_mode on failure: the on-disk entry was not
+		 * updated, so keeping lr_mode == EX lets the heartbeat timeout
+		 * trigger proper recovery instead of leaving an orphaned lock. */
+	} else {
+		lr->lr_mode   = OCSFS_LOCK_NL;
+		lr->lr_cached = false;
+	}
 	mutex_unlock(&lr->lr_mutex);
 	return ret;
 }

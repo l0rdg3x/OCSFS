@@ -451,7 +451,12 @@ int ocsfs_journal_replay_node(struct super_block *sb, u16 node_slot)
 	pr_info("ocsfs: replaying journal for node %u (tail=%llu head=%llu)\n",
 		node_slot, tmp_j.tail, tmp_j.head);
 
+	/* Set local barrier so EX lock acquisitions on *this* node also wait
+	 * during replay, even when ocsfs_journal_replay_node is called directly
+	 * without going through the full recovery path (NUOV-MEDIO-1). */
+	atomic_set(&sbi->s_recovery_barrier, 1);
 	ret = journal_replay_j(sb, &tmp_j);
+	atomic_set(&sbi->s_recovery_barrier, 0);
 
 	if (!ret) {
 		jh->jh_tail     = jh->jh_head;

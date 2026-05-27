@@ -147,7 +147,8 @@ static int cas_acquire_lease(struct super_block *sb, u64 block,
 	}
 
 	cl = (struct ocsfs_disk_cas_lease *)bh->b_data + eidx;
-	if (le16_to_cpu(cl->cl_owner_slot) != (u16)sbi->s_node_slot) {
+	if (le32_to_cpu(cl->cl_checksum) != cas_lease_crc(cl) ||
+	    le16_to_cpu(cl->cl_owner_slot) != (u16)sbi->s_node_slot) {
 		brelse(bh);
 		return -EAGAIN;
 	}

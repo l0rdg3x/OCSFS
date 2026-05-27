@@ -297,15 +297,35 @@ static int ocsfs_fsync(struct file *file, loff_t start, loff_t end,
 
 	/*
 	 * Lazily compress inline extents before syncing to disk.
-	 * If compression fails for any extent, log and proceed — the data
-	 * is already safely on disk uncompressed.
+	 * In cluster mode we must hold DLM EX for the entire compress to
+	 * avoid a race where a peer reads an extent map mid-rewrite.
 	 */
 	if (ocsfs_get_compression_algo(inode) != OCSFS_COMPRESS_NONE) {
-		int cr = ocsfs_compress_file(inode);
+		struct ocsfs_inode_info *oi = OCSFS_I(inode);
+		struct ocsfs_sb_info    *sbi_c = OCSFS_SB(inode->i_sb);
+		int cr;
 
+		if (sbi_c->s_clustered) {
+			cr = ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
+						OCSFS_LOCK_EX);
+			if (cr) {
+				pr_warn_ratelimited(
+					"ocsfs: compress_file: DLM EX failed "
+					"(%d), skipping compression\n", cr);
+				goto after_compress;
+			}
+		}
+
+		cr = ocsfs_compress_file(inode);
 		if (cr)
 			pr_warn_ratelimited("ocsfs: compress_file failed (%d), "
 					    "syncing uncompressed\n", cr);
+
+		if (sbi_c->s_clustered) {
+			ocsfs_flush_inode_locked(inode, false);
+			ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
+		}
+after_compress:;
 	}
 
 	ret = file_write_and_wait_range(file, start, end);

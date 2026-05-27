@@ -40,7 +40,9 @@ static int heartbeat_write_timeout(struct buffer_head *bh)
 			OCSFS_HB_IO_TIMEOUT_MS);
 		return -ETIMEDOUT;
 	}
-	return buffer_uptodate(bh) ? 0 : -EIO;
+	/* Check write I/O error, not read uptodate: a write can silently fail
+	 * while leaving the buffer marked uptodate from the last read. */
+	return buffer_write_io_error(bh) ? -EIO : 0;
 }
 
 /* Write this node's heartbeat entry to disk */
@@ -234,6 +236,41 @@ int ocsfs_heartbeat_check_peers(struct super_block *sb)
 
 	if (cur_bh)
 		brelse(cur_bh);
+
+	/*
+	 * CRIT-6: probe the recovery leader block for OCSFS_RL_REPLAY_ACTIVE.
+	 * If a peer leader has set this flag, it is currently replaying a failed
+	 * node's journal AFTER-images.  We set s_remote_recovery_barrier so that
+	 * ocsfs_lock_acquire() defers EX acquisitions, preventing the race where
+	 * a survivor writes a block that the replaying leader is about to restore.
+	 * The staleness window is at most one HB_CHECK interval.
+	 */
+	if (sbi->s_clustered) {
+		u64 rl_blk = OCSFS_RECOVERY_LEADER_OFF / sbi->s_block_size;
+		struct buffer_head *rl_bh = sb_getblk(sb, rl_blk);
+		bool remote_replay = false;
+
+		if (rl_bh) {
+			clear_buffer_uptodate(rl_bh);
+			if (bh_read(rl_bh, 0) >= 0) {
+				const struct ocsfs_disk_recovery_leader *rl =
+					(const struct ocsfs_disk_recovery_leader *)
+					rl_bh->b_data;
+
+				if (le32_to_cpu(rl->rl_magic) ==
+					    OCSFS_RECOVERY_LEADER_MAGIC &&
+				    le16_to_cpu(rl->rl_leader_slot) !=
+					    OCSFS_RL_SLOT_FREE &&
+				    le16_to_cpu(rl->rl_leader_slot) !=
+					    sbi->s_node_slot &&
+				    (le32_to_cpu(rl->rl_epoch) &
+					    OCSFS_RL_REPLAY_ACTIVE))
+					remote_replay = true;
+			}
+			brelse(rl_bh);
+		}
+		atomic_set(&sbi->s_remote_recovery_barrier, remote_replay ? 1 : 0);
+	}
 
 	return 0;
 }

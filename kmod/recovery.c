@@ -155,6 +155,48 @@ static void ocsfs_recovery_leader_release(struct super_block *sb,
 }
 
 /* ═══════════════════════════════════════════════════════════════
+ * REPLAY ACTIVE FLAG — cross-node quiescence for AFTER-image replay
+ *
+ * Sets or clears OCSFS_RL_REPLAY_ACTIVE in the on-disk recovery leader
+ * block.  Survivor nodes read this flag during heartbeat_check_peers and
+ * set s_remote_recovery_barrier, causing their EX lock acquisitions to
+ * return -EAGAIN until replay is complete.  This prevents the race where
+ * a survivor writes a block that the replaying leader is about to restore
+ * (NUOV-CRIT-6).  The staleness window is ≤ one HB_CHECK interval.
+ * ═══════════════════════════════════════════════════════════════ */
+static void ocsfs_recovery_set_replay_active(struct super_block *sb, bool active)
+{
+	struct ocsfs_disk_recovery_leader cur, new;
+	struct buffer_head *bh;
+	u64 block = ocsfs_rl_block(sb);
+
+	bh = sb_getblk(sb, block);
+	if (!bh)
+		return;
+	clear_buffer_uptodate(bh);
+	if (bh_read(bh, 0) < 0) {
+		brelse(bh);
+		return;
+	}
+	memcpy(&cur, bh->b_data, sizeof(cur));
+	memcpy(&new, &cur, sizeof(new));
+
+	if (active)
+		new.rl_epoch |= cpu_to_le32(OCSFS_RL_REPLAY_ACTIVE);
+	else
+		new.rl_epoch &= cpu_to_le32(~OCSFS_RL_REPLAY_ACTIVE);
+	new.rl_checksum = cpu_to_le32(ocsfs_rl_crc(&new));
+
+	lock_buffer(bh);
+	memcpy(bh->b_data, &new, sizeof(new));
+	set_buffer_uptodate(bh);
+	mark_buffer_dirty(bh);
+	unlock_buffer(bh);
+	sync_dirty_buffer(bh);
+	brelse(bh);
+}
+
+/* ═══════════════════════════════════════════════════════════════
  * RECOVERY EXECUTION — 5 phases
  * ═══════════════════════════════════════════════════════════════ */
 
@@ -278,17 +320,18 @@ int ocsfs_recovery_run(struct super_block *sb, u16 failed_slot)
 	/*
 	 * Phase 3 — Journal Replay
 	 *
-	 * Set s_recovery_barrier while replaying AFTER-images so that survivor
-	 * nodes cannot acquire EX locks on the blocks being replayed (CRIT-B).
-	 * This is a local barrier only; cross-node quiescence would require
-	 * writing a fence flag to the shared recovery leader block.
+	 * Write OCSFS_RL_REPLAY_ACTIVE to the shared leader block so survivor
+	 * nodes defer EX acquisitions during replay (cross-node quiescence,
+	 * NUOV-CRIT-6).  The local s_recovery_barrier is set inside
+	 * ocsfs_journal_replay_node so it is always paired correctly even if
+	 * the function is called directly (NUOV-MEDIO-1).
 	 */
 	pr_info("ocsfs: recovery phase 3: journal replay for node %u\n",
 		failed_slot);
 
-	atomic_set(&sbi->s_recovery_barrier, 1);
+	ocsfs_recovery_set_replay_active(sb, true);
 	ret = ocsfs_journal_replay_node(sb, failed_slot);
-	atomic_set(&sbi->s_recovery_barrier, 0);
+	ocsfs_recovery_set_replay_active(sb, false);
 
 	if (ret) {
 		pr_err("ocsfs: journal replay for node %u failed: %d — "
@@ -359,6 +402,15 @@ static void ocsfs_recovery_work_fn(struct work_struct *work)
 			 * If it finishes, we win the CAS next round.
 			 * If it dies, heartbeat fires a new trigger. */
 			msleep(50);
+		} else if (ret && ret != -EPERM && ret != -EUCLEAN) {
+			/* Transient error (I/O, ENOMEM, …): -EPERM means the
+			 * node is still alive (degraded cross-check), -EUCLEAN
+			 * means journal corruption → SB_RDONLY already set.
+			 * For everything else, re-arm and backoff 60s. */
+			set_bit(slot, sbi->s_recovery_pending);
+			pr_warn("ocsfs: recovery for slot %u failed (%d), "
+				"retrying in 60s\n", slot, ret);
+			msleep(60000);
 		}
 	}
 }
@@ -382,6 +434,8 @@ int ocsfs_recovery_init(struct super_block *sb)
 	mutex_init(&sbi->s_recovery_lock);
 	sbi->s_recovery_in_progress = false;
 	bitmap_zero(sbi->s_recovery_pending, OCSFS_MAX_NODES);
+	atomic_set(&sbi->s_recovery_barrier, 0);
+	atomic_set(&sbi->s_remote_recovery_barrier, 0);
 	INIT_WORK(&sbi->s_recovery_work, ocsfs_recovery_work_fn);
 
 	return 0;
