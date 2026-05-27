@@ -135,7 +135,7 @@ int lock_probe_slot(struct super_block *sb, struct ocsfs_lock_res *lr)
 	int i;
 
 	for (i = 0; i < OCSFS_LOCK_PROBE_MAX; i++) {
-		u32 slot = (base + i) % OCSFS_LOCK_ENTRY_COUNT;
+		u32 slot = (base + (u32)i * (u32)i) % OCSFS_LOCK_ENTRY_COUNT;
 		struct ocsfs_disk_lock dl;
 		struct buffer_head *bh;
 		int ret;

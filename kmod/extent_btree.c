@@ -717,6 +717,7 @@ int ocsfs_extent_btree_punch_hole(struct inode *inode,
 	struct ext_trunc_ctx tc;
 	struct ocsfs_txn *txn;
 	u64 search_from;
+	u64 saved_blocks;
 	int safety = 65536;
 	u32 i;
 	int ret;
@@ -729,6 +730,8 @@ int ocsfs_extent_btree_punch_hole(struct inode *inode,
 	if (IS_ERR(txn))
 		return PTR_ERR(txn);
 	ec.txn = txn;
+
+	saved_blocks = inode->i_blocks;
 
 	/* search_from: may need to find an extent starting just before start_block */
 	search_from = start_block > 0 ? start_block - 1 : 0;
@@ -821,6 +824,7 @@ int ocsfs_extent_btree_punch_hole(struct inode *inode,
 
 abort:
 	ocsfs_txn_abort(txn);
+	inode->i_blocks = saved_blocks;
 	return ret;
 }
 

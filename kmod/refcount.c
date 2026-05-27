@@ -192,8 +192,8 @@ static int ocsfs_refcount_apply_delta(struct super_block *sb, u64 phys_block,
 	rc_block = ocsfs_rc_table_block(sbi, ag, bucket);
 	nr_entries = ocsfs_rc_entries_per_block(sbi);
 
-	expected_buf = kmalloc(sbi->s_block_size, GFP_KERNEL);
-	new_buf      = kmalloc(sbi->s_block_size, GFP_KERNEL);
+	expected_buf = mempool_alloc(sbi->s_rc_buf_pool, GFP_KERNEL);
+	new_buf      = mempool_alloc(sbi->s_rc_buf_pool, GFP_KERNEL);
 	if (!expected_buf || !new_buf) {
 		ret = -ENOMEM;
 		goto out_free;
@@ -286,8 +286,8 @@ static int ocsfs_refcount_apply_delta(struct super_block *sb, u64 phys_block,
 		ret = -EBUSY;
 
 out_free:
-	kfree(expected_buf);
-	kfree(new_buf);
+	mempool_free(expected_buf, sbi->s_rc_buf_pool);
+	mempool_free(new_buf, sbi->s_rc_buf_pool);
 	return ret;
 }
 

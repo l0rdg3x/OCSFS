@@ -292,6 +292,12 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	spin_lock_init(&sbi->s_free_lock);
 	mutex_init(&sbi->s_decompress_lock);
 
+	sbi->s_rc_buf_pool = mempool_create_kmalloc_pool(4, sbi->s_block_size);
+	if (!sbi->s_rc_buf_pool) {
+		ret = -ENOMEM;
+		goto fail;
+	}
+
 	/* Set up super_block fields */
 	sb->s_magic  = OCSFS_MAGIC;
 	sb->s_flags |= SB_POSIXACL;
@@ -377,6 +383,7 @@ fail_ags:
 	kvfree(sbi->s_ags);
 fail:
 	brelse(bh);
+	mempool_destroy(sbi->s_rc_buf_pool);
 	kfree(sbi);
 	sb->s_fs_info = NULL;
 	return ret;
@@ -394,6 +401,7 @@ void ocsfs_put_super(struct super_block *sb)
 	ocsfs_cluster_exit(sb);
 	kvfree(sbi->s_decompress_wksp);
 	mutex_destroy(&sbi->s_decompress_lock);
+	mempool_destroy(sbi->s_rc_buf_pool);
 	kvfree(sbi->s_ags);
 	brelse(sbi->s_sbh);
 	kfree(sbi);

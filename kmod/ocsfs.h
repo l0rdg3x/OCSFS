@@ -37,6 +37,7 @@
 #include <linux/delay.h>
 #include <linux/workqueue.h>
 #include <linux/timekeeping.h>
+#include <linux/mempool.h>
 
 /* ═══════════════════════════════════════════════════════════════
  * ON-DISK CONSTANTS (mirrored from userspace ocsfs.h)
@@ -69,9 +70,9 @@
 
 /* CAS lease area — immediatamente dopo la lock table */
 #define OCSFS_CAS_LEASE_OFF         1384448ULL   /* = LOCK_TABLE_OFF + LOCK_TABLE_SIZE */
-#define OCSFS_CAS_LEASE_ENTRIES     256
+#define OCSFS_CAS_LEASE_ENTRIES     1024
 #define OCSFS_CAS_LEASE_MAGIC       0x4F43414CU  /* "OCAL" */
-#define OCSFS_CAS_LEASE_SIZE        8192ULL      /* 256 × 32 byte */
+#define OCSFS_CAS_LEASE_SIZE        32768ULL     /* 1024 × 32 byte */
 #define CAS_MAX_ATTEMPTS            128
 #define CAS_MAX_BACKOFF_US          32000 /* 32 ms — covers SAN RTTs up to ~10 ms */
 #define CAS_LEASE_TIMEOUT_NS        (10ULL * NSEC_PER_SEC)
@@ -229,7 +230,7 @@ static inline u16 ocsfs_ext_set_comp_algo(u16 flags, u8 algo)
 #define OCSFS_LOCK_MAX_RETRIES  50
 
 /* Open-addressing probe limit to resolve slot collisions */
-#define OCSFS_LOCK_PROBE_MAX    16
+#define OCSFS_LOCK_PROBE_MAX    64
 
 /* Lock caching — serve re-acquires from local cache for this window */
 #define OCSFS_LOCK_CACHE_MS     500ULL
@@ -527,11 +528,14 @@ struct ocsfs_txn {
 	struct list_head        t_buffers;      /* list of journaled BHs */
 	unsigned int            t_nr_blocks;
 	bool                    t_started;
+	/* O(1) idempotency check: hash by block_num & 63 */
+	struct hlist_head       t_block_hash[64];
 };
 
 /* Buffer in a transaction */
 struct ocsfs_txn_buf {
 	struct list_head        list;
+	struct hlist_node       hash_node;      /* link in t_block_hash[] */
 	struct buffer_head      *bh;
 	u64                     block_num;
 	u8                      *before_buf;    /* snapshot for rollback on abort */
@@ -642,6 +646,9 @@ struct ocsfs_sb_info {
 	struct mutex    s_decompress_lock;
 	void           *s_decompress_wksp;
 	size_t          s_decompress_wksp_sz;
+
+	/* Refcount CAS buffer pool — avoids per-call kmalloc in hot path */
+	mempool_t      *s_rc_buf_pool;
 };
 
 /*

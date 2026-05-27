@@ -332,10 +332,11 @@ int ocsfs_txn_add_bh(struct ocsfs_txn *txn, struct buffer_head *bh)
 	struct ocsfs_journal *j = txn->t_journal;
 	struct ocsfs_disk_journal_bref bref;
 	struct super_block *sb = j->j_sb;
+	u32 hslot = (u32)(bh->b_blocknr & 63U);
 	int ret;
 
-	/* Idempotent: skip if this block is already journaled in this txn */
-	list_for_each_entry(tb, &txn->t_buffers, list) {
+	/* O(1) idempotency check via hash-set (replaces O(n) list scan) */
+	hlist_for_each_entry(tb, &txn->t_block_hash[hslot], hash_node) {
 		if (tb->block_num == bh->b_blocknr)
 			return 0;
 	}
@@ -361,6 +362,7 @@ int ocsfs_txn_add_bh(struct ocsfs_txn *txn, struct buffer_head *bh)
 	tb->block_num = bh->b_blocknr;
 	get_bh(bh);
 	list_add_tail(&tb->list, &txn->t_buffers);
+	hlist_add_head(&tb->hash_node, &txn->t_block_hash[hslot]);
 	txn->t_nr_blocks++;
 
 	memset(&bref, 0, sizeof(bref));
@@ -385,6 +387,7 @@ int ocsfs_txn_add_bh(struct ocsfs_txn *txn, struct buffer_head *bh)
 undo_tb:
 		j->head = saved_head;
 		list_del(&tb->list);
+		hlist_del(&tb->hash_node);
 		txn->t_nr_blocks--;
 		kfree(tb->before_buf);
 		kfree(tb->after_buf);

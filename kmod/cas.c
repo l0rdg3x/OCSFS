@@ -11,7 +11,7 @@
  *   CAS_BACKEND_NONE      — single-node RMW (no cluster coordination).
  *
  * Lease area: 128 entry × 32 byte per block (4 KiB blocksize).
- * With OCSFS_CAS_LEASE_ENTRIES=256, two blocks are reserved.
+ * With OCSFS_CAS_LEASE_ENTRIES=1024, eight blocks are reserved.
  */
 #include <linux/module.h>
 #include <linux/fs.h>

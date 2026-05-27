@@ -166,6 +166,7 @@ int ocsfs_extent_truncate(struct inode *inode, u64 from_block)
 	struct super_block *sb = inode->i_sb;
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	struct ocsfs_txn *txn;
+	u64 saved_blocks;
 	int i, ret;
 
 	if (oi->i_extent_tree_root)
@@ -174,6 +175,8 @@ int ocsfs_extent_truncate(struct inode *inode, u64 from_block)
 	txn = ocsfs_txn_begin(sb);
 	if (IS_ERR(txn))
 		return PTR_ERR(txn);
+
+	saved_blocks = inode->i_blocks;
 
 	for (i = oi->i_extent_count - 1; i >= 0; i--) {
 		struct ocsfs_extent *e = &oi->i_extents[i];
@@ -236,6 +239,7 @@ int ocsfs_extent_truncate(struct inode *inode, u64 from_block)
 
 abort:
 	ocsfs_txn_abort(txn);
+	inode->i_blocks = saved_blocks;
 	return ret;
 }
 
