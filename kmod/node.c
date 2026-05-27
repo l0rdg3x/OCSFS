@@ -294,7 +294,8 @@ int ocsfs_node_claim_slot(struct super_block *sb)
 		}
 
 		/* -EAGAIN: race con un altro nodo — rileggi la tabella e riprova */
-		udelay(1 << min(attempt, 8));
+		usleep_range(1U << min(attempt, 8),
+			     2U << min(attempt, 8));
 	}
 
 	pr_err("ocsfs: node slot claim timeout after %d attempts\n",

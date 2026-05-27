@@ -149,9 +149,20 @@ static void ocsfs_recovery_leader_release(struct super_block *sb,
 	free.rl_epoch       = cur.rl_epoch;
 	free.rl_checksum    = cpu_to_le32(ocsfs_rl_crc(&free));
 
-	/* Best-effort CAS — if it fails, the deadline will expire naturally */
-	ret = ocsfs_atomic_cas(sb, block, 0, sizeof(cur), &cur, &free);
-	(void)ret;
+	/* Retry the CAS up to 3 times to avoid leaving the leader slot occupied
+	 * until deadline expiry (RECOVERY_LEADER_TIMEOUT_NS = 60s) on a transient
+	 * CAS collision.  After 3 attempts, the deadline eventually frees the slot. */
+	{
+		int attempt;
+
+		for (attempt = 0; attempt < 3; attempt++) {
+			ret = ocsfs_atomic_cas(sb, block, 0, sizeof(cur),
+					       &cur, &free);
+			if (ret != -EAGAIN)
+				break;
+			msleep(100);
+		}
+	}
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -410,7 +421,7 @@ static void ocsfs_recovery_work_fn(struct work_struct *work)
 			set_bit(slot, sbi->s_recovery_pending);
 			pr_warn("ocsfs: recovery for slot %u failed (%d), "
 				"retrying in 60s\n", slot, ret);
-			msleep(60000);
+			msleep(OCSFS_RECOVERY_BACKOFF_MS);
 		}
 	}
 }

@@ -309,6 +309,20 @@ int ocsfs_lock_recover_node(struct super_block *sb, u16 node_slot,
 		}
 		clear_waiter_bit(&dl, node_slot);
 
+		/* Also clear the 2-bit mode entry for this slot in le_waiter_modes[].
+		 * Encoding: 2 bits per slot, packed LSB-first in each byte. */
+		{
+			u32 mbyte = (node_slot * 2) / 8;
+			u32 mshift = (node_slot * 2) % 8;
+
+			if (mbyte < sizeof(dl.le_waiter_modes)) {
+				if (dl.le_waiter_modes[mbyte] & (3u << mshift)) {
+					dl.le_waiter_modes[mbyte] &= ~(3u << mshift);
+					modified = true;
+				}
+			}
+		}
+
 		if (modified) {
 			ret = lock_write_entry(sb, i, &dl, bh);
 			if (ret)

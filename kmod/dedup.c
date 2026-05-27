@@ -203,11 +203,23 @@ static int dedup_apply_pair(struct inode *inode, const struct dedup_pair *p)
 		return ret;
 	}
 
-	/* Free the duplicate physical block.
-	 * Crash here leaves a space leak; fsck detects stale refcount and frees. */
+	/* Free the duplicate physical block inside a journal transaction so that a
+	 * crash between the btree replace and this free is recoverable: the
+	 * uncommitted txn is rolled back on replay, leaving a stale-refcount block
+	 * that fsck can reclaim.  Fall back to non-journaled free if txn_begin
+	 * fails (transient OOM) — the existing stale-refcount fsck path still
+	 * handles that case. */
 	ocsfs_refcount_dec(inode->i_sb, p->dup_phys, 1, &should_free);
-	if (should_free)
-		ocsfs_free_blocks(inode->i_sb, p->dup_phys, 1);
+	if (should_free) {
+		struct ocsfs_txn *txn = ocsfs_txn_begin(inode->i_sb);
+
+		if (!IS_ERR(txn)) {
+			ocsfs_free_blocks_txn(txn, p->dup_phys, 1);
+			ocsfs_txn_commit(txn);
+		} else {
+			ocsfs_free_blocks(inode->i_sb, p->dup_phys, 1);
+		}
+	}
 
 	return 0;
 }

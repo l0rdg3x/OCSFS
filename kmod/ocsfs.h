@@ -236,6 +236,9 @@ static inline u16 ocsfs_ext_set_comp_algo(u16 flags, u8 algo)
 #define OCSFS_LOCK_CACHE_MS     500ULL
 #define OCSFS_LOCK_CACHE_NS     (OCSFS_LOCK_CACHE_MS * 1000000ULL)
 
+/* Recovery backoff for transient errors in the recovery work function */
+#define OCSFS_RECOVERY_BACKOFF_MS   60000U  /* 60s before re-arming a failed recovery */
+
 /* Recovery phases */
 #define OCSFS_RECOVERY_ELECT    1
 #define OCSFS_RECOVERY_FENCE    2
@@ -709,8 +712,11 @@ static inline u32 ocsfs_crc32c(u32 crc, const void *data, size_t len)
 /* Convert on-disk inode number to AG + offset within AG */
 static inline u32 ocsfs_ino_to_ag(struct ocsfs_sb_info *sbi, u64 ino)
 {
-	u64 inodes_per_ag = sbi->s_ag_size;  /* 1 inode slot per block as max */
-	return (u32)(ino / inodes_per_ag);
+	u64 ag_size = sbi->s_ag_size;  /* 1 inode slot per block as max */
+
+	if (unlikely(!ag_size))
+		return 0;
+	return (u32)(ino / ag_size);
 }
 
 /* Convert OCSFS file type to DT_* type for readdir */

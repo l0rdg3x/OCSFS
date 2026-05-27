@@ -279,7 +279,8 @@ static int ocsfs_refcount_apply_delta(struct super_block *sb, u64 phys_block,
 		}
 		if (ret != -EAGAIN)
 			break;
-		udelay(1 << min(attempt, 8));
+		usleep_range(1U << min(attempt, 8),
+			     2U << min(attempt, 8));
 	}
 
 	if (attempt == CAS_MAX_ATTEMPTS)
