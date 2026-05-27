@@ -15,6 +15,7 @@
 
 #include "ocsfs.h"
 #include <linux/iomap.h>
+#include <linux/fscrypt.h>
 
 /* OCSFS_MIN_PREALLOC_BLOCKS defined in ocsfs.h */
 
@@ -554,6 +555,140 @@ out:
 	return ret;
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ * ENCRYPTED FILE I/O (bounce-page path, needs_bounce_pages=1)
+ *
+ * For encrypted files we bypass iomap's async bio path and use a
+ * synchronous block-read + fscrypt_decrypt_pagecache_blocks() for reads,
+ * and fscrypt_encrypt_pagecache_blocks() + synchronous bio for writes.
+ * Readahead is disabled for encrypted files; the kernel falls back to
+ * individual read_folio calls.
+ * ═══════════════════════════════════════════════════════════════ */
+
+#ifdef CONFIG_FS_ENCRYPTION
+
+static int ocsfs_enc_read_folio(struct file *file, struct folio *folio)
+{
+	struct inode *inode = folio->mapping->host;
+	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
+	loff_t file_pos = folio_pos(folio);
+	size_t folio_sz = folio_size(folio);
+	size_t done = 0;
+	int ret = 0;
+
+	while (done < folio_sz && ret == 0) {
+		loff_t cur_off = file_pos + done;
+		u64 lblk;
+		struct ocsfs_extent ext;
+		size_t chunk = min_t(size_t, sbi->s_block_size, folio_sz - done);
+
+		if (cur_off >= i_size_read(inode)) {
+			folio_zero_range(folio, done, folio_sz - done);
+			break;
+		}
+
+		lblk = (u64)(cur_off >> inode->i_sb->s_blocksize_bits);
+		mutex_lock(&OCSFS_I(inode)->i_extent_lock);
+		ret = ocsfs_extent_lookup(inode, lblk, &ext);
+		mutex_unlock(&OCSFS_I(inode)->i_extent_lock);
+
+		if (ret) {
+			folio_zero_range(folio, done, chunk);
+			ret = 0;
+		} else {
+			u64 pblk = ext.physical_block + (lblk - ext.logical_block);
+			struct buffer_head *bh = sb_bread(inode->i_sb, pblk);
+
+			if (!bh) {
+				ret = -EIO;
+				break;
+			}
+			memcpy_to_folio(folio, done, bh->b_data, chunk);
+			brelse(bh);
+		}
+		done += chunk;
+	}
+
+	if (ret == 0)
+		ret = fscrypt_decrypt_pagecache_blocks(folio, folio_sz, 0);
+
+	if (!ret)
+		folio_mark_uptodate(folio);
+	folio_unlock(folio);
+	return ret;
+}
+
+static int ocsfs_enc_writepages(struct address_space *mapping,
+				struct writeback_control *wbc)
+{
+	struct inode *inode = mapping->host;
+	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
+	struct folio *folio = NULL;
+	int ret = 0;
+
+	while ((folio = writeback_iter(mapping, wbc, folio, &ret))) {
+		loff_t pos = folio_pos(folio);
+		loff_t isize = i_size_read(inode);
+		size_t len;
+		u64 lblk;
+		struct ocsfs_extent ext;
+		struct page *enc_page;
+		struct bio *bio;
+		u64 pblk;
+		int wr;
+
+		if (pos >= isize) {
+			folio_unlock(folio);
+			continue;
+		}
+		len = min_t(size_t, folio_size(folio),
+			    (size_t)(isize - pos));
+
+		lblk = (u64)(pos >> inode->i_sb->s_blocksize_bits);
+		mutex_lock(&OCSFS_I(inode)->i_extent_lock);
+		ret = ocsfs_extent_lookup(inode, lblk, &ext);
+		mutex_unlock(&OCSFS_I(inode)->i_extent_lock);
+		if (ret) {
+			folio_unlock(folio);
+			break;
+		}
+
+		enc_page = fscrypt_encrypt_pagecache_blocks(folio, len, 0,
+							    GFP_NOFS);
+		if (IS_ERR(enc_page)) {
+			ret = PTR_ERR(enc_page);
+			folio_unlock(folio);
+			break;
+		}
+
+		folio_start_writeback(folio);
+		folio_unlock(folio);
+
+		pblk = ext.physical_block + (lblk - ext.logical_block);
+		bio  = bio_alloc(inode->i_sb->s_bdev, 1,
+				 REQ_OP_WRITE | REQ_SYNC, GFP_NOIO);
+		bio->bi_iter.bi_sector = pblk * (sbi->s_block_size >> SECTOR_SHIFT);
+		if (!bio_add_page(bio, enc_page, len, 0)) {
+			bio_put(bio);
+			fscrypt_free_bounce_page(enc_page);
+			folio_end_writeback(folio);
+			ret = -ENOMEM;
+			break;
+		}
+		wr  = submit_bio_wait(bio);
+		bio_put(bio);
+		fscrypt_free_bounce_page(enc_page);
+
+		folio_end_writeback(folio);
+		if (wr && !ret)
+			ret = wr;
+	}
+
+	return ret;
+}
+
+#endif /* CONFIG_FS_ENCRYPTION */
+
 static int ocsfs_iomap_read_folio(struct file *file, struct folio *folio)
 {
 	struct inode *inode = folio->mapping->host;
@@ -562,6 +697,11 @@ static int ocsfs_iomap_read_folio(struct file *file, struct folio *folio)
 	u64 logical_block = (u64)(folio_pos(folio) / sbi->s_block_size);
 	struct ocsfs_extent ext;
 	int ret;
+
+#ifdef CONFIG_FS_ENCRYPTION
+	if (IS_ENCRYPTED(inode) && S_ISREG(inode->i_mode))
+		return ocsfs_enc_read_folio(file, folio);
+#endif
 
 	mutex_lock(&oi->i_extent_lock);
 	ret = ocsfs_extent_lookup(inode, logical_block, &ext);
@@ -585,6 +725,12 @@ static void ocsfs_iomap_readahead(struct readahead_control *rac)
 	u64 logical_block = (u64)(readahead_pos(rac) / sbi->s_block_size);
 	struct ocsfs_extent ext;
 	int ret;
+
+#ifdef CONFIG_FS_ENCRYPTION
+	/* No readahead for encrypted files — decrypt in read_folio instead */
+	if (IS_ENCRYPTED(inode) && S_ISREG(inode->i_mode))
+		return;
+#endif
 
 	mutex_lock(&oi->i_extent_lock);
 	ret = ocsfs_extent_lookup(inode, logical_block, &ext);
@@ -639,12 +785,19 @@ static const struct iomap_writeback_ops ocsfs_writeback_ops = {
 static int ocsfs_writepages(struct address_space *mapping,
 			    struct writeback_control *wbc)
 {
-	struct iomap_writepage_ctx wpc = {
-		.inode = mapping->host,
+	struct inode *inode = mapping->host;
+	struct iomap_writepage_ctx wpc;
+
+#ifdef CONFIG_FS_ENCRYPTION
+	if (IS_ENCRYPTED(inode) && S_ISREG(inode->i_mode))
+		return ocsfs_enc_writepages(mapping, wbc);
+#endif
+
+	wpc = (struct iomap_writepage_ctx){
+		.inode = inode,
 		.wbc   = wbc,
 		.ops   = &ocsfs_writeback_ops,
 	};
-
 	return iomap_writepages(&wpc);
 }
 

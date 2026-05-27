@@ -15,6 +15,7 @@
 
 #include "ocsfs.h"
 #include <linux/iomap.h>
+#include <linux/fscrypt.h>
 #include <linux/fiemap.h>
 
 /* ═══════════════════════════════════════════════════════════════
@@ -258,6 +259,10 @@ const struct address_space_operations ocsfs_aops = {
 
 static int ocsfs_open(struct inode *inode, struct file *file)
 {
+	int ret = fscrypt_file_open(inode, file);
+
+	if (ret)
+		return ret;
 	return generic_file_open(inode, file);
 }
 
@@ -591,6 +596,24 @@ static long ocsfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			return -EPERM;
 		return ocsfs_vaai_xcopy(inode->i_sb,
 					(const struct ocsfs_vaai_xcopy_arg __user *)arg);
+	}
+
+	/* fscrypt key and policy management — requires CONFIG_FS_ENCRYPTION */
+	switch (cmd) {
+	case FS_IOC_SET_ENCRYPTION_POLICY:
+		return fscrypt_ioctl_set_policy(file, (const void __user *)arg);
+	case FS_IOC_GET_ENCRYPTION_POLICY_EX:
+		return fscrypt_ioctl_get_policy_ex(file, (void __user *)arg);
+	case FS_IOC_ADD_ENCRYPTION_KEY:
+		return fscrypt_ioctl_add_key(file, (void __user *)arg);
+	case FS_IOC_REMOVE_ENCRYPTION_KEY:
+		return fscrypt_ioctl_remove_key(file, (void __user *)arg);
+	case FS_IOC_REMOVE_ENCRYPTION_KEY_ALL_USERS:
+		return fscrypt_ioctl_remove_key_all_users(file, (void __user *)arg);
+	case FS_IOC_GET_ENCRYPTION_KEY_STATUS:
+		return fscrypt_ioctl_get_key_status(file, (void __user *)arg);
+	case FS_IOC_GET_ENCRYPTION_NONCE:
+		return fscrypt_ioctl_get_nonce(file, (void __user *)arg);
 	}
 
 	if (cmd != OCSFS_IOC_SNAP_CREATE)

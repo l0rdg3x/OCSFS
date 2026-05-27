@@ -91,6 +91,14 @@
  * defer EX acquisitions, providing cross-node quiescence during replay. */
 #define OCSFS_RL_REPLAY_ACTIVE      (1U << 31)
 
+/* HB summary block — one 4 KiB block, 256×16-byte entries (NUOV-ARCH-3) */
+#define OCSFS_HB_SUMMARY_OFF   (OCSFS_RECOVERY_LEADER_OFF + OCSFS_DEFAULT_BLOCK_SIZE)
+
+struct ocsfs_disk_hb_summary_entry {
+	__le64  hse_sequence;   /* last written hb_sequence */
+	__le64  hse_timestamp;  /* ktime_get_real_ns() */
+} __packed;               /* 16 bytes × 256 = 4096 bytes */
+
 struct ocsfs_disk_recovery_leader {
 	__le32  rl_magic;
 	__le16  rl_leader_slot;   /* 0xFFFF = nessun leader attivo */
@@ -180,6 +188,7 @@ enum ocsfs_cas_backend {
 #define OCSFS_FEATURE_INCOMPAT_SUPP     (OCSFS_FEATURE_INCOMPAT_LOCK_TABLE_V2 | \
 					 OCSFS_FEATURE_INCOMPAT_RC_BTREE_PER_AG)
 #define OCSFS_FEATURE_RO_COMPAT_SUPP    (OCSFS_FEATURE_RO_COMPAT_SELECTIVE_INV | \
+					 OCSFS_FEATURE_RO_COMPAT_HB_SUMMARY | \
 					 OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB)
 #define OCSFS_FEATURE_COMPAT_SUPP       0ULL
 
@@ -741,6 +750,9 @@ struct ocsfs_sb_info {
 #define OCSFS_MAX_INLINE_SYMLINK  (OCSFS_INLINE_EXTENTS * 24 - 1)
 
 /* Per-inode in-memory info — wraps struct inode */
+/* Forward declaration — full type in <linux/fscrypt.h> */
+struct fscrypt_inode_info;
+
 struct ocsfs_inode_info {
 	u64                     i_disk_ino;     /* on-disk inode number */
 	u32                     i_ag;           /* home AG */
@@ -760,6 +772,8 @@ struct ocsfs_inode_info {
 	u64                     i_xattr_block;
 	/* VFS dquot pointers — user/group/project quota */
 	struct dquot           *i_dquot[MAXQUOTAS];
+	/* fscrypt key context — NULL unless directory/file is encrypted */
+	struct fscrypt_inode_info *i_crypt_info;
 	struct inode            vfs_inode;      /* must be last */
 };
 
@@ -1231,5 +1245,10 @@ int ocsfs_vaai_xcopy(struct super_block *sb,
 
 /* flock.c — POSIX distributed file locking via on-disk DLM */
 int ocsfs_file_lock(struct file *file, int cmd, struct file_lock *fl);
+
+/* crypto.c — fscrypt integration (optional per-directory encryption) */
+#ifdef CONFIG_FS_ENCRYPTION
+extern const struct fscrypt_operations ocsfs_fscrypt_ops;
+#endif
 
 #endif /* _OCSFS_KMOD_H */

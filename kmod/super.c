@@ -356,6 +356,9 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_qcop    = &dquot_quotactl_sysfile_ops;
 	sb->dq_op     = &dquot_operations;
 	sb->s_quota_types = QTYPE_MASK_USR | QTYPE_MASK_GRP | QTYPE_MASK_PRJ;
+#ifdef CONFIG_FS_ENCRYPTION
+	sb->s_cop = &ocsfs_fscrypt_ops;
+#endif
 
 	/* Load allocation group descriptors */
 	ret = ocsfs_load_ags(sb);

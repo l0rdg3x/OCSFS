@@ -6,6 +6,7 @@
  * Large-directory B+ tree index is in dir_btree.c.
  */
 
+#include <linux/fscrypt.h>
 #include "ocsfs.h"
 #include "ocsfs_btree.h"
 
@@ -578,10 +579,32 @@ struct dentry *ocsfs_lookup(struct inode *dir, struct dentry *dentry,
 	struct inode *inode = NULL;
 	u64 ino;
 
-	if (dentry->d_name.len > OCSFS_MAX_NAME_LEN)
-		return ERR_PTR(-ENAMETOOLONG);
+	if (IS_ENCRYPTED(dir)) {
+		struct fscrypt_name fname;
+		struct qstr disk_qstr;
+		int ret;
 
-	ino = ocsfs_find_dirent(dir, &dentry->d_name, NULL);
+		ret = fscrypt_prepare_lookup(dir, dentry, &fname);
+		if (ret)
+			return ERR_PTR(ret);
+
+		if (fname.disk_name.len > OCSFS_MAX_NAME_LEN) {
+			fscrypt_fname_free_buffer(&fname.crypto_buf);
+			return ERR_PTR(-ENAMETOOLONG);
+		}
+
+		disk_qstr.name = fname.disk_name.name;
+		disk_qstr.len  = fname.disk_name.len;
+		disk_qstr.hash = 0;
+
+		ino = ocsfs_find_dirent(dir, &disk_qstr, NULL);
+		fscrypt_fname_free_buffer(&fname.crypto_buf);
+	} else {
+		if (dentry->d_name.len > OCSFS_MAX_NAME_LEN)
+			return ERR_PTR(-ENAMETOOLONG);
+		ino = ocsfs_find_dirent(dir, &dentry->d_name, NULL);
+	}
+
 	if (ino) {
 		inode = ocsfs_iget(dir->i_sb, ino);
 		if (IS_ERR(inode))

@@ -10,6 +10,7 @@
 #include <linux/posix_acl.h>
 #include <linux/fileattr.h>
 #include <linux/quotaops.h>
+#include <linux/fscrypt.h>
 #include "ocsfs.h"
 
 /* ═══════════════════════════════════════════════════════════════
@@ -465,6 +466,7 @@ void ocsfs_evict_inode(struct inode *inode)
 	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
 
+	fscrypt_put_encryption_info(inode);
 	truncate_inode_pages_final(&inode->i_data);
 
 	/*

@@ -45,6 +45,37 @@ static int heartbeat_write_timeout(struct buffer_head *bh)
 	return buffer_write_io_error(bh) ? -EIO : 0;
 }
 
+/* NUOV-ARCH-3: best-effort RMW of own slot in the HB summary block. */
+static void ocsfs_hb_summary_update(struct super_block *sb, u16 slot,
+				     u64 sequence, u64 timestamp)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	u64 block = OCSFS_HB_SUMMARY_OFF / sbi->s_block_size;
+	u32 boff  = (u32)(slot * sizeof(struct ocsfs_disk_hb_summary_entry));
+	struct buffer_head *bh;
+	struct ocsfs_disk_hb_summary_entry *hse;
+
+	if (boff + sizeof(*hse) > sbi->s_block_size)
+		return;
+
+	bh = sb_getblk(sb, block);
+	if (!bh)
+		return;
+
+	if (heartbeat_read_timeout(bh) < 0) {
+		brelse(bh);
+		return;
+	}
+
+	hse = (struct ocsfs_disk_hb_summary_entry *)(bh->b_data + boff);
+	hse->hse_sequence  = cpu_to_le64(sequence);
+	hse->hse_timestamp = cpu_to_le64(timestamp);
+
+	mark_buffer_dirty(bh);
+	heartbeat_write_timeout(bh);
+	brelse(bh);
+}
+
 /* Write this node's heartbeat entry to disk */
 int ocsfs_heartbeat_write(struct super_block *sb)
 {
@@ -52,6 +83,7 @@ int ocsfs_heartbeat_write(struct super_block *sb)
 	struct buffer_head *bh;
 	struct ocsfs_disk_heartbeat *dhb;
 	int ret;
+	u64 seq, ts;
 	u64 off = OCSFS_HEARTBEAT_OFF +
 		  (u64)sbi->s_node_slot * OCSFS_HEARTBEAT_ENTRY_SIZE;
 	u64 block = off / sbi->s_block_size;
@@ -72,20 +104,26 @@ int ocsfs_heartbeat_write(struct super_block *sb)
 
 	dhb = (struct ocsfs_disk_heartbeat *)(bh->b_data + boff);
 
-	dhb->hb_magic = cpu_to_le32(OCSFS_HEARTBEAT_MAGIC);
+	ts  = ktime_get_real_ns();
+	seq = atomic64_inc_return(&sbi->s_hb.hb_sequence);
+
+	dhb->hb_magic     = cpu_to_le32(OCSFS_HEARTBEAT_MAGIC);
 	dhb->hb_node_slot = cpu_to_le16(sbi->s_node_slot);
-	dhb->hb_state = cpu_to_le16(OCSFS_NODE_ACTIVE);
-	dhb->hb_timestamp = cpu_to_le64(ktime_get_real_ns());
-	dhb->hb_sequence = cpu_to_le64(
-		atomic64_inc_return(&sbi->s_hb.hb_sequence));
+	dhb->hb_state     = cpu_to_le16(OCSFS_NODE_ACTIVE);
+	dhb->hb_timestamp = cpu_to_le64(ts);
+	dhb->hb_sequence  = cpu_to_le64(seq);
 	dhb->hb_mount_gen = cpu_to_le32(sbi->s_mount_gen);
-	dhb->hb_checksum = cpu_to_le32(
+	dhb->hb_checksum  = cpu_to_le32(
 		ocsfs_crc32c(~0U, dhb,
 			     OCSFS_HEARTBEAT_ENTRY_SIZE - sizeof(__le32)));
 
 	mark_buffer_dirty(bh);
 	ret = heartbeat_write_timeout(bh);
 	brelse(bh);
+
+	/* NUOV-ARCH-3: update summary block so check_peers needs only 1 read */
+	if (ret == 0 && (sbi->s_feature_ro_compat & OCSFS_FEATURE_RO_COMPAT_HB_SUMMARY))
+		ocsfs_hb_summary_update(sb, sbi->s_node_slot, seq, ts);
 
 	return ret;
 }
@@ -127,6 +165,86 @@ int ocsfs_heartbeat_check_peers(struct super_block *sb)
 	struct buffer_head *cur_bh = NULL;
 	u64 cur_block = (u64)-1;
 	u16 i;
+
+	/* NUOV-ARCH-3: O(1) fast path — one summary block instead of N/4 reads */
+	if (sbi->s_feature_ro_compat & OCSFS_FEATURE_RO_COMPAT_HB_SUMMARY) {
+		u64 sum_blk = OCSFS_HB_SUMMARY_OFF / sbi->s_block_size;
+		struct buffer_head *sum_bh = sb_getblk(sb, sum_blk);
+
+		if (sum_bh && heartbeat_read_timeout(sum_bh) == 0) {
+			for (i = 0; i < sbi->s_max_nodes; i++) {
+				struct ocsfs_node_info *ni;
+				const struct ocsfs_disk_hb_summary_entry *hse;
+				u64 hb_ts;
+				u32 boff;
+
+				if (i == sbi->s_node_slot)
+					continue;
+
+				spin_lock(&sbi->s_node_lock);
+				ni = &sbi->s_nodes[i];
+				if (ni->ni_state != OCSFS_NODE_ACTIVE &&
+				    ni->ni_state != OCSFS_NODE_SUSPECTED) {
+					spin_unlock(&sbi->s_node_lock);
+					continue;
+				}
+				spin_unlock(&sbi->s_node_lock);
+
+				boff = (u32)(i * sizeof(*hse));
+				if (boff + sizeof(*hse) > sbi->s_block_size)
+					continue;
+
+				hse = (const struct ocsfs_disk_hb_summary_entry *)
+				      (sum_bh->b_data + boff);
+				hb_ts = le64_to_cpu(hse->hse_timestamp);
+
+				spin_lock(&sbi->s_node_lock);
+				ni->ni_last_hb     = hb_ts;
+				ni->ni_hb_sequence = le64_to_cpu(hse->hse_sequence);
+				spin_unlock(&sbi->s_node_lock);
+
+				if (now - hb_ts > timeout_ns) {
+					u64 confirm_ns = (u64)OCSFS_HB_CONFIRM_MS *
+							 1000000ULL;
+
+					spin_lock(&sbi->s_node_lock);
+					if (ni->ni_state == OCSFS_NODE_ACTIVE) {
+						ni->ni_state = OCSFS_NODE_SUSPECTED;
+						ni->ni_suspect_time = now;
+						spin_unlock(&sbi->s_node_lock);
+						pr_warn("ocsfs: node slot %u heartbeat stale "
+							"(%llums), marking suspected\n",
+							i,
+							(now - hb_ts) / 1000000ULL);
+					} else if (ni->ni_state == OCSFS_NODE_SUSPECTED &&
+						   (now - ni->ni_suspect_time) > confirm_ns) {
+						spin_unlock(&sbi->s_node_lock);
+						pr_warn("ocsfs: node slot %u confirmed dead "
+							"(suspected %llums ago), triggering recovery\n",
+							i,
+							(now - ni->ni_suspect_time) / 1000000ULL);
+						ocsfs_recovery_trigger(sb, i);
+					} else {
+						spin_unlock(&sbi->s_node_lock);
+					}
+				} else {
+					spin_lock(&sbi->s_node_lock);
+					if (ni->ni_state == OCSFS_NODE_SUSPECTED) {
+						ni->ni_state = OCSFS_NODE_ACTIVE;
+						ni->ni_suspect_time = 0;
+						pr_info("ocsfs: node slot %u heartbeat recovered\n",
+							i);
+					}
+					spin_unlock(&sbi->s_node_lock);
+				}
+			}
+			brelse(sum_bh);
+			goto check_recovery_leader;
+		}
+		if (sum_bh)
+			brelse(sum_bh);
+		/* summary read failed — fall through to slow path */
+	}
 
 	for (i = 0; i < sbi->s_max_nodes; i++) {
 		struct ocsfs_node_info *ni;
@@ -237,6 +355,7 @@ int ocsfs_heartbeat_check_peers(struct super_block *sb)
 	if (cur_bh)
 		brelse(cur_bh);
 
+check_recovery_leader:
 	/*
 	 * CRIT-6: probe the recovery leader block for OCSFS_RL_REPLAY_ACTIVE.
 	 * If a peer leader has set this flag, it is currently replaying a failed

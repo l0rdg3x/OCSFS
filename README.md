@@ -101,6 +101,7 @@ SCSI CAW is now implemented via BSG-direct path — no kprobe required.
 | `debugfs.c` | Debugfs instrumentation: `/sys/kernel/debug/ocsfs/<dev>/lock_table` and `journal_stats` |
 | `vaai.c` | VAAI storage offload: WRITE SAME (0x93), UNMAP (0x42), EXTENDED COPY (0x83) via BSG |
 | `flock.c` | POSIX distributed file locking: fcntl(F_SETLK) → DLM SH/EX for cross-node qcow2 HA |
+| `crypto.c` | fscrypt integration: per-directory optional encryption, context xattr, bounce-page I/O |
 | `test_lock.c` | KUnit tests: B+ tree search, dir btree threshold |
 | `test_cas.c` | KUnit tests: CAS lock protocol |
 
@@ -141,7 +142,7 @@ SCSI CAW is now implemented via BSG-direct path — no kprobe required.
 
 | Gap | Notes |
 |---|---|
-| **Encryption** | Zero code. Would require fscrypt integration. |
+| **Encryption** | Implemented: per-directory optional fscrypt (`CONFIG_FS_ENCRYPTION`). Policy managed via `FS_IOC_SET_ENCRYPTION_POLICY` / `FS_IOC_ADD_ENCRYPTION_KEY`. Data path uses bounce pages (`needs_bounce_pages=1`). Limitations: readahead disabled for encrypted files; O_DIRECT not supported on encrypted inodes; write path is buffered-only with synchronous bio submission. |
 | **Quota** | Implemented: VFS `dquot` inode quota (commit `8bc4c38`) and block quota (commit `58933a7`). CoW, snapshot, and directory/metadata blocks are not charged. |
 | **Snapshot for large files** | Resolved for V2 filesystems: `snapshot_copy_btree_extents` + per-AG refcount B+ tree (ARCH-5, commit `eb88eeb`). Returns `-EOPNOTSUPP` only on V1 volumes without `INCOMPAT_RC_BTREE_PER_AG`. |
 | **Compression write path** | Compression is applied on fsync for buffered files only. No inline compression during O_DIRECT writes. |

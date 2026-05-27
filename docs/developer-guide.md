@@ -22,6 +22,7 @@
 13. [Debugfs Instrumentation](#13-debugfs-instrumentation)
 14. [VAAI Storage Offload](#14-vaai-storage-offload)
 15. [Open Issues and Limitations](#15-open-issues-and-limitations)
+16. [Encryption (fscrypt)](#16-encryption-fscrypt)
 
 ---
 
@@ -753,7 +754,85 @@ is now the top priority.
 | Compression write path (O_DIRECT) | O_DIRECT writes are never compressed | Architectural: O_DIRECT bypasses the page cache where compression hooks live |
 | Shared mmap in cluster mode | `MAP_SHARED|PROT_WRITE` returns `-EOPNOTSUPP` | Would require distributed cache coherence — out of scope for v0.1 |
 | POSIX distributed file locking | Implemented at inode granularity (`flock.c`): `F_RDLCK`→DLM SH, `F_WRLCK`→DLM EX. Same-node byte-range semantics via `posix_lock_file`; cross-node coherence via on-disk DLM. Multiple SH holders on the same inode will serialize if any node holds EX (DLM release/re-acquire path). | — implemented |
-| Encryption | Zero implementation | Would require `fscrypt` integration |
+| Encryption | Implemented via fscrypt (`crypto.c`). Per-directory policy; bounce-page I/O. Readahead and O_DIRECT unsupported on encrypted inodes. | See §16 |
 | Quota | Implemented: `i_dquot[MAXQUOTAS]` in `ocsfs_inode_info`; inode quota via `dquot_alloc/free_inode`; block quota via `dquot_alloc/free_space_nodirty` in `ocsfs_iomap_begin` and `ocsfs_alloc_extent`. Block quota is not charged for CoW, snapshot creation, or directory/metadata blocks. | Commits `8bc4c38` (inode) + `58933a7` (block) |
 | No out-of-band STONITH | Fencing relies solely on SCSI PR | Wire Proxmox API or iDRAC as a fallback fencing agent |
 | Node table TOCTOU | Mitigated by SCSI CAW (BSG-direct, now implemented) | Full fix requires per-device PR-scoped reservation on slot claim |
+
+---
+
+## 16. Encryption (fscrypt)
+
+OCSFS supports optional per-directory encryption via the Linux fscrypt
+framework (`CONFIG_FS_ENCRYPTION=y`). Encryption is entirely opt-in: an
+unencrypted filesystem behaves identically to previous versions.
+
+### Design
+
+| Component | Implementation |
+|---|---|
+| Context storage | xattr `security.c` on the directory inode (`ocsfs_fscrypt_ops.get/set_context`) |
+| Key management | Standard fscrypt key ring: `FS_IOC_ADD_ENCRYPTION_KEY` / `FS_IOC_REMOVE_ENCRYPTION_KEY` |
+| Policy | Per-directory: `FS_IOC_SET_ENCRYPTION_POLICY` on an empty directory |
+| Data path | Bounce pages (`needs_bounce_pages=1`): encrypted read/write handled in `ocsfs_enc_read_folio()` / `ocsfs_enc_writepages()` |
+| inode_info_offs | `ptrdiff_t` offset of `i_crypt_info` relative to `vfs_inode` inside `ocsfs_inode_info` — required by the fscrypt ABI |
+
+### Enabling encryption on a directory
+
+```bash
+# Add a key to the filesystem keyring
+fscryptctl add_key /mnt/ocsfs
+
+# Set an encryption policy on an empty directory
+fscryptctl set_policy <key_identifier> /mnt/ocsfs/private
+
+# All files created inside will be encrypted automatically
+echo "hello" > /mnt/ocsfs/private/secret.txt
+```
+
+Alternatively, use `ioctl` directly:
+
+```c
+struct fscrypt_policy_v2 policy = {
+    .version            = FSCRYPT_POLICY_V2,
+    .contents_encryption_mode  = FSCRYPT_MODE_AES_256_XTS,
+    .filenames_encryption_mode = FSCRYPT_MODE_AES_256_CTS,
+    .flags              = 0,
+};
+memcpy(policy.master_key_identifier, key_id, FSCRYPT_KEY_IDENTIFIER_SIZE);
+ioctl(dirfd, FS_IOC_SET_ENCRYPTION_POLICY, &policy);
+```
+
+### Supported ioctls
+
+| ioctl | Description |
+|---|---|
+| `FS_IOC_SET_ENCRYPTION_POLICY` | Set per-directory encryption policy |
+| `FS_IOC_GET_ENCRYPTION_POLICY_EX` | Read current policy |
+| `FS_IOC_ADD_ENCRYPTION_KEY` | Add a master key to the filesystem |
+| `FS_IOC_REMOVE_ENCRYPTION_KEY` | Remove a master key (current user) |
+| `FS_IOC_REMOVE_ENCRYPTION_KEY_ALL_USERS` | Remove a master key (all users, requires `CAP_SYS_ADMIN`) |
+| `FS_IOC_GET_ENCRYPTION_KEY_STATUS` | Query key presence |
+| `FS_IOC_GET_ENCRYPTION_NONCE` | Retrieve per-inode nonce |
+
+### Data path
+
+**Read:** `ocsfs_enc_read_folio()` reads each filesystem block synchronously
+via `sb_bread()`, copies the data into the folio, zero-fills holes, then
+calls `fscrypt_decrypt_pagecache_blocks()` to decrypt the folio in-place
+before marking it uptodate.
+
+**Write:** `ocsfs_enc_writepages()` (called from `ocsfs_writepages()`)
+iterates dirty folios with `writeback_iter()`. For each folio it calls
+`fscrypt_encrypt_pagecache_blocks()` to obtain an encrypted bounce `struct page *`,
+then submits a synchronous bio via `bio_add_page()` + `submit_bio_wait()`.
+The bounce page is freed with `fscrypt_free_bounce_page()` after I/O.
+
+### Limitations
+
+| Limitation | Notes |
+|---|---|
+| No readahead | Encrypted inodes return early from `ocsfs_iomap_readahead()` — the iomap-based readahead path cannot decrypt asynchronously |
+| No O_DIRECT | O_DIRECT bypasses the page cache; bounce-page decryption requires the page cache |
+| Buffered writes only | `ocsfs_enc_writepages()` submits one synchronous bio per folio — acceptable for VM disk images, suboptimal for bulk streaming |
+| Cluster mode | Works; each node independently decrypts using the same fscrypt master key (key must be added on every node) |

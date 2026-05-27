@@ -8,6 +8,7 @@
 #include <linux/xattr.h>
 #include <linux/posix_acl.h>
 #include <linux/quotaops.h>
+#include <linux/fscrypt.h>
 #include "ocsfs.h"
 
 /* ═══════════════════════════════════════════════════════════════
@@ -354,6 +355,11 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 	if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE))
 		return -EINVAL;
 
+	ret = fscrypt_prepare_rename(old_dir, old_dentry, new_dir, new_dentry,
+				     flags);
+	if (ret)
+		return ret;
+
 	/* RENAME_NOREPLACE: fail if target already exists */
 	if ((flags & RENAME_NOREPLACE) && new_inode)
 		return -EEXIST;
@@ -661,6 +667,7 @@ int ocsfs_create(struct mnt_idmap *idmap, struct inode *dir,
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(dir->i_sb);
 	struct inode *inode;
+	bool encrypt = false;
 	int ret;
 
 	dquot_initialize(dir);
@@ -668,6 +675,10 @@ int ocsfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	inode = ocsfs_new_inode(dir, mode);
 	if (IS_ERR(inode))
 		return PTR_ERR(inode);
+
+	ret = fscrypt_prepare_new_inode(dir, inode, &encrypt);
+	if (ret)
+		goto fail;
 
 	ret = security_inode_init_security(inode, dir, &dentry->d_name,
 					   ocsfs_initxattrs, NULL);
@@ -695,6 +706,11 @@ int ocsfs_create(struct mnt_idmap *idmap, struct inode *dir,
 		goto fail;
 
 	OCSFS_I(inode)->i_flags &= ~OCSFS_IFLAG_ORPHAN;
+	if (encrypt) {
+		ret = fscrypt_set_context(inode, NULL);
+		if (ret)
+			goto fail;
+	}
 	mark_inode_dirty(inode);
 	if (OCSFS_SB(inode->i_sb)->s_clustered) {
 		struct ocsfs_inode_info *oi = OCSFS_I(inode);
@@ -720,6 +736,7 @@ struct dentry *ocsfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(dir->i_sb);
 	struct inode *inode;
+	bool encrypt = false;
 	int ret;
 
 	dquot_initialize(dir);
@@ -727,6 +744,10 @@ struct dentry *ocsfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	inode = ocsfs_new_inode(dir, S_IFDIR | mode);
 	if (IS_ERR(inode))
 		return ERR_CAST(inode);
+
+	ret = fscrypt_prepare_new_inode(dir, inode, &encrypt);
+	if (ret)
+		goto fail;
 
 	ret = security_inode_init_security(inode, dir, &dentry->d_name,
 					   ocsfs_initxattrs, NULL);
@@ -760,6 +781,11 @@ struct dentry *ocsfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	if (ret)
 		goto fail;
 	OCSFS_I(inode)->i_flags &= ~OCSFS_IFLAG_ORPHAN;
+	if (encrypt) {
+		ret = fscrypt_set_context(inode, NULL);
+		if (ret)
+			goto fail;
+	}
 	mark_inode_dirty(inode);
 	if (OCSFS_SB(inode->i_sb)->s_clustered) {
 		struct ocsfs_inode_info *oi = OCSFS_I(inode);
@@ -922,6 +948,10 @@ static int ocsfs_link(struct dentry *old_dentry, struct inode *dir,
 
 	if (S_ISDIR(inode->i_mode))
 		return -EPERM;
+
+	ret = fscrypt_prepare_link(old_dentry, dir, dentry);
+	if (ret)
+		return ret;
 
 	if (sbi->s_clustered) {
 		ret = ocsfs_lock_acquire(dir->i_sb, &oi->i_lock_res,
