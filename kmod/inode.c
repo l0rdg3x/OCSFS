@@ -173,6 +173,26 @@ struct inode *ocsfs_iget(struct super_block *sb, u64 ino)
 		return ERR_PTR(-EUCLEAN);
 	}
 
+	/* Bound-check i_size and i_dirent_count against impossible values */
+	if (inode->i_size > sb->s_maxbytes) {
+		pr_err_ratelimited("ocsfs: inode %llu: i_size %llu exceeds maxbytes\n",
+				   ino, inode->i_size);
+		if (sbi->s_clustered)
+			ocsfs_lock_release(sb, &oi->i_lock_res);
+		iget_failed(inode);
+		return ERR_PTR(-EUCLEAN);
+	}
+	if (S_ISDIR(inode->i_mode) && inode->i_size > 0 &&
+	    oi->i_dirent_count > div64_u64(inode->i_size, OCSFS_DIRENT_SIZE) + 2) {
+		pr_err_ratelimited("ocsfs: inode %llu: i_dirent_count %u "
+				   "inconsistent with i_size %llu\n",
+				   ino, oi->i_dirent_count, inode->i_size);
+		if (sbi->s_clustered)
+			ocsfs_lock_release(sb, &oi->i_lock_res);
+		iget_failed(inode);
+		return ERR_PTR(-EUCLEAN);
+	}
+
 	/* Set up operations based on file type */
 	if (S_ISREG(inode->i_mode)) {
 		inode->i_op = &ocsfs_file_inode_ops;

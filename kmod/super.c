@@ -96,6 +96,50 @@ static int ocsfs_validate_super(struct ocsfs_disk_super *ds,
 		       le64_to_cpu(ds->s_ag_size));
 		return -EINVAL;
 	}
+	{
+		u64 bdev_size = bdev_nr_bytes(sb->s_bdev);
+		u64 blk       = le32_to_cpu(ds->s_block_size);
+		u64 n_nodes   = le16_to_cpu(ds->s_max_nodes);
+		u64 j_size    = (u64)le32_to_cpu(ds->s_journal_size);
+		u64 j_off     = le64_to_cpu(ds->s_journal_off);
+		u64 ag_off    = le64_to_cpu(ds->s_ag_desc_off);
+		u64 data_off  = le64_to_cpu(ds->s_data_off);
+		u64 total     = le64_to_cpu(ds->s_total_blocks);
+		u64 ag_count  = le32_to_cpu(ds->s_ag_count);
+
+		if (bdev_size > 0) {
+			/* journal must not overlap superblock */
+			if (j_off < blk) {
+				pr_err("ocsfs: s_journal_off (%llu) overlaps superblock\n", j_off);
+				return -EINVAL;
+			}
+			/* per-node journal regions must fit in device */
+			if (j_size == 0 || j_off + n_nodes * j_size > bdev_size) {
+				pr_err("ocsfs: journal layout exceeds device size\n");
+				return -EINVAL;
+			}
+			/* AG descriptor area must come after journal */
+			if (ag_off < j_off + n_nodes * j_size) {
+				pr_err("ocsfs: s_ag_desc_off (%llu) overlaps journal\n", ag_off);
+				return -EINVAL;
+			}
+			/* AG descriptor area size */
+			if (ag_off + ag_count * sizeof(struct ocsfs_disk_ag) > bdev_size) {
+				pr_err("ocsfs: AG descriptor area exceeds device size\n");
+				return -EINVAL;
+			}
+			/* data area */
+			if (data_off <= ag_off || data_off >= bdev_size) {
+				pr_err("ocsfs: s_data_off (%llu) is out of range\n", data_off);
+				return -EINVAL;
+			}
+			/* total block count */
+			if (total == 0 || total * blk > bdev_size) {
+				pr_err("ocsfs: s_total_blocks (%llu) exceeds device size\n", total);
+				return -EINVAL;
+			}
+		}
+	}
 	return 0;
 }
 
@@ -134,6 +178,19 @@ static int ocsfs_load_ags(struct super_block *sb)
 			kvfree(sbi->s_ags);
 			sbi->s_ags = NULL;
 			return -EINVAL;
+		}
+
+		{
+			u32 ag_crc = ocsfs_crc32c(~0U, dag,
+					offsetof(struct ocsfs_disk_ag, ag_checksum));
+			if (ag_crc != le32_to_cpu(dag->ag_checksum)) {
+				pr_err("ocsfs: AG %u checksum mismatch (disk=%08x calc=%08x)\n",
+				       i, le32_to_cpu(dag->ag_checksum), ag_crc);
+				brelse(bh);
+				kvfree(sbi->s_ags);
+				sbi->s_ags = NULL;
+				return -EINVAL;
+			}
 		}
 
 		ag->ag_no = i;
@@ -405,6 +462,8 @@ int ocsfs_sync_fs(struct super_block *sb, int wait)
 		mutex_lock(&ag->ag_lock);
 		dag->ag_free_blocks = cpu_to_le64(ag->free_blocks);
 		dag->ag_free_inodes = cpu_to_le64(ag->free_inodes);
+		dag->ag_checksum = cpu_to_le32(
+			ocsfs_crc32c(~0U, dag, offsetof(struct ocsfs_disk_ag, ag_checksum)));
 		mutex_unlock(&ag->ag_lock);
 		mark_buffer_dirty(bh);
 		sync_dirty_buffer(bh);

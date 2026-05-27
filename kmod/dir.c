@@ -86,6 +86,20 @@ static int ocsfs_dir_foreach(struct inode *dir,
 			if (de->de_name_len == 0)
 				continue;
 
+			/* Verify checksum (skip if zero = legacy dirent without checksum) */
+			if (le16_to_cpu(de->de_checksum) != 0) {
+				u16 expected = (u16)ocsfs_crc32c(
+					~0U, de, offsetof(struct ocsfs_disk_dirent, de_checksum));
+				if (le16_to_cpu(de->de_checksum) != expected) {
+					pr_warn_ratelimited(
+						"ocsfs: dir ino %llu block %llu off %u: "
+						"dirent checksum mismatch (disk=%04x calc=%04x), skipping\n",
+						(u64)dir->i_ino, b, off,
+						le16_to_cpu(de->de_checksum), expected);
+					continue;
+				}
+			}
+
 			ret = actor(de, b, off, priv);
 			if (ret) {
 				brelse(bh);
@@ -178,6 +192,9 @@ int __ocsfs_add_dirent(struct inode *dir, const struct qstr *name,
 	u64 b; u32 off = 0;
 	int ret = 0;
 
+	if (!name->len || name->len > OCSFS_MAX_NAME_LEN)
+		return -ENAMETOOLONG;
+
 	/* Scan for a free slot in existing blocks */
 	for (b = 0; b < dir_blocks; b++) {
 		bh = ocsfs_dir_bread(dir, b);
@@ -252,6 +269,12 @@ fill:
 		memset(de->de_name, 0, OCSFS_MAX_NAME_LEN + 1);
 		memcpy(de->de_name, name->name, name->len);
 		de->de_rec_len = cpu_to_le16(OCSFS_DIRENT_SIZE);
+
+		de->de_name_hash = cpu_to_le64(
+			ocsfs_crc32c(~0U, name->name, name->len));
+		de->de_checksum  = 0;
+		de->de_checksum  = cpu_to_le16((u16)ocsfs_crc32c(
+			~0U, de, offsetof(struct ocsfs_disk_dirent, de_checksum)));
 
 		brelse(bh);
 		bh = NULL;

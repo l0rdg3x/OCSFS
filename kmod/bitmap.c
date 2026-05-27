@@ -588,9 +588,20 @@ int ocsfs_orphan_scan(struct super_block *sb)
 			u32 boff  = off % sbi->s_block_size;
 			struct ocsfs_disk_inode *di;
 
-			bh = sb_bread(sb, block);
-			if (!bh)
-				continue;
+			if (sbi->s_clustered) {
+				bh = sb_getblk(sb, block);
+				if (!bh)
+					continue;
+				clear_buffer_uptodate(bh);
+				if (bh_read(bh, 0) < 0) {
+					brelse(bh);
+					continue;
+				}
+			} else {
+				bh = sb_bread(sb, block);
+				if (!bh)
+					continue;
+			}
 
 			di = (struct ocsfs_disk_inode *)(bh->b_data + boff);
 

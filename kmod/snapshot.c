@@ -225,6 +225,7 @@ int ocsfs_snapshot_create(struct inode *src, struct inode *dir,
 							   NULL);
 				}
 				snap_oi->i_extent_count = 0;
+				memset(snap_oi->i_extents, 0, sizeof(snap_oi->i_extents));
 				break;
 			}
 		}

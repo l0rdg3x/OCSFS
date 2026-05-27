@@ -315,6 +315,8 @@ int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block)
 	if (ret)
 		return ret;
 
+	u64 saved_blocks = inode->i_blocks;
+
 	txn = ocsfs_txn_begin(sb);
 	if (IS_ERR(txn))
 		return PTR_ERR(txn);
@@ -392,6 +394,7 @@ int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block)
 	return ret;
 
 abort:
+	inode->i_blocks = saved_blocks;
 	ocsfs_txn_abort(txn);
 	return ret;
 }
@@ -507,6 +510,8 @@ int ocsfs_extent_btree_replace(struct inode *inode,
 	if (ret)
 		return ret;
 
+	u64 saved_root = oi->i_extent_tree_root;
+
 	txn = ocsfs_txn_begin(inode->i_sb);
 	if (IS_ERR(txn))
 		return PTR_ERR(txn);
@@ -553,6 +558,7 @@ int ocsfs_extent_btree_replace(struct inode *inode,
 	return ret;
 
 abort:
+	oi->i_extent_tree_root = saved_root;
 	ocsfs_txn_abort(txn);
 	return ret;
 }

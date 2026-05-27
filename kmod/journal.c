@@ -244,6 +244,13 @@ static int journal_sync(struct super_block *sb, struct ocsfs_journal *j)
  * TRANSACTION API
  * ═══════════════════════════════════════════════════════════════ */
 
+/* Minimum number of blocks a txn must be able to accommodate.
+ * A typical OCSFS operation touches inode + dir block + bitmap + AG desc
+ * (4–8 blocks); 16 gives comfortable headroom for BEFORE+AFTER images plus
+ * the BEGIN/COMMIT records, without wasting excessive journal space.
+ */
+#define OCSFS_TXN_MIN_BLOCKS  16
+
 struct ocsfs_txn *ocsfs_txn_begin(struct super_block *sb)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
@@ -271,8 +278,8 @@ struct ocsfs_txn *ocsfs_txn_begin(struct super_block *sb)
 	journal_data_size = j->size - journal_start;
 	used              = j->head - j->tail;
 	min_space = (u64)sizeof(struct ocsfs_disk_journal_txn) * 2 +
-		    (u64)sizeof(struct ocsfs_disk_journal_bref) * 2 +
-		    (u64)sb->s_blocksize * 2;
+		    (u64)sizeof(struct ocsfs_disk_journal_bref) * OCSFS_TXN_MIN_BLOCKS +
+		    (u64)sb->s_blocksize * OCSFS_TXN_MIN_BLOCKS;
 	if (used + min_space > journal_data_size) {
 		mutex_unlock(&j->j_lock);
 		kfree(txn);
@@ -362,11 +369,29 @@ int ocsfs_txn_add_bh(struct ocsfs_txn *txn, struct buffer_head *bh)
 	bref.jbr_checksum  = cpu_to_le32(
 		ocsfs_crc32c(~0U, bh->b_data, bh->b_size));
 
-	ret = journal_write(sb, j, &bref, sizeof(bref));
-	if (ret)
-		return ret;
+	{
+		u64 saved_head = j->head;
 
-	return journal_write(sb, j, bh->b_data, bh->b_size);
+		ret = journal_write(sb, j, &bref, sizeof(bref));
+		if (ret)
+			goto undo_tb;
+
+		ret = journal_write(sb, j, bh->b_data, bh->b_size);
+		if (ret)
+			goto undo_tb;
+
+		return 0;
+
+undo_tb:
+		j->head = saved_head;
+		list_del(&tb->list);
+		txn->t_nr_blocks--;
+		kfree(tb->before_buf);
+		kfree(tb->after_buf);
+		put_bh(bh);
+		kfree(tb);
+		return ret;
+	}
 }
 
 int ocsfs_txn_commit(struct ocsfs_txn *txn)

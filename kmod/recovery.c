@@ -238,6 +238,44 @@ int ocsfs_recovery_run(struct super_block *sb, u16 failed_slot)
 			"continuing without hardware isolation\n", ret);
 
 	/*
+	 * Degraded safety check: if we have no hardware fence, re-read the
+	 * superblock and verify s_last_mount_time has not changed since we
+	 * started recovery. A changed timestamp means another node (possibly
+	 * the "dead" one) has written to the device — abort to prevent
+	 * split-brain.
+	 */
+	if (!sbi->s_pr_capable) {
+		struct buffer_head *sb_bh;
+		struct ocsfs_disk_super *sb_ds;
+		u64 current_mount_time;
+
+		sb_bh = sb_getblk(sb, 0);
+		if (sb_bh) {
+			clear_buffer_uptodate(sb_bh);
+			if (bh_read(sb_bh, 0) == 0) {
+				sb_ds = (struct ocsfs_disk_super *)sb_bh->b_data;
+				current_mount_time = le64_to_cpu(sb_ds->s_last_mount_time);
+				if (current_mount_time != le64_to_cpu(sbi->s_ds->s_last_mount_time)) {
+					pr_err("ocsfs: degraded recovery: superblock mount time "
+					       "changed during recovery (another node may be alive) — "
+					       "aborting to prevent split-brain\n");
+					brelse(sb_bh);
+					sb->s_flags |= SB_RDONLY;
+					ocsfs_node_mark_dead(sb, failed_slot);
+					ocsfs_recovery_leader_release(sb, failed_slot, leader_epoch);
+					sbi->s_recovery_in_progress = false;
+					mutex_unlock(&sbi->s_recovery_lock);
+					return -EPERM;
+				}
+			}
+			brelse(sb_bh);
+		} else {
+			pr_warn("ocsfs: degraded recovery: cannot re-read superblock, "
+				"proceeding without mount-time check\n");
+		}
+	}
+
+	/*
 	 * Phase 3 — Journal Replay
 	 *
 	 * Set s_recovery_barrier while replaying AFTER-images so that survivor
