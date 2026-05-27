@@ -571,7 +571,16 @@ static int ocsfs_enc_read_folio(struct file *file, struct folio *folio)
 {
 	struct inode *inode = folio->mapping->host;
 	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
+	struct ocsfs_inode_info *oi_r = OCSFS_I(inode);
 	loff_t file_pos = folio_pos(folio);
+
+	/* In cluster mode enc_read_folio must be called with at least DLM SH.
+	 * Paths like splice_read or userfaultfd may arrive without it, leading
+	 * to a stale extent map.  Warn so the call site can be audited. */
+	WARN_ONCE(sbi->s_clustered &&
+		  oi_r->i_lock_res.lr_mode < OCSFS_LOCK_SH,
+		  "ocsfs: enc_read_folio without DLM SH (ino=%lu)\n",
+		  inode->i_ino);
 	size_t folio_sz = folio_size(folio);
 	size_t done = 0;
 	int ret = 0;
@@ -623,8 +632,17 @@ static int ocsfs_enc_writepages(struct address_space *mapping,
 {
 	struct inode *inode = mapping->host;
 	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
+	struct ocsfs_inode_info *oi = OCSFS_I(inode);
 	struct folio *folio = NULL;
 	int ret = 0;
+
+	/* Background writeback (kswapd, bdi_writeback) does not hold DLM EX.
+	 * In cluster mode, writing encrypted data without EX can clobber blocks
+	 * reallocated to another inode.  Skip — ocsfs_file_write_iter calls
+	 * filemap_write_and_wait() under DLM EX, so all dirty pages are flushed
+	 * synchronously before the lock is released. */
+	if (sbi->s_clustered && oi->i_lock_res.lr_mode != OCSFS_LOCK_EX)
+		return 0;
 
 	while ((folio = writeback_iter(mapping, wbc, folio, &ret))) {
 		loff_t pos = folio_pos(folio);

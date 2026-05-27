@@ -754,7 +754,7 @@ is now the top priority.
 | Compression write path (O_DIRECT) | O_DIRECT writes are never compressed | Architectural: O_DIRECT bypasses the page cache where compression hooks live |
 | Shared mmap in cluster mode | `MAP_SHARED|PROT_WRITE` returns `-EOPNOTSUPP` | Would require distributed cache coherence — out of scope for v0.1 |
 | POSIX distributed file locking | Implemented at inode granularity (`flock.c`): `F_RDLCK`→DLM SH, `F_WRLCK`→DLM EX. Same-node byte-range semantics via `posix_lock_file`; cross-node coherence via on-disk DLM. Multiple SH holders on the same inode will serialize if any node holds EX (DLM release/re-acquire path). | — implemented |
-| Encryption | Implemented via fscrypt (`crypto.c`). Per-directory policy; bounce-page I/O. Readahead and O_DIRECT unsupported on encrypted inodes. | See §16 |
+| Encryption | Implemented via fscrypt (`crypto.c`). Per-directory policy; bounce-page I/O. Cluster-safe write path (Sprint A). Reflink/snapshot/symlinks in encrypted dirs return `-EOPNOTSUPP`. Node-local keys (ARCH-V3-1 open). | See §16 |
 | Quota | Implemented: `i_dquot[MAXQUOTAS]` in `ocsfs_inode_info`; inode quota via `dquot_alloc/free_inode`; block quota via `dquot_alloc/free_space_nodirty` in `ocsfs_iomap_begin` and `ocsfs_alloc_extent`. Block quota is not charged for CoW, snapshot creation, or directory/metadata blocks. | Commits `8bc4c38` (inode) + `58933a7` (block) |
 | No out-of-band STONITH | Fencing relies solely on SCSI PR | Wire Proxmox API or iDRAC as a fallback fencing agent |
 | Node table TOCTOU | Mitigated by SCSI CAW (BSG-direct, now implemented) | Full fix requires per-device PR-scoped reservation on slot claim |
@@ -828,6 +828,22 @@ iterates dirty folios with `writeback_iter()`. For each folio it calls
 then submits a synchronous bio via `bio_add_page()` + `submit_bio_wait()`.
 The bounce page is freed with `fscrypt_free_bounce_page()` after I/O.
 
+### Cluster safety (Sprint A — 2026-05-28)
+
+The following correctness issues identified in the Opus v3 review have been fixed:
+
+| Issue | Fix |
+|---|---|
+| Async writeback without DLM EX (CRIT-V3-1) | `ocsfs_enc_writepages()` skips early if `lr_mode != OCSFS_LOCK_EX`. Background writeback (kswapd, bdi_writeback) is a no-op; `ocsfs_file_write_iter()` flushes dirty pages under DLM EX via `filemap_write_and_wait()` before releasing. |
+| Reflink of encrypted file (CRIT-V3-5) | `ocsfs_remap_file_range()` returns `-EOPNOTSUPP` if either source or destination is encrypted. Sharing physical blocks with different fscrypt IVs produces unreadable ciphertext. |
+| Snapshot of encrypted file (CRIT-V3-6) | `ocsfs_snapshot_create()` returns `-EOPNOTSUPP` for encrypted inodes. The snapshot inode has a different `i_ino`, so fscrypt derives a different IV and reads produce garbage. |
+| Symlinks in encrypted directories (CRIT-V3-7) | `ocsfs_symlink()` returns `-EOPNOTSUPP` if the parent directory is encrypted (`fscrypt_get_symlink` plumbing not yet implemented). `ocsfs_iget()` no longer loads inline ciphertext as a plaintext symlink target for encrypted inodes. |
+| `fscrypt_set_context` after `add_dirent` (ALTO-V3-7) | In `ocsfs_create()` and `ocsfs_mkdir()`, the encryption context is now persisted and flushed to disk **before** the directory entry is added to the parent. This closes the window where a peer node could see the new inode without a crypto context and write plaintext. |
+| `i_crypt_info` not reset on slab reuse (ALTO-V3-1) | `ocsfs_alloc_inode()` now initialises `oi->i_crypt_info = NULL`. |
+| `enc_read_folio` without DLM SH (ALTO-V3-6) | Added `WARN_ONCE` in `ocsfs_enc_read_folio()` to surface call sites (splice_read, userfaultfd) that arrive without DLM SH in cluster mode. |
+
+**Architectural gap (ARCH-V3-1, not yet fixed):** fscrypt keys are node-local. A node that has not added the master key will write plaintext to files that other nodes encrypted. `FS_IOC_ADD_ENCRYPTION_KEY` emits a `pr_warn_once` reminding operators to add the key on all cluster nodes. A cluster-wide key propagation protocol requires dedicated engineering effort.
+
 ### Limitations
 
 | Limitation | Notes |
@@ -835,4 +851,6 @@ The bounce page is freed with `fscrypt_free_bounce_page()` after I/O.
 | No readahead | Encrypted inodes return early from `ocsfs_iomap_readahead()` — the iomap-based readahead path cannot decrypt asynchronously |
 | No O_DIRECT | O_DIRECT bypasses the page cache; bounce-page decryption requires the page cache |
 | Buffered writes only | `ocsfs_enc_writepages()` submits one synchronous bio per folio — acceptable for VM disk images, suboptimal for bulk streaming |
-| Cluster mode | Works; each node independently decrypts using the same fscrypt master key (key must be added on every node) |
+| No reflink / snapshot | Both operations return `-EOPNOTSUPP` on encrypted inodes (see cluster safety above) |
+| No symlinks in encrypted dirs | Returns `-EOPNOTSUPP` until `fscrypt_get_symlink` is wired up |
+| Node-local keys | Key must be added independently on each cluster node (`FS_IOC_ADD_ENCRYPTION_KEY`); warns at runtime if in cluster mode |

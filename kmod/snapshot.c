@@ -148,6 +148,11 @@ int ocsfs_snapshot_create(struct inode *src, struct inode *dir,
 	if (!S_ISREG(src->i_mode))
 		return -EINVAL;
 
+	/* Snapshot shares physical blocks but the snapshot inode has a different
+	 * i_ino, so fscrypt derives a different IV → read returns garbage. */
+	if (IS_ENCRYPTED(src))
+		return -EOPNOTSUPP;
+
 	/* Create the snapshot inode */
 	snap = ocsfs_new_inode(dir, src->i_mode);
 	if (IS_ERR(snap))

@@ -699,12 +699,10 @@ int ocsfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	if (ret)
 		goto fail;
 
-	ret = ocsfs_add_dirent(dir, &dentry->d_name,
-			       OCSFS_I(inode)->i_disk_ino,
-			       ocsfs_mode_to_ft(mode));
-	if (ret)
-		goto fail;
-
+	/* Persist encryption context and flush inode to disk BEFORE adding the
+	 * dirent to the parent directory.  If set_context runs after add_dirent,
+	 * a peer node can see the new dirent and open the inode while it still
+	 * lacks a crypto context, causing it to write plaintext. */
 	OCSFS_I(inode)->i_flags &= ~OCSFS_IFLAG_ORPHAN;
 	if (encrypt) {
 		ret = fscrypt_set_context(inode, NULL);
@@ -722,6 +720,13 @@ int ocsfs_create(struct mnt_idmap *idmap, struct inode *dir,
 			ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
 		}
 	}
+
+	ret = ocsfs_add_dirent(dir, &dentry->d_name,
+			       OCSFS_I(inode)->i_disk_ino,
+			       ocsfs_mode_to_ft(mode));
+	if (ret)
+		goto fail;
+
 	d_instantiate(dentry, inode);
 	return 0;
 
@@ -776,10 +781,8 @@ struct dentry *ocsfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	if (ret)
 		goto fail;
 
-	ret = ocsfs_add_dirent(dir, &dentry->d_name,
-			       OCSFS_I(inode)->i_disk_ino, OCSFS_FT_DIR);
-	if (ret)
-		goto fail;
+	/* Same ordering requirement as ocsfs_create: persist encryption context
+	 * before the parent dirent becomes visible to peer nodes. */
 	OCSFS_I(inode)->i_flags &= ~OCSFS_IFLAG_ORPHAN;
 	if (encrypt) {
 		ret = fscrypt_set_context(inode, NULL);
@@ -798,6 +801,12 @@ struct dentry *ocsfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 			ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
 		}
 	}
+
+	ret = ocsfs_add_dirent(dir, &dentry->d_name,
+			       OCSFS_I(inode)->i_disk_ino, OCSFS_FT_DIR);
+	if (ret)
+		goto fail;
+
 	inc_nlink(dir);
 	mark_inode_dirty(dir);
 	d_instantiate(dentry, inode);
@@ -823,6 +832,12 @@ static int ocsfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 
 	if (slen > OCSFS_MAX_INLINE_SYMLINK)
 		return -ENAMETOOLONG;
+
+	/* fscrypt symlink support requires fscrypt_get_symlink() plumbing which
+	 * OCSFS does not implement; without it the ciphertext is exposed as the
+	 * link target.  Refuse until proper support is added. */
+	if (IS_ENCRYPTED(dir))
+		return -EOPNOTSUPP;
 
 	dquot_initialize(dir);
 

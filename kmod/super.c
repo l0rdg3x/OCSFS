@@ -39,6 +39,7 @@ static struct inode *ocsfs_alloc_inode(struct super_block *sb)
 	oi->i_symlink    = NULL;
 	oi->i_xattr_block = 0;
 	oi->i_last_writer_slot = OCSFS_INVALID_WRITER_SLOT;
+	oi->i_crypt_info = NULL;
 
 	return &oi->vfs_inode;
 }

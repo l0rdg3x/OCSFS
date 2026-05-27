@@ -409,6 +409,11 @@ static loff_t ocsfs_remap_file_range(struct file *src_file, loff_t pos_in,
 	if (remap_flags & ~REMAP_FILE_CAN_SHORTEN)
 		return -EINVAL;
 
+	/* Sharing physical blocks between files with different fscrypt IVs
+	 * (different ino or key) produces unreadable ciphertext. */
+	if (IS_ENCRYPTED(src) || IS_ENCRYPTED(dst))
+		return -EOPNOTSUPP;
+
 	lock_two_nondirectories(src, dst);
 
 	if (sbi->s_clustered) {
@@ -605,6 +610,14 @@ static long ocsfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case FS_IOC_GET_ENCRYPTION_POLICY_EX:
 		return fscrypt_ioctl_get_policy_ex(file, (void __user *)arg);
 	case FS_IOC_ADD_ENCRYPTION_KEY:
+		/* fscrypt keys are local to each node.  In cluster mode every
+		 * node that may access encrypted files MUST add the key
+		 * independently; there is no cluster-wide key propagation
+		 * (ARCH-V3-1).  A node without the key will write plaintext. */
+		if (OCSFS_SB(file_inode(file)->i_sb)->s_clustered)
+			pr_warn_once("ocsfs: encryption key added on one node only — "
+				     "add the key on all cluster nodes to prevent "
+				     "plaintext writes (ARCH-V3-1)\n");
 		return fscrypt_ioctl_add_key(file, (void __user *)arg);
 	case FS_IOC_REMOVE_ENCRYPTION_KEY:
 		return fscrypt_ioctl_remove_key(file, (void __user *)arg);

@@ -208,7 +208,11 @@ struct inode *ocsfs_iget(struct super_block *sb, u64 ino)
 		size_t slen = inode->i_size;
 
 		oi->i_symlink = NULL;
-		if (slen > 0 && slen <= OCSFS_MAX_INLINE_SYMLINK) {
+		/* Never load inline data as a plaintext symlink target for
+		 * inodes in an encrypted directory — the stored bytes are
+		 * ciphertext and would be exposed as-is via get_link. */
+		if (!IS_ENCRYPTED(inode) &&
+		    slen > 0 && slen <= OCSFS_MAX_INLINE_SYMLINK) {
 			oi->i_symlink = kmalloc(slen + 1, GFP_KERNEL);
 			if (!oi->i_symlink) {
 				if (sbi->s_clustered)

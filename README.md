@@ -17,20 +17,23 @@ Proxmox VE as an open alternative to VMware VMFS.
 
 ---
 
-## Production Readiness (as of 2026-05-27)
+## Production Readiness (as of 2026-05-28)
 
 | Scenario | Score |
 |---|---|
 | Single-node read/write | ~92% |
 | Multi-node — no crashes | ~88% |
 | Multi-node — crash + recovery | ~78% |
+| Multi-node — with encryption (Sprint A) | ~78% |
 | VMFS feature parity | ~72% |
 
-The main gap keeping the cluster score below 90% is the absence of
-real-hardware integration testing (xfstests on a multi-node testbed).
-All other known correctness, security, and performance issues from the
-Opus v2 review have been addressed. SCSI CAW is implemented via
-BSG-direct — no kprobe required.
+Sprint A (encryption cluster safety, Opus v3 review) addressed the main
+fscrypt correctness issues in cluster mode: async writeback without DLM
+EX, reflink/snapshot of encrypted files, symlinks in encrypted
+directories, and the create/mkdir ordering window. SCSI CAW is
+implemented via BSG-direct — no kprobe required. The remaining gap to
+90%+ is real-hardware integration testing (xfstests on a multi-node
+testbed).
 
 ---
 
@@ -144,7 +147,7 @@ BSG-direct — no kprobe required.
 
 | Gap | Notes |
 |---|---|
-| **Encryption** | Implemented: per-directory optional fscrypt (`CONFIG_FS_ENCRYPTION`). Policy managed via `FS_IOC_SET_ENCRYPTION_POLICY` / `FS_IOC_ADD_ENCRYPTION_KEY`. Data path uses bounce pages (`needs_bounce_pages=1`). Limitations: readahead disabled for encrypted files; O_DIRECT not supported on encrypted inodes; write path is buffered-only with synchronous bio submission. |
+| **Encryption** | Implemented: per-directory optional fscrypt (`CONFIG_FS_ENCRYPTION`). Policy managed via `FS_IOC_SET_ENCRYPTION_POLICY` / `FS_IOC_ADD_ENCRYPTION_KEY`. Data path uses bounce pages (`needs_bounce_pages=1`). Cluster safety: encrypted writeback is gated on DLM EX; reflink and snapshot of encrypted files return `-EOPNOTSUPP`; symlinks in encrypted directories return `-EOPNOTSUPP`. **Architectural gap**: fscrypt keys are node-local — every cluster node must independently add the key (warned at runtime via `pr_warn_once`). Remaining limitations: readahead disabled; O_DIRECT not supported; no cluster-wide key propagation protocol. |
 | **Quota** | Implemented: VFS `dquot` inode quota (commit `8bc4c38`) and block quota (commit `58933a7`). CoW, snapshot, and directory/metadata blocks are not charged. |
 | **Snapshot for large files** | Resolved for V2 filesystems: `snapshot_copy_btree_extents` + per-AG refcount B+ tree (ARCH-5, commit `eb88eeb`). Returns `-EOPNOTSUPP` only on V1 volumes without `INCOMPAT_RC_BTREE_PER_AG`. |
 | **Compression write path** | Compression is applied on fsync for buffered files only. No inline compression during O_DIRECT writes. |
