@@ -95,6 +95,11 @@
 #define OCSFS_FEAT_MULTI_LUN    (1ULL << 5)
 #define OCSFS_FEAT_AUTH         (1ULL << 6)
 
+/* V2 on-disk format feature bits (ARCH-1) */
+#define OCSFS_FEATURE_INCOMPAT_LOCK_TABLE_V2    (1ULL << 0)
+#define OCSFS_FEATURE_INCOMPAT_RC_BTREE_PER_AG  (1ULL << 1)
+#define OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB     (1ULL << 0)
+
 /* ═══════════════════════════════════════════════════════════════
  * NODE SLOT STATES
  * ═══════════════════════════════════════════════════════════════ */
@@ -196,7 +201,12 @@ struct ocsfs_superblock {
     uint64_t    s_mkfs_time;        /* creation timestamp (ns) */
     uint64_t    s_mount_count;      /* total mount count */
     uint64_t    s_last_mount_time;  /* last mount timestamp (ns) */
-    uint8_t     s_reserved[3890];   /* pad to 4096 bytes */
+    uint32_t    s_revision_level;    /* 0 = legacy; 1 = V2 format */
+    uint64_t    s_feature_compat;
+    uint64_t    s_feature_incompat;
+    uint64_t    s_feature_ro_compat;
+    uint32_t    s_lock_primary_count; /* 0 = use legacy 4096 */
+    uint8_t     s_reserved[3858];    /* was 3890; 32 bytes carved for V2 fields */
     uint32_t    s_checksum;         /* CRC32C of bytes 0..4091 */
 } __attribute__((packed));
 
@@ -256,7 +266,11 @@ struct ocsfs_lock_entry {
     uint8_t     le_waiters[32];     /* bitmask: waiting node slots */
     uint8_t     le_waiter_modes[64]; /* requested mode per waiter (packed 2 bits each) */
     uint32_t    le_version;         /* CAS version for atomicity */
-    uint8_t     le_reserved[84];    /* pad to 256 bytes */
+    uint64_t    le_inv_lo;           /* ARCH-7: dirty range start (bytes) */
+    uint64_t    le_inv_hi;           /* ARCH-7: dirty range end (bytes) */
+    uint32_t    le_inv_epoch;        /* ARCH-7: bumped on EX release */
+    uint64_t    le_overflow_block;   /* ARCH-2: overflow chain block (0 = none) */
+    uint8_t     le_reserved[56];     /* was 84; 28 bytes carved */
     uint32_t    le_checksum;        /* CRC32C */
 } __attribute__((packed));
 
@@ -329,7 +343,8 @@ struct ocsfs_ag_desc {
     uint64_t    ag_inode_btree_off; /* byte offset to inode B+ tree root */
     uint16_t    ag_owner_node;      /* preferred (home) node for this AG */
     uint16_t    ag_flags;
-    uint8_t     ag_reserved[3992];  /* pad to 4096 bytes */
+    uint64_t    ag_rc_btree_root;    /* ARCH-5: B+ tree root block for refcount (0 = empty) */
+    uint8_t     ag_reserved[3984];  /* was 3992 */
     uint32_t    ag_checksum;        /* CRC32C */
 } __attribute__((packed));
 

@@ -37,6 +37,15 @@ static void read_at(int fd, uint64_t offset, void *buf, size_t len)
     }
 }
 
+static void write_at(int fd, uint64_t offset, const void *buf, size_t len)
+{
+    if (pwrite(fd, buf, len, offset) != (ssize_t)len) {
+        fprintf(stderr, "ocsfs-tool: write error at offset %lu: %s\n",
+                (unsigned long)offset, strerror(errno));
+        exit(1);
+    }
+}
+
 static struct ocsfs_superblock read_superblock(int fd, int mirror)
 {
     struct ocsfs_superblock sb;
@@ -435,6 +444,39 @@ static void cmd_check(int fd)
     printf("\n");
 }
 
+static int cmd_tune(int fd, int argc, char **argv)
+{
+    if (argc < 2 || strcmp(argv[1], "--upgrade") != 0) {
+        fprintf(stderr, "Usage: ocsfs-tool tune <device> --upgrade\n");
+        return 1;
+    }
+
+    struct ocsfs_superblock sb = read_superblock(fd, 0);
+
+    if (sb.s_revision_level >= 1) {
+        printf("Volume is already V2 (revision_level=%u), nothing to do.\n",
+               sb.s_revision_level);
+        return 0;
+    }
+
+    /* Apply V2 fields */
+    sb.s_revision_level    = 1;
+    sb.s_feature_incompat |= OCSFS_FEATURE_INCOMPAT_LOCK_TABLE_V2 |
+                              OCSFS_FEATURE_INCOMPAT_RC_BTREE_PER_AG;
+    sb.s_feature_ro_compat|= OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB;
+    sb.s_lock_primary_count = OCSFS_LOCK_ENTRY_COUNT;
+
+    /* Recompute checksum */
+    sb.s_checksum = ocsfs_crc32c(0, &sb, sizeof(sb) - sizeof(uint32_t));
+
+    /* Write primary then mirror */
+    write_at(fd, OCSFS_SUPERBLOCK_OFFSET, &sb, sizeof(sb));
+    write_at(fd, OCSFS_SUPERBLOCK_MIRROR,  &sb, sizeof(sb));
+
+    printf("Upgrade V1->V2 completato.\n");
+    return 0;
+}
+
 /* ─── Main ──────────────────────────────────────────────────── */
 
 static void usage(void)
@@ -448,6 +490,7 @@ static void usage(void)
         "  locks     Lock table entries\n"
         "  df        Space usage report\n"
         "  check     Integrity check (offline)\n"
+        "  tune      Offline volume tuning (--upgrade: migrate V1->V2)\n"
         "\n");
     exit(1);
 }
@@ -460,7 +503,8 @@ int main(int argc, char *argv[])
     const char *cmd = argv[1];
     const char *dev = argv[2];
 
-    int fd = open(dev, O_RDONLY);
+    int flags = strcmp(cmd, "tune") == 0 ? O_RDWR : O_RDONLY;
+    int fd = open(dev, flags);
     if (fd < 0) {
         fprintf(stderr, "ocsfs-tool: cannot open %s: %s\n", dev, strerror(errno));
         exit(1);
@@ -474,7 +518,11 @@ int main(int argc, char *argv[])
     else if (strcmp(cmd, "locks") == 0)  cmd_locks(fd);
     else if (strcmp(cmd, "df") == 0)     cmd_df(fd);
     else if (strcmp(cmd, "check") == 0)  cmd_check(fd);
-    else {
+    else if (strcmp(cmd, "tune") == 0) {
+        int rc = cmd_tune(fd, argc - 2, argv + 2);
+        close(fd);
+        return rc;
+    } else {
         fprintf(stderr, "ocsfs-tool: unknown command '%s'\n", cmd);
         usage();
     }

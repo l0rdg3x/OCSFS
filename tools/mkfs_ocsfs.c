@@ -217,6 +217,7 @@ static void format_device(int fd, uint64_t dev_size)
         printf("  Journal/node:     %u bytes (%.1f MiB)\n",
                cfg.journal_size, cfg.journal_size / (1024.0 * 1024));
         printf("  AG count:         %u\n", ag_count);
+        printf("  Format:           V2 (revision_level=1)\n");
         printf("  AG size:          %lu blocks (%.2f GiB)\n",
                (unsigned long)ag_blocks,
                (double)ag_blocks * cfg.block_size / (1024.0 * 1024 * 1024));
@@ -261,6 +262,11 @@ static void format_device(int fd, uint64_t dev_size)
     sb.s_mkfs_time = now_ns();
     sb.s_mount_count = 0;
     sb.s_last_mount_time = 0;
+    sb.s_revision_level   = 1;
+    sb.s_feature_incompat = OCSFS_FEATURE_INCOMPAT_LOCK_TABLE_V2 |
+                            OCSFS_FEATURE_INCOMPAT_RC_BTREE_PER_AG;
+    sb.s_feature_ro_compat = OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB;
+    sb.s_lock_primary_count = OCSFS_LOCK_ENTRY_COUNT;
     sb.s_checksum = ocsfs_crc32c(0, &sb, sizeof(sb) - sizeof(uint32_t));
 
     write_at(fd, OCSFS_SUPERBLOCK_OFFSET, &sb, sizeof(sb));
