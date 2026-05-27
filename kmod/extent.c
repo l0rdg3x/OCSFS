@@ -233,8 +233,13 @@ int ocsfs_extent_truncate(struct inode *inode, u64 from_block)
 	}
 
 	ret = ocsfs_txn_commit(txn);
-	if (!ret)
+	if (!ret) {
+		u64 freed_bytes = (saved_blocks - inode->i_blocks) * 512;
+
+		if (freed_bytes)
+			dquot_free_space_nodirty(inode, freed_bytes);
 		mark_inode_dirty(inode);
+	}
 	return ret;
 
 abort:

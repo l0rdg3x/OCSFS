@@ -208,11 +208,21 @@ int ocsfs_alloc_extent(struct inode *inode, u64 logical_block,
 
 	*allocated = try_count;
 
+	/* Charge block quota for allocated blocks */
+	ret = dquot_alloc_space_nodirty(inode,
+		(u64)try_count * sbi->s_block_size);
+	if (ret) {
+		ocsfs_free_blocks(inode->i_sb, *phys_out, try_count);
+		return ret;
+	}
+
 	/* Insert the extent into the inode's extent map */
 	ret = ocsfs_extent_insert(inode, logical_block, *phys_out,
 				  try_count, flags);
 	if (ret) {
 		ocsfs_free_blocks(inode->i_sb, *phys_out, try_count);
+		dquot_free_space_nodirty(inode,
+			(u64)try_count * sbi->s_block_size);
 		return ret;
 	}
 

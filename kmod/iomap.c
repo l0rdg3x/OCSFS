@@ -169,6 +169,15 @@ static int ocsfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 
 		alloc_blocks = try_blocks;
 
+		/* Charge block quota before inserting the extent */
+		ret = dquot_alloc_space_nodirty(inode,
+			(u64)alloc_blocks * sbi->s_block_size);
+		if (ret) {
+			ocsfs_free_blocks(inode->i_sb, phys, alloc_blocks);
+			mutex_unlock(&oi->i_extent_lock);
+			return ret;
+		}
+
 		/*
 		 * Insert as UNWRITTEN so that blocks not yet reached by the
 		 * write are never exposed as MAPPED.  iomap_end converts the
@@ -187,6 +196,8 @@ static int ocsfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 					  alloc_blocks, OCSFS_EXT_UNWRITTEN);
 		if (ret) {
 			ocsfs_free_blocks(inode->i_sb, phys, alloc_blocks);
+			dquot_free_space_nodirty(inode,
+				(u64)alloc_blocks * sbi->s_block_size);
 			mutex_unlock(&oi->i_extent_lock);
 			return ret;
 		}
