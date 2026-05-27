@@ -353,12 +353,29 @@ ssize_t ocsfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		if (ret)
 			goto out_unlock;
 		/*
-		 * ARCH-7 fast-path: if WE were the last EX holder (same node
-		 * slot), our page cache is still coherent — skip full flush.
-		 * If another node wrote last, full invalidation is required.
+		 * ARCH-7 write-path selective invalidation.
+		 *
+		 * lock_acquire(EX) captured the previous EX holder's dirty range
+		 * in lr_inv_lo/lr_inv_hi.  If we were the last writer our cache
+		 * is coherent — skip.  Otherwise invalidate only the range that
+		 * the previous EX holder actually dirtied; pages outside that
+		 * range are still valid.  If no range was recorded, fall back to
+		 * full invalidation.  After invalidation, zero lr_inv_lo/hi so
+		 * iomap_end starts tracking only this write's range.
 		 */
-		if (oi->i_last_writer_slot != sbi->s_node_slot)
-			invalidate_inode_pages2(inode->i_mapping);
+		if (oi->i_last_writer_slot != sbi->s_node_slot) {
+			if (oi->i_lock_res.lr_inv_lo < oi->i_lock_res.lr_inv_hi) {
+				pgoff_t lo_pg = oi->i_lock_res.lr_inv_lo >> PAGE_SHIFT;
+				pgoff_t hi_pg =
+					(oi->i_lock_res.lr_inv_hi - 1) >> PAGE_SHIFT;
+				invalidate_mapping_pages(inode->i_mapping,
+							 lo_pg, hi_pg);
+			} else {
+				invalidate_inode_pages2(inode->i_mapping);
+			}
+			oi->i_lock_res.lr_inv_lo = 0;
+			oi->i_lock_res.lr_inv_hi = 0;
+		}
 	}
 
 	ret = generic_write_checks(iocb, from);

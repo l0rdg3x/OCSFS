@@ -54,8 +54,9 @@ int ocsfs_lock_acquire(struct super_block *sb, struct ocsfs_lock_res *lr,
 	struct ocsfs_disk_lock dl;
 	struct buffer_head *bh;
 	int ret;
-	int retries = 0;
 	u32 delay_us = OCSFS_LOCK_RETRY_MIN_US;
+	ktime_t deadline = ktime_add_ms(ktime_get(),
+					OCSFS_LOCK_ACQUIRE_TIMEOUT_MS);
 
 	if (!sbi->s_clustered) {
 		lr->lr_mode = mode;
@@ -127,13 +128,14 @@ retry:
 
 		if (ret == 0) {
 			lr->lr_mode = mode;
-			/* ARCH-7: snapshot dirty range/epoch so read path can do
-			 * selective page cache invalidation instead of full flush. */
-			if (mode == OCSFS_LOCK_SH) {
-				lr->lr_inv_lo    = le64_to_cpu(dl.le_inv_lo);
-				lr->lr_inv_hi    = le64_to_cpu(dl.le_inv_hi);
-				lr->lr_inv_epoch = le32_to_cpu(dl.le_inv_epoch);
-			}
+			/* ARCH-7: snapshot the previous EX holder's dirty range/epoch
+			 * for both SH and EX mode.
+			 * SH: read path uses it for selective page cache invalidation.
+			 * EX: write path uses it before starting the write so it can
+			 *     invalidate only the stale pages (not the full mapping). */
+			lr->lr_inv_lo    = le64_to_cpu(dl.le_inv_lo);
+			lr->lr_inv_hi    = le64_to_cpu(dl.le_inv_hi);
+			lr->lr_inv_epoch = le32_to_cpu(dl.le_inv_epoch);
 		}
 
 		mutex_unlock(&lr->lr_mutex);
@@ -144,9 +146,10 @@ retry:
 	lr_write_entry(sb, lr, &dl, bh);
 	brelse(bh);
 
-	if (++retries > OCSFS_LOCK_MAX_RETRIES) {
-		pr_warn("ocsfs: lock acquire timeout on resource 0x%llx "
+	if (ktime_after(ktime_get(), deadline)) {
+		pr_warn("ocsfs: lock acquire timeout (%ums) on resource 0x%llx "
 			"(mode %u, held %u by slot %u)\n",
+			OCSFS_LOCK_ACQUIRE_TIMEOUT_MS,
 			lr->lr_resource_id, mode, cur_mode,
 			le16_to_cpu(dl.le_holder_slot));
 		mutex_unlock(&lr->lr_mutex);

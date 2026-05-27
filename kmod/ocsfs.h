@@ -264,9 +264,10 @@ static inline u16 ocsfs_ext_set_comp_algo(u16 flags, u8 algo)
 #define OCSFS_HB_SUSPECTED_MULT     2
 
 /* Lock acquisition retry */
-#define OCSFS_LOCK_RETRY_MIN_US 1000   /* 1 ms */
-#define OCSFS_LOCK_RETRY_MAX_US 100000 /* 100 ms */
-#define OCSFS_LOCK_MAX_RETRIES  200
+#define OCSFS_LOCK_RETRY_MIN_US         1000    /* 1 ms — initial backoff */
+#define OCSFS_LOCK_RETRY_MAX_US         100000  /* 100 ms — backoff cap */
+#define OCSFS_LOCK_ACQUIRE_TIMEOUT_MS   30000U  /* 30s wall-clock deadline for acquire */
+#define OCSFS_LOCK_MAX_RETRIES          200     /* release-path CAS retry limit */
 
 /* Open-addressing probe limit to resolve slot collisions */
 #define OCSFS_LOCK_PROBE_MAX    64
