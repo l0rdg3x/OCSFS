@@ -443,9 +443,18 @@ int ocsfs_txn_commit(struct ocsfs_txn *txn)
 			goto out_locked;
 	}
 
+	/* jt_block_count is __le16 — truncation to U16_MAX would corrupt replay */
+	if (txn->t_nr_blocks > U16_MAX) {
+		pr_err("ocsfs: txn %llu: t_nr_blocks %u exceeds u16 max, aborting\n",
+		       txn->t_id, txn->t_nr_blocks);
+		ret = -EINVAL;
+		goto out_locked;
+	}
+
 	/*
 	 * data_len: BEFORE-images (from add_bh) + AFTER-images (written above).
 	 * Each bh contributes 2 * (bref + block) to the payload.
+	 * Max: 65535 * 2 * ~4112 ≈ 539 MiB, well within u32.
 	 */
 	data_len = (u32)txn->t_nr_blocks * 2 *
 		   (u32)(sizeof(struct ocsfs_disk_journal_bref) +

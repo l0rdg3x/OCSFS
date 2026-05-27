@@ -498,7 +498,15 @@ static int ocsfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		return -ENOPARAM;
 
 	hex = param->string;
-	len = strlen(hex);
+	if (!hex) {
+		pr_err("ocsfs: cluster_secret: missing value\n");
+		return -EINVAL;
+	}
+	len = strnlen(hex, 129);
+	if (len > 128) {
+		pr_err("ocsfs: cluster_secret: value too long (max 128 chars)\n");
+		return -EINVAL;
+	}
 	if (len != 64) {
 		pr_err("ocsfs: cluster_secret must be 64 hex chars (32 bytes)\n");
 		return -EINVAL;
@@ -514,6 +522,8 @@ static int ocsfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		ctx->fc_secret[i] = (u8)byte;
 	}
 	ctx->fc_has_secret = true;
+	/* Zero the raw hex string so it does not linger in kernel memory */
+	memzero_explicit(param->string, len);
 	return 0;
 }
 

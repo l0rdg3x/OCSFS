@@ -185,8 +185,7 @@ retry_release:
 		 * updated, so keeping lr_mode == EX lets the heartbeat timeout
 		 * trigger proper recovery instead of leaving an orphaned lock. */
 	} else {
-		lr->lr_mode   = OCSFS_LOCK_NL;
-		lr->lr_cached = false;
+		lr->lr_mode = OCSFS_LOCK_NL;
 	}
 	mutex_unlock(&lr->lr_mutex);
 	return ret;
@@ -245,10 +244,8 @@ int ocsfs_lock_downgrade(struct super_block *sb, struct ocsfs_lock_res *lr,
 	ret = lock_write_entry(sb, lr->lr_slot, &dl, bh);
 	brelse(bh);
 
-	if (ret == 0) {
-		lr->lr_mode   = new_mode;
-		lr->lr_cached = false;
-	}
+	if (ret == 0)
+		lr->lr_mode = new_mode;
 
 	mutex_unlock(&lr->lr_mutex);
 	return ret;

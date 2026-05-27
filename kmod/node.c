@@ -12,6 +12,7 @@
 
 #include <linux/utsname.h>
 #include <linux/crypto.h>
+#include <crypto/algapi.h>
 #include <crypto/hash.h>
 #include <crypto/sha2.h>
 #include "ocsfs.h"
@@ -198,7 +199,7 @@ int ocsfs_node_verify_auth(struct super_block *sb,
 	if (ret)
 		return ret;
 
-	if (memcmp(expected, dns->ns_auth_token, 32) != 0) {
+	if (crypto_memneq(expected, dns->ns_auth_token, 32)) {
 		pr_warn("ocsfs: node slot %u auth mismatch — wrong cluster secret?\n",
 			le16_to_cpu(dns->ns_slot_id));
 		return -EACCES;

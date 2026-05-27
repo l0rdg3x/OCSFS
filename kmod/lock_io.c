@@ -263,7 +263,6 @@ void ocsfs_lock_init(struct ocsfs_lock_res *lr, u64 resource_id,
 	lr->lr_resource_type = resource_type;
 	lr->lr_mode          = OCSFS_LOCK_NL;
 	lr->lr_slot          = ocsfs_lock_table_slot(resource_id);
-	lr->lr_cached = false;
 	mutex_init(&lr->lr_mutex);
 	INIT_LIST_HEAD(&lr->lr_list);
 }

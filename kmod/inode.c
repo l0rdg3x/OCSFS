@@ -354,6 +354,10 @@ int ocsfs_flush_inode_locked(struct inode *inode, bool force_sync)
 	if (S_ISLNK(inode->i_mode) && oi->i_symlink) {
 		size_t slen = min_t(size_t, inode->i_size, OCSFS_MAX_INLINE_SYMLINK);
 
+		/* Zero the entire area first so stale extent bytes from a
+		 * previously reused inode block cannot leak to disk. */
+		memset(di->i_inline_extents, 0,
+		       OCSFS_INLINE_EXTENTS * sizeof(struct ocsfs_disk_extent));
 		memcpy(di->i_inline_extents, oi->i_symlink, slen);
 	} else {
 		for (i = 0; i < oi->i_extent_count && i < OCSFS_INLINE_EXTENTS; i++) {

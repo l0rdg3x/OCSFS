@@ -99,7 +99,6 @@ static void test_lock_res_init_defaults(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, (int)lr.lr_mode, (int)OCSFS_LOCK_NL);
 	KUNIT_EXPECT_EQ(test, lr.lr_resource_id, 0x1234ULL);
 	KUNIT_EXPECT_EQ(test, lr.lr_resource_type, (u32)OCSFS_LOCKRES_INODE);
-	KUNIT_EXPECT_FALSE(test, lr.lr_cached);
 }
 
 /* ─── BUG-003: SCSI CAW CDB construction ─────────────────────── */

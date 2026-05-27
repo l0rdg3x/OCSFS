@@ -574,6 +574,10 @@ static long ocsfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	if (cmd != OCSFS_IOC_SNAP_CREATE)
 		return -ENOTTY;
 
+	/* Caller must own (or be capable of) the source file */
+	if (!inode_owner_or_capable(idmap, inode))
+		return -EPERM;
+
 	if (copy_from_user(&sa, (void __user *)arg, sizeof(sa)))
 		return -EFAULT;
 	sa.name[OCSFS_SNAP_NAME_MAX] = '\0';
@@ -581,6 +585,8 @@ static long ocsfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	if (!qname.len)
 		return -EINVAL;
 	qname.name = sa.name;
+	if (sa.dir_ino == 0)
+		return -EINVAL;
 	dir = ocsfs_iget(inode->i_sb, sa.dir_ino);
 	if (IS_ERR(dir))
 		return PTR_ERR(dir);
