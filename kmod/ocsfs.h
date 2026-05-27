@@ -173,7 +173,8 @@ enum ocsfs_cas_backend {
 #define OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB     (1ULL << 2)  /* ARCH-6 */
 
 /* Masks of features this build understands.  Update as features land. */
-#define OCSFS_FEATURE_INCOMPAT_SUPP     OCSFS_FEATURE_INCOMPAT_LOCK_TABLE_V2
+#define OCSFS_FEATURE_INCOMPAT_SUPP     (OCSFS_FEATURE_INCOMPAT_LOCK_TABLE_V2 | \
+					 OCSFS_FEATURE_INCOMPAT_RC_BTREE_PER_AG)
 #define OCSFS_FEATURE_RO_COMPAT_SUPP    0ULL   /* ARCH-3/6/7 not yet implemented */
 #define OCSFS_FEATURE_COMPAT_SUPP       0ULL
 
@@ -387,7 +388,8 @@ struct ocsfs_disk_ag {
 	__le64  ag_inode_btree_off;
 	__le16  ag_owner_node;
 	__le16  ag_flags;
-	__u8    ag_reserved[3992];
+	__le64  ag_rc_btree_root;   /* ARCH-5: B+ tree root block for refcount (0 = empty) */
+	__u8    ag_reserved[3984];
 	__le32  ag_checksum;
 } __packed;
 
@@ -545,6 +547,7 @@ struct ocsfs_ag_info {
 	u64             inode_table_off;
 	u64             inode_count;
 	u64             free_inodes;
+	u64             rc_btree_root;  /* ARCH-5: B+ tree root block (0 = empty) */
 	struct mutex    ag_lock;        /* protects bitmap + inode table (local) */
 	struct ocsfs_lock_res ag_lock_res; /* cross-node DLM lock for this AG */
 	struct ocsfs_lock_res ag_rc_lock_res; /* cross-node DLM refcount lock */

@@ -227,7 +227,8 @@ static int ocsfs_load_ags(struct super_block *sb)
 		ag->bitmap_size = le64_to_cpu(dag->ag_bitmap_size);
 		ag->inode_table_off = le64_to_cpu(dag->ag_inode_table_off);
 		ag->inode_count = le64_to_cpu(dag->ag_inode_count);
-		ag->free_inodes = le64_to_cpu(dag->ag_free_inodes);
+		ag->free_inodes    = le64_to_cpu(dag->ag_free_inodes);
+		ag->rc_btree_root  = le64_to_cpu(dag->ag_rc_btree_root);
 		if (unlikely(!ag->block_count || !ag->bitmap_size)) {
 			pr_warn("ocsfs: AG %u has zero block_count=%llu or bitmap_size=%llu — possibly corrupt descriptor\n",
 				i, ag->block_count, ag->bitmap_size);
@@ -508,8 +509,9 @@ int ocsfs_sync_fs(struct super_block *sb, int wait)
 			continue;
 		dag = (struct ocsfs_disk_ag *)bh->b_data;
 		mutex_lock(&ag->ag_lock);
-		dag->ag_free_blocks = cpu_to_le64(ag->free_blocks);
-		dag->ag_free_inodes = cpu_to_le64(ag->free_inodes);
+		dag->ag_free_blocks  = cpu_to_le64(ag->free_blocks);
+		dag->ag_free_inodes  = cpu_to_le64(ag->free_inodes);
+		dag->ag_rc_btree_root = cpu_to_le64(ag->rc_btree_root);
 		dag->ag_checksum = cpu_to_le32(
 			ocsfs_crc32c(~0U, dag, offsetof(struct ocsfs_disk_ag, ag_checksum)));
 		mutex_unlock(&ag->ag_lock);
