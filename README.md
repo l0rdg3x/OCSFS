@@ -21,14 +21,16 @@ Proxmox VE as an open alternative to VMware VMFS.
 
 | Scenario | Score |
 |---|---|
-| Single-node read/write | ~88% |
-| Multi-node — no crashes | ~85% |
-| Multi-node — crash + recovery | ~70% |
-| VMFS feature parity | ~58% |
+| Single-node read/write | ~92% |
+| Multi-node — no crashes | ~88% |
+| Multi-node — crash + recovery | ~78% |
+| VMFS feature parity | ~72% |
 
 The main gap keeping the cluster score below 90% is the absence of
 real-hardware integration testing (xfstests on a multi-node testbed).
-SCSI CAW is now implemented via BSG-direct path — no kprobe required.
+All other known correctness, security, and performance issues from the
+Opus v2 review have been addressed. SCSI CAW is implemented via
+BSG-direct — no kprobe required.
 
 ---
 
@@ -152,7 +154,7 @@ SCSI CAW is now implemented via BSG-direct path — no kprobe required.
 | **POSIX distributed file locking** | Implemented via on-disk DLM: `fcntl(F_SETLK)` maps F_RDLCK→SH, F_WRLCK→EX at inode granularity (not byte-range). Correct for qcow2 HA; may serialize same-file readers across nodes. |
 | **STONITH** | Fencing via SCSI PR works; out-of-band STONITH (PDU, iDRAC) not wired. For Proxmox labs, the Proxmox API can serve as soft STONITH. |
 | **Lock acquire timeout** | Wall-clock deadline of 30 s (`OCSFS_LOCK_ACQUIRE_TIMEOUT_MS`). Exponential backoff 1 ms → 100 ms; fails with `-ETIMEDOUT` at deadline (commit `ffeb901`). |
-| **Refcount table fill-up** | Per-AG refcount table is fixed at 16 blocks; a CoW/snapshot-heavy workload can exhaust it independently of data space. Requires on-disk redesign. |
+| **Refcount table fill-up** | Resolved for V2 filesystems: per-AG refcount B+ tree grows dynamically by allocating blocks from the AG itself (ARCH-5, `INCOMPAT_RC_BTREE_PER_AG`, commit `eb88eeb`). V1 volumes without the feature bit return `-EOPNOTSUPP` on CoW/snapshot operations. |
 
 ---
 
