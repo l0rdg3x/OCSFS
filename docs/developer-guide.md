@@ -529,6 +529,59 @@ queues and I/O scheduler.
 
 ---
 
+### Architectural hardening (Sprint G — ARCH-V3-2/4/5/6)
+
+**ARCH-V3-2 — Superblock mirror fallback (`super.c`, `ocsfs.h`):**
+A mirror copy of the superblock is kept at block 1 (byte offset
+`OCSFS_SUPERBLOCK_MIRROR` = 4096, one block after the primary at block 0).
+During mount `ocsfs_fill_super` tries the primary first; if it fails CRC
+validation or returns an I/O error, it transparently falls back to the mirror
+with a `pr_warn` message advising the operator to run fsck to repair the
+primary. The mirror is kept in sync by `ocsfs_update_super_mirror` (called
+after the mount-count write and from `ocsfs_sync_fs`) via `sb_getblk` +
+`sync_dirty_buffer` without opening a journal transaction (the mirror is
+not journaled — it is a best-effort safety net, not a primary metadata path).
+
+**ARCH-V3-4 — Extent btree 4-bit flags (`extent_btree.c`, `ocsfs.h`,
+`include/ocsfs.h`, `tools/mkfs_ocsfs.c`):**
+The v1 on-disk extent encoding packs bits as `[39:0]=phys, [61:40]=len
+(22-bit), [63:62]=flags (2-bit)`. With only 2 flag bits the `ENCRYPTED`
+flag (0x4) was silently dropped on btree round-trips, making large encrypted
+files (beyond the 16-inline-extent threshold) unreadable after the first
+write. The v2 encoding (feature bit `OCSFS_FEATURE_INCOMPAT_EXT_FLAGS4`)
+repacks as `[39:0]=phys, [59:40]=len (20-bit), [63:60]=flags (4-bit)`,
+trading 2 extent-length bits (max 1 M blocks instead of 4 M blocks per
+extent) for 4 flag bits. All btree helpers (`ext_encode`, `ext_len`,
+`ext_flags`) now take a `bool f4` parameter precomputed from
+`OCSFS_SB(sb)->s_ext_flags4` at function entry; `ext_phys` is unchanged
+(lower 40 bits are identical in both encodings). `mkfs.ocsfs` sets the
+feature bit for all new volumes.
+
+**ARCH-V3-5 — Lock delegation/lease (deferred):**
+Full delegation requires a new on-disk signaling mechanism so the leaseholder
+is notified when a peer enqueues for the same lock. This cannot be
+retrofitted without a protocol break (on-disk lock entry redesign). The
+epoch-based lock cache introduced in Sprint D already eliminates the
+dominant overhead (disk round-trip on same-mode re-acquire after a
+recovery-free period). ARCH-V3-5 is tracked as a future protocol revision;
+estimated effort: ~40h.
+
+**ARCH-V3-6 — Cluster-wide filesystem freeze (`super.c`, `file.c`,
+`ocsfs.h`):**
+`OCSFS_IOC_FREEZE_FS` and `OCSFS_IOC_THAW_FS` ioctls (added to
+`ocsfs_ioctl` in `file.c`, both require `CAP_SYS_ADMIN`) call the VFS
+`freeze_super(sb, FREEZE_HOLDER_USERSPACE, NULL)` and
+`thaw_super(sb, FREEZE_HOLDER_USERSPACE, NULL)` helpers. The VFS freeze
+drains in-flight writes and prevents new ones from entering the data path,
+which is necessary for consistent backup snapshots and live VM migration.
+In cluster mode, `ocsfs_freeze_fs` (wired into `super_operations`) acquires
+a DLM EX lock on `sbi->s_freeze_lock_res` (type `OCSFS_LOCKRES_FREEZE`,
+initialized during mount) so only one cluster node holds the freeze
+coordinator role at a time. `ocsfs_unfreeze_fs` releases the lock. Single-node
+mounts skip the DLM step and rely on the VFS freeze alone.
+
+---
+
 ## 9. I/O Path
 
 ### Data (regular files) — iomap path

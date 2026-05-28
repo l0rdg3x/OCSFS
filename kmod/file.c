@@ -592,6 +592,18 @@ static long ocsfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return 0;
 	}
 
+	/* ARCH-V3-6: cluster-wide filesystem freeze / thaw */
+	if (cmd == OCSFS_IOC_FREEZE_FS) {
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+		return freeze_super(inode->i_sb, FREEZE_HOLDER_USERSPACE, NULL);
+	}
+	if (cmd == OCSFS_IOC_THAW_FS) {
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+		return thaw_super(inode->i_sb, FREEZE_HOLDER_USERSPACE, NULL);
+	}
+
 	/* VAAI offload commands — require CAP_SYS_ADMIN or device owner */
 	if (cmd == OCSFS_IOC_WRITE_SAME) {
 		if (!capable(CAP_SYS_ADMIN))

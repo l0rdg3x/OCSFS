@@ -264,7 +264,8 @@ static void format_device(int fd, uint64_t dev_size)
     sb.s_last_mount_time = 0;
     sb.s_revision_level   = 1;
     sb.s_feature_incompat = OCSFS_FEATURE_INCOMPAT_LOCK_TABLE_V2 |
-                            OCSFS_FEATURE_INCOMPAT_RC_BTREE_PER_AG;
+                            OCSFS_FEATURE_INCOMPAT_RC_BTREE_PER_AG |
+                            OCSFS_FEATURE_INCOMPAT_EXT_FLAGS4;
     sb.s_feature_ro_compat = OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB |
                              OCSFS_FEATURE_RO_COMPAT_HB_SUMMARY;
     sb.s_lock_primary_count = OCSFS_LOCK_ENTRY_COUNT;

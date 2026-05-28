@@ -178,6 +178,7 @@ enum ocsfs_cas_backend {
 /* INCOMPAT bits — layout-breaking features */
 #define OCSFS_FEATURE_INCOMPAT_LOCK_TABLE_V2    (1ULL << 0)  /* ARCH-2 */
 #define OCSFS_FEATURE_INCOMPAT_RC_BTREE_PER_AG  (1ULL << 1)  /* ARCH-5 */
+#define OCSFS_FEATURE_INCOMPAT_EXT_FLAGS4       (1ULL << 2)  /* ARCH-V3-4: 4-bit extent flags */
 
 /* RO_COMPAT bits — read-write-semantic features */
 #define OCSFS_FEATURE_RO_COMPAT_SELECTIVE_INV   (1ULL << 0)  /* ARCH-7 */
@@ -186,7 +187,8 @@ enum ocsfs_cas_backend {
 
 /* Masks of features this build understands.  Update as features land. */
 #define OCSFS_FEATURE_INCOMPAT_SUPP     (OCSFS_FEATURE_INCOMPAT_LOCK_TABLE_V2 | \
-					 OCSFS_FEATURE_INCOMPAT_RC_BTREE_PER_AG)
+					 OCSFS_FEATURE_INCOMPAT_RC_BTREE_PER_AG | \
+					 OCSFS_FEATURE_INCOMPAT_EXT_FLAGS4)
 #define OCSFS_FEATURE_RO_COMPAT_SUPP    (OCSFS_FEATURE_RO_COMPAT_SELECTIVE_INV | \
 					 OCSFS_FEATURE_RO_COMPAT_HB_SUMMARY | \
 					 OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB)
@@ -265,6 +267,7 @@ static inline u16 ocsfs_ext_set_comp_algo(u16 flags, u8 algo)
 #define OCSFS_LOCKRES_RECOVERY  5
 #define OCSFS_LOCKRES_SUPER     6
 #define OCSFS_LOCKRES_REFCOUNT  7
+#define OCSFS_LOCKRES_FREEZE    8  /* ARCH-V3-6: cluster freeze coordinator */
 
 /* Heartbeat constants */
 #define OCSFS_HB_INTERVAL_MS        5000   /* write every 5s */
@@ -682,6 +685,8 @@ struct ocsfs_sb_info {
 	u32             s_lock_primary_count;    /* 0 = legacy (OCSFS_LOCK_ENTRY_COUNT) */
 	u64             s_data_off;             /* first data byte */
 	u64             s_ag_desc_off;
+	/* ARCH-V3-4: true when OCSFS_FEATURE_INCOMPAT_EXT_FLAGS4 is set */
+	bool            s_ext_flags4;
 
 	/* Allocation groups */
 	struct ocsfs_ag_info    *s_ags;         /* array [s_ag_count] */
@@ -748,6 +753,9 @@ struct ocsfs_sb_info {
 
 	/* ARCH-6: background dedup scrub daemon */
 	struct delayed_work s_dedup_scrub_work;
+
+	/* ARCH-V3-6: cluster freeze coordinator lock */
+	struct ocsfs_lock_res s_freeze_lock_res;
 
 	/* debugfs directory entry for this mount */
 	struct dentry      *s_debugfs_dir;
@@ -1247,6 +1255,9 @@ struct ocsfs_vaai_xcopy_arg {
 #define OCSFS_IOC_WRITE_SAME  _IOW('O', 10, struct ocsfs_vaai_arg)
 #define OCSFS_IOC_UNMAP       _IOW('O', 11, struct ocsfs_vaai_arg)
 #define OCSFS_IOC_XCOPY       _IOW('O', 12, struct ocsfs_vaai_xcopy_arg)
+/* ARCH-V3-6: cluster-wide filesystem freeze/thaw (CAP_SYS_ADMIN required) */
+#define OCSFS_IOC_FREEZE_FS   _IO ('O', 20)
+#define OCSFS_IOC_THAW_FS     _IO ('O', 21)
 
 int ocsfs_vaai_write_same(struct super_block *sb,
 			   const struct ocsfs_vaai_arg __user *uarg);

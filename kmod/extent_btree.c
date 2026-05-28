@@ -6,21 +6,41 @@
 #include "ocsfs.h"
 #include "ocsfs_btree.h"
 
-/* ── value encoding ── */
+/* ── value encoding ──
+ * v1 layout (OCSFS_FEATURE_INCOMPAT_EXT_FLAGS4 NOT set):
+ *   bits[0..39]  = phys (40-bit physical block)
+ *   bits[40..61] = len  (22-bit length)
+ *   bits[62..63] = flags (2 bits: WRITTEN/UNWRITTEN only)
+ *
+ * v2 layout (OCSFS_FEATURE_INCOMPAT_EXT_FLAGS4 set, ARCH-V3-4):
+ *   bits[0..39]  = phys (40-bit physical block — unchanged)
+ *   bits[40..59] = len  (20-bit length, max 4 GiB per extent at 4 KiB/block)
+ *   bits[60..63] = flags (4 bits: WRITTEN/UNWRITTEN/COMPRESSED/ENCRYPTED)
+ */
 
-static inline u64 ext_encode(u64 phys, u32 len, u16 flags)
+static inline u64 ext_encode(bool f4, u64 phys, u32 len, u16 flags)
 {
-	/* btree encoding stores only 2 flag bits (WRITTEN/UNWRITTEN).
-	 * Callers must decompress/decrypt extents before btree round-trips. */
+	if (f4) {
+		WARN_ON_ONCE(flags & ~0xFU);
+		return (phys & 0xFFFFFFFFFFULL) |
+		       ((u64)(len   & 0xFFFFFU) << 40) |
+		       ((u64)(flags & 0xFU)     << 60);
+	}
 	WARN_ON_ONCE(flags & ~0x3U);
 	return (phys & 0xFFFFFFFFFFULL) |
 	       ((u64)(len   & 0x3FFFFFU) << 40) |
 	       ((u64)(flags & 0x3U)      << 62);
 }
 
-static inline u64  ext_phys(u64 v)  { return v & 0xFFFFFFFFFFULL; }
-static inline u32  ext_len(u64 v)   { return (u32)((v >> 40) & 0x3FFFFFU); }
-static inline u16  ext_flags(u64 v) { return (u16)((v >> 62) & 0x3U); }
+static inline u64  ext_phys(u64 v) { return v & 0xFFFFFFFFFFULL; }
+static inline u32  ext_len(bool f4, u64 v)
+{
+	return f4 ? (u32)((v >> 40) & 0xFFFFFU) : (u32)((v >> 40) & 0x3FFFFFU);
+}
+static inline u16  ext_flags(bool f4, u64 v)
+{
+	return f4 ? (u16)((v >> 60) & 0xFU) : (u16)((v >> 62) & 0x3U);
+}
 
 /* ── I/O callbacks ── */
 
@@ -158,18 +178,19 @@ int ocsfs_extent_btree_lookup(struct inode *inode, u64 logical,
 {
 	struct ocsfs_btree bt;
 	struct ext_btree_ctx ec;
+	bool f4 = OCSFS_SB(inode->i_sb)->s_ext_flags4;
 	u64 key, val;
 	int ret = ext_btree_open(inode, &bt, &ec);
 
 	if (ret)
 		return ret;
 	ret = ocsfs_btree_search_le(&bt, logical, &key, &val);
-	if (ret || logical >= key + ext_len(val))
+	if (ret || logical >= key + ext_len(f4, val))
 		return -ENOENT;
 	out->logical_block  = key;
 	out->physical_block = ext_phys(val);
-	out->length         = ext_len(val);
-	out->flags          = ext_flags(val);
+	out->length         = ext_len(f4, val);
+	out->flags          = ext_flags(f4, val);
 	return 0;
 }
 
@@ -180,11 +201,14 @@ int ocsfs_extent_btree_insert(struct inode *inode, u64 logical, u64 physical,
 	struct ocsfs_txn *txn;
 	struct ocsfs_btree bt;
 	struct ext_btree_ctx ec;
+	bool f4 = OCSFS_SB(inode->i_sb)->s_ext_flags4;
+	u32 maxlen = f4 ? 0xFFFFFU : 0x3FFFFFU;
+	u16 fmask  = f4 ? 0xFU    : 0x3U;
 	int ret;
 
 	OCSFS_WARN_NO_EX(inode);
 
-	if (physical > 0xFFFFFFFFFFULL || len > 0x3FFFFFU || (flags & ~0x3U))
+	if (physical > 0xFFFFFFFFFFULL || len > maxlen || (flags & ~fmask))
 		return -EINVAL;
 
 	ret = ext_btree_open(inode, &bt, &ec);
@@ -195,7 +219,7 @@ int ocsfs_extent_btree_insert(struct inode *inode, u64 logical, u64 physical,
 	if (IS_ERR(txn))
 		return PTR_ERR(txn);
 	ec.txn = txn;
-	ret = ocsfs_btree_insert(&bt, logical, ext_encode(physical, len, flags));
+	ret = ocsfs_btree_insert(&bt, logical, ext_encode(f4, physical, len, flags));
 	if (ret) {
 		ocsfs_txn_abort(txn);
 		return ret;
@@ -223,21 +247,22 @@ int ocsfs_extent_btree_migrate(struct inode *inode)
 	struct ocsfs_txn *txn;
 	struct ocsfs_btree bt;
 	struct ext_btree_ctx ec;
+	bool f4 = OCSFS_SB(inode->i_sb)->s_ext_flags4;
 	int i, ret;
 
-	/*
-	 * The btree encoding only preserves 2 flag bits (WRITTEN/UNWRITTEN).
-	 * Compressed extents (bit 2) would silently lose the COMPRESSED flag
-	 * after a btree round-trip, making the data unreadable.  Decompress
-	 * all compressed extents before opening the migration txn; each
-	 * decompress call manages its own block alloc/free internally.
-	 */
-	for (i = 0; i < oi->i_extent_count; i++) {
-		if (oi->i_extents[i].flags & OCSFS_EXT_COMPRESSED) {
-			ret = ocsfs_extent_decompress_for_write(
-				inode, oi->i_extents[i].logical_block);
-			if (ret)
-				return ret;
+	/* v1 encoding only preserves 2 flag bits (WRITTEN/UNWRITTEN).
+	 * Compressed extents would silently lose OCSFS_EXT_COMPRESSED after a
+	 * btree round-trip on v1 volumes, making the data unreadable.
+	 * v2 (EXT_FLAGS4) stores 4 bits so COMPRESSED and ENCRYPTED are
+	 * preserved — decompression before migration is NOT needed in that case. */
+	if (!f4) {
+		for (i = 0; i < oi->i_extent_count; i++) {
+			if (oi->i_extents[i].flags & OCSFS_EXT_COMPRESSED) {
+				ret = ocsfs_extent_decompress_for_write(
+					inode, oi->i_extents[i].logical_block);
+				if (ret)
+					return ret;
+			}
 		}
 	}
 
@@ -255,13 +280,14 @@ int ocsfs_extent_btree_migrate(struct inode *inode)
 		u64 val;
 
 		if (e->physical_block > 0xFFFFFFFFFFULL ||
-		    e->length > 0x3FFFFFU || (e->flags & ~0x3U)) {
+		    e->length > (f4 ? 0xFFFFFU : 0x3FFFFFU) ||
+		    (e->flags & (f4 ? ~0xFU : ~0x3U))) {
 			pr_err("ocsfs: inode %llu: extent %d overflows btree encoding\n",
 			       oi->i_disk_ino, i);
 			ret = -EINVAL;
 			goto abort;
 		}
-		val = ext_encode(e->physical_block, e->length, e->flags);
+		val = ext_encode(f4, e->physical_block, e->length, e->flags);
 		ret = ocsfs_btree_insert(&bt, e->logical_block, val);
 		if (ret) {
 			pr_err("ocsfs: inode %llu: migrate extent %d failed: %d\n",
@@ -304,6 +330,7 @@ int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block)
 	struct ocsfs_inode_info *oi  = OCSFS_I(inode);
 	struct super_block      *sb  = inode->i_sb;
 	struct ocsfs_sb_info    *sbi = OCSFS_SB(sb);
+	bool f4 = sbi->s_ext_flags4;
 	struct ocsfs_btree bt;
 	struct ext_btree_ctx ec;
 	struct ext_trunc_ctx tc;
@@ -332,7 +359,7 @@ int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block)
 	/* Shrink any extent that straddles from_block */
 	if (from_block > 0 &&
 	    !ocsfs_btree_search_le(&bt, from_block - 1, &key, &val)) {
-		u32 elen = ext_len(val);
+		u32 elen = ext_len(f4, val);
 
 		if (key + elen > from_block) {
 			u32 keep  = (u32)(from_block - key);
@@ -347,8 +374,8 @@ int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block)
 			if (ret)
 				goto abort;
 			ret = ocsfs_btree_insert(&bt, key,
-						 ext_encode(ext_phys(val), keep,
-							    ext_flags(val)));
+						 ext_encode(f4, ext_phys(val), keep,
+							    ext_flags(f4, val)));
 			if (ret)
 				goto abort;
 			oi->i_extent_tree_root = bt.root_block;
@@ -371,10 +398,10 @@ int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block)
 				if (!ocsfs_btree_search(&bt, tc.keys[i], &v)) {
 					ret = ocsfs_free_blocks_txn(txn,
 								    ext_phys(v),
-								    ext_len(v));
+								    ext_len(f4, v));
 					if (ret)
 						goto abort;
-					inode->i_blocks -= (u64)ext_len(v) *
+					inode->i_blocks -= (u64)ext_len(f4, v) *
 							   (sbi->s_block_size / 512);
 					ret = ocsfs_btree_delete(&bt, tc.keys[i]);
 					if (ret)
@@ -446,6 +473,7 @@ int ocsfs_extent_btree_convert_unwritten(struct inode *inode, u64 logical, u32 l
 	struct ocsfs_txn *txn;
 	struct ocsfs_btree bt;
 	struct ext_btree_ctx ec;
+	bool f4 = OCSFS_SB(inode->i_sb)->s_ext_flags4;
 	u64 key, val, ext_end, cvt_end;
 	u64 phys;
 	u32 elen;
@@ -460,12 +488,12 @@ int ocsfs_extent_btree_convert_unwritten(struct inode *inode, u64 logical, u32 l
 	if (ret)
 		return 0;
 
-	eflags = ext_flags(val);
+	eflags = ext_flags(f4, val);
 	if (!(eflags & OCSFS_EXT_UNWRITTEN))
 		return 0;
 
 	phys    = ext_phys(val);
-	elen    = ext_len(val);
+	elen    = ext_len(f4, val);
 	ext_end = key + elen;
 	cvt_end = logical + len;
 
@@ -486,7 +514,7 @@ int ocsfs_extent_btree_convert_unwritten(struct inode *inode, u64 logical, u32 l
 		u32 head_len = (u32)(logical - key);
 
 		ret = ocsfs_btree_insert(&bt, key,
-				   ext_encode(phys, head_len, OCSFS_EXT_UNWRITTEN));
+				   ext_encode(f4, phys, head_len, OCSFS_EXT_UNWRITTEN));
 		if (ret)
 			goto abort;
 		oi->i_extent_tree_root = bt.root_block;
@@ -499,7 +527,7 @@ int ocsfs_extent_btree_convert_unwritten(struct inode *inode, u64 logical, u32 l
 		u32 m_len  = (u32)(m_end - m_key);
 
 		ret = ocsfs_btree_insert(&bt, m_key,
-				   ext_encode(m_phys, m_len, OCSFS_EXT_WRITTEN));
+				   ext_encode(f4, m_phys, m_len, OCSFS_EXT_WRITTEN));
 		if (ret)
 			goto abort;
 		oi->i_extent_tree_root = bt.root_block;
@@ -511,7 +539,7 @@ int ocsfs_extent_btree_convert_unwritten(struct inode *inode, u64 logical, u32 l
 		u32 tail_len  = (u32)(ext_end - tail_key);
 
 		ret = ocsfs_btree_insert(&bt, tail_key,
-				   ext_encode(tail_phys, tail_len,
+				   ext_encode(f4, tail_phys, tail_len,
 					      OCSFS_EXT_UNWRITTEN));
 		if (ret)
 			goto abort;
@@ -538,6 +566,7 @@ int ocsfs_extent_btree_replace(struct inode *inode,
 				u64 offset_in_ext, u32 cow_len, u64 new_phys)
 {
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
+	bool f4 = OCSFS_SB(inode->i_sb)->s_ext_flags4;
 	struct ocsfs_txn *txn;
 	struct ocsfs_btree bt;
 	struct ext_btree_ctx ec;
@@ -563,7 +592,7 @@ int ocsfs_extent_btree_replace(struct inode *inode,
 
 	if (offset_in_ext > 0) {
 		ret = ocsfs_btree_insert(&bt, orig->logical_block,
-				ext_encode(orig->physical_block,
+				ext_encode(f4, orig->physical_block,
 					   (u32)offset_in_ext, orig->flags));
 		if (ret)
 			goto abort;
@@ -571,7 +600,7 @@ int ocsfs_extent_btree_replace(struct inode *inode,
 	}
 
 	ret = ocsfs_btree_insert(&bt, orig->logical_block + offset_in_ext,
-			ext_encode(new_phys, cow_len, OCSFS_EXT_WRITTEN));
+			ext_encode(f4, new_phys, cow_len, OCSFS_EXT_WRITTEN));
 	if (ret)
 		goto abort;
 	oi->i_extent_tree_root = bt.root_block;
@@ -582,7 +611,7 @@ int ocsfs_extent_btree_replace(struct inode *inode,
 		u32 tail_len  = orig->length - (u32)offset_in_ext - cow_len;
 
 		ret = ocsfs_btree_insert(&bt, tail_log,
-				ext_encode(tail_phys, tail_len, orig->flags));
+				ext_encode(f4, tail_phys, tail_len, orig->flags));
 		if (ret)
 			goto abort;
 		oi->i_extent_tree_root = bt.root_block;
@@ -686,18 +715,18 @@ int ocsfs_extent_btree_init_empty(struct inode *inode)
 
 /* ── iterate / count ── */
 
-struct ext_iter_state { ocsfs_extent_iter_fn fn; void *ctx; };
+struct ext_iter_state { ocsfs_extent_iter_fn fn; void *ctx; bool f4; };
 
 static int ext_iter_wrap(u64 k, u64 v, void *c)
 {
 	struct ext_iter_state *s = c;
-	return s->fn(k, ext_phys(v), ext_len(v), ext_flags(v), s->ctx);
+	return s->fn(k, ext_phys(v), ext_len(s->f4, v), ext_flags(s->f4, v), s->ctx);
 }
 
 int ocsfs_extent_btree_iterate(struct inode *inode,
 			       ocsfs_extent_iter_fn fn, void *ctx)
 {
-	struct ext_iter_state s = { fn, ctx };
+	struct ext_iter_state s = { fn, ctx, OCSFS_SB(inode->i_sb)->s_ext_flags4 };
 	struct ocsfs_btree bt;
 	struct ext_btree_ctx ec;
 	int ret = ext_btree_open(inode, &bt, &ec);
@@ -716,6 +745,7 @@ int ocsfs_extent_btree_iterate(struct inode *inode,
  */
 u64 ocsfs_extent_btree_goal_block(struct inode *inode)
 {
+	bool f4 = OCSFS_SB(inode->i_sb)->s_ext_flags4;
 	struct ocsfs_btree bt;
 	struct ext_btree_ctx ec;
 	u64 key = 0, val = 0;
@@ -724,22 +754,30 @@ u64 ocsfs_extent_btree_goal_block(struct inode *inode)
 		return 0;
 	if (ocsfs_btree_search_le(&bt, U64_MAX, &key, &val))
 		return 0;
-	return ext_phys(val) + ext_len(val);
+	return ext_phys(val) + ext_len(f4, val);
 }
 
+struct ext_count_ctx { bool f4; u64 count; };
+
 static int ext_count_cb(u64 key, u64 val, void *ctx)
-	{ (void)key; *(u64 *)ctx += ext_len(val); return 0; }
+{
+	struct ext_count_ctx *c = ctx;
+	(void)key;
+	c->count += ext_len(c->f4, val);
+	return 0;
+}
 
 int ocsfs_extent_btree_count(struct inode *inode, u64 *count)
 {
+	struct ext_count_ctx c = { OCSFS_SB(inode->i_sb)->s_ext_flags4, 0 };
 	struct ocsfs_btree bt;
 	struct ext_btree_ctx ec;
 	int ret = ext_btree_open(inode, &bt, &ec);
 
 	if (ret)
 		return ret;
-	*count = 0;
-	ocsfs_btree_range_scan(&bt, 0, U64_MAX, ext_count_cb, count);
+	ocsfs_btree_range_scan(&bt, 0, U64_MAX, ext_count_cb, &c);
+	*count = c.count;
 	return 0;
 }
 
@@ -751,6 +789,7 @@ int ocsfs_extent_btree_punch_hole(struct inode *inode,
 	struct ocsfs_inode_info *oi  = OCSFS_I(inode);
 	struct super_block      *sb  = inode->i_sb;
 	struct ocsfs_sb_info    *sbi = OCSFS_SB(sb);
+	bool f4 = sbi->s_ext_flags4;
 	struct ocsfs_btree bt;
 	struct ext_btree_ctx ec;
 	struct ext_trunc_ctx tc;
@@ -790,9 +829,9 @@ int ocsfs_extent_btree_punch_hole(struct inode *inode,
 
 			key = tc.keys[i];
 			{
-				u64 ext_end = key + ext_len(val);
+				u64 ext_end = key + ext_len(f4, val);
 				u64 phys    = ext_phys(val);
-				u16 flags   = ext_flags(val);
+				u16 flags   = ext_flags(f4, val);
 
 				/* Skip extents entirely before start_block */
 				if (ext_end <= start_block)
@@ -808,7 +847,7 @@ int ocsfs_extent_btree_punch_hole(struct inode *inode,
 					u32 keep = (u32)(start_block - key);
 
 					ret = ocsfs_btree_insert(&bt, key,
-							ext_encode(phys, keep, flags));
+							ext_encode(f4, phys, keep, flags));
 					if (ret)
 						goto abort;
 					oi->i_extent_tree_root = bt.root_block;
@@ -823,7 +862,7 @@ int ocsfs_extent_btree_punch_hole(struct inode *inode,
 					u64 tail_phys = ext_phys(val) + tail_off;
 
 					ret = ocsfs_btree_insert(&bt, end_block,
-							ext_encode(tail_phys, tail_len, flags));
+							ext_encode(f4, tail_phys, tail_len, flags));
 					if (ret)
 						goto abort;
 					oi->i_extent_tree_root = bt.root_block;
@@ -874,6 +913,7 @@ int ocsfs_extent_btree_zero_range(struct inode *inode,
 {
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
 	struct super_block      *sb = inode->i_sb;
+	bool f4 = OCSFS_SB(sb)->s_ext_flags4;
 	struct ocsfs_btree bt;
 	struct ext_btree_ctx ec;
 	struct ext_trunc_ctx tc;
@@ -907,7 +947,7 @@ int ocsfs_extent_btree_zero_range(struct inode *inode,
 
 			key = tc.keys[i];
 			{
-				u64 ext_end = key + ext_len(val);
+				u64 ext_end = key + ext_len(f4, val);
 				u64 phys    = ext_phys(val);
 
 				if (ext_end <= start_block)
@@ -923,7 +963,7 @@ int ocsfs_extent_btree_zero_range(struct inode *inode,
 					u32 hlen = (u32)(start_block - key);
 
 					ret = ocsfs_btree_insert(&bt, key,
-							ext_encode(phys, hlen, ext_flags(val)));
+							ext_encode(f4, phys, hlen, ext_flags(f4, val)));
 					if (ret)
 						goto abort;
 					oi->i_extent_tree_root = bt.root_block;
@@ -937,7 +977,7 @@ int ocsfs_extent_btree_zero_range(struct inode *inode,
 					u32 m_len  = (u32)(m_end - m_key);
 
 					ret = ocsfs_btree_insert(&bt, m_key,
-							ext_encode(m_phys, m_len,
+							ext_encode(f4, m_phys, m_len,
 								   OCSFS_EXT_UNWRITTEN));
 					if (ret)
 						goto abort;
@@ -951,7 +991,7 @@ int ocsfs_extent_btree_zero_range(struct inode *inode,
 					u32 t_len  = (u32)(ext_end - end_block);
 
 					ret = ocsfs_btree_insert(&bt, end_block,
-							ext_encode(t_phys, t_len, ext_flags(val)));
+							ext_encode(f4, t_phys, t_len, ext_flags(f4, val)));
 					if (ret)
 						goto abort;
 					oi->i_extent_tree_root = bt.root_block;
@@ -986,6 +1026,7 @@ int ocsfs_extent_btree_compress_one(struct inode *inode,
 				    u64 new_phys, u32 new_len, u16 new_flags)
 {
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
+	bool f4 = OCSFS_SB(inode->i_sb)->s_ext_flags4;
 	struct ocsfs_txn *txn;
 	struct ocsfs_btree bt;
 	struct ext_btree_ctx ec;
@@ -1006,7 +1047,7 @@ int ocsfs_extent_btree_compress_one(struct inode *inode,
 	oi->i_extent_tree_root = bt.root_block;
 
 	ret = ocsfs_btree_insert(&bt, old_ext->logical_block,
-				 ext_encode(new_phys, new_len, new_flags));
+				 ext_encode(f4, new_phys, new_len, new_flags));
 	if (ret)
 		goto abort_cmp;
 	oi->i_extent_tree_root = bt.root_block;

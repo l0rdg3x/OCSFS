@@ -31,9 +31,10 @@ Proxmox VE as an open alternative to VMware VMFS.
 | Inode refresh + lock cache (Sprint D) | ~87% |
 | Journal + dedup safety (Sprint E) | ~89% |
 | Security hardening (Sprint F) | ~90% |
+| Superblock mirror + btree v2 + cluster freeze (Sprint G) | ~91% |
 | VMFS feature parity | ~72% |
 
-Sprints A–F from the Opus v3 review have been applied.
+Sprints A–G from the Opus v3 review have been applied.
 Sprint A: fscrypt cluster safety. Sprint B: HB summary sector-level SCSI
 CAW. Sprint C: recovery back-off, umount drain, lock overflow chain.
 Sprint D: `ocsfs_inode_refresh` now syncs all VFS fields (mode, uid, gid,
@@ -55,6 +56,19 @@ VAAI; (3) `OCSFS_IOC_SNAP_CREATE` returns `-EROFS` on read-only mounts instead
 of silently failing deep in `ocsfs_snapshot_create`; (4) `OCSFS_IOC_DEDUP`
 enforces a 60-second per-inode rate limit to prevent file-owner DoS via
 repeated expensive scan-and-dedup passes on large files.
+Sprint G: four architectural hardening fixes — (1) superblock mirror at block 1
+(4 KiB offset): mount falls back to mirror if primary CRC fails or I/O errors,
+and the mirror is kept in sync on every superblock write; (2) extent btree v2
+encoding (`OCSFS_FEATURE_INCOMPAT_EXT_FLAGS4`): bits[60:63] carry 4-bit flags
+(up from 2-bit), preserving the ENCRYPTED flag (0x4) across B+ tree round-trips
+so large encrypted files remain readable after the 16-inline-extent threshold;
+(3) cluster-wide filesystem freeze via `OCSFS_IOC_FREEZE_FS` / `OCSFS_IOC_THAW_FS`
+ioctls: calls VFS `freeze_super`/`thaw_super`; in cluster mode the freeze
+coordinator acquires a DLM EX lock (`s_freeze_lock_res`) so only one node holds
+the freeze role at a time — safe for backup tooling and live migration;
+(4) ARCH-V3-5 (lock delegation/lease) deferred: requires an on-disk signaling
+protocol redesign to notify the leaseholder when a peer waits; the epoch-based
+cache (Sprint D) already covers the dominant optimization path.
 The remaining gap to 95%+ is real-hardware integration testing (xfstests
 on a multi-node testbed).
 

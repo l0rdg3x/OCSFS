@@ -257,6 +257,50 @@ static int ocsfs_load_ags(struct super_block *sb)
 	return 0;
 }
 
+/* ARCH-V3-2: Write primary superblock contents to the on-disk mirror copy.
+ * Called after every primary write so that the mirror is always consistent. */
+static void ocsfs_update_super_mirror(struct super_block *sb)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	u64 mirror_blk = OCSFS_SUPERBLOCK_MIRROR / sbi->s_block_size;
+	struct buffer_head *mbh;
+
+	mbh = sb_getblk(sb, mirror_blk);
+	if (!mbh)
+		return;
+	lock_buffer(mbh);
+	memcpy(mbh->b_data, sbi->s_sbh->b_data, sbi->s_block_size);
+	set_buffer_uptodate(mbh);
+	mark_buffer_dirty(mbh);
+	unlock_buffer(mbh);
+	sync_dirty_buffer(mbh);
+	brelse(mbh);
+}
+
+/* ARCH-V3-6: Cluster-aware freeze/thaw hooks called by the VFS freeze path.
+ * In cluster mode: the freeze coordinator acquires EX on s_freeze_lock_res so
+ * that two nodes cannot hold the freeze coordinator role simultaneously, and
+ * the DLM lock entry is visible cluster-wide as a freeze-in-progress signal. */
+static int ocsfs_freeze_fs(struct super_block *sb)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+
+	if (!sbi->s_clustered)
+		return 0;
+
+	return ocsfs_lock_acquire(sb, &sbi->s_freeze_lock_res, OCSFS_LOCK_EX);
+}
+
+static int ocsfs_unfreeze_fs(struct super_block *sb)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+
+	if (!sbi->s_clustered)
+		return 0;
+
+	return ocsfs_lock_release(sb, &sbi->s_freeze_lock_res);
+}
+
 /* fill_super — called during mount */
 int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
@@ -274,18 +318,35 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		return -EINVAL;
 	}
 
-	/* Read superblock from block 0 */
+	/* ARCH-V3-2: Read superblock — try primary (block 0) first, then mirror.
+	 * Mirror is at OCSFS_SUPERBLOCK_MIRROR bytes from start = block 1. */
 	bh = sb_bread(sb, 0);
-	if (!bh) {
-		pr_err("ocsfs: unable to read superblock\n");
-		return -EIO;
+	if (bh) {
+		ds = (struct ocsfs_disk_super *)bh->b_data;
+		ret = ocsfs_validate_super(ds, sb, silent);
+		if (ret) {
+			brelse(bh);
+			bh = NULL;
+		}
 	}
+	if (!bh) {
+		u64 mirror_blk = OCSFS_SUPERBLOCK_MIRROR / OCSFS_DEFAULT_BLOCK_SIZE;
 
-	ds = (struct ocsfs_disk_super *)bh->b_data;
-	ret = ocsfs_validate_super(ds, sb, silent);
-	if (ret) {
-		brelse(bh);
-		return ret;
+		pr_warn("ocsfs: primary superblock invalid or unreadable, trying mirror at block %llu\n",
+			mirror_blk);
+		bh = sb_bread(sb, mirror_blk);
+		if (!bh) {
+			pr_err("ocsfs: unable to read primary or mirror superblock\n");
+			return -EIO;
+		}
+		ds = (struct ocsfs_disk_super *)bh->b_data;
+		ret = ocsfs_validate_super(ds, sb, silent);
+		if (ret) {
+			brelse(bh);
+			pr_err("ocsfs: both primary and mirror superblocks are corrupt\n");
+			return ret;
+		}
+		pr_warn("ocsfs: mounted from mirror superblock — run fsck to repair primary\n");
 	}
 
 	/* Allocate in-memory superblock info */
@@ -329,6 +390,8 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sbi->s_lock_primary_count    = le32_to_cpu(ds->s_lock_primary_count);
 	sbi->s_data_off = le64_to_cpu(ds->s_data_off);
 	sbi->s_ag_desc_off = le64_to_cpu(ds->s_ag_desc_off);
+	sbi->s_ext_flags4 = !!(sbi->s_feature_incompat &
+			       OCSFS_FEATURE_INCOMPAT_EXT_FLAGS4);
 
 	/* Enforce: auth feature requires cluster_secret= mount option */
 	if ((sbi->s_feature_flags & OCSFS_FEAT_AUTH) && !sbi->s_auth_required) {
@@ -340,6 +403,7 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	init_rwsem(&sbi->s_global_lock);
 	spin_lock_init(&sbi->s_free_lock);
 	mutex_init(&sbi->s_decompress_lock);
+	ocsfs_lock_init(&sbi->s_freeze_lock_res, 0, OCSFS_LOCKRES_FREEZE);
 
 	sbi->s_rc_buf_pool = mempool_create_kmalloc_pool(4, sbi->s_block_size);
 	if (!sbi->s_rc_buf_pool) {
@@ -422,6 +486,7 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	ds->s_checksum = cpu_to_le32(ocsfs_crc32c(~0U, ds, OCSFS_SUPERBLOCK_SIZE - 4));
 	mark_buffer_dirty(bh);
 	sync_dirty_buffer(bh);
+	ocsfs_update_super_mirror(sb);
 
 	pr_info("ocsfs: mounted \"%.64s\" AGs=%u free=%llu slot=%u%s%s\n",
 		ds->s_label, sbi->s_ag_count, sbi->s_free_blocks, sbi->s_node_slot,
@@ -514,6 +579,7 @@ int ocsfs_sync_fs(struct super_block *sb, int wait)
 		ocsfs_crc32c(~0U, sbi->s_ds, OCSFS_SUPERBLOCK_SIZE - 4));
 	mark_buffer_dirty(sbi->s_sbh);
 	sync_dirty_buffer(sbi->s_sbh);
+	ocsfs_update_super_mirror(sb);
 
 	/* Persist per-AG free counts to AG descriptor blocks */
 	for (i = 0; i < sbi->s_ag_count; i++) {
@@ -556,6 +622,8 @@ const struct super_operations ocsfs_sops = {
 	.put_super      = ocsfs_put_super,
 	.statfs         = ocsfs_statfs,
 	.sync_fs        = ocsfs_sync_fs,
+	.freeze_fs      = ocsfs_freeze_fs,
+	.unfreeze_fs    = ocsfs_unfreeze_fs,
 	.get_dquots     = ocsfs_get_dquots,
 };
 
