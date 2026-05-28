@@ -569,10 +569,21 @@ static long ocsfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	}
 
 	if (cmd == OCSFS_IOC_DEDUP) {
+		struct ocsfs_inode_info *oi = OCSFS_I(inode);
 		struct ocsfs_dedup_result res;
+		unsigned long now = jiffies;
 
 		if (!inode_owner_or_capable(idmap, inode))
 			return -EPERM;
+
+		/* SEC-V3-8: Per-inode rate-limit to prevent a file owner from
+		 * triggering unbounded dedup scans on large files as a DoS.
+		 * Minimum interval: 60 s. */
+		if (oi->i_dedup_last_jiffies &&
+		    time_before(now, oi->i_dedup_last_jiffies + 60 * HZ))
+			return -EBUSY;
+		oi->i_dedup_last_jiffies = now;
+
 		ret = ocsfs_dedup_file(inode, &res.bytes_deduped);
 		if (ret)
 			return ret;
@@ -631,6 +642,10 @@ static long ocsfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 	if (cmd != OCSFS_IOC_SNAP_CREATE)
 		return -ENOTTY;
+
+	/* SEC-V3-7: Snapshot creation mutates metadata; reject on read-only mounts. */
+	if (inode->i_sb->s_flags & SB_RDONLY)
+		return -EROFS;
 
 	/* Caller must own (or be capable of) the source file */
 	if (!inode_owner_or_capable(idmap, inode))

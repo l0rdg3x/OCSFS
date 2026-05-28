@@ -63,6 +63,12 @@ int ocsfs_vaai_write_same(struct super_block *sb,
 	if (ret)
 		return ret;
 
+	/* SEC-V3-4: Reject writes that would overwrite filesystem metadata
+	 * (superblock, journal, lock table, node table, heartbeat area).
+	 * s_data_off is the first byte offset belonging to user data. */
+	if (arg.offset < OCSFS_SB(sb)->s_data_off)
+		return -EPERM;
+
 	memset(cdb, 0, sizeof(cdb));
 	cdb[0]  = 0x93;          /* WRITE SAME(16) */
 	cdb[1]  = (1 << 0);      /* NDOB bit: no data-out buffer needed */

@@ -784,6 +784,8 @@ struct ocsfs_inode_info {
 	struct dquot           *i_dquot[MAXQUOTAS];
 	/* fscrypt key context — NULL unless directory/file is encrypted */
 	struct fscrypt_inode_info *i_crypt_info;
+	/* SEC-V3-8: rate-limit OCSFS_IOC_DEDUP; 0 = never called */
+	unsigned long           i_dedup_last_jiffies;
 	struct inode            vfs_inode;      /* must be last */
 };
 

@@ -30,9 +30,10 @@ Proxmox VE as an open alternative to VMware VMFS.
 | Recovery robustness (Sprint C) | ~82% |
 | Inode refresh + lock cache (Sprint D) | ~87% |
 | Journal + dedup safety (Sprint E) | ~89% |
+| Security hardening (Sprint F) | ~90% |
 | VMFS feature parity | ~72% |
 
-Sprints A–E from the Opus v3 review have been applied.
+Sprints A–F from the Opus v3 review have been applied.
 Sprint A: fscrypt cluster safety. Sprint B: HB summary sector-level SCSI
 CAW. Sprint C: recovery back-off, umount drain, lock overflow chain.
 Sprint D: `ocsfs_inode_refresh` now syncs all VFS fields (mode, uid, gid,
@@ -46,7 +47,15 @@ eliminating false-positive peer-write skips caused by hash collisions on large
 filesystems; `dedup_apply_pair` now holds `i_extent_lock` across lookup+replace
 to prevent data races with concurrent truncate; `dedup_blocks_equal` uses
 forced disk reads in cluster mode to avoid stale page-cache comparisons.
-The remaining gap to 90%+ is real-hardware integration testing (xfstests
+Sprint F: four security hardening fixes — (1) node slot claim now re-reads and
+verifies HMAC-SHA256 auth after successful CAS to catch wrong-cluster joins;
+(2) `OCSFS_IOC_WRITE_SAME` rejects writes below `s_data_off` to prevent
+`CAP_SYS_ADMIN` callers from silently overwriting filesystem metadata via
+VAAI; (3) `OCSFS_IOC_SNAP_CREATE` returns `-EROFS` on read-only mounts instead
+of silently failing deep in `ocsfs_snapshot_create`; (4) `OCSFS_IOC_DEDUP`
+enforces a 60-second per-inode rate limit to prevent file-owner DoS via
+repeated expensive scan-and-dedup passes on large files.
+The remaining gap to 95%+ is real-hardware integration testing (xfstests
 on a multi-node testbed).
 
 ---

@@ -498,6 +498,35 @@ collapse two logically distinct files onto the same physical blocks. Now uses
 ordering via `wait_event(j_ckpt_waitq, j_ckpt_now == my_ticket)` ensures the
 journal tail advances monotonically.
 
+### Security hardening (Sprint F — SEC-V3-1/4/7/8)
+
+**SEC-V3-1 — Node slot post-CAS auth re-verify (`node.c`):**
+After a successful CAS write in `ocsfs_node_claim_slot`, the slot is
+immediately re-read from disk and `ocsfs_node_verify_auth` is called on the
+read-back data. A mismatch (wrong cluster secret, CAS implementation bug in
+storage array) causes the slot to be released via `ocsfs_node_release_slot`
+and `-EACCES` to be returned, preventing a node with the wrong secret from
+joining the cluster. Active only when `sbi->s_auth_required` is set.
+
+**SEC-V3-4 — VAAI WRITE SAME metadata guard (`vaai.c`):**
+`ocsfs_vaai_write_same` now rejects requests where `arg.offset <
+sbi->s_data_off`. Without this check a `CAP_SYS_ADMIN` caller could silently
+overwrite the superblock, journal, lock table, or node table via the SCSI
+WRITE SAME(16) offload path. Returns `-EPERM` for out-of-bounds targets.
+
+**SEC-V3-7 — Snapshot create EROFS check (`file.c`):**
+`OCSFS_IOC_SNAP_CREATE` now returns `-EROFS` immediately if
+`sb->s_flags & SB_RDONLY`. Previously the call propagated into
+`ocsfs_snapshot_create` and failed silently or with a confusing error deep in
+the journal path.
+
+**SEC-V3-8 — Dedup ioctl rate-limit (`file.c`, `ocsfs.h`):**
+`OCSFS_IOC_DEDUP` enforces a per-inode minimum interval of 60 seconds via
+`i_dedup_last_jiffies` (new field in `ocsfs_inode_info`). Returns `-EBUSY`
+if called again within the window. Prevents a file owner from continuously
+triggering expensive full-file dedup scans as a local DoS against the work
+queues and I/O scheduler.
+
 ---
 
 ## 9. I/O Path

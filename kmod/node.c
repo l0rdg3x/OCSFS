@@ -283,6 +283,36 @@ int ocsfs_node_claim_slot(struct super_block *sb)
 		/* CAS atomico: se -EAGAIN un altro nodo ha preso lo slot */
 		ret = ocsfs_node_write_slot(sb, i);
 		if (ret == 0) {
+			/* SEC-V3-1: re-read and verify auth on our own slot.
+			 * Catches wrong-cluster joins where our secret doesn't
+			 * match what the existing cluster expects, or CAS
+			 * implementation bugs in the storage array. */
+			if (sbi->s_auth_required) {
+				struct ocsfs_disk_node_slot verify_dns;
+				u64 voff = OCSFS_NODE_SLOT_TABLE_OFF +
+					   (u64)i * sizeof(verify_dns);
+				u64 vblk = voff / sbi->s_block_size;
+				u32 vboff = voff % sbi->s_block_size;
+				struct buffer_head *vbh = sb_getblk(sb, vblk);
+
+				if (vbh) {
+					clear_buffer_uptodate(vbh);
+					if (bh_read(vbh, 0) >= 0) {
+						memcpy(&verify_dns,
+						       vbh->b_data + vboff,
+						       sizeof(verify_dns));
+						brelse(vbh);
+						if (ocsfs_node_verify_auth(sb, &verify_dns) < 0) {
+							ocsfs_node_release_slot(sb);
+							pr_err("ocsfs: slot %u auth failed after CAS — wrong cluster secret?\n",
+							       i);
+							return -EACCES;
+						}
+					} else {
+						brelse(vbh);
+					}
+				}
+			}
 			pr_info("ocsfs: claimed node slot %u (gen=%u)\n",
 				i, sbi->s_mount_gen);
 			return 0;
