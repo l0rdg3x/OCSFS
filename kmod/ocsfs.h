@@ -553,6 +553,10 @@ struct ocsfs_lock_res {
 	u64             lr_inv_lo;
 	u64             lr_inv_hi;
 	u32             lr_inv_epoch;
+	/* MEDIO-V3-1 / ARCH-V3-7: epoch-based lock cache.
+	 * lr_lock_epoch records sbi->s_lock_epoch at last disk validation.
+	 * Cache hit: lr_mode >= requested && lr_lock_epoch == s_lock_epoch. */
+	u32             lr_lock_epoch;
 	/* ARCH-2: overflow chain — if non-zero, entry lives in this overflow block */
 	u64             lr_overflow_addr; /* absolute byte addr on disk; 0 = primary table */
 };
@@ -710,7 +714,7 @@ struct ocsfs_sb_info {
 	/* Distributed lock manager */
 	struct list_head        s_lock_list;    /* active lock_res list */
 	spinlock_t              s_lock_list_lock;
-	atomic_t                s_lock_epoch;  /* incremented by lock_recover_node */
+	atomic_t                s_lock_epoch;  /* bumped by recovery; enables per-lr cache via lr_lock_epoch */
 
 	/* Recovery */
 	struct work_struct      s_recovery_work;

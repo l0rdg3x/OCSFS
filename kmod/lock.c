@@ -77,10 +77,31 @@ int ocsfs_lock_acquire(struct super_block *sb, struct ocsfs_lock_res *lr,
 	mutex_lock(&lr->lr_mutex);
 
 	/*
-	 * Lock cache is DISABLED in cluster mode: s_lock_epoch is bumped only
-	 * on node recovery, not on EX release from a peer.  Always round-trip
-	 * to disk so every acquisition sees the current holder.
+	 * Epoch-based lock cache (MEDIO-V3-1, ARCH-V3-7).
+	 *
+	 * Cache hit: we already hold a compatible mode AND s_lock_epoch hasn't
+	 * changed since our last disk validation (no recovery since then).
+	 * Skip both lock_probe_slot and the disk CAS round-trip.
+	 *
+	 * Safety: while we hold SH no peer can hold EX, so the disk state
+	 * cannot have changed in a way that would invalidate our SH.  While
+	 * we hold EX no peer can hold anything, so EX re-acquires are safe.
+	 * Recovery bumps s_lock_epoch, invalidating all cached entries.
+	 *
+	 * CW is excluded from caching: it is never requested in the current
+	 * code paths, so the numeric ordering (CW=3 > EX=2) is not a proxy
+	 * for lock strength.
 	 */
+	{
+		u32 cur_epoch = (u32)atomic_read(&sbi->s_lock_epoch);
+
+		if (lr->lr_mode >= mode &&
+		    lr->lr_mode != OCSFS_LOCK_CW &&
+		    lr->lr_lock_epoch == cur_epoch) {
+			mutex_unlock(&lr->lr_mutex);
+			return 0;
+		}
+	}
 
 	ret = lock_probe_slot(sb, lr);
 	if (ret) {
@@ -133,9 +154,12 @@ retry:
 			 * SH: read path uses it for selective page cache invalidation.
 			 * EX: write path uses it before starting the write so it can
 			 *     invalidate only the stale pages (not the full mapping). */
-			lr->lr_inv_lo    = le64_to_cpu(dl.le_inv_lo);
-			lr->lr_inv_hi    = le64_to_cpu(dl.le_inv_hi);
-			lr->lr_inv_epoch = le32_to_cpu(dl.le_inv_epoch);
+			lr->lr_inv_lo     = le64_to_cpu(dl.le_inv_lo);
+			lr->lr_inv_hi     = le64_to_cpu(dl.le_inv_hi);
+			lr->lr_inv_epoch  = le32_to_cpu(dl.le_inv_epoch);
+			/* Record epoch for cache: next acquire at same-or-lower mode
+			 * skips the disk round-trip (MEDIO-V3-1). */
+			lr->lr_lock_epoch = (u32)atomic_read(&sbi->s_lock_epoch);
 		}
 
 		mutex_unlock(&lr->lr_mutex);
@@ -227,6 +251,7 @@ retry_release:
 		 * trigger proper recovery instead of leaving an orphaned lock. */
 	} else {
 		lr->lr_mode = OCSFS_LOCK_NL;
+		lr->lr_lock_epoch = 0;  /* invalidate cache; next acquire goes to disk */
 	}
 	mutex_unlock(&lr->lr_mutex);
 	return ret;

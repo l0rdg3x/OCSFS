@@ -260,6 +260,14 @@ ocsfs_put_super()
         └── ocsfs_pr_unregister()      → SCSI-3 PR RELEASE
 ```
 
+### Inode refresh (`inode.c:ocsfs_inode_refresh`)
+
+Called by read/write/stat paths when the caller holds DLM SH. Re-reads the
+inode from disk and populates all VFS fields. **Sprint D (ALTO-V3-3):** now
+refreshes `i_mode`, `i_nlink`, `i_uid`, `i_gid`, and `i_atime` in addition
+to the previously-refreshed size/timestamps/extents, so a remote `chmod` or
+`chown` is visible without remounting.
+
 ---
 
 ## 5. Distributed Locking Protocol
@@ -276,10 +284,10 @@ ocsfs_put_super()
 ### Lock acquire (`lock.c:ocsfs_lock_acquire`)
 
 ```
-1. SH cache fast-path: if lr_cached && epoch unchanged && not expired → return 0
+1. Epoch cache check: if lr_mode >= requested AND lr_lock_epoch == s_lock_epoch → return 0 (no disk)
 2. ocsfs_lock_probe_slot()  → find physical slot (linear probing, max 16)
 3. lock_read_entry()        → forced disk read (bypasses page cache)
-4. Compatible?              → update entry via lock_write_entry() with version check
+4. Compatible?              → update entry via lock_write_entry() with version check; record lr_lock_epoch
 5. Conflict?                → set_waiter_bit() + exponential backoff (1ms → 100ms, wall-clock deadline 30s)
 ```
 
@@ -308,11 +316,19 @@ slot = resource_id % OCSFS_LOCK_ENTRY_COUNT
 
 Collisions are handled by linear probing (max `OCSFS_LOCK_PROBE_MAX = 16` slots).
 
-### Epoch-based SH cache invalidation
+### Epoch-based lock cache (Sprint D — MEDIO-V3-1, ARCH-V3-7)
 
-Each call to `ocsfs_lock_recover_node()` atomically increments
-`sbi->s_lock_epoch`. Cached SH grants that were obtained in an earlier epoch
-are silently invalidated at next access, forcing a fresh disk read.
+Each `ocsfs_lock_res` carries `lr_lock_epoch` (recorded from `sbi->s_lock_epoch`
+after each disk acquisition). On the next `ocsfs_lock_acquire`, if
+`lr_mode >= requested_mode` and `lr_lock_epoch == s_lock_epoch`, the disk
+round-trip is skipped entirely — no probe, no read, no CAS. This eliminates
+the per-inode disk access on repeated `stat`/`open`/`readdir` calls in
+cluster mode, making `find`/`ls -lR` workloads practical.
+
+Invalidation: `ocsfs_lock_recover_node()` atomically increments `sbi->s_lock_epoch`
+after any node crash. All cached entries whose `lr_lock_epoch` is stale then
+miss on the next acquire, forcing a fresh disk read. On lock release,
+`lr_lock_epoch` is cleared to 0 so the next acquire always goes to disk.
 
 ### Selective page cache invalidation (ARCH-7)
 

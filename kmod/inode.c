@@ -251,8 +251,15 @@ int ocsfs_inode_refresh(struct inode *inode)
 	if (ret)
 		return ret;
 	mutex_lock(&oi->i_extent_lock);
+	/* Refresh all VFS fields so cluster chmod/chown/link are visible
+	 * to permission checks on this node (ALTO-V3-3). */
+	inode->i_mode   = le16_to_cpu(di.i_mode);
+	set_nlink(inode, le16_to_cpu(di.i_nlink));
+	i_uid_write(inode, le32_to_cpu(di.i_uid));
+	i_gid_write(inode, le32_to_cpu(di.i_gid));
 	inode->i_size   = le64_to_cpu(di.i_size);
 	inode->i_blocks = le64_to_cpu(di.i_blocks) * (sbi->s_block_size / 512);
+	inode_set_atime_to_ts(inode, ns_to_timespec64(le64_to_cpu(di.i_atime)));
 	inode_set_mtime_to_ts(inode, ns_to_timespec64(le64_to_cpu(di.i_mtime)));
 	inode_set_ctime_to_ts(inode, ns_to_timespec64(le64_to_cpu(di.i_ctime)));
 	oi->i_flags            = le32_to_cpu(di.i_flags);
