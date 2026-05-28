@@ -91,6 +91,15 @@
  * defer EX acquisitions, providing cross-node quiescence during replay. */
 #define OCSFS_RL_REPLAY_ACTIVE      (1U << 31)
 
+/* rl_phase values — persisted on-disk for crash-safe recovery resume (ARCH-V3-3).
+ * A new leader inherits the dead leader's phase and skips already-completed steps.
+ * rl_phase is NOT covered by rl_checksum (appended after it); a wrong phase value
+ * at worst causes redundant but idempotent work, not data corruption. */
+#define OCSFS_RECOVERY_PHASE_ELECTED  0  /* won CAS, no phase completed yet */
+#define OCSFS_RECOVERY_PHASE_FENCED   1  /* SCSI PR fencing complete */
+#define OCSFS_RECOVERY_PHASE_REPLAYED 2  /* journal replay complete */
+#define OCSFS_RECOVERY_PHASE_LOCKS    3  /* lock cleanup complete */
+
 /* HB summary block — one 4 KiB block, 256×16-byte entries (NUOV-ARCH-3) */
 #define OCSFS_HB_SUMMARY_OFF   (OCSFS_RECOVERY_LEADER_OFF + OCSFS_DEFAULT_BLOCK_SIZE)
 
@@ -107,6 +116,8 @@ struct ocsfs_disk_recovery_leader {
 	__le32  rl_epoch;         /* monotonic — incrementato ad ogni elezione */
 	__le64  rl_deadline_ns;   /* scadenza leadership (ktime_get_real_ns) */
 	__le32  rl_checksum;      /* crc32c dei primi 24 byte */
+	__u8    rl_phase;         /* OCSFS_RECOVERY_PHASE_* — not in checksum */
+	__u8    rl_pad[3];
 } __packed;
 
 /* 32 byte per entry; 128 entry per blocco da 4096 byte */

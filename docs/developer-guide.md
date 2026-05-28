@@ -849,6 +849,60 @@ journals the new extent map first; a subsequent crash is a space leak (old
 refcount entry not decremented, old blocks not freed) rather than a
 cross-link or data corruption.
 
+### Sprint K — Recovery phase persistence (2026-05-28)
+
+Sprint K addresses ARCH-V3-3: persisting the recovery phase on-disk so that a
+crash-replacement recovery leader can skip already-completed phases rather than
+restarting from Phase 1 every time.
+
+**ARCH-V3-3 — Recovery phase lost if leader crashes mid-recovery (`recovery.c`):**
+
+Before Sprint K, the recovery phase progression (Phase 1 → Phase 5) was
+entirely in-memory. If the recovery leader crashed after completing Phase 2
+(fencing) but before finishing Phase 3 (journal replay), the new leader won
+the CAS election and found no record of what the dead leader had already done.
+It would restart from Phase 1 — re-doing fencing (idempotent but wasteful) and
+re-running journal replay (safe, but involves setting `REPLAY_ACTIVE` again,
+which causes all survivor nodes to defer EX acquisitions for the full replay
+duration). Worse, if the dead leader had crashed after REPLAY_ACTIVE was
+cleared, the new leader would set it again unnecessarily.
+
+Fix: add `rl_phase` (`__u8`) to `ocsfs_disk_recovery_leader` (at offset 28,
+after `rl_checksum`; not covered by the existing CRC — a wrong phase causes
+redundant but idempotent work, not data corruption). Add four phase constants:
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `OCSFS_RECOVERY_PHASE_ELECTED` | 0 | Won CAS; no phase completed |
+| `OCSFS_RECOVERY_PHASE_FENCED` | 1 | SCSI PR fencing complete |
+| `OCSFS_RECOVERY_PHASE_REPLAYED` | 2 | Journal replay complete |
+| `OCSFS_RECOVERY_PHASE_LOCKS` | 3 | Lock cleanup complete |
+
+`ocsfs_recovery_leader_acquire` gains a `u8 *phase_out` parameter. When
+winning the CAS over a dead leader's block, it sets `new.rl_phase =
+cur.rl_phase` (inheriting the dead leader's phase) and reports it back.
+
+`ocsfs_recovery_set_phase` (new helper) performs a direct write to the on-disk
+leader block after each phase completes. It checks that the epoch in the block
+still matches the caller's `leader_epoch` before writing — if leadership was
+superseded, the write is silently skipped.
+
+`ocsfs_recovery_run` wraps Phases 2, 3, and 4 in `if (start_phase <
+OCSFS_RECOVERY_PHASE_*)` guards and calls `ocsfs_recovery_set_phase` after
+each phase succeeds. Error paths are consolidated with goto labels
+(`out_release_dead`, `out_release`, `out_done`) to eliminate repeated
+unlock/return patterns. Phase 5 (slot cleanup) always runs because
+`ocsfs_node_mark_dead` is idempotent.
+
+Crash behaviour after Sprint K:
+
+| Crash point | New leader behaviour |
+|---|---|
+| After Phase 2 (FENCED written) | Skips Phase 2 + degraded check; runs Phase 3 onwards |
+| After Phase 3 (REPLAYED written) | Skips Phase 2 + Phase 3; runs Phase 4 + 5 |
+| After Phase 4 (LOCKS written) | Skips Phases 2–4; runs Phase 5 only |
+| No phase written (crash in Phase 1 or between phases) | Restarts from elected phase; worst case is redundant idempotent work |
+
 ---
 
 ## 9. I/O Path

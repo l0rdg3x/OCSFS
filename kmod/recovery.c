@@ -47,7 +47,8 @@ static u32 ocsfs_rl_crc(const struct ocsfs_disk_recovery_leader *rl)
  * epoch_out receives the epoch to pass to ocsfs_recovery_leader_release().
  */
 static int ocsfs_recovery_leader_acquire(struct super_block *sb,
-					 u16 failed_slot, u32 *epoch_out)
+					 u16 failed_slot, u32 *epoch_out,
+					 u8 *phase_out)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	struct ocsfs_disk_recovery_leader cur, new;
@@ -77,15 +78,17 @@ static int ocsfs_recovery_leader_acquire(struct super_block *sb,
 		    le64_to_cpu(cur.rl_deadline_ns) > now) {
 			/* Valid leader exists and hasn't expired */
 			if (le16_to_cpu(cur.rl_leader_slot) == sbi->s_node_slot) {
-				/* We already hold it (retry after own timeout?) */
 				if (epoch_out)
 					*epoch_out = le32_to_cpu(cur.rl_epoch);
+				if (phase_out)
+					*phase_out = cur.rl_phase;
 				return 0;
 			}
 			return -EAGAIN;
 		}
 
-		/* Build new leader block claiming leadership for this node */
+		/* Build new leader block — inherit the dead leader's phase so a
+		 * new leader can skip already-completed recovery steps (ARCH-V3-3). */
 		memset(&new, 0, sizeof(new));
 		new.rl_magic       = cpu_to_le32(OCSFS_RECOVERY_LEADER_MAGIC);
 		new.rl_leader_slot = cpu_to_le16(sbi->s_node_slot);
@@ -93,12 +96,16 @@ static int ocsfs_recovery_leader_acquire(struct super_block *sb,
 		new.rl_leader_gen  = cpu_to_le32(sbi->s_mount_gen);
 		new.rl_epoch       = cpu_to_le32(le32_to_cpu(cur.rl_epoch) + 1);
 		new.rl_deadline_ns = cpu_to_le64(now + RECOVERY_LEADER_TIMEOUT_NS);
+		new.rl_phase       = (le32_to_cpu(cur.rl_magic) == OCSFS_RECOVERY_LEADER_MAGIC) ?
+				     cur.rl_phase : 0;
 		new.rl_checksum    = cpu_to_le32(ocsfs_rl_crc(&new));
 
 		ret = ocsfs_atomic_cas(sb, block, 0, sizeof(cur), &cur, &new);
 		if (ret == 0) {
 			if (epoch_out)
 				*epoch_out = le32_to_cpu(new.rl_epoch);
+			if (phase_out)
+				*phase_out = new.rl_phase;
 			return 0;
 		}
 		if (ret != -EAGAIN)
@@ -212,6 +219,36 @@ static void ocsfs_recovery_set_replay_active(struct super_block *sb, bool active
 	brelse(bh);
 }
 
+/*
+ * ocsfs_recovery_set_phase — persist the current recovery phase on-disk.
+ * Called by the leader after each phase completes so a crash-replacement
+ * leader can skip already-finished work (ARCH-V3-3).
+ * No CAS needed: only the current leader (which owns the epoch) writes this.
+ */
+static void ocsfs_recovery_set_phase(struct super_block *sb, u32 epoch, u8 phase)
+{
+	struct ocsfs_disk_recovery_leader rl;
+	struct buffer_head *bh;
+	u64 block = ocsfs_rl_block(sb);
+
+	bh = sb_getblk(sb, block);
+	if (!bh)
+		return;
+	clear_buffer_uptodate(bh);
+	if (bh_read(bh, 0) < 0) { brelse(bh); return; }
+	memcpy(&rl, bh->b_data, sizeof(rl));
+	/* Guard: abort if leadership was superseded (epoch mismatch). */
+	if ((le32_to_cpu(rl.rl_epoch) & ~OCSFS_RL_REPLAY_ACTIVE) !=
+	    (epoch & ~OCSFS_RL_REPLAY_ACTIVE)) { brelse(bh); return; }
+	lock_buffer(bh);
+	((struct ocsfs_disk_recovery_leader *)bh->b_data)->rl_phase = phase;
+	set_buffer_uptodate(bh);
+	mark_buffer_dirty(bh);
+	unlock_buffer(bh);
+	sync_dirty_buffer(bh);
+	brelse(bh);
+}
+
 /* ═══════════════════════════════════════════════════════════════
  * RECOVERY EXECUTION — 5 phases
  * ═══════════════════════════════════════════════════════════════ */
@@ -220,173 +257,129 @@ int ocsfs_recovery_run(struct super_block *sb, u16 failed_slot)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	struct ocsfs_node_info *ni;
-	u32 failed_gen, leader_epoch;
+	u32 failed_gen, leader_epoch = 0;
 	u64 failed_pr_key;
+	u8  start_phase = 0;
 	int ret;
 
 	mutex_lock(&sbi->s_recovery_lock);
 	sbi->s_recovery_in_progress = true;
+	pr_warn("ocsfs: ═══ RECOVERY START for node slot %u ═══\n", failed_slot);
 
-	pr_warn("ocsfs: ═══ RECOVERY START for node slot %u ═══\n",
-		failed_slot);
-
-	/* Cache failed node info */
 	spin_lock(&sbi->s_node_lock);
 	ni = &sbi->s_nodes[failed_slot];
-	failed_gen = ni->ni_mount_gen;
+	failed_gen    = ni->ni_mount_gen;
 	failed_pr_key = ni->ni_pr_key;
 	spin_unlock(&sbi->s_node_lock);
 
-	/*
-	 * Phase 1 — Leader Election via CAS on-disk.
-	 *
-	 * ocsfs_recovery_leader_acquire() atomically writes our node slot
-	 * into the on-disk recovery leader block.  Only the node that wins
-	 * the CAS will proceed; others get -EAGAIN and defer gracefully.
-	 * This replaces both the in-memory scan and the DLM re-check that
-	 * had a TOCTOU window between them.
-	 */
+	/* Phase 1 — Leader Election via CAS on-disk (TOCTOU-free). */
 	pr_info("ocsfs: recovery phase 1: CAS leader election\n");
-
-	ret = ocsfs_recovery_leader_acquire(sb, failed_slot, &leader_epoch);
+	ret = ocsfs_recovery_leader_acquire(sb, failed_slot, &leader_epoch,
+					    &start_phase);
 	if (ret) {
 		if (ret == -EAGAIN)
 			pr_info("ocsfs: not the recovery leader for slot %u, deferring\n",
 				failed_slot);
 		else
-			pr_warn("ocsfs: leader election for slot %u failed (%d), deferring\n",
+			pr_warn("ocsfs: leader election for slot %u failed (%d)\n",
 				failed_slot, ret);
-		sbi->s_recovery_in_progress = false;
-		mutex_unlock(&sbi->s_recovery_lock);
-		return ret;
+		goto out_done;
 	}
+	pr_info("ocsfs: node %u is recovery leader; resuming from phase %u\n",
+		sbi->s_node_slot, start_phase);
 
-	pr_info("ocsfs: this node (slot %u) is the recovery leader\n",
-		sbi->s_node_slot);
+	/* Phase 2 — SCSI PR Fencing (skip if already completed by dead leader). */
+	if (start_phase < OCSFS_RECOVERY_PHASE_FENCED) {
+		pr_info("ocsfs: recovery phase 2: SCSI PR fencing\n");
+		spin_lock(&sbi->s_node_lock);
+		ni->ni_state = OCSFS_NODE_EVICTING;
+		spin_unlock(&sbi->s_node_lock);
 
-	/*
-	 * Phase 2 — SCSI PR Fencing
-	 */
-	pr_info("ocsfs: recovery phase 2: SCSI PR fencing\n");
-
-	spin_lock(&sbi->s_node_lock);
-	ni->ni_state = OCSFS_NODE_EVICTING;
-	spin_unlock(&sbi->s_node_lock);
-
-	ret = ocsfs_pr_preempt_abort(sb, failed_pr_key,
-				     OCSFS_PR_TYPE_WRITE_EXCL_REG);
-	if (ret && ret != -EOPNOTSUPP && sbi->s_pr_capable) {
-		/*
-		 * We registered PR successfully at mount (s_pr_capable) but
-		 * fencing of the dead node failed now.  The node may still be
-		 * alive and writing — proceeding with journal replay would risk
-		 * split-brain corruption.  Force read-only and bail.
-		 */
-		pr_err("ocsfs: PR fencing failed (ret=%d) on PR-capable device — "
-		       "forcing read-only to prevent split-brain\n", ret);
-		sb->s_flags |= SB_RDONLY;
-		ocsfs_node_mark_dead(sb, failed_slot);
-		ocsfs_recovery_leader_release(sb, failed_slot, leader_epoch);
-		sbi->s_recovery_in_progress = false;
-		mutex_unlock(&sbi->s_recovery_lock);
-		return ret;
-	}
-	if (ret)
-		pr_warn("ocsfs: PR fencing unavailable (ret=%d), "
-			"continuing without hardware isolation\n", ret);
-
-	/*
-	 * Degraded safety check: if we have no hardware fence, re-read the
-	 * superblock and verify s_last_mount_time has not changed since we
-	 * started recovery. A changed timestamp means another node (possibly
-	 * the "dead" one) has written to the device — abort to prevent
-	 * split-brain.
-	 */
-	if (!sbi->s_pr_capable) {
-		struct buffer_head *sb_bh;
-		struct ocsfs_disk_super *sb_ds;
-		u64 current_mount_time;
-
-		sb_bh = sb_getblk(sb, 0);
-		if (sb_bh) {
-			clear_buffer_uptodate(sb_bh);
-			if (bh_read(sb_bh, 0) == 0) {
-				sb_ds = (struct ocsfs_disk_super *)sb_bh->b_data;
-				current_mount_time = le64_to_cpu(sb_ds->s_last_mount_time);
-				if (current_mount_time != le64_to_cpu(sbi->s_ds->s_last_mount_time)) {
-					pr_err("ocsfs: degraded recovery: superblock mount time "
-					       "changed during recovery (another node may be alive) — "
-					       "aborting to prevent split-brain\n");
-					brelse(sb_bh);
-					sb->s_flags |= SB_RDONLY;
-					ocsfs_node_mark_dead(sb, failed_slot);
-					ocsfs_recovery_leader_release(sb, failed_slot, leader_epoch);
-					sbi->s_recovery_in_progress = false;
-					mutex_unlock(&sbi->s_recovery_lock);
-					return -EPERM;
-				}
-			}
-			brelse(sb_bh);
-		} else {
-			pr_warn("ocsfs: degraded recovery: cannot re-read superblock, "
-				"proceeding without mount-time check\n");
+		ret = ocsfs_pr_preempt_abort(sb, failed_pr_key,
+					     OCSFS_PR_TYPE_WRITE_EXCL_REG);
+		if (ret && ret != -EOPNOTSUPP && sbi->s_pr_capable) {
+			pr_err("ocsfs: PR fencing failed (%d) — forcing read-only\n", ret);
+			sb->s_flags |= SB_RDONLY;
+			goto out_release_dead;
 		}
+		if (ret)
+			pr_warn("ocsfs: PR fencing unavailable (%d), continuing\n", ret);
+
+		if (!sbi->s_pr_capable) {
+			struct buffer_head *sb_bh = sb_getblk(sb, 0);
+
+			if (sb_bh) {
+				clear_buffer_uptodate(sb_bh);
+				if (bh_read(sb_bh, 0) == 0) {
+					struct ocsfs_disk_super *ds =
+						(struct ocsfs_disk_super *)sb_bh->b_data;
+					if (le64_to_cpu(ds->s_last_mount_time) !=
+					    le64_to_cpu(sbi->s_ds->s_last_mount_time)) {
+						pr_err("ocsfs: degraded recovery: SB mount time "
+						       "changed — another node may be alive\n");
+						brelse(sb_bh);
+						sb->s_flags |= SB_RDONLY;
+						ret = -EPERM;
+						goto out_release_dead;
+					}
+				}
+				brelse(sb_bh);
+			} else {
+				pr_warn("ocsfs: degraded recovery: cannot re-read SB\n");
+			}
+		}
+		ocsfs_recovery_set_phase(sb, leader_epoch, OCSFS_RECOVERY_PHASE_FENCED);
 	}
 
-	/*
-	 * Phase 3 — Journal Replay
-	 *
-	 * Write OCSFS_RL_REPLAY_ACTIVE to the shared leader block so survivor
-	 * nodes defer EX acquisitions during replay (cross-node quiescence,
-	 * NUOV-CRIT-6).  The local s_recovery_barrier is set inside
-	 * ocsfs_journal_replay_node so it is always paired correctly even if
-	 * the function is called directly (NUOV-MEDIO-1).
-	 */
-	pr_info("ocsfs: recovery phase 3: journal replay for node %u\n",
-		failed_slot);
-
-	ocsfs_recovery_set_replay_active(sb, true);
-	ret = ocsfs_journal_replay_node(sb, failed_slot);
-	ocsfs_recovery_set_replay_active(sb, false);
-
-	if (ret) {
-		pr_err("ocsfs: journal replay for node %u failed: %d — "
-		       "forcing read-only\n", failed_slot, ret);
-		sb->s_flags |= SB_RDONLY;
-		ocsfs_recovery_leader_release(sb, failed_slot, leader_epoch);
-		sbi->s_recovery_in_progress = false;
-		mutex_unlock(&sbi->s_recovery_lock);
-		return ret;
+	/* Phase 3 — Journal Replay (skip if already replayed by dead leader). */
+	if (start_phase < OCSFS_RECOVERY_PHASE_REPLAYED) {
+		pr_info("ocsfs: recovery phase 3: journal replay for node %u\n",
+			failed_slot);
+		ocsfs_recovery_set_replay_active(sb, true);
+		ret = ocsfs_journal_replay_node(sb, failed_slot);
+		ocsfs_recovery_set_replay_active(sb, false);
+		if (ret) {
+			pr_err("ocsfs: journal replay for node %u failed: %d — read-only\n",
+			       failed_slot, ret);
+			sb->s_flags |= SB_RDONLY;
+			goto out_release;
+		}
+		ocsfs_recovery_set_phase(sb, leader_epoch, OCSFS_RECOVERY_PHASE_REPLAYED);
 	}
 
-	/*
-	 * Phase 4 — Lock Recovery
-	 */
-	pr_info("ocsfs: recovery phase 4: lock recovery\n");
+	/* Phase 4 — Lock Recovery (skip if already cleaned up). */
+	if (start_phase < OCSFS_RECOVERY_PHASE_LOCKS) {
+		pr_info("ocsfs: recovery phase 4: lock recovery\n");
+		ret = ocsfs_lock_recover_node(sb, failed_slot, failed_gen);
+		if (ret)
+			pr_err("ocsfs: lock recovery for node %u failed: %d\n",
+			       failed_slot, ret);
+		ocsfs_recovery_set_phase(sb, leader_epoch, OCSFS_RECOVERY_PHASE_LOCKS);
+	}
 
-	ret = ocsfs_lock_recover_node(sb, failed_slot, failed_gen);
-	if (ret)
-		pr_err("ocsfs: lock recovery for node %u failed: %d\n",
-		       failed_slot, ret);
-
-	/*
-	 * Phase 5 — Slot Cleanup
-	 */
+	/* Phase 5 — Slot Cleanup (always runs; idempotent). */
 	pr_info("ocsfs: recovery phase 5: slot cleanup\n");
-
 	ret = ocsfs_node_mark_dead(sb, failed_slot);
 	if (ret)
 		pr_err("ocsfs: failed to mark node %u as dead: %d\n",
 		       failed_slot, ret);
+	ret = 0;
 
+out_release:
 	ocsfs_recovery_leader_release(sb, failed_slot, leader_epoch);
+	if (!ret)
+		pr_warn("ocsfs: ═══ RECOVERY COMPLETE for node slot %u ═══\n",
+			failed_slot);
+	goto out_done;
+
+out_release_dead:
+	ocsfs_node_mark_dead(sb, failed_slot);
+	ocsfs_recovery_leader_release(sb, failed_slot, leader_epoch);
+
+out_done:
 	sbi->s_recovery_in_progress = false;
-
-	pr_warn("ocsfs: ═══ RECOVERY COMPLETE for node slot %u ═══\n",
-		failed_slot);
-
 	mutex_unlock(&sbi->s_recovery_lock);
-	return 0;
+	return ret;
 }
 
 /* ═══════════════════════════════════════════════════════════════
