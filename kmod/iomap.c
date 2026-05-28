@@ -792,6 +792,29 @@ static ssize_t ocsfs_writeback_range(struct iomap_writepage_ctx *wpc,
 			return ret;
 	}
 
+	/* ALTO-N2: writeback path does not call iomap_end, so UNWRITTEN extents
+	 * would remain UNWRITTEN after data reaches disk — subsequent reads
+	 * return zeroes instead of the written data.  Convert here instead. */
+	if (wpc->iomap.type == IOMAP_UNWRITTEN) {
+		struct inode *inode = wpc->inode;
+		struct ocsfs_inode_info *oi = OCSFS_I(inode);
+		struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
+		u64 start_block = pos / sbi->s_block_size;
+		u32 nblocks = (u32)((len + sbi->s_block_size - 1) /
+				    sbi->s_block_size);
+		int cr;
+
+		mutex_lock(&oi->i_extent_lock);
+		cr = ocsfs_extent_convert_unwritten(inode, start_block, nblocks);
+		mutex_unlock(&oi->i_extent_lock);
+		if (cr)
+			pr_warn_ratelimited(
+				"ocsfs: writeback UNWRITTEN→WRITTEN failed (%d)\n",
+				cr);
+		else
+			wpc->iomap.type = IOMAP_MAPPED;
+	}
+
 	return iomap_add_to_ioend(wpc, folio, pos, end_pos, len);
 }
 

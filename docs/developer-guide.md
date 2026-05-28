@@ -765,6 +765,92 @@ and `exit(1)`.
 
 ---
 
+### Sprint J — Crash-consistency metadata (2026-05-28)
+
+Sprint J eliminates several non-transactional paths in thin.c, iomap.c,
+dir.c, refcount.c, and snapshot.c where in-memory metadata changes could
+be lost on crash, causing cross-links, phantom extents, or corrupted
+refcount trees.
+
+**ALTO-N1 — punch_hole / zero_range inline journal-before-free
+(`thin.c`):**
+The inline (non-btree) path of `ocsfs_punch_hole` called `ocsfs_free_blocks`
+inside the loop that modified `oi->i_extents[]`, then relied on async
+`mark_inode_dirty` to persist the updated extent map. A crash between the
+bitmap commit (blocks freed) and the inode writeback left the inode
+referencing freed blocks — which could then be reallocated to another file,
+producing a cross-link.
+
+Fix: replace all `ocsfs_free_blocks` calls inside the loop with deferred
+`{phys, count}` entries in a stack-allocated array
+(`deferred_frees[OCSFS_INLINE_EXTENTS + 1]`). After the loop, call
+`ocsfs_flush_inode_locked(inode, false)` to journal the updated extent map
+first, then free all deferred blocks. Crash after journal but before free →
+space leak (no cross-link). `ocsfs_zero_range` inline path is similarly
+fixed: flag changes are journaled via `ocsfs_flush_inode_locked` before
+returning.
+
+**ALTO-N2 — writeback of UNWRITTEN extents stays UNWRITTEN (`iomap.c`):**
+The `ocsfs_writeback_range` callback uses `flags=0` (no IOMAP_WRITE) when
+looking up the physical mapping for a dirty folio. `ocsfs_iomap_end` only
+performs the UNWRITTEN→WRITTEN conversion when `flags & IOMAP_WRITE`, and
+the iomap writeback framework does not call `iomap_end` at all. Result: data
+written via mmap+dirty-page or buffered write to a pre-allocated (fallocated)
+UNWRITTEN extent reached the block device during writeback but the on-disk
+extent remained UNWRITTEN — a subsequent read returned zeros instead of the
+data.
+
+Fix: in `ocsfs_writeback_range`, after getting the iomap, if the type is
+`IOMAP_UNWRITTEN`, call `ocsfs_extent_convert_unwritten` (under
+`i_extent_lock`) and update `wpc->iomap.type = IOMAP_MAPPED`. The conversion
+is safe at writeback time: the folio is dirty because a write to the page
+cache already succeeded; converting to WRITTEN before the bio completes is
+no worse than the crash window that exists in the normal write path.
+
+**ALTO-N3 — directory `i_size` not journaled with dirent insert (`dir.c`):**
+In the "new block" path of `__ocsfs_add_dirent`, `dir->i_size` is incremented
+in memory (line 253) and `mark_inode_dirty` is called asynchronously after the
+dirent transaction commits. In single-node mode there is no subsequent flush;
+if the system crashes between the dirent commit and the inode writeback, the
+on-disk `i_size` does not cover the new block → `ocsfs_dir_foreach` never
+visits it → the entry appears to vanish.
+
+Fix: add `ocsfs_flush_inode_locked(dir, false)` unconditionally at the end
+of `__ocsfs_add_dirent` (after btree index updates), ensuring `i_size` and
+`i_dirent_count` reach disk in a journal transaction before the function
+returns. In cluster mode the existing flush in `ocsfs_add_dirent` becomes
+redundant but harmless (second flush on an already-clean inode is a no-op).
+
+**ARCH-N2 — refcount B+ tree not journaled (`refcount.c`):**
+`rc_bt_write` called `sync_dirty_buffer` directly for every btree node write
+and `rc_btree_persist_root` did the same for the AG descriptor. A crash
+mid-split could leave tree nodes written but the root pointer not updated —
+or vice versa — producing a silently corrupted refcount tree. Incorrect
+refcounts can cause either premature block free (use-after-free → data
+corruption) or permanent block leak.
+
+Fix: add `struct ocsfs_txn *txn` to `ocsfs_rc_io_ctx`. When non-NULL,
+`rc_bt_write` calls `ocsfs_txn_add_bh` instead of `sync_dirty_buffer`;
+`rc_btree_persist_root` gains a `txn` parameter and does likewise.
+`rc_apply_delta` now opens a journal transaction, sets `rctx.txn`, performs
+the btree search/delete/insert, persists the root, and commits — all
+atomically. On abort, all btree node writes are rolled back by the journal.
+
+**ARCH-N3 — CoW extent inline path not transactional (`snapshot.c`):**
+`ocsfs_cow_extent` for the inline extent path modified `oi->i_extents[]`
+in memory, then called `ocsfs_refcount_dec` + `ocsfs_free_blocks`. A crash
+between the block free and the subsequent inode flush (done by the caller)
+left the inode on disk still referencing the original (now-freed and possibly
+reallocated) blocks.
+
+Fix: after the inline extent modification and before `ocsfs_refcount_dec` /
+`ocsfs_free_blocks`, call `ocsfs_flush_inode_locked(inode, false)`. This
+journals the new extent map first; a subsequent crash is a space leak (old
+refcount entry not decremented, old blocks not freed) rather than a
+cross-link or data corruption.
+
+---
+
 ## 9. I/O Path
 
 ### Data (regular files) — iomap path

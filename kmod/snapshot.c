@@ -580,14 +580,26 @@ int ocsfs_cow_extent(struct inode *inode, u64 logical, u32 len)
 		}
 	}
 
-	/* Decrement refcount on old blocks */
+	/* ARCH-N3: journal inode with new extent map BEFORE decrementing
+	 * refcount and freeing old blocks (journal-before-free pattern).
+	 * Without this, a crash between free and inode flush leaves the inode
+	 * pointing to already-freed (and possibly reallocated) blocks. */
+	{
+		int fr = ocsfs_flush_inode_locked(inode, false);
+
+		if (fr)
+			pr_warn_ratelimited(
+				"ocsfs: cow_extent inode flush failed (%d)\n",
+				fr);
+	}
+
+	/* Decrement refcount on old blocks (safe: inode no longer references them) */
 	{
 		bool should_free = false;
 
 		ret = ocsfs_refcount_dec(sb, old_phys, len, &should_free);
-		if (ret == 0 && should_free) {
+		if (ret == 0 && should_free)
 			ocsfs_free_blocks(sb, old_phys, len);
-		}
 	}
 
 	mark_inode_dirty(inode);

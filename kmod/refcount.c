@@ -22,6 +22,7 @@
 struct ocsfs_rc_io_ctx {
 	struct super_block *sb;
 	u32 ag_no;
+	struct ocsfs_txn *txn; /* non-NULL: add bh to txn instead of sync */
 };
 
 static int rc_bt_read(void *ctx, u64 block, void *buf, u32 size)
@@ -44,7 +45,8 @@ static int rc_bt_read(void *ctx, u64 block, void *buf, u32 size)
 
 static int rc_bt_write(void *ctx, u64 block, const void *buf, u32 size)
 {
-	struct super_block *sb = ((struct ocsfs_rc_io_ctx *)ctx)->sb;
+	struct ocsfs_rc_io_ctx *rctx = ctx;
+	struct super_block *sb = rctx->sb;
 	struct buffer_head *bh;
 
 	bh = sb_getblk(sb, block);
@@ -55,6 +57,15 @@ static int rc_bt_write(void *ctx, u64 block, const void *buf, u32 size)
 	set_buffer_uptodate(bh);
 	mark_buffer_dirty(bh);
 	unlock_buffer(bh);
+
+	/* ARCH-N2: if a transaction is active, add bh to it instead of
+	 * syncing directly so btree writes are crash-consistent. */
+	if (rctx->txn) {
+		int ret = ocsfs_txn_add_bh(rctx->txn, bh);
+
+		brelse(bh);
+		return ret;
+	}
 	sync_dirty_buffer(bh);
 	brelse(bh);
 	return 0;
@@ -115,13 +126,15 @@ static int rc_btree_open_or_create(struct ocsfs_btree *bt,
  * Must be called with ag_rc_lock_res held EX.
  */
 static int rc_btree_persist_root(struct super_block *sb,
-				 struct ocsfs_ag_info *ag, u64 new_root)
+				 struct ocsfs_ag_info *ag, u64 new_root,
+				 struct ocsfs_txn *txn)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	u64 off = sbi->s_ag_desc_off + (u64)ag->ag_no * sizeof(struct ocsfs_disk_ag);
 	u64 blk = ocsfs_byte_to_block(sbi, off);
 	struct buffer_head *bh;
 	struct ocsfs_disk_ag *dag;
+	int ret;
 
 	bh = sb_getblk(sb, blk);
 	if (!bh)
@@ -132,11 +145,19 @@ static int rc_btree_persist_root(struct super_block *sb,
 	dag->ag_checksum = cpu_to_le32(
 		ocsfs_crc32c(~0U, dag, offsetof(struct ocsfs_disk_ag, ag_checksum)));
 	mark_buffer_dirty(bh);
-	sync_dirty_buffer(bh);
-	brelse(bh);
 
-	ag->rc_btree_root = new_root;
-	return 0;
+	if (txn) {
+		ret = ocsfs_txn_add_bh(txn, bh);
+		brelse(bh);
+	} else {
+		sync_dirty_buffer(bh);
+		brelse(bh);
+		ret = 0;
+	}
+
+	if (ret == 0)
+		ag->rc_btree_root = new_root;
+	return ret;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -204,6 +225,7 @@ static int rc_apply_delta(struct super_block *sb, u64 phys_block,
 	struct ocsfs_ag_info *ag;
 	struct ocsfs_rc_io_ctx rctx;
 	struct ocsfs_btree bt;
+	struct ocsfs_txn *txn;
 	u64 old_val = 0;
 	u32 old_count, new_count;
 	bool existed;
@@ -220,9 +242,18 @@ static int rc_apply_delta(struct super_block *sb, u64 phys_block,
 	if (ret)
 		return ret;
 
+	/* ARCH-N2: wrap btree writes in a journal transaction so a crash
+	 * mid-split cannot leave the refcount tree in an inconsistent state. */
+	txn = ocsfs_txn_begin(sb);
+	if (IS_ERR(txn)) {
+		ret = PTR_ERR(txn);
+		goto out_unlock;
+	}
+	rctx.txn = txn;
+
 	ret = rc_btree_open_or_create(&bt, sb, ag, &rctx);
 	if (ret)
-		goto out_unlock;
+		goto out_abort;
 
 	ret = ocsfs_btree_search(&bt, phys_block, &old_val);
 	existed   = (ret == 0);
@@ -237,22 +268,28 @@ static int rc_apply_delta(struct super_block *sb, u64 phys_block,
 	if (existed) {
 		ret = ocsfs_btree_delete(&bt, phys_block);
 		if (ret)
-			goto out_persist;
+			goto out_abort;
 	}
 
 	if (new_count > 1) {
 		ret = ocsfs_btree_insert(&bt, phys_block, (u64)new_count);
 		if (ret)
-			goto out_persist;
+			goto out_abort;
 	}
-	ret = 0;
 
-out_persist:
-	if (bt.root_block != ag->rc_btree_root)
-		rc_btree_persist_root(sb, ag, bt.root_block);
+	if (bt.root_block != ag->rc_btree_root) {
+		ret = rc_btree_persist_root(sb, ag, bt.root_block, txn);
+		if (ret)
+			goto out_abort;
+	}
 
+	ret = ocsfs_txn_commit(txn);
 	if (ret == 0 && result_out)
 		*result_out = new_count;
+	goto out_unlock;
+
+out_abort:
+	ocsfs_txn_abort(txn);
 out_unlock:
 	ocsfs_lock_release(sb, &ag->ag_rc_lock_res);
 	return ret;
@@ -323,5 +360,5 @@ int ocsfs_refcount_init_ag(struct super_block *sb, u32 ag_no)
 	if (ret)
 		return ret;
 
-	return rc_btree_persist_root(sb, ag, bt.root_block);
+	return rc_btree_persist_root(sb, ag, bt.root_block, NULL);
 }

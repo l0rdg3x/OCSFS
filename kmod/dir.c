@@ -306,6 +306,17 @@ fill:
 				       phys_off_for_btree);
 	else if (ocsfs_dir_btree_should_build(dir))
 		ocsfs_dir_btree_migrate(dir);
+	/* ALTO-N3: journal i_size/i_dirent_count unconditionally so a crash
+	 * between dirent commit and async writeback cannot leave i_size stale
+	 * (which would hide the dirent from ocsfs_dir_foreach on recovery). */
+	{
+		int fr = ocsfs_flush_inode_locked(dir, false);
+
+		if (fr)
+			pr_warn_ratelimited(
+				"ocsfs: add_dirent inode flush failed (%d)\n",
+				fr);
+	}
 out:
 	return ret;
 }

@@ -48,6 +48,13 @@ int ocsfs_punch_hole(struct inode *inode, loff_t offset, loff_t len)
 	truncate_pagecache_range(inode, offset,
 				 offset + len - 1);
 
+	/* ALTO-N1: journal-before-free — collect blocks to free, modify extents
+	 * in memory, journal the inode, THEN free.  Prevents cross-link on crash
+	 * (without this, free commits to bitmap before inode flush, so crashed
+	 * block can be reallocated while this inode still references it). */
+	struct { u64 phys; u32 count; } deferred_frees[OCSFS_INLINE_EXTENTS + 1];
+	int nfrees = 0;
+
 	mutex_lock(&oi->i_extent_lock);
 
 	/*
@@ -70,7 +77,9 @@ int ocsfs_punch_hole(struct inode *inode, loff_t offset, loff_t len)
 			/* Case 1: Entire extent is punched */
 			u32 phys = ocsfs_ext_phys_blocks(e);
 
-			ocsfs_free_blocks(inode->i_sb, e->physical_block, phys);
+			deferred_frees[nfrees].phys  = e->physical_block;
+			deferred_frees[nfrees].count = phys;
+			nfrees++;
 			inode->i_blocks -= (u64)phys * (sbi->s_block_size / 512);
 
 			/* Remove from array */
@@ -99,8 +108,9 @@ int ocsfs_punch_hole(struct inode *inode, loff_t offset, loff_t len)
 			/* Case 2: Punch head of extent */
 			u32 removed = (u32)(end_block - ext_start);
 
-			ocsfs_free_blocks(inode->i_sb,
-					  e->physical_block, removed);
+			deferred_frees[nfrees].phys  = e->physical_block;
+			deferred_frees[nfrees].count = removed;
+			nfrees++;
 			inode->i_blocks -= (u64)removed *
 					   (sbi->s_block_size / 512);
 
@@ -111,10 +121,10 @@ int ocsfs_punch_hole(struct inode *inode, loff_t offset, loff_t len)
 			/* Case 3: Punch tail of extent */
 			u32 removed = (u32)(ext_end - start_block);
 
-			ocsfs_free_blocks(inode->i_sb,
-					  e->physical_block +
-					  (e->length - removed),
-					  removed);
+			deferred_frees[nfrees].phys  = e->physical_block +
+						       (e->length - removed);
+			deferred_frees[nfrees].count = removed;
+			nfrees++;
 			inode->i_blocks -= (u64)removed *
 					   (sbi->s_block_size / 512);
 
@@ -127,10 +137,9 @@ int ocsfs_punch_hole(struct inode *inode, loff_t offset, loff_t len)
 					(end_block - ext_start);
 			u32 removed = (u32)(end_block - start_block);
 
-			/* Free the punched middle blocks */
-			ocsfs_free_blocks(inode->i_sb,
-					  e->physical_block + head_len,
-					  removed);
+			deferred_frees[nfrees].phys  = e->physical_block + head_len;
+			deferred_frees[nfrees].count = removed;
+			nfrees++;
 			inode->i_blocks -= (u64)removed *
 					   (sbi->s_block_size / 512);
 
@@ -143,9 +152,9 @@ int ocsfs_punch_hole(struct inode *inode, loff_t offset, loff_t len)
 						  e->flags);
 			if (ret) {
 				/*
-				 * Insert failed — blocks are already freed.
-				 * This leaves a gap, but the filesystem is
-				 * still consistent (just lost some blocks).
+				 * Insert failed — deferred_free still holds the
+				 * middle blocks; they will be freed below after
+				 * inode flush, so no cross-link on crash.
 				 */
 				pr_warn("ocsfs: punch_hole split failed: "
 					"inode %llu, lost %u blocks\n",
@@ -156,9 +165,27 @@ int ocsfs_punch_hole(struct inode *inode, loff_t offset, loff_t len)
 		}
 	}
 
+	/* Journal inode with updated extent map BEFORE freeing blocks */
+	if (nfrees > 0) {
+		int fr = ocsfs_flush_inode_locked(inode, false);
+
+		if (fr)
+			pr_warn_ratelimited(
+				"ocsfs: punch_hole inode flush failed (%d)\n",
+				fr);
+	}
 	mark_inode_dirty(inode);
 	mutex_unlock(&oi->i_extent_lock);
 
+	/* Free blocks only after inode is safely on disk */
+	{
+		int k;
+
+		for (k = 0; k < nfrees; k++)
+			ocsfs_free_blocks(inode->i_sb,
+					  deferred_frees[k].phys,
+					  deferred_frees[k].count);
+	}
 	return ret;
 }
 
@@ -208,6 +235,15 @@ int ocsfs_zero_range(struct inode *inode, loff_t offset, loff_t len)
 		/* Partial overlaps: only mark if fully contained */
 	}
 
+	/* ALTO-N1: journal flag change before returning */
+	{
+		int fr = ocsfs_flush_inode_locked(inode, false);
+
+		if (fr)
+			pr_warn_ratelimited(
+				"ocsfs: zero_range inode flush failed (%d)\n",
+				fr);
+	}
 	mark_inode_dirty(inode);
 	mutex_unlock(&oi->i_extent_lock);
 
