@@ -977,16 +977,12 @@ sending raw CDBs. It uses a two-path design:
    pointer placed there by `scsi_mq_setup_tags()`. Works on hardened kernels
    where `CONFIG_KPROBES=n`. Validated with `sdev->host != NULL`.
 2. **kprobe shim (fallback):** resolves the unexported
-   `scsi_device_from_queue()` via `register_kprobe()`. Kept for compatibility
-   with unpatched kernels that cannot use the BSG-direct path.
+   `scsi_device_from_queue()` via `register_kprobe()`. Active only when
+   `CONFIG_KPROBES=y`; gracefully disabled otherwise.
 
 `ocsfs_scsi_caw()` calls `ocsfs_bsg_execute_cdb()` with a pre-built CAW CDB
 (opcode 0x89, SBC-4 §5.3): `expected || new_data` in a mempool-backed buffer.
 `lock_write_entry()` uses CAW when `s_caw_supported` is set.
-
-The kernel patch in `docs/kernel-patches/` exports `scsi_device_from_queue()`
-unconditionally — that is the upstream path if the BSG-direct workaround is
-ever rejected.
 
 **No integration test suite**
 

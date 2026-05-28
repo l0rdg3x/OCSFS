@@ -129,7 +129,6 @@ multi-node testbed with SCSI-3 PR).
 | `conf/` | systemd template units + udev rules for SAN auto-detection |
 | `debian/` | Debian packaging: ocsfs-tools, ocsfs-dkms, ocsfs-proxmox |
 | `man/` | Man pages for all CLI tools |
-| `docs/kernel-patches/` | Patch to export `scsi_device_from_queue` (upstream path for CAW) |
 
 ---
 
@@ -231,7 +230,7 @@ ocsfs/
 ├── tests/          KUnit tests + xfstests config
 ├── conf/           systemd units + udev rules
 ├── man/            Man pages
-├── docs/           Developer guide, admin guide, kernel patch
+├── docs/           Developer guide, admin guide
 ├── debian/         Debian packaging
 ├── include/        Shared headers (on-disk format)
 └── LICENSE         GPL-2.0-only
