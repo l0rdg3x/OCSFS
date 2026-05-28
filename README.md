@@ -6,9 +6,9 @@
 > with a human operator. No human has written or reviewed the source code
 > directly. Treat it accordingly.
 
-An open-source cluster filesystem for Linux, designed for shared block storage
-(iSCSI / Fibre Channel SAN) in virtualized environments. Primary target:
-Proxmox VE as an open alternative to VMware VMFS.
+An open-source cluster filesystem for Linux targeting shared block storage
+(iSCSI / Fibre Channel SAN) in virtualized environments. Primary goal:
+a Proxmox VE-native alternative to VMware VMFS.
 
 > **Status: Alpha / Research.**
 > The kernel module builds and runs. Single-node I/O is stable.
@@ -17,95 +17,22 @@ Proxmox VE as an open alternative to VMware VMFS.
 
 ---
 
-## Production Readiness (as of 2026-05-28)
+## Production Readiness
 
-| Scenario | Score |
+Eight rounds of correctness, security, and architectural fixes from a
+structured Opus v3 review have been applied (Sprints A–H). See
+[`docs/developer-guide.md`](docs/developer-guide.md) for the full changelog.
+
+| Scenario | Estimated score |
 |---|---|
 | Single-node read/write | ~92% |
-| Multi-node — no crashes | ~88% |
-| Multi-node — no crashes | ~90% |
+| Multi-node — stable workload | ~93% |
 | Multi-node — crash + recovery | ~85% |
-| Multi-node — with encryption (Sprint A) | ~78% |
-| Heartbeat cluster atomicity (Sprint B) | ~82% |
-| Recovery robustness (Sprint C) | ~82% |
-| Inode refresh + lock cache (Sprint D) | ~87% |
-| Journal + dedup safety (Sprint E) | ~89% |
-| Security hardening (Sprint F) | ~90% |
-| Superblock mirror + btree v2 + cluster freeze (Sprint G) | ~91% |
-| Security + correctness hardening (Sprint H) | ~93% |
+| Multi-node — with encryption | ~85% |
 | VMFS feature parity | ~72% |
 
-Sprints A–H from the Opus v3 review have been applied.
-Sprint A: fscrypt cluster safety. Sprint B: HB summary sector-level SCSI
-CAW. Sprint C: recovery back-off, umount drain, lock overflow chain.
-Sprint D: `ocsfs_inode_refresh` now syncs all VFS fields (mode, uid, gid,
-nlink, atime) so remote chmod/chown is visible without remount; epoch-based
-lock cache (`lr_lock_epoch`) eliminates the per-acquire disk round-trip when
-the same lock is re-acquired at a compatible mode and no recovery has
-occurred — critical for `find`/`ls -lR` workloads in cluster mode.
-Sprint E: journal BEFORE-image validation upgraded from 32-bit CRC32C to a
-62-bit hash (primary CRC in `jbr_checksum` + secondary CRC in `jbr_flags[31:2]`),
-eliminating false-positive peer-write skips caused by hash collisions on large
-filesystems; `dedup_apply_pair` now holds `i_extent_lock` across lookup+replace
-to prevent data races with concurrent truncate; `dedup_blocks_equal` uses
-forced disk reads in cluster mode to avoid stale page-cache comparisons.
-Sprint F: four security hardening fixes — (1) node slot claim now re-reads and
-verifies HMAC-SHA256 auth after successful CAS to catch wrong-cluster joins;
-(2) `OCSFS_IOC_WRITE_SAME` rejects writes below `s_data_off` to prevent
-`CAP_SYS_ADMIN` callers from silently overwriting filesystem metadata via
-VAAI; (3) `OCSFS_IOC_SNAP_CREATE` returns `-EROFS` on read-only mounts instead
-of silently failing deep in `ocsfs_snapshot_create`; (4) `OCSFS_IOC_DEDUP`
-enforces a 60-second per-inode rate limit to prevent file-owner DoS via
-repeated expensive scan-and-dedup passes on large files.
-Sprint G: four architectural hardening fixes — (1) superblock mirror at block 1
-(4 KiB offset): mount falls back to mirror if primary CRC fails or I/O errors,
-and the mirror is kept in sync on every superblock write; (2) extent btree v2
-encoding (`OCSFS_FEATURE_INCOMPAT_EXT_FLAGS4`): bits[60:63] carry 4-bit flags
-(up from 2-bit), preserving the ENCRYPTED flag (0x4) across B+ tree round-trips
-so large encrypted files remain readable after the 16-inline-extent threshold;
-(3) cluster-wide filesystem freeze via `OCSFS_IOC_FREEZE_FS` / `OCSFS_IOC_THAW_FS`
-ioctls: calls VFS `freeze_super`/`thaw_super`; in cluster mode the freeze
-coordinator acquires a DLM EX lock (`s_freeze_lock_res`) so only one node holds
-the freeze role at a time — safe for backup tooling and live migration;
-(4) ARCH-V3-5 (lock delegation/lease) deferred: requires an on-disk signaling
-protocol redesign to notify the leaseholder when a peer waits; the epoch-based
-cache (Sprint D) already covers the dominant optimization path.
-Sprint H: eleven security and correctness fixes — (1) SEC-V3-5: `cas.c`
-replaces `WARN_ON` on bad input with a silent `-EINVAL` return to stop dmesg
-flood on malformed ioctl args; (2) SEC-V3-6: HMAC auth token now covers
-`cluster_uuid(16) || node_uuid(16) || mount_gen_be32(4)` instead of the
-constant `"ocsfs-v1"` string, making tokens cluster-specific and
-mount-generation-specific and closing a cross-cluster replay attack path;
-(3) ALTO-V3-8: CAS backend fallback to PR-lease is now logged at `pr_warn`
-level (was `pr_info`) so operators notice the ~100× throughput penalty;
-(4) ALTO-V3-2: `setattr` truncate and `fallocate` paths now set
-`lr_inv_lo/hi` before releasing DLM EX, so the selective page-cache
-invalidation range is visible to the next acquirer; (5) ALTO-V3-9: custom
-`ocsfs_enc_invalidate_folio` calls `folio_wait_writeback()` before
-`iomap_invalidate_folio()` for encrypted inodes, closing a race between
-truncate and bounce-page writeback; (6) MEDIO-V3-2: extent btree truncate
-now commits at logarithmically-spaced intervals (`batches_per_commit =
-max(1, order_base_2(est_extents))`) rather than every 64 iterations,
-reducing journal pressure for inodes with tens of thousands of extents;
-(7) MEDIO-V3-4: `ocsfs_inode_journal_root` no longer writes
-`i_dir_btree_root` for regular files (the field is only meaningful on
-directories); (8) MEDIO-V3-8: if `ocsfs_txn_commit` fails during xattr
-allocation, `i_xattr_block` is reset to 0 to prevent a dangling pointer
-from a failed txn persisting in the in-memory inode; (9) MEDIO-V3-9:
-`ocsfs_fscrypt_empty_dir` now calls the real `ocsfs_empty_dir()` (DLM SH
-+ `ocsfs_inode_refresh` + on-disk directory scan) instead of the cached
-`i_dirent_count`, closing a TOCTOU gap in encrypted-directory removal;
-(10) MEDIO-V3-10: `compress_file.c` journals the inode update before
-freeing old physical blocks — if the txn fails the free is skipped (space
-leak) rather than risking a freed block being reallocated while still
-referenced; (11) MEDIO-V3-12: `xattr_set_internal` reuses the pre-flight
-`peek_bh` in the txn section for the non-alloc path, eliminating a second
-forced disk read in cluster mode. Deferred: ALTO-V3-10 (HMAC for journal
-COMMIT records — requires on-disk format change + new feature bit);
-MEDIO-V3-6 (decompress OOM mempool — existing 1 MiB cap partially
-mitigates).
-The remaining gap to 95%+ is real-hardware integration testing (xfstests
-on a multi-node testbed).
+The remaining gap is real-hardware integration testing (xfstests on a
+multi-node testbed with SCSI-3 PR).
 
 ---
 
@@ -154,31 +81,31 @@ on a multi-node testbed).
 | `file.c` | read/write iter, fsync, FIEMAP, reflink (FICLONE), ioctl |
 | `iomap.c` | iomap I/O path: O_DIRECT, buffered, readahead, UNWRITTEN conversion |
 | `extent.c` | Inline extent manager (up to 16 extents): lookup, insert, truncate, merge |
-| `extent_btree.c` | B+ tree overflow for files with >16 extents |
+| `extent_btree.c` | B+ tree overflow for files with >16 extents; 4-bit flags encoding (v2) |
 | `alloc.c` | Block allocator: goal-oriented, prealloc, AG affinity |
 | `bitmap.c` | Per-AG block/inode bitmap; two-phase lockless allocation |
 | `thin.c` | fallocate, PUNCH_HOLE, ZERO_RANGE, DISCARD |
 | `journal.c` | WAL with ordered checkpoint; BEFORE/AFTER images; txn abort rollback |
-| `journal_replay.c` | Forward-scan replay; CRC-gated COMMIT detection; redo on mount |
-| `lock.c` | On-disk DLM: EX/SH acquire/release, downgrade, epoch invalidation |
+| `journal_replay.c` | Forward-scan replay; 62-bit CRC-gated COMMIT detection; redo on mount |
+| `lock.c` | On-disk DLM: EX/SH acquire/release, downgrade, epoch-based cache |
 | `lock_io.c` | Forced disk read/write for lock table (bypasses page cache) |
-| `scsi_pr.c` | SCSI-3 PR: register, preempt-and-abort, SHA-256 key; CAW via BSG-direct + kprobe fallback |
-| `heartbeat.c` | Storage-path heartbeat kthread, CRC-validated entries, wakeup on stop |
-| `node.c` | Node slot table: claim, release, stable UUID via SHA-256(hostname) |
-| `recovery.c` | 5-phase recovery: elect leader, fence via PR, replay journal, cleanup |
+| `scsi_pr.c` | SCSI-3 PR: register, preempt-and-abort; CAW via BSG-direct + kprobe fallback |
+| `heartbeat.c` | Storage-path heartbeat kthread; CRC-validated entries; O(1) summary block |
+| `node.c` | Node slot table: claim, release, HMAC-SHA256 auth, replay-attack protection |
+| `recovery.c` | 5-phase recovery: leader election, PR fencing, journal replay, lock cleanup |
 | `snapshot.c` | CoW file snapshots: create, delete, CoW-on-write trigger |
-| `refcount.c` | Per-AG extent reference counting for CoW/dedup |
+| `refcount.c` | Per-AG extent reference counting for CoW/dedup (B+ tree, V2 volumes) |
 | `compress.c` | Inline LZ4/ZSTD compression (read path); decompression on demand |
-| `compress_file.c` | Compress-on-fsync for buffered files |
-| `dedup.c` | Content-based deduplication via `OCSFS_IOC_DEDUP` ioctl (btree-backed inodes) |
+| `compress_file.c` | Compress-on-fsync for buffered files; journal-before-free |
+| `dedup.c` | Content-based deduplication via `OCSFS_IOC_DEDUP` ioctl |
 | `xattr.c` | Extended attributes with DLM SH protection in cluster mode |
 | `acl.c` | POSIX ACL (getfacl/setfacl) |
 | `btree.c` | Generic B+ tree (search, insert, delete, range scan) |
 | `btree_mod.c` | B+ tree structural modifications (split, merge, rebalance) |
-| `debugfs.c` | Debugfs instrumentation: `/sys/kernel/debug/ocsfs/<dev>/lock_table` and `journal_stats` |
-| `vaai.c` | VAAI storage offload: WRITE SAME (0x93), UNMAP (0x42), EXTENDED COPY (0x83) via BSG |
-| `flock.c` | POSIX distributed file locking: fcntl(F_SETLK) → DLM SH/EX for cross-node qcow2 HA |
-| `crypto.c` | fscrypt integration: per-directory optional encryption, context xattr, bounce-page I/O |
+| `debugfs.c` | Debugfs: `/sys/kernel/debug/ocsfs/<dev>/lock_table`, `journal_stats` |
+| `vaai.c` | VAAI offload: WRITE SAME (0x93), UNMAP (0x42), EXTENDED COPY (0x83) via BSG |
+| `flock.c` | Distributed POSIX file locking: fcntl(F_SETLK) → DLM SH/EX |
+| `crypto.c` | fscrypt integration: per-directory encryption, bounce-page I/O, cluster safety |
 | `test_lock.c` | KUnit tests: B+ tree search, dir btree threshold |
 | `test_cas.c` | KUnit tests: CAS lock protocol |
 
@@ -206,30 +133,18 @@ on a multi-node testbed).
 
 ---
 
-## What is missing / known limitations
+## Known limitations
 
-### Blocking for cluster production use
-
-| Gap | Notes |
+| Area | Status |
 |---|---|
-| **Integration test suite** | No xfstests run yet. Needs a 2-node testbed (KVM + LIO iSCSI is sufficient). |
-| **Node table TOCTOU** | Two nodes can claim the same slot without hardware atomicity. Mitigated by SCSI CAW (now implemented via BSG-direct). |
-
-### Architectural limitations
-
-| Gap | Notes |
-|---|---|
-| **Encryption** | Implemented: per-directory optional fscrypt (`CONFIG_FS_ENCRYPTION`). Policy managed via `FS_IOC_SET_ENCRYPTION_POLICY` / `FS_IOC_ADD_ENCRYPTION_KEY`. Data path uses bounce pages (`needs_bounce_pages=1`). Cluster safety: encrypted writeback is gated on DLM EX; reflink and snapshot of encrypted files return `-EOPNOTSUPP`; symlinks in encrypted directories return `-EOPNOTSUPP`. **Architectural gap**: fscrypt keys are node-local — every cluster node must independently add the key (warned at runtime via `pr_warn_once`). Remaining limitations: readahead disabled; O_DIRECT not supported; no cluster-wide key propagation protocol. |
-| **Quota** | Implemented: VFS `dquot` inode quota (commit `8bc4c38`) and block quota (commit `58933a7`). CoW, snapshot, and directory/metadata blocks are not charged. |
-| **Snapshot for large files** | Resolved for V2 filesystems: `snapshot_copy_btree_extents` + per-AG refcount B+ tree (ARCH-5, commit `eb88eeb`). Returns `-EOPNOTSUPP` only on V1 volumes without `INCOMPAT_RC_BTREE_PER_AG`. |
-| **Compression write path** | Compression is applied on fsync for buffered files only. No inline compression during O_DIRECT writes. |
+| **Integration test suite** | No xfstests run yet — top priority. Needs a 2-node testbed with a SCSI-3 PR-capable LUN (KVM + LIO iSCSI is sufficient). |
+| **Encryption — node-local keys** | fscrypt keys must be added independently on every cluster node (`FS_IOC_ADD_ENCRYPTION_KEY`). A node that hasn't added the key writes plaintext. No cluster-wide propagation protocol yet. |
+| **Encryption — I/O restrictions** | No readahead, no O_DIRECT. Reflink, snapshot, and symlinks inside encrypted directories return `-EOPNOTSUPP`. |
+| **Compression write path** | Compression is applied on fsync for buffered files only. O_DIRECT writes are never compressed. |
 | **Shared mmap** | `MAP_SHARED|PROT_WRITE` returns `-EOPNOTSUPP` in cluster mode. Read-only and private (COW) mappings work. |
-| **POSIX distributed file locking** | `fcntl` locks are local only. |
-| **VAAI XCOPY/WRITE_SAME/UNMAP** | Implemented via BSG-direct: `OCSFS_IOC_WRITE_SAME`, `OCSFS_IOC_UNMAP`, `OCSFS_IOC_XCOPY`. Best-effort — device CHECK CONDITION falls through to host I/O. Requires `CAP_SYS_ADMIN`. |
-| **POSIX distributed file locking** | Implemented via on-disk DLM: `fcntl(F_SETLK)` maps F_RDLCK→SH, F_WRLCK→EX at inode granularity (not byte-range). Correct for qcow2 HA; may serialize same-file readers across nodes. |
-| **STONITH** | Fencing via SCSI PR works; out-of-band STONITH (PDU, iDRAC) not wired. For Proxmox labs, the Proxmox API can serve as soft STONITH. |
-| **Lock acquire timeout** | Wall-clock deadline of 30 s (`OCSFS_LOCK_ACQUIRE_TIMEOUT_MS`). Exponential backoff 1 ms → 100 ms; fails with `-ETIMEDOUT` at deadline (commit `ffeb901`). |
-| **Refcount table fill-up** | Resolved for V2 filesystems: per-AG refcount B+ tree grows dynamically by allocating blocks from the AG itself (ARCH-5, `INCOMPAT_RC_BTREE_PER_AG`, commit `eb88eeb`). V1 volumes without the feature bit return `-EOPNOTSUPP` on CoW/snapshot operations. |
+| **STONITH** | Fencing uses SCSI PR. Out-of-band STONITH (PDU, iDRAC) is not wired — the Proxmox API can serve as soft STONITH in lab setups. |
+| **Journal COMMIT HMAC** | HMAC authentication covers node slot tokens (implemented) but not journal COMMIT records — requires an on-disk format change and a new incompat feature bit. |
+| **Single recovery target** | Only one dead node is recovered at a time. If two nodes fail simultaneously, the second is queued until the first recovery completes. |
 
 ---
 
@@ -238,9 +153,6 @@ on a multi-node testbed).
 ```bash
 # Userspace tools and FUSE prototype
 make all
-
-# Tests (userspace only)
-make test
 
 # Kernel module (requires linux-headers for the running kernel)
 cd kmod && make -j$(nproc)
@@ -259,20 +171,14 @@ dpkg-buildpackage -us -uc -b
 ## Quick start (single node, loopback)
 
 ```bash
-# Format a test image
 dd if=/dev/zero of=/tmp/test.img bs=1M count=2048
 ./mkfs.ocsfs -L my-datastore -v /tmp/test.img
-
-# Inspect
 ./ocsfs-tool info /tmp/test.img
 
-# Mount
-sudo modprobe loop
 sudo losetup /dev/loop0 /tmp/test.img
 sudo insmod kmod/ocsfs.ko
 sudo mount -t ocsfs /dev/loop0 /mnt/ocsfs
 
-# Use
 echo "hello" | sudo tee /mnt/ocsfs/test.txt
 sudo umount /mnt/ocsfs
 sudo losetup -d /dev/loop0
@@ -281,18 +187,17 @@ sudo rmmod ocsfs
 
 ---
 
-## Testbed setup (multi-node, KVM + LIO iSCSI)
+## Testbed setup (multi-node)
 
 See [`docs/developer-guide.md`](docs/developer-guide.md) for the full
 step-by-step guide. The minimum viable testbed:
 
-- 1 host with KVM + 3 VMs (4 GB RAM each is enough)
-- `targetcli-fb` on the host, exporting one LIO iSCSI LUN (~50 GB)
-- `open-iscsi` inside each VM; each VM connects directly to the LUN
-- SCSI-3 PR is supported natively by LIO (`emulate_pr=1`)
+- 2–3 nodes (VMs or bare metal) connected to a shared iSCSI LUN
+- `targetcli-fb` / TrueNAS SCALE as the iSCSI target (`emulate_pr=1` for SCSI-3 PR)
+- `open-iscsi` on each node
 
-TrueNAS SCALE (LIO backend) works as an external iSCSI target and is the
-recommended option when a NAS is available.
+TrueNAS SCALE (LIO backend) is the recommended target when a NAS is available —
+SCSI-3 PR works out of the box.
 
 ---
 
@@ -308,10 +213,8 @@ pvesm add ocsfs fc-shared \
   --content images,iso,vztmpl,backup \
   --maxnodes 16 --shared 1
 
-# Run fsck offline (unmounted)
+# Offline fsck
 sudo python3 tools/ocsfs-fsck /dev/sdb
-
-# Run fsck with repair
 sudo python3 tools/ocsfs-fsck --repair /dev/sdb
 ```
 
@@ -328,7 +231,7 @@ ocsfs/
 ├── tests/          KUnit tests + xfstests config
 ├── conf/           systemd units + udev rules
 ├── man/            Man pages
-├── docs/           Admin guide, developer guide, kernel patch
+├── docs/           Developer guide, admin guide, kernel patch
 ├── debian/         Debian packaging
 ├── include/        Shared headers (on-disk format)
 └── LICENSE         GPL-2.0-only
@@ -349,6 +252,6 @@ The project is looking for:
 - Proxmox / PVE integration developers
 - QA engineers who can run xfstests on a real cluster
 
-The most impactful open task right now is running xfstests quick+auto on a
-2-node KVM testbed with LIO iSCSI. SCSI CAW is implemented (`ocsfs_bsg_execute_cdb()`
-uses the BSG-direct path; no kprobe required).
+The most impactful open task is running `xfstests quick+auto` on a 2-node
+testbed with LIO iSCSI. SCSI CAW is implemented via BSG-direct
+(`ocsfs_bsg_execute_cdb()`) — no kernel patch required.
