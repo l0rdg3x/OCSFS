@@ -69,13 +69,37 @@ static bool dedup_blocks_equal(struct super_block *sb, u64 a, u64 b)
 	struct buffer_head *bha, *bhb;
 	bool eq;
 
-	bha = sb_bread(sb, a);
-	if (!bha)
-		return false;
-	bhb = sb_bread(sb, b);
-	if (!bhb) {
-		brelse(bha);
-		return false;
+	/* In cluster mode use forced reads so we never compare stale page-cache
+	 * content that a peer has already overwritten (MEDIO-V3-11). */
+	if (OCSFS_SB(sb)->s_clustered) {
+		bha = sb_getblk(sb, a);
+		if (!bha)
+			return false;
+		clear_buffer_uptodate(bha);
+		if (bh_read(bha, 0) < 0) {
+			brelse(bha);
+			return false;
+		}
+		bhb = sb_getblk(sb, b);
+		if (!bhb) {
+			brelse(bha);
+			return false;
+		}
+		clear_buffer_uptodate(bhb);
+		if (bh_read(bhb, 0) < 0) {
+			brelse(bha);
+			brelse(bhb);
+			return false;
+		}
+	} else {
+		bha = sb_bread(sb, a);
+		if (!bha)
+			return false;
+		bhb = sb_bread(sb, b);
+		if (!bhb) {
+			brelse(bha);
+			return false;
+		}
 	}
 	eq = memcmp(bha->b_data, bhb->b_data, bha->b_size) == 0;
 	brelse(bhb);
@@ -179,30 +203,45 @@ next_block:;
 
 static int dedup_apply_pair(struct inode *inode, const struct dedup_pair *p)
 {
+	struct ocsfs_inode_info *oi = OCSFS_I(inode);
 	struct ocsfs_extent orig;
 	u64 offset_in_ext;
 	bool should_free;
 	int ret;
 
+	/* Hold i_extent_lock across lookup + replace to prevent a concurrent
+	 * truncate from remapping or freeing the extent between the two calls,
+	 * which would cause silent extent-map corruption (CRIT-V3-4). */
+	mutex_lock(&oi->i_extent_lock);
+
 	ret = ocsfs_extent_lookup(inode, p->logical_block, &orig);
-	if (ret)
+	if (ret) {
+		mutex_unlock(&oi->i_extent_lock);
 		return ret;
+	}
 
 	/* Verify the physical block still matches — another op may have changed it */
 	offset_in_ext = p->logical_block - orig.logical_block;
-	if (orig.physical_block + offset_in_ext != p->dup_phys)
+	if (orig.physical_block + offset_in_ext != p->dup_phys) {
+		mutex_unlock(&oi->i_extent_lock);
 		return 0; /* already remapped; skip */
+	}
 
 	ret = ocsfs_refcount_inc(inode->i_sb, p->can_phys, 1);
-	if (ret)
+	if (ret) {
+		mutex_unlock(&oi->i_extent_lock);
 		return ret;
+	}
 
 	ret = ocsfs_extent_btree_replace(inode, &orig, offset_in_ext, 1,
 					 p->can_phys);
 	if (ret) {
+		mutex_unlock(&oi->i_extent_lock);
 		ocsfs_refcount_dec(inode->i_sb, p->can_phys, 1, NULL);
 		return ret;
 	}
+
+	mutex_unlock(&oi->i_extent_lock);
 
 	/* Free the duplicate physical block inside a journal transaction so that a
 	 * crash between the btree replace and this free is recoverable: the

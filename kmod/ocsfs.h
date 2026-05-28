@@ -239,6 +239,10 @@ static inline u16 ocsfs_ext_set_comp_algo(u16 flags, u8 algo)
 
 #define OCSFS_JBR_BEFORE        0x01
 #define OCSFS_JBR_AFTER         0x02
+/* Bits 2-31 of jbr_flags store a secondary CRC32C (seed ~1U) of the block
+ * data, giving 62 bits of total hash and eliminating CRC32C false-positive
+ * matches during BEFORE-image validation (CRIT-V3-3). */
+#define OCSFS_JBR_HASH2_MASK    0xFFFFFFFC
 
 /* Node slot states */
 #define OCSFS_NODE_FREE         0x00

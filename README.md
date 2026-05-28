@@ -24,14 +24,15 @@ Proxmox VE as an open alternative to VMware VMFS.
 | Single-node read/write | ~92% |
 | Multi-node — no crashes | ~88% |
 | Multi-node — no crashes | ~90% |
-| Multi-node — crash + recovery | ~82% |
+| Multi-node — crash + recovery | ~85% |
 | Multi-node — with encryption (Sprint A) | ~78% |
 | Heartbeat cluster atomicity (Sprint B) | ~82% |
 | Recovery robustness (Sprint C) | ~82% |
 | Inode refresh + lock cache (Sprint D) | ~87% |
+| Journal + dedup safety (Sprint E) | ~89% |
 | VMFS feature parity | ~72% |
 
-Sprints A–D from the Opus v3 review have been applied.
+Sprints A–E from the Opus v3 review have been applied.
 Sprint A: fscrypt cluster safety. Sprint B: HB summary sector-level SCSI
 CAW. Sprint C: recovery back-off, umount drain, lock overflow chain.
 Sprint D: `ocsfs_inode_refresh` now syncs all VFS fields (mode, uid, gid,
@@ -39,6 +40,12 @@ nlink, atime) so remote chmod/chown is visible without remount; epoch-based
 lock cache (`lr_lock_epoch`) eliminates the per-acquire disk round-trip when
 the same lock is re-acquired at a compatible mode and no recovery has
 occurred — critical for `find`/`ls -lR` workloads in cluster mode.
+Sprint E: journal BEFORE-image validation upgraded from 32-bit CRC32C to a
+62-bit hash (primary CRC in `jbr_checksum` + secondary CRC in `jbr_flags[31:2]`),
+eliminating false-positive peer-write skips caused by hash collisions on large
+filesystems; `dedup_apply_pair` now holds `i_extent_lock` across lookup+replace
+to prevent data races with concurrent truncate; `dedup_blocks_equal` uses
+forced disk reads in cluster mode to avoid stale page-cache comparisons.
 The remaining gap to 90%+ is real-hardware integration testing (xfstests
 on a multi-node testbed).
 

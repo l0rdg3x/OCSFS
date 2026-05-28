@@ -181,23 +181,31 @@ static int journal_replay_j(struct super_block *sb, struct ocsfs_journal *j)
 				if (flags & OCSFS_JBR_BEFORE) {
 					u64 blk = le64_to_cpu(bref.jbr_block_num);
 					u32 expected_crc = le32_to_cpu(bref.jbr_checksum);
+					u32 expected_h2  = flags & OCSFS_JBR_HASH2_MASK;
 					struct buffer_head *bh = sb_bread(sb, blk);
 
 					if (bh) {
 						if (!journal_read(sb, j, replay_pos,
 								  bh->b_data,
 								  bh->b_size)) {
+							/* 62-bit integrity check on journal BEFORE-image
+							 * (CRIT-V3-3): both hash components must match */
 							u32 actual = ocsfs_crc32c(~0U,
 								bh->b_data,
 								bh->b_size);
-							if (actual == expected_crc) {
+							u32 actual_h2 = ocsfs_crc32c(~1U,
+								bh->b_data,
+								bh->b_size) &
+								OCSFS_JBR_HASH2_MASK;
+							if (actual == expected_crc &&
+							    actual_h2 == expected_h2) {
 								mark_buffer_dirty(bh);
 								sync_dirty_buffer(bh);
 								clear_buffer_uptodate(bh);
 								this_replayed++;
 								replayed++;
 							} else {
-								pr_warn("ocsfs: BEFORE-image CRC mismatch for block %llu in txn %llu, skipping\n",
+								pr_warn("ocsfs: BEFORE-image hash mismatch for block %llu in txn %llu, skipping\n",
 									blk, tid);
 								clear_buffer_uptodate(bh);
 							}
@@ -218,18 +226,22 @@ static int journal_replay_j(struct super_block *sb, struct ocsfs_journal *j)
 			 * Redo: apply AFTER-images so committed data survives
 			 * crash.
 			 *
-			 * Coherence guard (CRIT-3): before applying each
-			 * AFTER-image, verify that the current disk content
-			 * matches the stored BEFORE-image CRC for the same
-			 * block.  A mismatch means a live peer node wrote to
-			 * the block after the dead node committed and released
-			 * EX — that peer's data is newer, so we skip the
-			 * stale AFTER-image.
+			 * Coherence guard (CRIT-3 / CRIT-V3-3): before applying
+			 * each AFTER-image, verify that the current disk content
+			 * matches the stored BEFORE-image hash for the same block.
+			 * A mismatch means a live peer node wrote to the block
+			 * after the dead node committed and released EX — that
+			 * peer's data is newer, so we skip the stale AFTER-image.
 			 *
-			 * Implementation: single allocation split into two
-			 * parallel arrays (before_blks, before_crcs).  Pass 1
-			 * fills them from BEFORE entries; Pass 2 applies AFTER
-			 * entries using the map as a gate.
+			 * Hash width: 62 bits — primary CRC32C in jbr_checksum
+			 * plus secondary CRC32C (seed ~1U) in jbr_flags[31:2]
+			 * (OCSFS_JBR_HASH2_MASK).  This reduces false-positive
+			 * probability from 1/2^32 to 1/2^62 (CRIT-V3-3).
+			 *
+			 * Implementation: single allocation split into three
+			 * parallel arrays (before_blks, before_crcs, before_h2s).
+			 * Pass 1 fills them from BEFORE entries; Pass 2 applies
+			 * AFTER entries using the map as a gate.
 			 */
 			u64 payload_start = scan_pos + sizeof(jt);
 			u64 stride = sizeof(struct ocsfs_disk_journal_bref) +
@@ -239,19 +251,21 @@ static int journal_replay_j(struct super_block *sb, struct ocsfs_journal *j)
 			int this_replayed = 0;
 			u64 *before_blks = NULL;
 			u32 *before_crcs = NULL;
+			u32 *before_h2s  = NULL;
 			u32 before_count = 0;
 
-			/* Single kvmalloc: [max_ent u64s][max_ent u32s] */
+			/* Single kvmalloc: [max_ent u64s][max_ent u32s crc1][max_ent u32s h2] */
 			if (max_ent) {
 				before_blks = kvmalloc(
-					max_ent * (sizeof(u64) + sizeof(u32)),
+					max_ent * (sizeof(u64) + 2 * sizeof(u32)),
 					GFP_KERNEL);
-				if (before_blks)
-					before_crcs = (u32 *)(before_blks +
-							      max_ent);
+				if (before_blks) {
+					before_crcs = (u32 *)(before_blks + max_ent);
+					before_h2s  = before_crcs + max_ent;
+				}
 			}
 
-			/* Pass 1: collect BEFORE-image CRCs */
+			/* Pass 1: collect BEFORE-image hashes (62-bit) */
 			if (before_blks) {
 				u64 rpos = payload_start;
 
@@ -268,6 +282,9 @@ static int journal_replay_j(struct super_block *sb, struct ocsfs_journal *j)
 						    le64_to_cpu(b2.jbr_block_num);
 						before_crcs[before_count] =
 						    le32_to_cpu(b2.jbr_checksum);
+						before_h2s[before_count] =
+						    le32_to_cpu(b2.jbr_flags) &
+						    OCSFS_JBR_HASH2_MASK;
 						before_count++;
 					}
 					rpos += stride;
@@ -307,8 +324,13 @@ static int journal_replay_j(struct super_block *sb, struct ocsfs_journal *j)
 								for (bi = 0; bi < before_count; bi++) {
 									if (before_blks[bi] != blk)
 										continue;
-									/* Block modified by peer if CRC changed */
-									if (ocsfs_crc32c(~0U, bh->b_data, bh->b_size) != before_crcs[bi]) {
+									/* 62-bit peer-write detection (CRIT-V3-3):
+									 * block modified if either CRC hash differs */
+									if (ocsfs_crc32c(~0U, bh->b_data,
+										    bh->b_size) != before_crcs[bi] ||
+									    (ocsfs_crc32c(~1U, bh->b_data,
+										     bh->b_size) &
+									     OCSFS_JBR_HASH2_MASK) != before_h2s[bi]) {
 										pr_info("ocsfs: skip AFTER blk %llu txn %llu (peer-modified)\n",
 											blk, tid);
 										skip = true;

@@ -460,9 +460,35 @@ do not survive an abort.
 - Forward scan from journal tail to head.
 - A `TXN_BEGIN` record without a matching `TXN_COMMIT` (CRC-validated) is
   discarded — uncommitted transactions are not replayed.
-- AFTER-images are applied only when the on-disk BEFORE-image CRC matches the
-  saved before-image CRC, preventing replay from overwriting concurrent writes
+- AFTER-images are applied only when the on-disk block content matches the
+  stored BEFORE-image hash, preventing replay from overwriting concurrent writes
   from surviving nodes.
+
+**Sprint E (CRIT-V3-3) — 62-bit BEFORE-image hash:**
+The previous 32-bit CRC32C (`jbr_checksum`) could produce false-positive
+matches on filesystems with billions of blocks (~1/4B probability per block).
+A false match causes a stale AFTER-image to be applied to a block written by
+a live peer — silent data corruption.
+
+Fix: a secondary CRC32C (seed `~1U`) is packed into `jbr_flags[31:2]`
+(`OCSFS_JBR_HASH2_MASK`), giving 30 additional bits. Combined 62-bit hash
+reduces false-positive probability to ~1/4.6×10¹⁸. Both writer (`journal.c`)
+and replay reader (`journal_replay.c`) updated. The structure `ocsfs_disk_journal_bref`
+is unchanged — bits 0-1 of `jbr_flags` were already used for BEFORE/AFTER; bits
+2-31 were previously zero.
+
+### Dedup safety (Sprint E — CRIT-V3-4, MEDIO-V3-11)
+
+**CRIT-V3-4:** `dedup_apply_pair` called `ocsfs_extent_lookup` and
+`ocsfs_extent_btree_replace` without `i_extent_lock`, creating a data race
+with concurrent truncate that could silently corrupt the extent map. Both
+calls are now wrapped under `mutex_lock(&oi->i_extent_lock)`.
+
+**MEDIO-V3-11:** `dedup_blocks_equal` used `sb_bread` (page-cache) for
+comparison. In cluster mode, a peer may have modified one of the blocks
+since it was cached, producing a false content match and causing dedup to
+collapse two logically distinct files onto the same physical blocks. Now uses
+`sb_getblk` + `bh_read` (forced disk read) in cluster mode.
 
 ### Ordered checkpoint
 
