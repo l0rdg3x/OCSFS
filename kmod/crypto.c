@@ -48,9 +48,10 @@ static int ocsfs_fscrypt_set_context(struct inode *inode, const void *ctx,
 
 static bool ocsfs_fscrypt_empty_dir(struct inode *inode)
 {
-	/* i_dirent_count tracks live entries; 0 means the directory is empty.
-	 * fscrypt calls this before allowing a policy change on a directory. */
-	return OCSFS_I(inode)->i_dirent_count == 0;
+	/* MEDIO-V3-9: i_dirent_count is cached and may be stale in cluster mode.
+	 * Use ocsfs_empty_dir() which does a real disk scan with DLM SH + refresh
+	 * so a policy change is never allowed on a non-empty directory. */
+	return ocsfs_empty_dir(inode) != 0;
 }
 
 /* ─── fscrypt_operations ─────────────────────────────────────────────────

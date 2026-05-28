@@ -383,9 +383,18 @@ int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block)
 	}
 
 	/* Delete all extents fully beyond from_block.
-	 * Commit and restart the transaction every 64-extent batch to bound
-	 * journal usage for files with large extent trees. */
+	 * MEDIO-V3-2: commit every `batches_per_commit` inner 64-extent cycles
+	 * instead of every single cycle.  Scaling logarithmically with the
+	 * estimated extent count reduces txn overhead for large files:
+	 *   64 extents  → commit every  1 cycle  (~64  extents/txn)
+	 *   4K extents  → commit every  6 cycles (~384 extents/txn)
+	 *   1M extents  → commit every 20 cycles (~1280 extents/txn)
+	 * Journal space is still bounded: 64 × batches_per_commit × sizeof(bref). */
 	{
+		u64 est_extents = (inode->i_blocks * 512) /
+				  max_t(u64, sbi->s_block_size, 1) + 1;
+		u32 batches_per_commit = max_t(u32, 1U, order_base_2(est_extents));
+		u32 inner_count = 0;
 		int safety = 65536;
 
 		do {
@@ -420,27 +429,31 @@ int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block)
 					goto abort;
 				}
 
-				/* Commit this batch and charge freed blocks to quota */
-				ret = ocsfs_inode_journal_root(txn, inode);
-				if (ret)
-					goto abort;
-				ret = ocsfs_txn_commit(txn);
-				if (ret)
-					return ret;
-				{
-					u64 freed_bytes = (batch_start_blocks -
-							   inode->i_blocks) * 512;
-					if (freed_bytes)
-						dquot_free_space_nodirty(inode,
-									 freed_bytes);
-				}
-				mark_inode_dirty(inode);
-				batch_start_blocks = inode->i_blocks;
+				inner_count++;
+				if (inner_count >= batches_per_commit || tc.count < 64) {
+					/* Commit this batch and charge freed blocks to quota */
+					ret = ocsfs_inode_journal_root(txn, inode);
+					if (ret)
+						goto abort;
+					ret = ocsfs_txn_commit(txn);
+					if (ret)
+						return ret;
+					{
+						u64 freed_bytes = (batch_start_blocks -
+								   inode->i_blocks) * 512;
+						if (freed_bytes)
+							dquot_free_space_nodirty(inode,
+										 freed_bytes);
+					}
+					mark_inode_dirty(inode);
+					batch_start_blocks = inode->i_blocks;
+					inner_count = 0;
 
-				txn = ocsfs_txn_begin(sb);
-				if (IS_ERR(txn))
-					return PTR_ERR(txn);
-				ec.txn = txn;
+					txn = ocsfs_txn_begin(sb);
+					if (IS_ERR(txn))
+						return PTR_ERR(txn);
+					ec.txn = txn;
+				}
 			}
 		} while (tc.count > 0);
 	}

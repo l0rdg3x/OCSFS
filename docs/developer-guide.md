@@ -580,6 +580,109 @@ initialized during mount) so only one cluster node holds the freeze
 coordinator role at a time. `ocsfs_unfreeze_fs` releases the lock. Single-node
 mounts skip the DLM step and rely on the VFS freeze alone.
 
+### Security and correctness hardening (Sprint H — SEC-V3-5/6, ALTO-V3-2/8/9, MEDIO-V3-2/4/8/9/10/12)
+
+**SEC-V3-5 — CAS bad-input guard (`cas.c`):**
+`ocsfs_atomic_cas` replaces `WARN_ON(boff + len > sb->s_blocksize)` with a
+plain `return -EINVAL`. `WARN_ON` is intended for programmer-visible invariants,
+not for user-supplied coordinates that could be invalid from a malformed ioctl.
+The old form produced a kernel backtrace on every bad call, which could be
+used to flood dmesg under `CAP_SYS_ADMIN`.
+
+**SEC-V3-6 — HMAC replay attack fix (`node.c`):**
+The node auth token is now `HMAC-SHA256(secret, cluster_uuid || node_uuid ||
+mount_gen_be32)`. The previous constant `"ocsfs-v1"` message meant a token
+issued by any cluster sharing the same secret was valid on any other — a
+node could replay a stolen slot token across a cluster boundary. The new
+message includes the 16-byte cluster UUID (`sbi->s_ds->s_uuid`) and the
+32-bit mount generation, scoping tokens to a specific cluster and mount
+instance. `ocsfs_build_auth_msg` is a shared helper used by both
+`ocsfs_build_new_slot` (writer) and `ocsfs_node_verify_auth` (reader).
+
+**ALTO-V3-8 — CAS PR-lease fallback visibility (`cas.c`):**
+The `pr_info` log message for the PR-lease CAS backend in clustered mode is
+upgraded to `pr_warn`. PR-lease is ~100× slower than SCSI CAW; operators
+should not miss this downgrade silently in a busy log stream.
+
+**ALTO-V3-2 — Selective invalidation range before EX release (`inode.c`,
+`thin.c`):**
+`ocsfs_lock_res.lr_inv_lo/hi` must be populated before `ocsfs_lock_release`
+is called. Previously, the setattr truncate path and the fallocate path set
+the dirty range after releasing EX, so the range was never stored into the
+on-disk lock entry and the next acquirer had no range to invalidate.
+Fix: `inode.c:ocsfs_setattr` sets `lr_inv_lo = from_block; lr_inv_hi =
+U64_MAX` (full tail) before the lock is released. `thin.c:ocsfs_fallocate`
+sets the exact byte-range of the fallocate operation converted to blocks.
+
+**ALTO-V3-9 — Encrypted folio invalidation race (`iomap.c`):**
+When fscrypt is enabled, `ocsfs_iomap_aops.invalidate_folio` is wired to
+`ocsfs_enc_invalidate_folio` instead of the plain `iomap_invalidate_folio`.
+The wrapper calls `folio_wait_writeback(folio)` first, ensuring any
+in-flight bounce-page bio for the folio has completed before the iomap
+layer discards the folio. Without this, a concurrent truncate could race
+with a bounce-page bio that holds a reference to the same folio, causing
+a use-after-free in the fscrypt writeback path.
+
+**MEDIO-V3-2 — Logarithmic txn batch scaling in btree truncate
+(`extent_btree.c`):**
+`ocsfs_extent_btree_truncate` previously committed a journal transaction
+every 64 extent removals regardless of the total extent count. For large
+files with tens of thousands of extents this produces thousands of small
+transactions, each with 16 KB of overhead. The new heuristic estimates
+`est_extents = (i_blocks × 512) / block_size + 1` and sets
+`batches_per_commit = max(1, order_base_2(est_extents))`, so a file with
+~1024 extents commits every 10 batches rather than every 1, reducing
+journal traffic by ~10×.
+
+**MEDIO-V3-4 — `ocsfs_inode_journal_root` dir-only guard (`inode.c`):**
+The function was unconditionally writing `i_dir_btree_root` to the on-disk
+inode for all inode types. Regular files do not have a dir btree root; the
+field should be zero and is never read. Fix: the write is now gated on
+`S_ISDIR(inode->i_mode)`, preventing stale non-zero garbage from a previous
+directory inode from poisoning the field when the inode slot is reused as a
+file.
+
+**MEDIO-V3-8 — xattr alloc txn-failure cleanup (`xattr.c`):**
+If `ocsfs_txn_commit` fails after a new xattr block was allocated and
+assigned to `oi->i_xattr_block`, the in-memory inode carries a block
+address that was never journaled. A subsequent xattr set would try to read
+that block and find uninitialized data. Fix: on commit failure in the
+`need_alloc` branch, `oi->i_xattr_block` is reset to 0 so the next call
+re-allocates cleanly.
+
+**MEDIO-V3-9 — `ocsfs_fscrypt_empty_dir` real disk scan (`crypto.c`):**
+The previous implementation checked `oi->i_dirent_count == 0`, a cached
+in-memory counter that can lag behind the on-disk state in cluster mode (a
+peer could have added entries since the last inode refresh). The fix
+delegates to `ocsfs_empty_dir()`, which acquires DLM SH, calls
+`ocsfs_inode_refresh()`, and performs a real on-disk directory scan via
+`ocsfs_dir_foreach`. This closes the TOCTOU gap that would allow
+`fscrypt_drop_inode` to conclude a directory is empty when it is not.
+
+**MEDIO-V3-10 — Journal-before-free in compress_file (`compress_file.c`):**
+When compression produces a smaller block set, the old physical blocks
+must be freed. The previous code called `ocsfs_free_blocks` before
+journaling the inode update, so a crash between those two steps would
+produce a freed block with a live reference. The fix opens a journal txn,
+flushes the inode via `ocsfs_flush_inode_locked`, commits the txn, and
+only calls `ocsfs_free_blocks` on success. If the txn fails, the old
+blocks are kept (space leak) rather than risking use-after-free.
+
+**MEDIO-V3-12 — xattr pre-flight bh reuse (`xattr.c`):**
+`xattr_set_internal` performs a pre-flight forced read of the xattr block
+to validate the current content before opening a txn. In the non-alloc
+path it then repeated the same forced read inside the txn. Fix: the
+pre-flight `buffer_head` is kept alive (`peek_bh`) and transferred
+directly into the txn via `ocsfs_txn_add_bh`, eliminating a second disk
+read-trip in cluster mode.
+
+**Deferred items:**
+
+| Item | Reason for deferral |
+|---|---|
+| ALTO-V3-10 — HMAC for journal COMMIT records | `ocsfs_disk_journal_txn` (28 bytes) has no space for a 32-byte HMAC without a format bump and a new incompat feature bit. Redesign tracked separately. |
+| MEDIO-V3-6 — decompress OOM mempool | The existing `comp_size > 1 MiB` guard added in Batch-C already limits single-decompression memory usage. Full per-CPU mempool redesign deferred. |
+
 ---
 
 ## 9. I/O Path

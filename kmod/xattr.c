@@ -190,6 +190,7 @@ int ocsfs_xattr_set_internal(struct inode *inode, u8 ns, const char *name,
 	struct ocsfs_disk_xattr_block *xb;
 	struct ocsfs_xattr_entry *xe;
 	struct buffer_head *bh = NULL;
+	struct buffer_head *peek_bh = NULL;
 	struct ocsfs_txn *txn;
 	bool remove = (value == NULL);
 	bool need_alloc;
@@ -230,31 +231,37 @@ int ocsfs_xattr_set_internal(struct inode *inode, u8 ns, const char *name,
 
 	need_alloc = (oi->i_xattr_block == 0);
 
-	/* Pre-flight: check existence/flags before starting txn */
+	/* Pre-flight: check existence/flags before starting txn.
+	 * For !need_alloc we keep the bh alive (peek_bh) and reuse it in the
+	 * txn section, avoiding a second forced-read round-trip (MEDIO-V3-12). */
 	if (need_alloc) {
 		if (remove || (flags & XATTR_REPLACE)) {
 			ret = -ENODATA;
 			goto out_release;
 		}
+		peek_bh = NULL;
 	} else {
-		struct buffer_head *peek = xattr_read_bh(inode);
+		peek_bh = xattr_read_bh(inode);
 
-		if (IS_ERR(peek)) {
-			ret = PTR_ERR(peek);
+		if (IS_ERR(peek_bh)) {
+			ret = PTR_ERR(peek_bh);
+			peek_bh = NULL;
 			goto out_release;
 		}
-		xb = (struct ocsfs_disk_xattr_block *)peek->b_data;
+		xb = (struct ocsfs_disk_xattr_block *)peek_bh->b_data;
 		xe = xattr_find(xb, ns, name, name_len, NULL);
-		brelse(peek);
 
 		if (xe && (flags & XATTR_CREATE)) {
+			brelse(peek_bh);
 			ret = -EEXIST;
 			goto out_release;
 		}
 		if (!xe && ((flags & XATTR_REPLACE) || remove)) {
+			brelse(peek_bh);
 			ret = -ENODATA;
 			goto out_release;
 		}
+		/* peek_bh is held; consumed by the !need_alloc txn branch */
 	}
 
 	txn = ocsfs_txn_begin(inode->i_sb);
@@ -291,20 +298,11 @@ int ocsfs_xattr_set_internal(struct inode *inode, u8 ns, const char *name,
 			goto out_abort;
 		}
 	} else {
-		if (sbi->s_clustered) {
-			bh = sb_getblk(inode->i_sb, oi->i_xattr_block);
-			if (!bh) { ret = -EIO; goto out_abort; }
-			clear_buffer_uptodate(bh);
-			if (bh_read(bh, 0) < 0) {
-				brelse(bh);
-				ret = -EIO;
-				goto out_abort;
-			}
-		} else {
-			bh = sb_bread(inode->i_sb, oi->i_xattr_block);
-			if (!bh) { ret = -EIO; goto out_abort; }
-		}
-
+		/* Reuse the bh from the pre-flight check (MEDIO-V3-12):
+		 * xattr_read_bh already did a forced-read in cluster mode,
+		 * so no second round-trip is needed. */
+		bh = peek_bh;
+		peek_bh = NULL;
 		ret = ocsfs_txn_add_bh(txn, bh);
 		if (ret) {
 			brelse(bh);
@@ -349,7 +347,13 @@ int ocsfs_xattr_set_internal(struct inode *inode, u8 ns, const char *name,
 			     OCSFS_DEFAULT_BLOCK_SIZE - sizeof(__le32)));
 
 	ret = ocsfs_txn_commit(txn);
-	if (ret == 0) {
+	if (ret) {
+		/* MEDIO-V3-8: if we allocated a new xattr block but the commit
+		 * failed, reset i_xattr_block so a future set-xattr call re-allocates
+		 * cleanly rather than pointing at an uncommitted block. */
+		if (need_alloc)
+			oi->i_xattr_block = 0;
+	} else {
 		mark_inode_dirty(inode);
 		if (sbi->s_clustered)
 			ocsfs_flush_inode_locked(inode, true);

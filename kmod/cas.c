@@ -69,7 +69,8 @@ int ocsfs_cas_probe(struct super_block *sb)
 	}
 
 	sbi->s_cas_backend = CAS_BACKEND_PR_LEASE;
-	pr_info("ocsfs: CAS backend: PR-lease (software), PR-capable: %s\n",
+	pr_warn("ocsfs: CAS backend: PR-lease (software, ~100× slower than SCSI CAW) — "
+		"SCSI CAW not available; PR-capable: %s\n",
 		sbi->s_pr_capable ? "yes" : "no");
 	return 0;
 }
@@ -238,7 +239,7 @@ int ocsfs_atomic_cas(struct super_block *sb, u64 block, u32 boff,
 	struct buffer_head *data_bh;
 	int attempt, ret;
 
-	if (WARN_ON(boff + len > (u32)sb->s_blocksize))
+	if (boff + len > (u32)sb->s_blocksize)
 		return -EINVAL;
 
 	if (sbi->s_cas_backend == CAS_BACKEND_NONE)

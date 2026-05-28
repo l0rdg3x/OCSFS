@@ -268,7 +268,35 @@ int ocsfs_compress_file(struct inode *inode)
 		inode->i_blocks -= (u64)(old_len - comp_blocks) *
 				   (sbi->s_block_size / 512);
 		mark_inode_dirty(inode);
-		ocsfs_free_blocks(sb, old_phys, old_len);
+
+		/* MEDIO-V3-10: journal the inode update BEFORE freeing old blocks.
+		 * This ensures that on crash we never have the inode pointing at
+		 * freed (possibly reused) blocks.  On txn failure skip the free —
+		 * a space leak is recoverable by fsck; corruption is not. */
+		{
+			bool do_free = false;
+			struct ocsfs_txn *ctxn = ocsfs_txn_begin(sb);
+
+			if (!IS_ERR(ctxn)) {
+				int jr = ocsfs_flush_inode_locked(inode, true);
+
+				if (!jr) {
+					ocsfs_txn_commit(ctxn);
+					do_free = true;
+				} else {
+					ocsfs_txn_abort(ctxn);
+					pr_warn_ratelimited(
+						"ocsfs: compress_file: journal failed (%d), "
+						"old blocks kept (space leak)\n", jr);
+				}
+			} else {
+				pr_warn_ratelimited(
+					"ocsfs: compress_file: txn_begin failed, "
+					"old blocks kept (space leak)\n");
+			}
+			if (do_free)
+				ocsfs_free_blocks(sb, old_phys, old_len);
+		}
 	}
 unlock:
 	mutex_unlock(&oi->i_extent_lock);

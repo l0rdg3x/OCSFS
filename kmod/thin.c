@@ -287,8 +287,16 @@ long ocsfs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 out:
 	if (sbi->s_clustered) {
 		if (ret == 0) {
-			int fr = ocsfs_flush_inode_locked(inode, true);
+			int fr;
 
+			/* ALTO-V3-2: record the modified block range so the next SH
+			 * acquirer can do selective page cache invalidation (ARCH-7). */
+			oi->i_lock_res.lr_inv_lo = (u64)(offset / sbi->s_block_size);
+			oi->i_lock_res.lr_inv_hi = (u64)((offset + len +
+							   sbi->s_block_size - 1) /
+							  sbi->s_block_size);
+
+			fr = ocsfs_flush_inode_locked(inode, true);
 			if (fr)
 				pr_warn_ratelimited(
 					"ocsfs: fallocate inode flush failed (%d)\n", fr);

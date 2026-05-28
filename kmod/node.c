@@ -36,6 +36,18 @@ static int ocsfs_hmac_sha256(const u8 *key, const u8 *msg, size_t msg_len,
 	return ret;
 }
 
+/* Token: HMAC-SHA256(secret, cluster_uuid||node_uuid||mount_gen_be32) */
+static void ocsfs_build_auth_msg(const struct ocsfs_sb_info *sbi,
+				 const u8 *node_uuid, u32 mount_gen,
+				 u8 msg[36])
+{
+	__be32 gen_be = cpu_to_be32(mount_gen);
+
+	memcpy(msg,      sbi->s_ds->s_uuid, 16);
+	memcpy(msg + 16, node_uuid,          16);
+	memcpy(msg + 32, &gen_be,             4);
+}
+
 /* ═══════════════════════════════════════════════════════════════
  * READ NODE TABLE — load all node slots into memory
  * ═══════════════════════════════════════════════════════════════ */
@@ -125,8 +137,10 @@ static int ocsfs_build_new_slot(struct super_block *sb, u16 slot,
 		le32_to_cpu(expected_dns->ns_version) + 1);
 
 	if (sbi->s_auth_required) {
-		ret = ocsfs_hmac_sha256(sbi->s_cluster_secret,
-					"ocsfs-v1", 8,
+		u8 msg[36];
+
+		ocsfs_build_auth_msg(sbi, ni->ni_uuid, ni->ni_mount_gen, msg);
+		ret = ocsfs_hmac_sha256(sbi->s_cluster_secret, msg, sizeof(msg),
 					new_dns->ns_auth_token);
 		if (ret)
 			return ret;
@@ -182,20 +196,26 @@ static int ocsfs_node_write_slot(struct super_block *sb, u16 slot)
 /* ═══════════════════════════════════════════════════════════════
  * AUTH VERIFICATION — compare a slot's token against our secret
  * Protects against stray nodes joining the wrong cluster.
- * Token is HMAC-SHA256(secret, "ocsfs-v1") in ns_auth_token[0..31].
+ *
+ * Token is HMAC-SHA256(secret, cluster_uuid||node_uuid||mount_gen_be32).
+ * Including cluster_uuid and mount_gen makes tokens cluster-specific and
+ * mount-specific, preventing replay attacks across clusters sharing the
+ * same secret or across reboots.
  * ═══════════════════════════════════════════════════════════════ */
 
 int ocsfs_node_verify_auth(struct super_block *sb,
 			    const struct ocsfs_disk_node_slot *dns)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
-	u8 expected[32];
+	u8 msg[36], expected[32];
 	int ret;
 
 	if (!sbi->s_auth_required)
 		return 0;
 
-	ret = ocsfs_hmac_sha256(sbi->s_cluster_secret, "ocsfs-v1", 8, expected);
+	ocsfs_build_auth_msg(sbi, dns->ns_uuid,
+			     le32_to_cpu(dns->ns_mount_gen), msg);
+	ret = ocsfs_hmac_sha256(sbi->s_cluster_secret, msg, sizeof(msg), expected);
 	if (ret)
 		return ret;
 

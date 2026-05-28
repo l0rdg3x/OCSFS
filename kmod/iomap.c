@@ -819,9 +819,27 @@ static int ocsfs_writepages(struct address_space *mapping,
 	return iomap_writepages(&wpc);
 }
 
+/* ALTO-V3-9: encrypted files use a separate invalidate_folio that waits for
+ * writeback before delegating to iomap.  The bounce-page bio for fscrypt may
+ * complete after the folio's writeback bit is cleared, so a concurrent truncate
+ * could free the underlying blocks while the bio is still in flight.
+ * folio_wait_writeback() serialises against the bio completion path. */
+#ifdef CONFIG_FS_ENCRYPTION
+static void ocsfs_enc_invalidate_folio(struct folio *folio,
+				       size_t offset, size_t len)
+{
+	folio_wait_writeback(folio);
+	iomap_invalidate_folio(folio, offset, len);
+}
+#endif
+
 const struct address_space_operations ocsfs_iomap_aops = {
 	.dirty_folio      = iomap_dirty_folio,
+#ifdef CONFIG_FS_ENCRYPTION
+	.invalidate_folio = ocsfs_enc_invalidate_folio,
+#else
 	.invalidate_folio = iomap_invalidate_folio,
+#endif
 	.release_folio    = iomap_release_folio,
 	.read_folio       = ocsfs_iomap_read_folio,
 	.readahead        = ocsfs_iomap_readahead,

@@ -439,7 +439,11 @@ int ocsfs_inode_journal_root(struct ocsfs_txn *txn, struct inode *inode)
 	}
 
 	di = (struct ocsfs_disk_inode *)(bh->b_data + boff);
-	di->i_dir_btree_root   = cpu_to_le64(oi->i_dir_btree_root);
+	/* MEDIO-V3-4: only write i_dir_btree_root for directories.
+	 * For regular files the field is always 0; writing the in-memory value
+	 * risks clobbering a fresh disk read with a stale cached value. */
+	if (S_ISDIR(inode->i_mode))
+		di->i_dir_btree_root = cpu_to_le64(oi->i_dir_btree_root);
 	di->i_extent_tree_root = cpu_to_le64(oi->i_extent_tree_root);
 	di->i_checksum = cpu_to_le32(
 		ocsfs_crc32c(~0U, di, OCSFS_INODE_SIZE - 4));
@@ -679,6 +683,12 @@ int ocsfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			mutex_lock(&oi->i_extent_lock);
 			ocsfs_extent_truncate(inode, from_block);
 			mutex_unlock(&oi->i_extent_lock);
+			/* ALTO-V3-2: record dirty range so the next SH acquirer
+			 * performs selective page cache invalidation (ARCH-7). */
+			if (sbi->s_clustered) {
+				oi->i_lock_res.lr_inv_lo = from_block;
+				oi->i_lock_res.lr_inv_hi = U64_MAX;
+			}
 		} else {
 			truncate_setsize(inode, attr->ia_size);
 		}

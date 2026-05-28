@@ -32,9 +32,10 @@ Proxmox VE as an open alternative to VMware VMFS.
 | Journal + dedup safety (Sprint E) | ~89% |
 | Security hardening (Sprint F) | ~90% |
 | Superblock mirror + btree v2 + cluster freeze (Sprint G) | ~91% |
+| Security + correctness hardening (Sprint H) | ~93% |
 | VMFS feature parity | ~72% |
 
-Sprints A–G from the Opus v3 review have been applied.
+Sprints A–H from the Opus v3 review have been applied.
 Sprint A: fscrypt cluster safety. Sprint B: HB summary sector-level SCSI
 CAW. Sprint C: recovery back-off, umount drain, lock overflow chain.
 Sprint D: `ocsfs_inode_refresh` now syncs all VFS fields (mode, uid, gid,
@@ -69,6 +70,40 @@ the freeze role at a time — safe for backup tooling and live migration;
 (4) ARCH-V3-5 (lock delegation/lease) deferred: requires an on-disk signaling
 protocol redesign to notify the leaseholder when a peer waits; the epoch-based
 cache (Sprint D) already covers the dominant optimization path.
+Sprint H: eleven security and correctness fixes — (1) SEC-V3-5: `cas.c`
+replaces `WARN_ON` on bad input with a silent `-EINVAL` return to stop dmesg
+flood on malformed ioctl args; (2) SEC-V3-6: HMAC auth token now covers
+`cluster_uuid(16) || node_uuid(16) || mount_gen_be32(4)` instead of the
+constant `"ocsfs-v1"` string, making tokens cluster-specific and
+mount-generation-specific and closing a cross-cluster replay attack path;
+(3) ALTO-V3-8: CAS backend fallback to PR-lease is now logged at `pr_warn`
+level (was `pr_info`) so operators notice the ~100× throughput penalty;
+(4) ALTO-V3-2: `setattr` truncate and `fallocate` paths now set
+`lr_inv_lo/hi` before releasing DLM EX, so the selective page-cache
+invalidation range is visible to the next acquirer; (5) ALTO-V3-9: custom
+`ocsfs_enc_invalidate_folio` calls `folio_wait_writeback()` before
+`iomap_invalidate_folio()` for encrypted inodes, closing a race between
+truncate and bounce-page writeback; (6) MEDIO-V3-2: extent btree truncate
+now commits at logarithmically-spaced intervals (`batches_per_commit =
+max(1, order_base_2(est_extents))`) rather than every 64 iterations,
+reducing journal pressure for inodes with tens of thousands of extents;
+(7) MEDIO-V3-4: `ocsfs_inode_journal_root` no longer writes
+`i_dir_btree_root` for regular files (the field is only meaningful on
+directories); (8) MEDIO-V3-8: if `ocsfs_txn_commit` fails during xattr
+allocation, `i_xattr_block` is reset to 0 to prevent a dangling pointer
+from a failed txn persisting in the in-memory inode; (9) MEDIO-V3-9:
+`ocsfs_fscrypt_empty_dir` now calls the real `ocsfs_empty_dir()` (DLM SH
++ `ocsfs_inode_refresh` + on-disk directory scan) instead of the cached
+`i_dirent_count`, closing a TOCTOU gap in encrypted-directory removal;
+(10) MEDIO-V3-10: `compress_file.c` journals the inode update before
+freeing old physical blocks — if the txn fails the free is skipped (space
+leak) rather than risking a freed block being reallocated while still
+referenced; (11) MEDIO-V3-12: `xattr_set_internal` reuses the pre-flight
+`peek_bh` in the txn section for the non-alloc path, eliminating a second
+forced disk read in cluster mode. Deferred: ALTO-V3-10 (HMAC for journal
+COMMIT records — requires on-disk format change + new feature bit);
+MEDIO-V3-6 (decompress OOM mempool — existing 1 MiB cap partially
+mitigates).
 The remaining gap to 95%+ is real-hardware integration testing (xfstests
 on a multi-node testbed).
 
