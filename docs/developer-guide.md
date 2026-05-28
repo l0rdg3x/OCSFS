@@ -408,6 +408,14 @@ non-PR devices (degraded mode), a warning is logged and recovery continues.
 is a single `u16`). If two nodes fail simultaneously, the second is not
 recovered until the first recovery completes.
 
+**Sprint C (2026-05-28) — recovery robustness:**
+
+| Issue | Fix | Detail |
+|---|---|---|
+| ALTO-V3-4: busy-wait livelock on -EAGAIN | Exponential backoff 50 ms → 5 s | `ocsfs_recovery_work_fn`: `eagain_ms` doubles each contended round, caps at `OCSFS_RECOVERY_EAGAIN_MAX_MS` (5000 ms); resets on success or next slot |
+| ALTO-V3-5: umount drops in-flight recovery | `flush_work` before `cancel_work_sync` | `ocsfs_recovery_exit`: drains current execution first; warns if pending bits remain after drain |
+| MEDIO-V3-3: lock recovery misses overflow chain | Traverse ARCH-2 overflow chain per primary slot | `ocsfs_lock_recover_node`: after processing each primary entry follows `le_overflow_block` chain via `lock_read_entry_at_addr` / `lock_write_entry_at_addr`; helper `ocsfs_lock_recover_entry` avoids code duplication |
+
 ---
 
 ## 8. Journal and Crash Recovery

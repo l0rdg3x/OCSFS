@@ -287,9 +287,11 @@ static inline u16 ocsfs_ext_set_comp_algo(u16 flags, u8 algo)
 #define OCSFS_LOCK_CACHE_NS     (OCSFS_LOCK_CACHE_MS * 1000000ULL)
 
 /* Recovery backoff for transient errors in the recovery work function */
-#define OCSFS_RECOVERY_BACKOFF_MS   60000U  /* 60s before re-arming a failed recovery */
+#define OCSFS_RECOVERY_BACKOFF_MS     60000U  /* 60s before re-arming a failed recovery */
 /* Yield when another node is already running recovery for this slot */
-#define OCSFS_RECOVERY_YIELD_MS     50U
+#define OCSFS_RECOVERY_YIELD_MS       50U
+/* Max -EAGAIN backoff: doubles each round, caps at 5s (ALTO-V3-4) */
+#define OCSFS_RECOVERY_EAGAIN_MAX_MS  5000U
 
 /* Recovery phases */
 #define OCSFS_RECOVERY_ELECT    1

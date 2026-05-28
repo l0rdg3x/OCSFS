@@ -399,6 +399,10 @@ static void ocsfs_recovery_work_fn(struct work_struct *work)
 		container_of(work, struct ocsfs_sb_info, s_recovery_work);
 	struct super_block *sb = sbi->s_sb;
 	unsigned int slot;
+	/* Per-slot exponential backoff for -EAGAIN (ALTO-V3-4).
+	 * Doubles on each contended round, resets when we win or move
+	 * to a different slot. */
+	unsigned int eagain_ms = OCSFS_RECOVERY_YIELD_MS;
 
 	while ((slot = find_first_bit(sbi->s_recovery_pending,
 				      OCSFS_MAX_NODES)) < OCSFS_MAX_NODES) {
@@ -414,10 +418,13 @@ static void ocsfs_recovery_work_fn(struct work_struct *work)
 		clear_bit(slot, sbi->s_recovery_pending);
 		if (ret == -EAGAIN) {
 			set_bit(slot, sbi->s_recovery_pending);
-			/* Don't busy-spin: another node is running recovery.
-			 * If it finishes, we win the CAS next round.
-			 * If it dies, heartbeat fires a new trigger. */
-			msleep(OCSFS_RECOVERY_YIELD_MS);
+			/* Exponential backoff: another node is the leader now.
+			 * Ramp 50ms → 5s to avoid busy-looping when a slow
+			 * leader holds the CAS for an extended period. */
+			msleep(eagain_ms);
+			eagain_ms = min_t(unsigned int,
+					  eagain_ms * 2,
+					  OCSFS_RECOVERY_EAGAIN_MAX_MS);
 		} else if (ret && ret != -EPERM && ret != -EUCLEAN) {
 			/* Transient error (I/O, ENOMEM, …): -EPERM means the
 			 * node is still alive (degraded cross-check), -EUCLEAN
@@ -427,6 +434,10 @@ static void ocsfs_recovery_work_fn(struct work_struct *work)
 			pr_warn("ocsfs: recovery for slot %u failed (%d), "
 				"retrying in 60s\n", slot, ret);
 			msleep(OCSFS_RECOVERY_BACKOFF_MS);
+			eagain_ms = OCSFS_RECOVERY_YIELD_MS;
+		} else {
+			/* Success or permanent error: reset backoff for next slot. */
+			eagain_ms = OCSFS_RECOVERY_YIELD_MS;
 		}
 	}
 }
@@ -461,5 +472,12 @@ void ocsfs_recovery_exit(struct super_block *sb)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 
+	/* Drain any in-progress recovery run before cancelling (ALTO-V3-5).
+	 * flush_work waits for the current execution to complete; cancel_work_sync
+	 * then prevents any re-queued execution from starting. */
+	flush_work(&sbi->s_recovery_work);
 	cancel_work_sync(&sbi->s_recovery_work);
+	if (unlikely(!bitmap_empty(sbi->s_recovery_pending, OCSFS_MAX_NODES)))
+		pr_warn("ocsfs: umount with pending recovery slots — "
+			"these nodes were not fully recovered\n");
 }

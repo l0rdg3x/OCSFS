@@ -296,9 +296,61 @@ int ocsfs_lock_downgrade(struct super_block *sb, struct ocsfs_lock_res *lr,
  * LOCK RECOVERY — release all locks held by a failed node
  * ═══════════════════════════════════════════════════════════════ */
 
+/* Apply recovery to one lock entry.  Clears EX/SH/waiter state for
+ * node_slot/mount_gen.  Returns true if the entry was modified. */
+static bool ocsfs_lock_recover_entry(struct ocsfs_disk_lock *dl,
+				     u16 node_slot, u32 mount_gen,
+				     int *recovered)
+{
+	bool modified = false;
+	u32 wbyte, mbyte, mshift;
+	u8  wbit;
+
+	if (le16_to_cpu(dl->le_mode) == OCSFS_LOCK_EX &&
+	    le16_to_cpu(dl->le_holder_slot) == node_slot &&
+	    /* le_holder_gen is 32-bit: wraps after 2^32 mounts — accepted
+	     * risk; upgrading to 64-bit requires an on-disk format change. */
+	    le32_to_cpu(dl->le_holder_gen) == mount_gen) {
+		dl->le_holder_slot = 0;
+		dl->le_holder_gen  = 0;
+		if (!has_sh_holders(dl))
+			dl->le_mode = cpu_to_le16(OCSFS_LOCK_NL);
+		modified = true;
+		(*recovered)++;
+	}
+
+	if (is_sh_holder(dl, node_slot)) {
+		remove_sh_holder(dl, node_slot);
+		if (!has_sh_holders(dl) &&
+		    le16_to_cpu(dl->le_mode) != OCSFS_LOCK_EX)
+			dl->le_mode = cpu_to_le16(OCSFS_LOCK_NL);
+		modified = true;
+		(*recovered)++;
+	}
+
+	wbyte = node_slot / 8;
+	wbit  = 1u << (node_slot % 8);
+	if (!modified && wbyte < sizeof(dl->le_waiters) &&
+	    (dl->le_waiters[wbyte] & wbit))
+		modified = true;
+	clear_waiter_bit(dl, node_slot);
+
+	/* 2-bit mode entry: 2 bits per slot, packed LSB-first in each byte. */
+	mbyte  = (node_slot * 2) / 8;
+	mshift = (node_slot * 2) % 8;
+	if (mbyte < sizeof(dl->le_waiter_modes) &&
+	    (dl->le_waiter_modes[mbyte] & (3u << mshift))) {
+		dl->le_waiter_modes[mbyte] &= ~(3u << mshift);
+		modified = true;
+	}
+
+	return modified;
+}
+
 int ocsfs_lock_recover_node(struct super_block *sb, u16 node_slot,
 			    u32 mount_gen)
 {
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	struct ocsfs_disk_lock dl;
 	struct buffer_head *bh;
 	u32 i;
@@ -308,7 +360,9 @@ int ocsfs_lock_recover_node(struct super_block *sb, u16 node_slot,
 	pr_info("ocsfs: recovering locks for node slot %u (gen=%u)\n",
 		node_slot, mount_gen);
 
-	for (i = 0; i < ocsfs_lock_primary_count(OCSFS_SB(sb)); i++) {
+	for (i = 0; i < ocsfs_lock_primary_count(sbi); i++) {
+		u64 chain_block;
+
 		ret = lock_read_entry(sb, i, &dl, &bh);
 		if (ret)
 			continue;
@@ -318,55 +372,10 @@ int ocsfs_lock_recover_node(struct super_block *sb, u16 node_slot,
 			continue;
 		}
 
-		bool modified = false;
+		chain_block = le64_to_cpu(dl.le_overflow_block);
 
-		if (le16_to_cpu(dl.le_mode) == OCSFS_LOCK_EX &&
-		    le16_to_cpu(dl.le_holder_slot) == node_slot &&
-		    /* le_holder_gen is 32-bit: wraps after 2^32 mounts — accepted
-		     * risk; upgrading to 64-bit requires an on-disk format change. */
-		    le32_to_cpu(dl.le_holder_gen) == mount_gen) {
-			dl.le_holder_slot = 0;
-			dl.le_holder_gen  = 0;
-			if (!has_sh_holders(&dl))
-				dl.le_mode = cpu_to_le16(OCSFS_LOCK_NL);
-			modified = true;
-			recovered++;
-		}
-
-		if (is_sh_holder(&dl, node_slot)) {
-			remove_sh_holder(&dl, node_slot);
-			if (!has_sh_holders(&dl) &&
-			    le16_to_cpu(dl.le_mode) != OCSFS_LOCK_EX)
-				dl.le_mode = cpu_to_le16(OCSFS_LOCK_NL);
-			modified = true;
-			recovered++;
-		}
-
-		if (!modified) {
-			u32 wbyte = node_slot / 8;
-			u8  wbit  = 1u << (node_slot % 8);
-
-			if (wbyte < sizeof(dl.le_waiters) &&
-			    (dl.le_waiters[wbyte] & wbit))
-				modified = true;
-		}
-		clear_waiter_bit(&dl, node_slot);
-
-		/* Also clear the 2-bit mode entry for this slot in le_waiter_modes[].
-		 * Encoding: 2 bits per slot, packed LSB-first in each byte. */
-		{
-			u32 mbyte = (node_slot * 2) / 8;
-			u32 mshift = (node_slot * 2) % 8;
-
-			if (mbyte < sizeof(dl.le_waiter_modes)) {
-				if (dl.le_waiter_modes[mbyte] & (3u << mshift)) {
-					dl.le_waiter_modes[mbyte] &= ~(3u << mshift);
-					modified = true;
-				}
-			}
-		}
-
-		if (modified) {
+		if (ocsfs_lock_recover_entry(&dl, node_slot, mount_gen,
+					     &recovered)) {
 			ret = lock_write_entry(sb, i, &dl, bh);
 			if (ret)
 				pr_warn("ocsfs: lock recovery write failed for "
@@ -374,6 +383,53 @@ int ocsfs_lock_recover_node(struct super_block *sb, u16 node_slot,
 		}
 
 		brelse(bh);
+
+		/* Follow overflow chain for this primary slot (MEDIO-V3-3).
+		 * Each overflow block stores up to (block_size / entry_size)
+		 * entries; slot-0 of each block holds the next chain link in
+		 * le_overflow_block. */
+		while (chain_block) {
+			u64 addr = chain_block * sbi->s_block_size;
+			u32 entries_per_block =
+				sbi->s_block_size / OCSFS_LOCK_ENTRY_SIZE;
+			u64 next_chain_block = 0;
+			u32 j;
+
+			for (j = 0; j < entries_per_block; j++) {
+				u64 entry_addr =
+					addr + (u64)j * OCSFS_LOCK_ENTRY_SIZE;
+				struct ocsfs_disk_lock odl;
+				struct buffer_head *obh;
+
+				ret = lock_read_entry_at_addr(sb, entry_addr,
+							      &odl, &obh);
+				if (ret)
+					break;
+
+				if (j == 0)
+					next_chain_block =
+						le64_to_cpu(odl.le_overflow_block);
+
+				if (le32_to_cpu(odl.le_magic) == OCSFS_LOCK_MAGIC &&
+				    ocsfs_lock_recover_entry(&odl, node_slot,
+							     mount_gen,
+							     &recovered)) {
+					ret = lock_write_entry_at_addr(
+						sb, entry_addr, &odl, obh);
+					if (ret)
+						pr_warn("ocsfs: lock recovery "
+							"write failed for "
+							"overflow addr %llu "
+							"(%d)\n",
+							(unsigned long long)
+							entry_addr, ret);
+				}
+
+				brelse(obh);
+			}
+
+			chain_block = next_chain_block;
+		}
 	}
 
 	/*
@@ -381,7 +437,7 @@ int ocsfs_lock_recover_node(struct super_block *sb, u16 node_slot,
 	 * every lock_res on this node. Next acquire will hit the slow path
 	 * and re-validate from disk.
 	 */
-	atomic_inc(&OCSFS_SB(sb)->s_lock_epoch);
+	atomic_inc(&sbi->s_lock_epoch);
 
 	pr_info("ocsfs: recovered %d locks from node slot %u\n",
 		recovered, node_slot);
