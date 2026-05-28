@@ -19,12 +19,11 @@ a Proxmox VE-native alternative to VMware VMFS.
 
 ## Production Readiness
 
-Twelve rounds of correctness, security, and architectural fixes have been
-applied (Sprints A–H from the Opus v3 review, Sprints I–L from the Opus 4.8
-review). Sprint I fixed a critical AG offset bug. Sprint K adds on-disk
-recovery phase persistence. Sprint L addresses VFS semantics (orphan inode
-reclaim, zero_range partial overlap, enc_read_folio safety) and VAAI
-ownership validation.
+Fifteen rounds of correctness, security, and architectural fixes have been
+applied (Sprints A–H from the Opus v3 review, Sprints I–L plus M/N/O from the
+Opus 4.8 review). Sprint M adds a compression buffer mempool; Sprint N adds
+HMAC authentication to journal COMMIT records; Sprint O adds EX lock leases
+that allow waiters to use the lease deadline instead of blind polling.
 See [`docs/developer-guide.md`](docs/developer-guide.md) for the full
 changelog.
 

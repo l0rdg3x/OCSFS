@@ -11,7 +11,41 @@
  */
 
 #include <linux/xxhash.h>
+#include <linux/crypto.h>
+#include <crypto/hash.h>
 #include "ocsfs.h"
+
+/*
+ * ocsfs_journal_hmac_commit — compute HMAC-SHA256/128 of a COMMIT record.
+ * Covers the first 28 bytes (excluding jt_checksum) to authenticate the
+ * txn identity, block count, and data length.  ALTO-V3-10.
+ */
+int ocsfs_journal_hmac_commit(struct super_block *sb,
+			      const struct ocsfs_disk_journal_txn *jt,
+			      u8 *out16)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	struct crypto_shash *tfm;
+	struct shash_desc *desc;
+	u8 tmp[32];
+	int ret;
+
+	tfm = crypto_alloc_shash("hmac(sha256)", 0, 0);
+	if (IS_ERR(tfm))
+		return PTR_ERR(tfm);
+	desc = kzalloc(sizeof(*desc) + crypto_shash_descsize(tfm), GFP_NOFS);
+	if (!desc) { crypto_free_shash(tfm); return -ENOMEM; }
+	desc->tfm = tfm;
+	ret = crypto_shash_setkey(tfm, sbi->s_cluster_secret, 32);
+	if (!ret)
+		ret = crypto_shash_digest(desc, (const u8 *)jt,
+					  sizeof(*jt) - sizeof(__le32), tmp);
+	kfree(desc);
+	crypto_free_shash(tfm);
+	if (!ret)
+		memcpy(out16, tmp, 16);
+	return ret;
+}
 
 /* ═══════════════════════════════════════════════════════════════
  * JOURNAL INIT / EXIT
@@ -495,6 +529,24 @@ int ocsfs_txn_commit(struct ocsfs_txn *txn)
 	ret = journal_sync(sb, j);
 	if (ret)
 		goto out_locked;
+
+	/* ALTO-V3-10: write HMAC record immediately after COMMIT when feature
+	 * is active, so journal_replay can verify authenticity of AFTER-images. */
+	if (OCSFS_SB(sb)->s_feature_incompat & OCSFS_FEATURE_INCOMPAT_JOURNAL_HMAC) {
+		struct ocsfs_disk_journal_hmac_rec hr;
+		u8 hmac[16];
+
+		if (ocsfs_journal_hmac_commit(sb, &jt, hmac) == 0) {
+			memset(&hr, 0, sizeof(hr));
+			hr.jhr_type     = cpu_to_le32(OCSFS_JTYPE_HMAC);
+			hr.jhr_txn_id   = jt.jt_id;
+			memcpy(hr.jhr_hmac, hmac, 16);
+			hr.jhr_checksum = cpu_to_le32(
+				ocsfs_crc32c(~0U, &hr,
+					     sizeof(hr) - sizeof(__le32)));
+			journal_write_sync(sb, j, &hr, sizeof(hr));
+		}
+	}
 
 	/*
 	 * COMMIT is durable.  Claim a checkpoint ticket (in commit order, under

@@ -26,9 +26,42 @@
  * The Linux kernel provides LZ4 and ZSTD libraries natively.
  */
 
+#include <linux/mempool.h>
 #include "ocsfs.h"
 #include <linux/lz4.h>
 #include <linux/zstd.h>
+
+/* ═══════════════════════════════════════════════════════════════
+ * MEDIO-V3-6: per-FS mempool for 1MiB compression I/O buffers.
+ * Prevents OOM under parallel read load on cluster nodes.
+ * All compressed extents are capped at 1MiB (EFBIG guard above).
+ * ═══════════════════════════════════════════════════════════════ */
+#define OCSFS_COMP_BUF_SZ      (1U << 20)   /* 1 MiB */
+#define OCSFS_COMP_BUF_POOL_N  8            /* 8 × 1 MiB pre-allocated */
+
+static void *comp_buf_alloc(gfp_t gfp, void *data)
+{
+	return kvmalloc((size_t)(uintptr_t)data, gfp);
+}
+
+static void comp_buf_free(void *element, void *data)
+{
+	kvfree(element);
+}
+
+int ocsfs_comp_pool_create(struct ocsfs_sb_info *sbi)
+{
+	sbi->s_comp_buf_pool = mempool_create(OCSFS_COMP_BUF_POOL_N,
+					      comp_buf_alloc, comp_buf_free,
+					      (void *)(uintptr_t)OCSFS_COMP_BUF_SZ);
+	return sbi->s_comp_buf_pool ? 0 : -ENOMEM;
+}
+
+void ocsfs_comp_pool_destroy(struct ocsfs_sb_info *sbi)
+{
+	mempool_destroy(sbi->s_comp_buf_pool);
+	sbi->s_comp_buf_pool = NULL;
+}
 
 /* ═══════════════════════════════════════════════════════════════
  * COMPRESSION ALGORITHM INTERFACE
@@ -279,13 +312,14 @@ int ocsfs_compress_extent_read(struct inode *inode,
 		return -EFBIG;
 
 	/* Allocate buffers */
-	comp_buf = kvmalloc(comp_size, GFP_NOFS);
+	/* MEDIO-V3-6: use mempool to avoid OOM under parallel cluster reads */
+	comp_buf = mempool_alloc(sbi->s_comp_buf_pool, GFP_NOFS);
 	if (!comp_buf)
 		return -ENOMEM;
 
-	decomp_buf = kvmalloc(decomp_size, GFP_NOFS);
+	decomp_buf = mempool_alloc(sbi->s_comp_buf_pool, GFP_NOFS);
 	if (!decomp_buf) {
-		kvfree(comp_buf);
+		mempool_free(comp_buf, sbi->s_comp_buf_pool);
 		return -ENOMEM;
 	}
 
@@ -323,8 +357,8 @@ int ocsfs_compress_extent_read(struct inode *inode,
 	ret = 0;
 
 out:
-	kvfree(decomp_buf);
-	kvfree(comp_buf);
+	mempool_free(decomp_buf, sbi->s_comp_buf_pool);
+	mempool_free(comp_buf, sbi->s_comp_buf_pool);
 	return ret;
 }
 

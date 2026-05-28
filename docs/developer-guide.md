@@ -969,6 +969,64 @@ Fix:
    extents. For btree inodes, the check trusts the existing `CAP_SYS_ADMIN`
    gate in `file.c`. Returns `-EPERM` if the range is not owned.
 
+### Sprint M/N/O — Deferred architectural items (2026-05-28)
+
+These three items were explicitly deferred from the Sprint I–L roadmap and are now resolved.
+
+**MEDIO-V3-6 — Decompress OOM under parallel cluster reads (`compress.c`, `super.c`):**
+`ocsfs_compress_extent_read` allocated two `kvmalloc` buffers of up to 1 MiB each per call
+(compressed data buffer + decompressed output buffer). Under concurrent read pressure on a
+cluster node — multiple kswapd/readahead paths reading compressed extents simultaneously —
+these allocations could fail or trigger the OOM killer.
+
+Fix: add a `mempool_t *s_comp_buf_pool` to `ocsfs_sb_info` (initialized in `fill_super`,
+destroyed in `put_super`) backed by 8 pre-allocated 1 MiB buffers using custom
+`kvmalloc`/`kvfree` callbacks. `ocsfs_compress_extent_read` now calls `mempool_alloc` /
+`mempool_free` instead of `kvmalloc`/`kvfree`. `mempool_alloc` blocks until a buffer is
+available rather than failing immediately, converting the allocation from a potential OOM
+failure into a bounded wait.
+
+**ALTO-V3-10 — No HMAC on journal COMMIT records (`journal.c`, `journal_replay.c`):**
+In degraded mode (no SCSI PR, non-PR device), a malicious or malfunctioning node could forge
+journal COMMIT records with arbitrary AFTER-images. The existing CRC32C covers record
+integrity but not authenticity — the cluster secret was not used in the journal.
+
+Fix: add `OCSFS_FEATURE_INCOMPAT_JOURNAL_HMAC (1ULL << 3)`. When set, a 32-byte
+`ocsfs_disk_journal_hmac_rec` is written immediately after each COMMIT record. The HMAC
+record is the same size as `ocsfs_disk_journal_txn` (32 bytes) so the forward scanner
+advances by the same stride regardless of record type. The HMAC covers the first 28 bytes of
+the COMMIT record (jt_type through jt_data_len, excluding jt_checksum) using
+HMAC-SHA256/128 (16-byte truncation) keyed on `sbi->s_cluster_secret`. At replay time, if
+the feature is active, the HMAC record is verified before AFTER-images are applied; a
+mismatch causes the commit to be skipped (not applied), which is equivalent to treating the
+transaction as uncommitted.
+
+The `ocsfs_journal_hmac_commit(sb, jt, out16)` helper is exported from `journal.c` and used
+by `journal_replay.c` without code duplication.
+
+**ARCH-V3-5 — EX lock re-acquire requires disk round-trip per operation (`lock.c`):**
+The epoch-based cache (ARCH-V3-7, Sprint D) already eliminates disk round-trips on EX
+re-acquire when no recovery happened. ARCH-V3-5 adds a complementary mechanism for the
+waiter side: when a node holds EX, it writes a lease deadline (`le_lease_ns`) into the
+on-disk lock entry alongside `le_lease_slot`. Nodes waiting for EX see the deadline and
+sleep until it expires rather than polling with exponential backoff — eliminating unnecessary
+CAS retries and reducing SAN I/O under lock contention.
+
+Fields added to `ocsfs_disk_lock` (within `le_reserved`, no change in struct size):
+- `le_lease_ns`: 8-byte ktime_get_real_ns() expiry; 0 = no lease
+- `le_lease_slot`: 2-byte node slot of the lease holder; 0xFFFF = no lease
+- `le_lease_pad`: 2-byte alignment pad
+- `le_reserved` reduced from 56 to 44 bytes
+
+Since the CRC covers the same bytes regardless of how `le_reserved` is sub-divided, the
+lease fields are backward-compatible: old nodes see them as zero reserved bytes (no lease
+written), new nodes write and read the lease correctly. No INCOMPAT feature bit is required
+for correctness.
+
+New function `ocsfs_lock_renew_lease(sb, lr)`: updates `le_lease_ns` for the current EX
+holder, allowing long-running write operations to extend the lease without full
+release-and-reacquire.
+
 ---
 
 ## 9. I/O Path

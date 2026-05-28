@@ -190,6 +190,7 @@ enum ocsfs_cas_backend {
 #define OCSFS_FEATURE_INCOMPAT_LOCK_TABLE_V2    (1ULL << 0)  /* ARCH-2 */
 #define OCSFS_FEATURE_INCOMPAT_RC_BTREE_PER_AG  (1ULL << 1)  /* ARCH-5 */
 #define OCSFS_FEATURE_INCOMPAT_EXT_FLAGS4       (1ULL << 2)  /* ARCH-V3-4: 4-bit extent flags */
+#define OCSFS_FEATURE_INCOMPAT_JOURNAL_HMAC     (1ULL << 3)  /* ALTO-V3-10: HMAC on COMMIT records */
 
 /* RO_COMPAT bits — read-write-semantic features */
 #define OCSFS_FEATURE_RO_COMPAT_SELECTIVE_INV   (1ULL << 0)  /* ARCH-7 */
@@ -199,7 +200,8 @@ enum ocsfs_cas_backend {
 /* Masks of features this build understands.  Update as features land. */
 #define OCSFS_FEATURE_INCOMPAT_SUPP     (OCSFS_FEATURE_INCOMPAT_LOCK_TABLE_V2 | \
 					 OCSFS_FEATURE_INCOMPAT_RC_BTREE_PER_AG | \
-					 OCSFS_FEATURE_INCOMPAT_EXT_FLAGS4)
+					 OCSFS_FEATURE_INCOMPAT_EXT_FLAGS4       | \
+					 OCSFS_FEATURE_INCOMPAT_JOURNAL_HMAC)
 #define OCSFS_FEATURE_RO_COMPAT_SUPP    (OCSFS_FEATURE_RO_COMPAT_SELECTIVE_INV | \
 					 OCSFS_FEATURE_RO_COMPAT_HB_SUMMARY | \
 					 OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB)
@@ -249,6 +251,10 @@ static inline u16 ocsfs_ext_set_comp_algo(u16 flags, u8 algo)
 #define OCSFS_JTYPE_COMMIT      3
 #define OCSFS_JTYPE_ABORT       4
 #define OCSFS_JTYPE_CHECKPOINT  5
+/* ALTO-V3-10: HMAC record immediately follows COMMIT when INCOMPAT_JOURNAL_HMAC set.
+ * Same size as ocsfs_disk_journal_txn (32 bytes) so the forward scanner advances
+ * by the same stride regardless of record type. */
+#define OCSFS_JTYPE_HMAC        6
 
 #define OCSFS_JBR_BEFORE        0x01
 #define OCSFS_JBR_AFTER         0x02
@@ -294,6 +300,10 @@ static inline u16 ocsfs_ext_set_comp_algo(u16 flags, u8 algo)
 /* Lock acquisition retry */
 #define OCSFS_LOCK_RETRY_MIN_US         1000    /* 1 ms — initial backoff */
 #define OCSFS_LOCK_RETRY_MAX_US         100000  /* 100 ms — backoff cap */
+/* ARCH-V3-5: EX lease duration written at acquire, cleared at release.
+ * Waiters sleep until the lease expires rather than polling blindly. */
+#define OCSFS_LOCK_LEASE_NS     (500ULL * NSEC_PER_MSEC) /* 500ms EX lease */
+#define OCSFS_LOCK_NO_LEASE     0xFFFFU                  /* le_lease_slot sentinel */
 #define OCSFS_LOCK_ACQUIRE_TIMEOUT_MS   30000U  /* 30s wall-clock deadline for acquire */
 #define OCSFS_LOCK_MAX_RETRIES          200     /* release-path CAS retry limit */
 
@@ -471,6 +481,16 @@ struct ocsfs_disk_journal_bref {
 	__le32  jbr_checksum;
 } __packed;
 
+/* ALTO-V3-10: HMAC record written immediately after COMMIT when
+ * OCSFS_FEATURE_INCOMPAT_JOURNAL_HMAC is set.  Exactly 32 bytes so the
+ * replay forward-scanner advances by the same stride as any other record. */
+struct ocsfs_disk_journal_hmac_rec {
+	__le32  jhr_type;      /* OCSFS_JTYPE_HMAC */
+	__le64  jhr_txn_id;    /* matches the preceding COMMIT jt_id */
+	__u8    jhr_hmac[16];  /* HMAC-SHA256 truncated to 128 bits */
+	__le32  jhr_checksum;  /* CRC32C([0..27]) */
+} __packed;                /* 32 bytes — same as ocsfs_disk_journal_txn */
+
 /* Xattr block — one per inode, allocated lazily, exactly one 4096-byte block */
 struct ocsfs_disk_xattr_block {
 	__le32  xb_magic;                       /* OCSFS_XATTR_MAGIC */
@@ -533,7 +553,14 @@ struct ocsfs_disk_lock {
 	__le32  le_inv_epoch;   /* bumped on every EX release; wrap-around accepted */
 	/* ARCH-2: overflow chain — 0 = no overflow; non-zero = phys block address */
 	__le64  le_overflow_block;
-	__u8    le_reserved[56]; /* was 84; reduced by 28 (ARCH-7: 20, ARCH-2: 8) */
+	/* ARCH-V3-5: EX lease — while le_lease_ns > now, le_lease_slot holds EX.
+	 * Other nodes see the deadline and defer rather than busy-polling.
+	 * Treated as le_reserved[0..11] by nodes that predate ARCH-V3-5;
+	 * CRC covers the same bytes regardless of how they are named. */
+	__le64  le_lease_ns;    /* ktime_get_real_ns expiry; 0 = no lease */
+	__le16  le_lease_slot;  /* holder node slot; 0xFFFF = no lease */
+	__le16  le_lease_pad;
+	__u8    le_reserved[44]; /* was 56; reduced by 12 (ARCH-V3-5) */
 	__le32  le_checksum;
 } __packed;
 
@@ -758,6 +785,7 @@ struct ocsfs_sb_info {
 	struct mutex    s_decompress_lock;
 	void           *s_decompress_wksp;
 	size_t          s_decompress_wksp_sz;
+	mempool_t      *s_comp_buf_pool;   /* MEDIO-V3-6: 1MiB buffers for compress I/O */
 
 	/* Refcount CAS buffer pool — avoids per-call kmalloc in hot path */
 	mempool_t      *s_rc_buf_pool;
@@ -1095,8 +1123,18 @@ int ocsfs_lock_acquire(struct super_block *sb, struct ocsfs_lock_res *lr,
 int ocsfs_lock_release(struct super_block *sb, struct ocsfs_lock_res *lr);
 int ocsfs_lock_downgrade(struct super_block *sb, struct ocsfs_lock_res *lr,
 			 u16 new_mode);
+int ocsfs_lock_renew_lease(struct super_block *sb, struct ocsfs_lock_res *lr);
 int ocsfs_lock_recover_node(struct super_block *sb, u16 node_slot,
 			    u32 mount_gen);
+
+/* journal.c — HMAC helper used by both journal.c and journal_replay.c */
+int ocsfs_journal_hmac_commit(struct super_block *sb,
+			      const struct ocsfs_disk_journal_txn *jt,
+			      u8 *out16);
+
+/* compress.c — mempool lifecycle */
+int  ocsfs_comp_pool_create(struct ocsfs_sb_info *sbi);
+void ocsfs_comp_pool_destroy(struct ocsfs_sb_info *sbi);
 
 /* Resource ID hashing */
 static inline u64 ocsfs_lock_hash_inode(u64 ino)

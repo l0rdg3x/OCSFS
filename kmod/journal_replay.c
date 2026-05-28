@@ -6,6 +6,7 @@
  */
 
 #include <linux/xxhash.h>
+#include <crypto/algapi.h>
 #include "ocsfs.h"
 
 /* Read raw data from the journal at a given logical position */
@@ -126,6 +127,32 @@ static int journal_replay_j(struct super_block *sb, struct ocsfs_journal *j)
 					sizeof(jt2) - sizeof(__le32));
 				if (le32_to_cpu(jt2.jt_checksum) == crc) {
 					committed = true;
+					/* ALTO-V3-10: verify HMAC record that
+					 * follows this COMMIT when feature active. */
+					if (sbi->s_feature_incompat &
+					    OCSFS_FEATURE_INCOMPAT_JOURNAL_HMAC) {
+						struct ocsfs_disk_journal_hmac_rec hr;
+						u8 expected[16];
+						u64 hp = ahead + sizeof(jt2);
+
+						if (journal_read(sb, j, hp, &hr,
+								 sizeof(hr)) != 0 ||
+						    le32_to_cpu(hr.jhr_type) !=
+							OCSFS_JTYPE_HMAC ||
+						    hr.jhr_txn_id != jt2.jt_id ||
+						    ocsfs_journal_hmac_commit(
+							sb, &jt2, expected) != 0 ||
+						    crypto_memneq(expected,
+								  hr.jhr_hmac,
+								  16) != 0) {
+							pr_err_ratelimited(
+							  "ocsfs: journal HMAC "
+							  "mismatch txn %llu — "
+							  "skipping commit\n",
+							  tid);
+							committed = false;
+						}
+					}
 					break;
 				}
 			}

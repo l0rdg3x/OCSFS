@@ -130,6 +130,10 @@ retry:
 			dl.le_mode        = cpu_to_le16(OCSFS_LOCK_EX);
 			dl.le_holder_slot = cpu_to_le16(sbi->s_node_slot);
 			dl.le_holder_gen  = cpu_to_le32(sbi->s_mount_gen);
+			/* ARCH-V3-5: write lease so waiters know when to retry */
+			dl.le_lease_ns   = cpu_to_le64(ktime_get_real_ns() +
+						       OCSFS_LOCK_LEASE_NS);
+			dl.le_lease_slot = cpu_to_le16(sbi->s_node_slot);
 		} else if (mode == OCSFS_LOCK_SH) {
 			dl.le_mode = cpu_to_le16(OCSFS_LOCK_SH);
 			add_sh_holder(&dl, sbi->s_node_slot);
@@ -180,6 +184,16 @@ retry:
 		return -ETIMEDOUT;
 	}
 
+	/* ARCH-V3-5: if the current holder has a valid lease, sleep until it
+	 * expires rather than waking every delay_us — reduces CAS contention. */
+	{
+		u64 lease = le64_to_cpu(dl.le_lease_ns);
+		u64 now   = ktime_get_real_ns();
+
+		if (lease && now < lease)
+			delay_us = min_t(u32, (u32)((lease - now) / 1000),
+					 OCSFS_LOCK_RETRY_MAX_US);
+	}
 	usleep_range(delay_us, delay_us * 2);
 	delay_us = min_t(u32, delay_us * 2, OCSFS_LOCK_RETRY_MAX_US);
 	goto retry;
@@ -222,6 +236,9 @@ retry_release:
 		lr->lr_inv_hi   = 0;
 		dl.le_holder_slot = 0;
 		dl.le_holder_gen  = 0;
+		/* ARCH-V3-5: clear lease so waiting nodes can proceed */
+		dl.le_lease_ns   = 0;
+		dl.le_lease_slot = cpu_to_le16(OCSFS_LOCK_NO_LEASE);
 		/*
 		 * Always reset to NL after EX release. Waiter bits indicate
 		 * demand but do not hold the lock — leaving mode=EX with no
@@ -471,4 +488,32 @@ int ocsfs_lock_recover_node(struct super_block *sb, u16 node_slot,
 	pr_info("ocsfs: recovered %d locks from node slot %u\n",
 		recovered, node_slot);
 	return 0;
+}
+
+/*
+ * ocsfs_lock_renew_lease — extend the EX lease of the current holder.
+ * Called by long-running write operations to avoid lease expiry while
+ * still holding the lock (ARCH-V3-5).
+ */
+int ocsfs_lock_renew_lease(struct super_block *sb, struct ocsfs_lock_res *lr)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	struct ocsfs_disk_lock dl;
+	struct buffer_head *bh;
+	int ret;
+
+	if (!sbi->s_clustered || lr->lr_mode != OCSFS_LOCK_EX)
+		return 0;
+	mutex_lock(&lr->lr_mutex);
+	ret = lr_read_entry(sb, lr, &dl, &bh);
+	if (ret == 0 &&
+	    le16_to_cpu(dl.le_holder_slot) == sbi->s_node_slot) {
+		dl.le_lease_ns   = cpu_to_le64(ktime_get_real_ns() +
+					       OCSFS_LOCK_LEASE_NS);
+		dl.le_lease_slot = cpu_to_le16(sbi->s_node_slot);
+		ret = lr_write_entry(sb, lr, &dl, bh);
+	}
+	brelse(bh);
+	mutex_unlock(&lr->lr_mutex);
+	return ret;
 }

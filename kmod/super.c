@@ -467,6 +467,13 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		goto fail_cluster;
 	}
 
+	/* MEDIO-V3-6: create compression buffer mempool before I/O begins */
+	ret = ocsfs_comp_pool_create(sbi);
+	if (ret) {
+		pr_err("ocsfs: failed to create compression buffer pool\n");
+		goto fail_cluster;
+	}
+
 	/* Initialize journal at our node slot's region */
 	ret = ocsfs_journal_init(sb);
 	if (ret)
@@ -535,6 +542,7 @@ void ocsfs_put_super(struct super_block *sb)
 	ocsfs_dedup_scrub_stop(sb);
 	ocsfs_journal_exit(sb);   /* flush journal before releasing cluster slot */
 	ocsfs_cluster_exit(sb);
+	ocsfs_comp_pool_destroy(sbi);
 	kvfree(sbi->s_decompress_wksp);
 	mutex_destroy(&sbi->s_decompress_lock);
 	mempool_destroy(sbi->s_rc_buf_pool);
