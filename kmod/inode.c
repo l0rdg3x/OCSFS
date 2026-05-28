@@ -506,8 +506,16 @@ void ocsfs_evict_inode(struct inode *inode)
 			lr = ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
 						OCSFS_LOCK_EX);
 		if (lr) {
-			pr_err_ratelimited("ocsfs: evict: DLM EX failed (%d), ino %llu leaked\n",
-					   lr, oi->i_disk_ino);
+			/* ALTO-N5: cannot free blocks — DLM EX unavailable.
+			 * Mark ORPHAN so ocsfs_orphan_scan recovers space on
+			 * next mount.  Writing only the flags field (additive,
+			 * no extent data modified) is safe without EX. */
+			oi->i_flags |= OCSFS_IFLAG_ORPHAN;
+			ocsfs_flush_inode_locked(inode, false);
+			pr_warn_ratelimited(
+				"ocsfs: evict: DLM EX failed (%d), ino %llu "
+				"flagged ORPHAN — reclaimed at next mount\n",
+				lr, oi->i_disk_ino);
 		} else {
 			mutex_lock(&oi->i_extent_lock);
 			ocsfs_extent_truncate(inode, 0);

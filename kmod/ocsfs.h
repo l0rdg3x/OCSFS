@@ -1270,9 +1270,9 @@ struct ocsfs_vaai_xcopy_arg {
 #define OCSFS_IOC_FREEZE_FS   _IO ('O', 20)
 #define OCSFS_IOC_THAW_FS     _IO ('O', 21)
 
-int ocsfs_vaai_write_same(struct super_block *sb,
+int ocsfs_vaai_write_same(struct inode *inode,
 			   const struct ocsfs_vaai_arg __user *uarg);
-int ocsfs_vaai_unmap(struct super_block *sb,
+int ocsfs_vaai_unmap(struct inode *inode,
 		      const struct ocsfs_vaai_arg __user *uarg);
 int ocsfs_vaai_xcopy(struct super_block *sb,
 		      const struct ocsfs_vaai_xcopy_arg __user *uarg);

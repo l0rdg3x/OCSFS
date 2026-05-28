@@ -36,9 +36,39 @@ static int bytes_to_lba(struct super_block *sb, u64 byte_off, u64 byte_len,
 	if (!byte_len)
 		return -EINVAL;
 
-	*lba_out   = byte_off / bs;
+	*lba_out     = byte_off / bs;
 	*nblocks_out = (u32)(byte_len / bs);
 	return 0;
+}
+
+/*
+ * SEC-N2: verify that [lba, lba+nblocks) falls within the inode's allocated
+ * physical extents.  For btree inodes we trust CAP_SYS_ADMIN (already
+ * checked in file.c); for inline inodes we do a full range check.
+ * Returns true if the range is owned by the inode (or btree — trusted).
+ */
+static bool ocsfs_vaai_owns_range(struct inode *inode, u64 lba, u32 nblocks)
+{
+	struct ocsfs_inode_info *oi = OCSFS_I(inode);
+	u64 end_lba = lba + nblocks;
+	u16 i;
+	bool found = false;
+
+	if (oi->i_extent_tree_root)
+		return true; /* btree inodes: CAP_SYS_ADMIN already verified */
+
+	mutex_lock(&oi->i_extent_lock);
+	for (i = 0; i < oi->i_extent_count; i++) {
+		struct ocsfs_extent *e = &oi->i_extents[i];
+
+		if (lba >= e->physical_block &&
+		    end_lba <= e->physical_block + e->length) {
+			found = true;
+			break;
+		}
+	}
+	mutex_unlock(&oi->i_extent_lock);
+	return found;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -47,9 +77,10 @@ static int bytes_to_lba(struct super_block *sb, u64 byte_off, u64 byte_len,
  * to request a device-side zero without transferring data.
  * ═══════════════════════════════════════════════════════════════ */
 
-int ocsfs_vaai_write_same(struct super_block *sb,
+int ocsfs_vaai_write_same(struct inode *inode,
 			   const struct ocsfs_vaai_arg __user *uarg)
 {
+	struct super_block *sb = inode->i_sb;
 	struct ocsfs_vaai_arg arg;
 	u64  lba;
 	u32  nblocks;
@@ -63,10 +94,12 @@ int ocsfs_vaai_write_same(struct super_block *sb,
 	if (ret)
 		return ret;
 
-	/* SEC-V3-4: Reject writes that would overwrite filesystem metadata
-	 * (superblock, journal, lock table, node table, heartbeat area).
-	 * s_data_off is the first byte offset belonging to user data. */
+	/* SEC-V3-4: protect filesystem metadata area. */
 	if (arg.offset < OCSFS_SB(sb)->s_data_off)
+		return -EPERM;
+
+	/* SEC-N2: for inline inodes, verify the range belongs to this file. */
+	if (!ocsfs_vaai_owns_range(inode, lba, nblocks))
 		return -EPERM;
 
 	memset(cdb, 0, sizeof(cdb));
@@ -104,9 +137,10 @@ int ocsfs_vaai_write_same(struct super_block *sb,
 #define UNMAP_DESC_SIZE      16
 #define UNMAP_PARAM_SIZE     (UNMAP_HDR_SIZE + UNMAP_DESC_SIZE)
 
-int ocsfs_vaai_unmap(struct super_block *sb,
+int ocsfs_vaai_unmap(struct inode *inode,
 		      const struct ocsfs_vaai_arg __user *uarg)
 {
+	struct super_block *sb = inode->i_sb;
 	struct ocsfs_vaai_arg arg;
 	u64  lba;
 	u32  nblocks;
@@ -120,6 +154,12 @@ int ocsfs_vaai_unmap(struct super_block *sb,
 	ret = bytes_to_lba(sb, arg.offset, arg.length, &lba, &nblocks);
 	if (ret)
 		return ret;
+
+	/* SEC-N2: protect metadata area + verify range belongs to this inode. */
+	if (arg.offset < OCSFS_SB(sb)->s_data_off)
+		return -EPERM;
+	if (!ocsfs_vaai_owns_range(inode, lba, nblocks))
+		return -EPERM;
 
 	param = kzalloc(UNMAP_PARAM_SIZE, GFP_KERNEL);
 	if (!param)

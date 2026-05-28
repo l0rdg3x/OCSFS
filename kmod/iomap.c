@@ -574,13 +574,17 @@ static int ocsfs_enc_read_folio(struct file *file, struct folio *folio)
 	struct ocsfs_inode_info *oi_r = OCSFS_I(inode);
 	loff_t file_pos = folio_pos(folio);
 
-	/* In cluster mode enc_read_folio must be called with at least DLM SH.
-	 * Paths like splice_read or userfaultfd may arrive without it, leading
-	 * to a stale extent map.  Warn so the call site can be audited. */
-	WARN_ONCE(sbi->s_clustered &&
-		  oi_r->i_lock_res.lr_mode < OCSFS_LOCK_SH,
-		  "ocsfs: enc_read_folio without DLM SH (ino=%lu)\n",
-		  inode->i_ino);
+	/* MEDIO-N4: in cluster mode enc_read_folio must be called with at
+	 * least DLM SH; paths like splice_read or userfaultfd may arrive
+	 * without it and would return stale ciphertext.  Return -EIO instead
+	 * of silently serving wrong data. */
+	if (sbi->s_clustered &&
+	    oi_r->i_lock_res.lr_mode < OCSFS_LOCK_SH) {
+		pr_warn_once("ocsfs: enc_read_folio without DLM SH (ino=%lu) — EIO\n",
+			     inode->i_ino);
+		folio_unlock(folio);
+		return -EIO;
+	}
 	size_t folio_sz = folio_size(folio);
 	size_t done = 0;
 	int ret = 0;

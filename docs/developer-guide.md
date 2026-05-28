@@ -903,6 +903,72 @@ Crash behaviour after Sprint K:
 | After Phase 4 (LOCKS written) | Skips Phases 2–4; runs Phase 5 only |
 | No phase written (crash in Phase 1 or between phases) | Restarts from elected phase; worst case is redundant idempotent work |
 
+### Sprint L — VFS semantics and security (2026-05-28)
+
+**ALTO-N5 — evict_inode on DLM EX failure leaks space permanently (`inode.c`):**
+When `ocsfs_evict_inode` ran on an unlinked inode in cluster mode and the DLM
+EX acquisition failed (another node holds the inode open), the blocks were
+silently leaked with no recovery path. The ORPHAN flag was only set during
+inode creation and cleared on dirent commit; an EX failure on evict left the
+inode without the flag, so `ocsfs_orphan_scan` would never reclaim it.
+
+Fix: on DLM EX failure, set `OCSFS_IFLAG_ORPHAN` in memory and call
+`ocsfs_flush_inode_locked` to persist it to disk. Writing only the inode flags
+field (additive, no extent layout modified) is safe without the EX lock. On
+the next mount, `ocsfs_orphan_scan` (called from `fill_super`) will find the
+inode, set `nlink=0`, and call `iput`, which re-enters `evict_inode` — this
+time with no other node holding the lock, so blocks are freed normally.
+
+**ALTO-N6 — rename rollback may leave `i_dirent_count` stale (`dir_rename.c`):**
+In the add-before-remove rename path, if `__ocsfs_del_dirent(old_dir)` fails
+after `__ocsfs_add_dirent(new_dir)` succeeds, the compensating
+`__ocsfs_del_dirent(new_dir)` correctly uses the btree fast path to find the
+just-added entry. If the compensation itself fails (I/O error), the entry
+remains in `new_dir` with its correct count, but the on-disk inode metadata
+for `new_dir` may not reflect the in-memory state.
+
+Fix: on failed compensation, call `ocsfs_flush_inode_locked(new_dir, false)`
+to persist the current in-memory `i_dirent_count` to disk. This ensures the
+on-disk count matches whatever state we ended up in. The ghost-in-both-dirs
+situation is still logged with an explicit fsck recommendation.
+
+**MEDIO-N2 — zero_range inline silently skips partial overlaps (`thin.c`):**
+The inline zero_range path (files with ≤16 extents) only converted extents to
+UNWRITTEN when the extent was FULLY contained in the zero range. Partial
+overlaps — where the range starts or ends in the middle of an extent — were
+silently skipped. `fallocate(ZERO_RANGE)` returned 0 but data in the partial
+blocks was not zeroed.
+
+Fix: for partial overlaps, physically zero the overlapping blocks via
+`sb_getblk` + `memset` + `sync_dirty_buffer`. This is always correct and
+handles the partial-block boundaries that the UNWRITTEN optimization cannot.
+
+**MEDIO-N4 — enc_read_folio without DLM SH returns ciphertext (`iomap.c`):**
+`ocsfs_enc_read_folio` in cluster mode had a `WARN_ONCE` when called without
+at least DLM SH, but the read proceeded and returned stale or wrongly decrypted
+data (ciphertext served to `splice_read` or `userfaultfd` paths). Warn-and-
+continue is inappropriate for a data-correctness invariant.
+
+Fix: change to an early return of `-EIO` with `pr_warn_once`. Any call path
+that reaches this function without DLM SH is a caller bug; the fix surfaces it
+immediately as an error rather than returning wrong data silently.
+
+**SEC-N2 — VAAI WRITE_SAME / UNMAP have no ownership validation (`vaai.c`):**
+`ocsfs_vaai_write_same` had a metadata-area bound check (`s_data_off`) but
+`ocsfs_vaai_unmap` had no such check. Additionally, both operations accepted
+arbitrary device-level block ranges from the caller without verifying that
+those blocks belong to the inode on which the ioctl was invoked.
+
+Fix:
+1. Add `s_data_off` metadata bound check to `ocsfs_vaai_unmap` (same protection
+   that `write_same` had).
+2. Change both function signatures to accept `struct inode *` instead of
+   `struct super_block *` so the caller's inode is available.
+3. Add `ocsfs_vaai_owns_range` helper: for inline-extent inodes, checks that
+   `[lba, lba+nblocks)` is contained within one of the inode's physical
+   extents. For btree inodes, the check trusts the existing `CAP_SYS_ADMIN`
+   gate in `file.c`. Returns `-EPERM` if the range is not owned.
+
 ---
 
 ## 9. I/O Path

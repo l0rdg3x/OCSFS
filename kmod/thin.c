@@ -224,15 +224,32 @@ int ocsfs_zero_range(struct inode *inode, loff_t offset, loff_t len)
 		if (ext_end <= start_block || e->logical_block >= end_block)
 			continue;
 
-		/*
-		 * For simplicity, mark the entire overlapping extent as
-		 * UNWRITTEN. A more sophisticated implementation would
-		 * split at boundaries, but this is correct and simpler.
-		 */
 		if (e->logical_block >= start_block && ext_end <= end_block) {
+			/* Fully contained: mark UNWRITTEN (reads return zeros). */
 			e->flags = OCSFS_EXT_UNWRITTEN;
+		} else if (ext_end > start_block && e->logical_block < end_block) {
+			/* MEDIO-N2: partial overlap — physically zero the blocks
+			 * that intersect the range so callers see zero data. */
+			u64 zs   = max(e->logical_block, start_block);
+			u64 ze   = min(ext_end, end_block);
+			u64 phys = e->physical_block + (zs - e->logical_block);
+			u64 k;
+
+			for (k = 0; k < ze - zs; k++) {
+				struct buffer_head *zbh =
+					sb_getblk(inode->i_sb, phys + k);
+
+				if (!zbh)
+					continue;
+				lock_buffer(zbh);
+				memset(zbh->b_data, 0, sbi->s_block_size);
+				set_buffer_uptodate(zbh);
+				mark_buffer_dirty(zbh);
+				unlock_buffer(zbh);
+				sync_dirty_buffer(zbh);
+				brelse(zbh);
+			}
 		}
-		/* Partial overlaps: only mark if fully contained */
 	}
 
 	/* ALTO-N1: journal flag change before returning */

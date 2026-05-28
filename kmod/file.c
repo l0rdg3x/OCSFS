@@ -608,14 +608,14 @@ static long ocsfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	if (cmd == OCSFS_IOC_WRITE_SAME) {
 		if (!capable(CAP_SYS_ADMIN))
 			return -EPERM;
-		return ocsfs_vaai_write_same(inode->i_sb,
+		return ocsfs_vaai_write_same(inode,
 					     (const struct ocsfs_vaai_arg __user *)arg);
 	}
 
 	if (cmd == OCSFS_IOC_UNMAP) {
 		if (!capable(CAP_SYS_ADMIN))
 			return -EPERM;
-		return ocsfs_vaai_unmap(inode->i_sb,
+		return ocsfs_vaai_unmap(inode,
 					(const struct ocsfs_vaai_arg __user *)arg);
 	}
 

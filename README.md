@@ -19,12 +19,12 @@ a Proxmox VE-native alternative to VMware VMFS.
 
 ## Production Readiness
 
-Eleven rounds of correctness, security, and architectural fixes have been
-applied (Sprints A–H from the Opus v3 review, Sprints I–K from the Opus 4.8
-review). Sprint I fixed a critical AG offset bug (`super.c`: bitmap and
-inode table offsets were AG-relative but used as absolute). Sprint K adds
-on-disk recovery phase persistence so a crash-replacement recovery leader can
-resume from the last completed phase rather than restarting from Phase 1.
+Twelve rounds of correctness, security, and architectural fixes have been
+applied (Sprints A–H from the Opus v3 review, Sprints I–L from the Opus 4.8
+review). Sprint I fixed a critical AG offset bug. Sprint K adds on-disk
+recovery phase persistence. Sprint L addresses VFS semantics (orphan inode
+reclaim, zero_range partial overlap, enc_read_folio safety) and VAAI
+ownership validation.
 See [`docs/developer-guide.md`](docs/developer-guide.md) for the full
 changelog.
 

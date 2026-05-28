@@ -524,14 +524,21 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 
 	ret = __ocsfs_del_dirent(old_dir, &old_dentry->d_name);
 	if (ret) {
-		/* Compensate: undo new entry to avoid ghost in new_dir */
+		/* Compensate: undo new entry to avoid ghost in new_dir.
+		 * ALTO-N6: after __ocsfs_add_dirent may have triggered
+		 * btree_migrate, the entry is indexed and should be findable
+		 * via the btree fast path in __ocsfs_del_dirent. */
 		int comp = __ocsfs_del_dirent(new_dir, &new_dentry->d_name);
 
-		if (comp)
+		if (comp) {
 			pr_err("ocsfs: rename rollback failed (%d) — "
-			       "inode %llu may appear in both directories, "
+			       "inode %llu may appear in both directories; "
 			       "run fsck\n",
 			       comp, OCSFS_I(old_inode)->i_disk_ino);
+			/* Persist current in-memory i_dirent_count so on-disk
+			 * count matches whatever state we ended up in. */
+			ocsfs_flush_inode_locked(new_dir, false);
+		}
 		goto out_unlock;
 	}
 
