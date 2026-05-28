@@ -19,20 +19,26 @@ a Proxmox VE-native alternative to VMware VMFS.
 
 ## Production Readiness
 
-Eight rounds of correctness, security, and architectural fixes from a
-structured Opus v3 review have been applied (Sprints A–H). See
-[`docs/developer-guide.md`](docs/developer-guide.md) for the full changelog.
+Nine rounds of correctness, security, and architectural fixes have been
+applied (Sprints A–H from the Opus v3 review, Sprint I from the Opus 4.8
+review). Sprint I fixed a critical AG offset bug (`super.c`: bitmap and
+inode table offsets were AG-relative but used as absolute, causing the kernel
+to address the wrong device blocks for any volume with `data_start > 0`).
+See [`docs/developer-guide.md`](docs/developer-guide.md) for the full
+changelog.
 
 | Scenario | Estimated score |
 |---|---|
 | Single-node read/write | ~92% |
 | Multi-node — stable workload | ~93% |
 | Multi-node — crash + recovery | ~85% |
-| Multi-node — with encryption | ~85% |
-| VMFS feature parity | ~72% |
+| Multi-node — with encryption | ~82% |
+| VMFS feature parity | ~70% |
 
 The remaining gap is real-hardware integration testing (xfstests on a
-multi-node testbed with SCSI-3 PR).
+multi-node testbed with SCSI-3 PR). Known open items that could cause
+data loss under load are tracked in
+[`docs/developer-guide.md`](docs/developer-guide.md).
 
 ---
 

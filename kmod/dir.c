@@ -271,8 +271,13 @@ fill:
 		memcpy(de->de_name, name->name, name->len);
 		de->de_rec_len = cpu_to_le16(OCSFS_DIRENT_SIZE);
 
-		de->de_name_hash = cpu_to_le64(
-			ocsfs_crc32c(~0U, name->name, name->len));
+		/* de_name_hash mirrors the dir B+ tree key (dual-CRC32c) so
+		 * that fsck can reconstruct the btree from dirent records. */
+		{
+			u32 hi = ocsfs_crc32c(name->len, name->name, name->len);
+			u32 lo = ocsfs_crc32c(~hi, name->name, name->len);
+			de->de_name_hash = cpu_to_le64(((u64)hi << 32) | lo);
+		}
 		de->de_checksum  = 0;
 		de->de_checksum  = cpu_to_le16((u16)ocsfs_crc32c(
 			~0U, de, offsetof(struct ocsfs_disk_dirent, de_checksum)));

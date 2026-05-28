@@ -5,6 +5,7 @@
  * journal_write / journal_sync helpers and the transaction API are in journal.c.
  */
 
+#include <linux/xxhash.h>
 #include "ocsfs.h"
 
 /* Read raw data from the journal at a given logical position */
@@ -193,10 +194,10 @@ static int journal_replay_j(struct super_block *sb, struct ocsfs_journal *j)
 							u32 actual = ocsfs_crc32c(~0U,
 								bh->b_data,
 								bh->b_size);
-							u32 actual_h2 = ocsfs_crc32c(~1U,
+							u32 actual_h2 = (u32)(xxh64(
 								bh->b_data,
-								bh->b_size) &
-								OCSFS_JBR_HASH2_MASK;
+								bh->b_size, 0) &
+								OCSFS_JBR_HASH2_MASK);
 							if (actual == expected_crc &&
 							    actual_h2 == expected_h2) {
 								mark_buffer_dirty(bh);
@@ -325,11 +326,11 @@ static int journal_replay_j(struct super_block *sb, struct ocsfs_journal *j)
 									if (before_blks[bi] != blk)
 										continue;
 									/* 62-bit peer-write detection (CRIT-V3-3):
-									 * block modified if either CRC hash differs */
+									 * block modified if either hash differs;
+									 * h2 uses xxh64 (ALTO-N4 — independent of CRC32C) */
 									if (ocsfs_crc32c(~0U, bh->b_data,
 										    bh->b_size) != before_crcs[bi] ||
-									    (ocsfs_crc32c(~1U, bh->b_data,
-										     bh->b_size) &
+									    (u32)(xxh64(bh->b_data, bh->b_size, 0) &
 									     OCSFS_JBR_HASH2_MASK) != before_h2s[bi]) {
 										pr_info("ocsfs: skip AFTER blk %llu txn %llu (peer-modified)\n",
 											blk, tid);

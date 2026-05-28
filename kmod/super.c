@@ -147,6 +147,12 @@ static int ocsfs_validate_super(struct ocsfs_disk_super *ds,
 				pr_err("ocsfs: s_total_blocks (%llu) exceeds device size\n", total);
 				return -EINVAL;
 			}
+			/* AG geometry must not exceed total block count */
+			if (ag_count * le64_to_cpu(ds->s_ag_size) > total) {
+				pr_err("ocsfs: ag_count(%llu) * ag_size(%llu) exceeds s_total_blocks(%llu)\n",
+				       ag_count, le64_to_cpu(ds->s_ag_size), total);
+				return -EINVAL;
+			}
 		}
 	}
 
@@ -231,9 +237,15 @@ static int ocsfs_load_ags(struct super_block *sb)
 		ag->block_start = le64_to_cpu(dag->ag_block_start);
 		ag->block_count = le64_to_cpu(dag->ag_block_count);
 		ag->free_blocks = le64_to_cpu(dag->ag_free_blocks);
-		ag->bitmap_off = le64_to_cpu(dag->ag_bitmap_off);
+		/* ag_bitmap_off and ag_inode_table_off are AG-relative on disk;
+		 * convert to absolute device byte offsets at load time so every
+		 * caller can use them directly without adding block_start. */
+		{
+			u64 abs_base = ag->block_start * (u64)sbi->s_block_size;
+			ag->bitmap_off      = abs_base + le64_to_cpu(dag->ag_bitmap_off);
+			ag->inode_table_off = abs_base + le64_to_cpu(dag->ag_inode_table_off);
+		}
 		ag->bitmap_size = le64_to_cpu(dag->ag_bitmap_size);
-		ag->inode_table_off = le64_to_cpu(dag->ag_inode_table_off);
 		ag->inode_count = le64_to_cpu(dag->ag_inode_count);
 		ag->free_inodes    = le64_to_cpu(dag->ag_free_inodes);
 		ag->rc_btree_root  = le64_to_cpu(dag->ag_rc_btree_root);

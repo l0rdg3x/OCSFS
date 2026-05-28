@@ -310,8 +310,12 @@ int ocsfs_lock_downgrade(struct super_block *sb, struct ocsfs_lock_res *lr,
 	ret = lr_write_entry(sb, lr, &dl, bh);
 	brelse(bh);
 
-	if (ret == 0)
+	if (ret == 0) {
 		lr->lr_mode = new_mode;
+		/* Invalidate cache: after EX→SH downgrade a peer can take EX
+		 * and modify data; the next SH acquire must go to disk. */
+		lr->lr_lock_epoch = 0;
+	}
 
 	mutex_unlock(&lr->lr_mutex);
 	return ret;

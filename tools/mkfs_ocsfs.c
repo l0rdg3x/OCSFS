@@ -430,9 +430,17 @@ int main(int argc, char *argv[])
         case 'L':
             snprintf(cfg.label, OCSFS_MAX_LABEL, "%s", optarg);
             break;
-        case 'N':
-            cfg.max_nodes = (uint16_t)atoi(optarg);
+        case 'N': {
+            char *end;
+            long v = strtol(optarg, &end, 10);
+            if (*end || v < 1 || v > OCSFS_MAX_NODES) {
+                fprintf(stderr, "mkfs.ocsfs: invalid max_nodes '%s' (must be 1-%d)\n",
+                        optarg, OCSFS_MAX_NODES);
+                exit(1);
+            }
+            cfg.max_nodes = (uint16_t)v;
             break;
+        }
         case 'b':
             cfg.block_size = (uint32_t)parse_size(optarg);
             break;

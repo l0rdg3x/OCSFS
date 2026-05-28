@@ -574,9 +574,9 @@ struct ocsfs_ag_info {
 	u64             block_start;    /* first block (absolute) */
 	u64             block_count;
 	u64             free_blocks;
-	u64             bitmap_off;     /* byte offset on disk */
+	u64             bitmap_off;     /* absolute byte offset on device (converted from AG-relative at mount) */
 	u64             bitmap_size;
-	u64             inode_table_off;
+	u64             inode_table_off; /* absolute byte offset on device (converted from AG-relative at mount) */
 	u64             inode_count;
 	u64             free_inodes;
 	u64             rc_btree_root;  /* ARCH-5: B+ tree root block (0 = empty) */

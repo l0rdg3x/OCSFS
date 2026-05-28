@@ -414,7 +414,9 @@ static void cmd_check(int fd)
     if (sb.s_ag_count > 0) {
         struct ocsfs_ag_desc ag0;
         read_at(fd, sb.s_ag_desc_off, &ag0, sizeof(ag0));
-        uint64_t root_off = sb.s_data_off + ag0.ag_inode_table_off +
+        /* ag_inode_table_off is AG-relative; absolute = ag_block_start*block_size + rel_off */
+        uint64_t root_off = (uint64_t)ag0.ag_block_start * sb.s_block_size +
+                            ag0.ag_inode_table_off +
                             OCSFS_ROOT_INO * OCSFS_INODE_SIZE;
         struct ocsfs_inode root;
         read_at(fd, root_off, &root, sizeof(root));

@@ -442,6 +442,9 @@ check_recovery_leader:
 					(const struct ocsfs_disk_recovery_leader *)
 					rl_bh->b_data;
 
+				/* CRIT-N2/MEDIO-N7: also verify leader deadline
+				 * is still in the future; a crashed leader may
+				 * have left REPLAY_ACTIVE set on disk. */
 				if (le32_to_cpu(rl->rl_magic) ==
 					    OCSFS_RECOVERY_LEADER_MAGIC &&
 				    le16_to_cpu(rl->rl_leader_slot) !=
@@ -449,7 +452,9 @@ check_recovery_leader:
 				    le16_to_cpu(rl->rl_leader_slot) !=
 					    sbi->s_node_slot &&
 				    (le32_to_cpu(rl->rl_epoch) &
-					    OCSFS_RL_REPLAY_ACTIVE))
+					    OCSFS_RL_REPLAY_ACTIVE) &&
+				    le64_to_cpu(rl->rl_deadline_ns) >
+					    ktime_get_real_ns())
 					remote_replay = true;
 			}
 			brelse(rl_bh);

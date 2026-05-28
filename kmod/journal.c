@@ -10,6 +10,7 @@
  * Recovery of a failed node uses ocsfs_journal_replay_node() in journal_replay.c.
  */
 
+#include <linux/xxhash.h>
 #include "ocsfs.h"
 
 /* ═══════════════════════════════════════════════════════════════
@@ -370,8 +371,10 @@ int ocsfs_txn_add_bh(struct ocsfs_txn *txn, struct buffer_head *bh)
 	/* 62-bit BEFORE-image hash: primary CRC in jbr_checksum, secondary CRC
 	 * (different seed) packed into jbr_flags[31:2] (CRIT-V3-3). */
 	bref.jbr_checksum  = cpu_to_le32(ocsfs_crc32c(~0U, bh->b_data, bh->b_size));
+	/* ALTO-N4: use xxh64 for hash2 — independent from the CRC32C primary;
+	 * seed ~1U CRC32C was linearly correlated with seed ~0U (same collisions). */
 	bref.jbr_flags     = cpu_to_le32(OCSFS_JBR_BEFORE |
-		(ocsfs_crc32c(~1U, bh->b_data, bh->b_size) & OCSFS_JBR_HASH2_MASK));
+		((u32)(xxh64(bh->b_data, bh->b_size, 0) & OCSFS_JBR_HASH2_MASK)));
 
 	{
 		u64 saved_head = j->head;

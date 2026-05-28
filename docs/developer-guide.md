@@ -685,6 +685,86 @@ read-trip in cluster mode.
 
 ---
 
+### Sprint I — On-disk correctness (2026-05-28)
+
+Sprint I was driven by a fresh Opus 4.8 review that identified a critical
+offset bug in `ocsfs_load_ags` that caused the kernel to address inode and
+bitmap blocks from near the beginning of the device instead of the correct
+per-AG position. All Sprint I fixes are in `super.c`, `kmod/ocsfs.h`,
+`dir.c`, `journal.c`, `journal_replay.c`, `lock.c`, `heartbeat.c`,
+`tools/mkfs_ocsfs.c`, and `tools/ocsfs_tool.c`.
+
+**CRIT-N1 — AG-relative to absolute offset conversion (`super.c`,
+`kmod/ocsfs.h`, `tools/ocsfs_tool.c`):**
+`ag_bitmap_off` and `ag_inode_table_off` are stored on disk as offsets
+relative to the start of their AG's data region (e.g., 4096 for the bitmap
+at block 1 of the AG). `ocsfs_load_ags` was copying these values directly
+into `ocsfs_ag_info.bitmap_off` / `.inode_table_off` without adding
+`ag->block_start * block_size`. Every subsequent caller (`bitmap.c:80`,
+`bitmap.c:447`, `bitmap.c:542`, `bitmap.c:590`,
+`ocsfs_inode_disk_off()`) divided or used these values as absolute device
+byte offsets — reading from blocks 1–2 of the device instead of the actual
+inode/bitmap region (which begins at `data_start ≈ 130 MB+`). Fix: in
+`ocsfs_load_ags`, compute `abs_base = block_start × block_size` and add it
+to both fields once, so all callers are automatically correct. `ocsfs_tool`
+was also updated to use `ag_block_start × block_size + ag_inode_table_off`
+instead of `s_data_off + ag_inode_table_off` (the latter was equivalent for
+AG 0 only).
+
+**CRIT-N3 — `de_name_hash` aligned with dir B+ tree key (`dir.c`,
+`include/ocsfs.h`):**
+`__ocsfs_add_dirent` was computing `de_name_hash` as `crc32c(~0U, name, len)`
+(single-pass, 32 bits) while the directory B+ tree uses a dual-CRC32c
+64-bit key `((crc32c(len,name)<<32) | crc32c(~hi,name))`. These hash spaces
+are incompatible; any offline fsck trying to reconstruct the btree from
+dirent records would produce a corrupt index. Fix: `de_name_hash` now stores
+the same dual-CRC32c value as the btree key. The comment in
+`include/ocsfs.h` is updated accordingly.
+
+**ALTO-N4 — Truly independent hash2 in journal BEFORE records (`journal.c`,
+`journal_replay.c`):**
+The 62-bit BEFORE-image integrity check (CRIT-V3-3) used `crc32c(~0U,...)` as
+the primary hash and `crc32c(~1U,...)` as the secondary. CRC32C is a linear
+function: for any fixed data length, `crc32c(~1U,data)` is a deterministic
+XOR-transform of `crc32c(~0U,data)`. Two blocks that produce the same
+primary hash automatically produce the same secondary hash — providing only
+~32 bits of effective collision resistance, not 62. Fix: hash2 now uses
+`xxh64(data, size, 0)`, an independent hash family. Both the write path in
+`journal.c` and the two verification sites in `journal_replay.c` are updated
+consistently.
+
+**ARCH-N1 — `lr_lock_epoch` cleared on EX→SH downgrade (`lock.c`):**
+`ocsfs_lock_downgrade` sets `lr->lr_mode = new_mode` on success but did not
+clear `lr->lr_lock_epoch`. After an EX→SH downgrade, if the holder releases
+SH and then re-acquires SH, the cache-hit path in `ocsfs_lock_acquire` could
+fire with a stale epoch, skipping the disk round-trip and returning cached
+data modified by a peer between the downgrade and the re-acquire. Fix:
+`lr->lr_lock_epoch = 0` is now set alongside `lr_mode` on a successful
+downgrade write, forcing the next acquire to go to disk.
+
+**CRIT-N2 / MEDIO-N7 — Stale REPLAY_ACTIVE barrier in heartbeat
+(`heartbeat.c`):**
+`heartbeat_check_peers` set `s_remote_recovery_barrier` whenever the
+recovery leader block had `OCSFS_RL_REPLAY_ACTIVE` set — without checking
+whether the leader's deadline was still in the future. A leader that crashed
+during replay left the flag set permanently, freezing all EX acquisitions
+cluster-wide until a manual intervention. Fix: the REPLAY_ACTIVE check now
+also requires `rl_deadline_ns > ktime_get_real_ns()`, ensuring the barrier
+only applies to a living leader.
+
+**MEDIO-N1 — AG geometry cross-check (`super.c`):**
+`ocsfs_validate_super` now verifies `s_ag_count × s_ag_size ≤ s_total_blocks`,
+preventing mount on a superblock where a malicious or corrupt `s_ag_count`
+would allocate `kvmalloc_array(65536, ...)` with more AG slots than could
+possibly fit on the device.
+
+**SEC-N1 — `mkfs` max_nodes input validation (`tools/mkfs_ocsfs.c`):**
+`atoi(optarg)` silently wraps on values outside the int range. Replaced with
+`strtol` + range check (1..`OCSFS_MAX_NODES`) with an explicit error message
+and `exit(1)`.
+
+---
+
 ## 9. I/O Path
 
 ### Data (regular files) — iomap path

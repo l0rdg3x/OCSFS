@@ -359,7 +359,7 @@ _Static_assert(sizeof(struct ocsfs_ag_desc) == 4096,
 struct ocsfs_dirent {
     uint32_t    de_magic;           /* OCSFS_DIRENT_MAGIC */
     uint64_t    de_ino;             /* target inode number */
-    uint64_t    de_name_hash;       /* XXH3-64 of filename */
+    uint64_t    de_name_hash;       /* dir B+ tree key: ((hi<<32)|lo), hi=crc32c(len,name), lo=crc32c(~hi,name) */
     uint8_t     de_file_type;       /* OCSFS_FT_* */
     uint8_t     de_name_len;        /* filename length (1..255) */
     char        de_name[OCSFS_MAX_NAME_LEN + 1]; /* null-terminated filename */
