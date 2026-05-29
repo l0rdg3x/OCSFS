@@ -16,6 +16,7 @@
 #include "ocsfs.h"
 #include <linux/iomap.h>
 #include <linux/fscrypt.h>
+#include <linux/sched/mm.h>   /* memalloc_nofs_save/restore */
 
 /* OCSFS_MIN_PREALLOC_BLOCKS defined in ocsfs.h */
 
@@ -235,12 +236,25 @@ static int ocsfs_iomap_end(struct inode *inode, loff_t pos, loff_t length,
 			u64 start_block = pos / sbi->s_block_size;
 			u32 nblocks = (u32)((written + sbi->s_block_size - 1) /
 					    sbi->s_block_size);
+			unsigned int nofs;
 			int cr;
 
+			/*
+			 * DEADLOCK FIX: convert_unwritten walks/extends the extent
+			 * B+ tree, doing buffer reads that allocate memory. Under
+			 * memory pressure a GFP_KERNEL allocation here recurses into
+			 * this fs's writeback (ocsfs_writepages → iomap_begin), which
+			 * needs i_extent_lock — the very lock we hold — so the flush
+			 * worker and this write deadlock (seen as a >600s hung_task on
+			 * large buffered writes). memalloc_nofs_save() strips __GFP_FS
+			 * for the locked region so reclaim cannot re-enter writeback.
+			 */
 			mutex_lock(&oi->i_extent_lock);
+			nofs = memalloc_nofs_save();
 			cr = ocsfs_extent_convert_unwritten(inode,
 							    start_block,
 							    nblocks);
+			memalloc_nofs_restore(nofs);
 			mutex_unlock(&oi->i_extent_lock);
 			if (cr)
 				pr_warn_ratelimited(
@@ -806,10 +820,14 @@ static ssize_t ocsfs_writeback_range(struct iomap_writepage_ctx *wpc,
 		u64 start_block = pos / sbi->s_block_size;
 		u32 nblocks = (u32)((len + sbi->s_block_size - 1) /
 				    sbi->s_block_size);
+		unsigned int nofs;
 		int cr;
 
+		/* Same reclaim-recursion guard as ocsfs_iomap_end (see there). */
 		mutex_lock(&oi->i_extent_lock);
+		nofs = memalloc_nofs_save();
 		cr = ocsfs_extent_convert_unwritten(inode, start_block, nblocks);
+		memalloc_nofs_restore(nofs);
 		mutex_unlock(&oi->i_extent_lock);
 		if (cr)
 			pr_warn_ratelimited(
