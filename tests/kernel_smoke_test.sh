@@ -43,7 +43,10 @@ rm -f "$IMG"; truncate -s 2G "$IMG"
 
 log "load module + attach loopback"
 rmmod ocsfs 2>/dev/null
-insmod "$KO" || { bad "insmod"; exit 1; }
+# insmod does not pull in dependencies; load them first (the module references
+# LZ4_compress_default from lz4_compress).
+modprobe lz4_compress 2>/dev/null
+insmod "$KO" || { bad "insmod (check: dmesg | tail)"; dmesg | tail -5; exit 1; }
 LOOP="$(losetup -f --show "$IMG")" || { bad "losetup"; exit 1; }
 mkdir -p "$MNT"
 
