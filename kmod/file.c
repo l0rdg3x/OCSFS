@@ -633,37 +633,48 @@ static long ocsfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case FS_IOC_GET_ENCRYPTION_POLICY_EX:
 		return fscrypt_ioctl_get_policy_ex(file, (void __user *)arg);
 	case FS_IOC_ADD_ENCRYPTION_KEY: {
-		/* ARCH-V3-1: in cluster mode, persist the key in the shared
-		 * encrypted key store so other nodes can retrieve and add it.
-		 * We copy the raw key from userspace, encrypt it with
-		 * ChaCha20-Poly1305 / cluster_secret, write to the LUN, then
-		 * proceed with the standard fscrypt add-key path. */
+		/* ARCH-V3-1: in cluster mode, persist the validated key in the
+		 * shared encrypted key store so other nodes can retrieve it.
+		 *
+		 * Security ordering:
+		 * 1. Call fscrypt_ioctl_add_key() FIRST — it validates the key
+		 *    spec, raw_size, and key material.  Only persist to the cluster
+		 *    store if fscrypt accepted the key (ret == 0).
+		 * 2. Require CAP_SYS_ADMIN for the cluster store write — the key
+		 *    store is a shared cluster-admin resource, not a per-user one.
+		 *    FS_IOC_ADD_ENCRYPTION_KEY is callable by any user; without this
+		 *    gate any process could fill the 32-slot store or inject keys.
+		 * 3. Re-read from user space after fscrypt success so that for
+		 *    IDENTIFIER-type keys we capture the derived identifier that
+		 *    fscrypt wrote back, not attacker-controlled bytes. */
 		struct fscrypt_add_key_arg hdr;
 		u8 raw_key[FSCRYPT_MAX_KEY_SIZE];
 		struct ocsfs_sb_info *ks_sbi = OCSFS_SB(inode->i_sb);
+		long fret;
 
-		if (ks_sbi->s_clustered &&
-		    (ks_sbi->s_feature_incompat & OCSFS_FEATURE_INCOMPAT_KEY_STORE)) {
-			if (copy_from_user(&hdr, (void __user *)arg, sizeof(hdr))) {
-				return -EFAULT;
+		fret = fscrypt_ioctl_add_key(file, (void __user *)arg);
+
+		if (fret == 0 &&
+		    ks_sbi->s_clustered &&
+		    (ks_sbi->s_feature_incompat & OCSFS_FEATURE_INCOMPAT_KEY_STORE) &&
+		    capable(CAP_SYS_ADMIN)) {
+			if (!copy_from_user(&hdr, (void __user *)arg, sizeof(hdr)) &&
+			    hdr.raw_size > 0 &&
+			    hdr.raw_size <= FSCRYPT_MAX_KEY_SIZE &&
+			    !copy_from_user(raw_key,
+					    (u8 __user *)arg + sizeof(hdr),
+					    hdr.raw_size)) {
+				if (ocsfs_key_store_add(inode->i_sb,
+							&hdr.key_spec,
+							raw_key,
+							(u16)hdr.raw_size))
+					pr_warn_ratelimited(
+						"ocsfs: key_store_add failed — "
+						"key not persisted to cluster store\n");
 			}
-			if (hdr.raw_size > 0 && hdr.raw_size <= FSCRYPT_MAX_KEY_SIZE) {
-				if (!copy_from_user(raw_key,
-						    (u8 __user *)arg + sizeof(hdr),
-						    hdr.raw_size)) {
-					/* non-fatal: log on failure, proceed anyway */
-					if (ocsfs_key_store_add(inode->i_sb,
-								&hdr.key_spec,
-								raw_key,
-								(u16)hdr.raw_size))
-						pr_warn_ratelimited(
-							"ocsfs: key_store_add failed — "
-							"key not persisted to cluster store\n");
-				}
-				memzero_explicit(raw_key, sizeof(raw_key));
-			}
+			memzero_explicit(raw_key, sizeof(raw_key));
 		}
-		return fscrypt_ioctl_add_key(file, (void __user *)arg);
+		return fret;
 	}
 	case FS_IOC_REMOVE_ENCRYPTION_KEY:
 		return fscrypt_ioctl_remove_key(file, (void __user *)arg);
