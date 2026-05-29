@@ -51,7 +51,7 @@ LOOP="$(losetup -f --show "$IMG")" || { bad "losetup"; exit 1; }
 mkdir -p "$MNT"
 
 log "mount (single node, no cluster secret)"
-if mount -t ocsfs "$LOOP" "$MNT"; then
+if mount -t ocsfs -o degraded "$LOOP" "$MNT"; then
     ok "mount succeeded — superblock CRC accepted by kernel"
 else
     bad "mount failed — check 'dmesg | tail' (CRC/layout mismatch?)"
@@ -77,7 +77,7 @@ truncate -s 4 "$MNT/data.bin"; [ "$(stat -c %s "$MNT/data.bin")" = 4 ] && ok "tr
 log "fsync + remount persistence"
 sync
 umount "$MNT"
-mount -t ocsfs "$LOOP" "$MNT" || { bad "remount"; dmesg | tail -15; exit 1; }
+mount -t ocsfs -o degraded "$LOOP" "$MNT" || { bad "remount"; dmesg | tail -15; exit 1; }
 [ "$(cat "$MNT/a/b/c/leaf" 2>/dev/null)" = deep ] && ok "nested persisted" || bad "nested lost"
 [ "$(ls "$MNT" | grep -c '^f')" = 15 ] && ok "15 files persisted" || bad "file count after remount"
 umount "$MNT"
