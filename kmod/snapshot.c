@@ -160,9 +160,13 @@ int ocsfs_snapshot_create(struct inode *src, struct inode *dir,
 
 	snap_oi = OCSFS_I(snap);
 
-	/* Copy file metadata */
+	/* Copy file metadata.
+	 * MEDIO-N3: i_blocks = 0 because the snapshot owns NO exclusive blocks
+	 * at creation — all extents are shared (refcount > 1).  snapshot_delete
+	 * already only decrements i_blocks when should_free == true, so the
+	 * value stays accurate as CoW unshares blocks over time. */
 	i_size_write(snap, i_size_read(src));
-	snap->i_blocks = src->i_blocks;
+	snap->i_blocks = 0;
 	snap_oi->i_flags = src_oi->i_flags;
 
 	/*

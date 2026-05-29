@@ -306,11 +306,23 @@ static int ocsfs_freeze_fs(struct super_block *sb)
 static int ocsfs_unfreeze_fs(struct super_block *sb)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	int ret;
 
 	if (!sbi->s_clustered)
 		return 0;
 
-	return ocsfs_lock_release(sb, &sbi->s_freeze_lock_res);
+	ret = ocsfs_lock_release(sb, &sbi->s_freeze_lock_res);
+	/* MEDIO-N6: always return 0 so thaw_super completes the VFS unfreeze
+	 * regardless of DLM state.  If the DLM release failed the filesystem
+	 * should still be accessible; the coordinator lock times out and the
+	 * stranded entry is cleaned up on next recovery.  Returning an error
+	 * here causes some kernel versions to skip the VFS unfreeze, leaving
+	 * the filesystem permanently frozen for all local writers. */
+	if (ret)
+		pr_err_ratelimited("ocsfs: unfreeze: DLM release failed (%d) — "
+				   "freeze lock may time out on next recovery\n",
+				   ret);
+	return 0;
 }
 
 /* fill_super — called during mount */

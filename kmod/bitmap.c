@@ -115,9 +115,15 @@ static int ocsfs_ag_alloc_blocks(struct super_block *sb, u32 ag_no,
 				brelse(bh);
 				continue;
 			}
-			/* Run broken; reset and scan from first_used */
+			/* Run broken; rescan from bit 0 of this block.
+			 * MEDIO-N5: resetting scan_pos to first_used skips
+			 * bits 0..first_used-1 as potential new run starts.
+			 * Restarting from 0 lets the while loop rediscover them;
+			 * since bit first_used is used they can't extend beyond
+			 * first_used bits, but the full rescan avoids missing
+			 * valid runs that straddle this block and the next. */
 			found = 0;
-			scan_pos = first_used;
+			scan_pos = 0;
 		} else {
 			scan_pos = 0;
 		}
