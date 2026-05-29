@@ -16,26 +16,28 @@
  * ═══════════════════════════════════════════════════════════════ */
 
 /*
- * In cluster mode the local page cache may hold a stale copy of shared
- * metadata blocks (bitmap, inode table) from before another node's last
- * write.  Even though DLM EX guarantees exclusive access *now*, the old
- * data can linger in our cache.  Use the forced-read pattern to bypass it.
+ * Read a metadata (bitmap) block through the buffer cache.
+ *
+ * This MUST be a cached read, not a forced disk re-read.  The allocator marks
+ * freshly-used bits in the bitmap buffer and stages the update in the current
+ * transaction (the buffer stays dirty/uptodate in cache but is NOT yet flushed
+ * to disk).  A second allocation in the same transaction — e.g. the multiple
+ * btree-node allocations done while converting an extent UNWRITTEN→WRITTEN —
+ * then reads the bitmap again; if that read forcibly re-read from disk it would
+ * miss the still-uncommitted bits and hand back the SAME block twice (a double
+ * allocation).  That was observed as an extent-B+tree node whose child pointer
+ * pointed to itself (new_int == new_root), making find_leaf cycle and wedging
+ * the mount on large writes.  Reading from the cache gives read-your-own-writes
+ * within the transaction and eliminates the double allocation.
+ *
+ * Cross-node coherence (discarding a stale cached bitmap from before another
+ * node modified it under its own AG EX lock) must be re-established by
+ * invalidating the AG's bitmap blocks at DLM EX acquisition, NOT by a per-read
+ * forced re-read — TODO for the multi-node testbed.  See ext_btree_read() for
+ * the same rationale on btree nodes.
  */
 static struct buffer_head *ocsfs_meta_getblk(struct super_block *sb, u64 blkno)
 {
-	struct buffer_head *bh;
-
-	if (OCSFS_SB(sb)->s_clustered) {
-		bh = sb_getblk(sb, blkno);
-		if (!bh)
-			return NULL;
-		clear_buffer_uptodate(bh);
-		if (bh_read(bh, 0) < 0) {
-			brelse(bh);
-			return NULL;
-		}
-		return bh;
-	}
 	return sb_bread(sb, blkno);
 }
 
