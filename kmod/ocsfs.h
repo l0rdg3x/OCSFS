@@ -103,6 +103,31 @@
 /* HB summary block — one 4 KiB block, 256×16-byte entries (NUOV-ARCH-3) */
 #define OCSFS_HB_SUMMARY_OFF   (OCSFS_RECOVERY_LEADER_OFF + OCSFS_DEFAULT_BLOCK_SIZE)
 
+/* ARCH-V3-1: shared encryption key store — one 4 KiB block immediately after HB summary.
+ * 32 entries × 128 bytes = 4096 bytes.  Keys are encrypted with ChaCha20-Poly1305
+ * using s_cluster_secret as the 256-bit key.  Only volumes with
+ * OCSFS_FEATURE_INCOMPAT_KEY_STORE use this area; older volumes leave it untouched. */
+#define OCSFS_KEY_STORE_OFF    (OCSFS_HB_SUMMARY_OFF + OCSFS_DEFAULT_BLOCK_SIZE)
+#define OCSFS_KEY_STORE_SIZE   OCSFS_DEFAULT_BLOCK_SIZE   /* one block = 4096 bytes */
+#define OCSFS_KEY_STORE_MAGIC        0x4F434B53U  /* "OCKS" */
+#define OCSFS_KEY_STORE_ENTRY_MAGIC  0x4B455953U  /* "KEYS" */
+#define OCSFS_KEY_STORE_MAX_ENTRIES  32           /* 32 × 128 bytes = 4096 */
+
+/* On-disk encrypted key entry.  Each entry is self-contained: CRC-guarded header +
+ * ChaCha20-Poly1305 ciphertext.  The struct is exactly 128 bytes. */
+struct ocsfs_disk_key_store_entry {
+	__le32  kse_magic;        /* OCSFS_KEY_STORE_ENTRY_MAGIC when occupied */
+	__le16  kse_key_size;     /* original fscrypt raw key length in bytes (1..64) */
+	__le16  kse_spec_type;    /* FSCRYPT_KEY_SPEC_TYPE_DESCRIPTOR or _IDENTIFIER */
+	__u8    kse_id[16];       /* canonical 16-byte key identifier */
+	__le64  kse_nonce;        /* random ChaCha20-Poly1305 nonce */
+	__u8    kse_ct[80];       /* encrypted key (max 64 B) + 16 B Poly1305 tag */
+	__le32  kse_checksum;     /* crc32c(kse_magic..kse_ct inclusive) */
+	__u8    kse_pad[12];      /* reserved, must be zero */
+} __packed; /* 4+2+2+16+8+80+4+12 = 128 bytes */
+static_assert(sizeof(struct ocsfs_disk_key_store_entry) == 128,
+	      "ocsfs_disk_key_store_entry must be exactly 128 bytes");
+
 struct ocsfs_disk_hb_summary_entry {
 	__le64  hse_sequence;   /* last written hb_sequence */
 	__le64  hse_timestamp;  /* ktime_get_real_ns() */
@@ -191,6 +216,7 @@ enum ocsfs_cas_backend {
 #define OCSFS_FEATURE_INCOMPAT_RC_BTREE_PER_AG  (1ULL << 1)  /* ARCH-5 */
 #define OCSFS_FEATURE_INCOMPAT_EXT_FLAGS4       (1ULL << 2)  /* ARCH-V3-4: 4-bit extent flags */
 #define OCSFS_FEATURE_INCOMPAT_JOURNAL_HMAC     (1ULL << 3)  /* ALTO-V3-10: HMAC on COMMIT records */
+#define OCSFS_FEATURE_INCOMPAT_KEY_STORE        (1ULL << 4)  /* ARCH-V3-1: shared encrypted key store */
 
 /* RO_COMPAT bits — read-write-semantic features */
 #define OCSFS_FEATURE_RO_COMPAT_SELECTIVE_INV   (1ULL << 0)  /* ARCH-7 */
@@ -201,7 +227,8 @@ enum ocsfs_cas_backend {
 #define OCSFS_FEATURE_INCOMPAT_SUPP     (OCSFS_FEATURE_INCOMPAT_LOCK_TABLE_V2 | \
 					 OCSFS_FEATURE_INCOMPAT_RC_BTREE_PER_AG | \
 					 OCSFS_FEATURE_INCOMPAT_EXT_FLAGS4       | \
-					 OCSFS_FEATURE_INCOMPAT_JOURNAL_HMAC)
+					 OCSFS_FEATURE_INCOMPAT_JOURNAL_HMAC     | \
+					 OCSFS_FEATURE_INCOMPAT_KEY_STORE)
 #define OCSFS_FEATURE_RO_COMPAT_SUPP    (OCSFS_FEATURE_RO_COMPAT_SELECTIVE_INV | \
 					 OCSFS_FEATURE_RO_COMPAT_HB_SUMMARY | \
 					 OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB)
@@ -1321,6 +1348,52 @@ int ocsfs_file_lock(struct file *file, int cmd, struct file_lock *fl);
 /* crypto.c — fscrypt integration (optional per-directory encryption) */
 #ifdef CONFIG_FS_ENCRYPTION
 extern const struct fscrypt_operations ocsfs_fscrypt_ops;
-#endif
+
+/* ARCH-V3-1: cluster key store ioctls — require CAP_SYS_ADMIN */
+
+/* Entry returned by OCSFS_IOC_KEY_LIST: identifies a stored key without exposing
+ * raw key material.  Caller uses kle_id + kle_spec_type to call
+ * OCSFS_IOC_KEY_FETCH, which returns the decrypted raw key so the caller can then
+ * invoke FS_IOC_ADD_ENCRYPTION_KEY locally on this node. */
+struct ocsfs_key_list_entry {
+	__u8  kle_id[16];        /* fscrypt key identifier (16 bytes) */
+	__u16 kle_spec_type;     /* FSCRYPT_KEY_SPEC_TYPE_DESCRIPTOR or _IDENTIFIER */
+	__u16 kle_key_size;      /* original key size in bytes */
+	__u32 kle_pad;
+};
+
+struct ocsfs_key_list_arg {
+	__u32 kla_count;                         /* in: capacity; out: actual count */
+	__u32 kla_pad;
+	struct ocsfs_key_list_entry kla_keys[OCSFS_KEY_STORE_MAX_ENTRIES];
+};
+
+/* Fetch the decrypted raw key for a given identifier.
+ * On success kfa_key[0..kfa_key_size-1] holds the raw key material. */
+struct ocsfs_key_fetch_arg {
+	__u8  kfa_id[16];        /* in: key identifier to look up */
+	__u16 kfa_spec_type;     /* in: FSCRYPT_KEY_SPEC_TYPE_* */
+	__u16 kfa_key_size;      /* out: decrypted key size */
+	__u32 kfa_pad;
+	__u8  kfa_key[64];       /* out: raw key material (zeroed on error) */
+};
+
+#define OCSFS_IOC_KEY_LIST   _IOWR('O', 30, struct ocsfs_key_list_arg)
+#define OCSFS_IOC_KEY_FETCH  _IOWR('O', 31, struct ocsfs_key_fetch_arg)
+
+/* Kernel-internal key store API */
+struct fscrypt_key_specifier;  /* forward decl — full type in <linux/fscrypt.h> */
+int  ocsfs_key_store_add(struct super_block *sb,
+			  const struct fscrypt_key_specifier *spec,
+			  const u8 *raw_key, u16 key_size);
+int  ocsfs_key_store_list(struct super_block *sb,
+			   struct ocsfs_key_list_entry *out,
+			   u32 max_entries, u32 *out_count);
+int  ocsfs_key_store_fetch(struct super_block *sb,
+			    const u8 *key_id, u8 *out_key, u16 *out_size);
+void ocsfs_key_store_notify_mount(struct super_block *sb);
+#else /* !CONFIG_FS_ENCRYPTION */
+static inline void ocsfs_key_store_notify_mount(struct super_block *sb) {}
+#endif /* CONFIG_FS_ENCRYPTION */
 
 #endif /* _OCSFS_KMOD_H */

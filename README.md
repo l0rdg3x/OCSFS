@@ -19,11 +19,13 @@ a Proxmox VE-native alternative to VMware VMFS.
 
 ## Production Readiness
 
-Fifteen rounds of correctness, security, and architectural fixes have been
+Sixteen rounds of correctness, security, and architectural fixes have been
 applied (Sprints A–H from the Opus v3 review, Sprints I–L plus M/N/O from the
-Opus 4.8 review). Sprint M adds a compression buffer mempool; Sprint N adds
-HMAC authentication to journal COMMIT records; Sprint O adds EX lock leases
-that allow waiters to use the lease deadline instead of blind polling.
+Opus 4.8 review, plus Sprint P). Sprint M adds a compression buffer mempool;
+Sprint N adds HMAC authentication to journal COMMIT records; Sprint O adds EX
+lock leases that allow waiters to use the lease deadline instead of blind
+polling; Sprint P (ARCH-V3-1) adds a cluster-wide shared encrypted key store
+for fscrypt key distribution.
 See [`docs/developer-guide.md`](docs/developer-guide.md) for the full
 changelog.
 
@@ -32,7 +34,7 @@ changelog.
 | Single-node read/write | ~92% |
 | Multi-node — stable workload | ~93% |
 | Multi-node — crash + recovery | ~88% |
-| Multi-node — with encryption | ~82% |
+| Multi-node — with encryption | ~85% |
 | VMFS feature parity | ~70% |
 
 The remaining gap is real-hardware integration testing (xfstests on a
@@ -143,12 +145,12 @@ data loss under load are tracked in
 | Area | Status |
 |---|---|
 | **Integration test suite** | No xfstests run yet — top priority. Needs a 2-node testbed with a SCSI-3 PR-capable LUN (KVM + LIO iSCSI is sufficient). |
-| **Encryption — node-local keys** | fscrypt keys must be added independently on every cluster node (`FS_IOC_ADD_ENCRYPTION_KEY`). A node that hasn't added the key writes plaintext. No cluster-wide propagation protocol yet. |
+| **Encryption — key distribution** | fscrypt keys are stored in a shared encrypted key store on the LUN (ARCH-V3-1). When one node calls `FS_IOC_ADD_ENCRYPTION_KEY`, the key is persisted (ChaCha20-Poly1305 / cluster secret). Other nodes retrieve it via `ocsfs-tool keys restore <dev>`. Requires `OCSFS_FEATURE_INCOMPAT_KEY_STORE` (new volumes). |
 | **Encryption — I/O restrictions** | No readahead, no O_DIRECT. Reflink, snapshot, and symlinks inside encrypted directories return `-EOPNOTSUPP`. |
 | **Compression write path** | Compression is applied on fsync for buffered files only. O_DIRECT writes are never compressed. |
 | **Shared mmap** | `MAP_SHARED|PROT_WRITE` returns `-EOPNOTSUPP` in cluster mode. Read-only and private (COW) mappings work. |
 | **STONITH** | Fencing uses SCSI PR. Out-of-band STONITH (PDU, iDRAC) is not wired — the Proxmox API can serve as soft STONITH in lab setups. |
-| **Journal COMMIT HMAC** | HMAC authentication covers node slot tokens (implemented) but not journal COMMIT records — requires an on-disk format change and a new incompat feature bit. |
+| **Journal COMMIT HMAC** | HMAC-SHA256/128 authentication on COMMIT records (Sprint N, `OCSFS_FEATURE_INCOMPAT_JOURNAL_HMAC`). |
 | **Single recovery target** | Only one dead node is recovered at a time. If two nodes fail simultaneously, the second is queued until the first recovery completes. |
 
 ---

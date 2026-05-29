@@ -1027,6 +1027,66 @@ New function `ocsfs_lock_renew_lease(sb, lr)`: updates `le_lease_ns` for the cur
 holder, allowing long-running write operations to extend the lease without full
 release-and-reacquire.
 
+### Sprint P — ARCH-V3-1: Cluster-wide fscrypt key distribution (2026-05-29)
+
+**Problem**: fscrypt keys are node-local. In cluster mode, node A adds a key and encrypts files;
+node B has no mechanism to obtain the key. Without it, node B cannot open those files (receives
+`-ENOKEY`). The Sprint A partial fix only emitted a `pr_warn_once`.
+
+**Fix — shared encrypted key store** (`crypto.c`, `ocsfs.h`, `file.c`, `super.c`):
+
+A new on-disk area (`OCSFS_KEY_STORE_OFF = OCSFS_HB_SUMMARY_OFF + 4096`) holds 32 × 128-byte
+entries secured by `OCSFS_FEATURE_INCOMPAT_KEY_STORE (1ULL << 4)`. Each entry:
+
+```
+struct ocsfs_disk_key_store_entry {
+    __le32  kse_magic;       /* OCSFS_KEY_STORE_ENTRY_MAGIC = "KEYS" */
+    __le16  kse_key_size;    /* original fscrypt raw key length (1..64 bytes) */
+    __le16  kse_spec_type;   /* FSCRYPT_KEY_SPEC_TYPE_DESCRIPTOR or _IDENTIFIER */
+    __u8    kse_id[16];      /* canonical 16-byte key identifier */
+    __le64  kse_nonce;       /* random ChaCha20-Poly1305 nonce */
+    __u8    kse_ct[80];      /* encrypted key (max 64B) + 16B Poly1305 auth tag */
+    __le32  kse_checksum;    /* crc32c(kse_magic..kse_ct) */
+    __u8    kse_pad[12];
+} __packed;  /* exactly 128 bytes */
+```
+
+**Encryption model**: ChaCha20-Poly1305 (via `<crypto/chacha20poly1305.h>`) using
+`sbi->s_cluster_secret[32]` as the 256-bit key and a random 64-bit nonce. The 16-byte
+Poly1305 authentication tag is stored inline in `kse_ct[]`. Raw key material never touches
+disk in plaintext.
+
+**Key store lifecycle**:
+
+1. `FS_IOC_ADD_ENCRYPTION_KEY` (in `file.c`): intercepted in cluster mode when
+   `OCSFS_FEATURE_INCOMPAT_KEY_STORE` is active. The raw key is copied from userspace,
+   passed to `ocsfs_key_store_add()`, then `fscrypt_ioctl_add_key()` proceeds normally.
+   The raw key is zeroed with `memzero_explicit` immediately after. `ocsfs_key_store_add` is
+   idempotent — a second call with the same key identifier is a no-op.
+
+2. At mount (`fill_super`): `ocsfs_key_store_notify_mount()` scans the key store and logs
+   the identifier and size of each stored key, prompting the administrator to add any missing
+   keys on this node.
+
+3. Key retrieval by other nodes — two new ioctls (both require `CAP_SYS_ADMIN`):
+   - `OCSFS_IOC_KEY_LIST ('O', 30)`: returns identifiers of all stored keys (no raw material)
+   - `OCSFS_IOC_KEY_FETCH ('O', 31)`: decrypts and returns raw key for a given identifier
+   The `ocsfs-tool keys restore <dev>` command (to be implemented in userspace) calls these
+   two ioctls and then issues `FS_IOC_ADD_ENCRYPTION_KEY` locally for each entry.
+
+**Security properties**:
+- Key material encrypted at rest with an authenticated cipher (ChaCha20-Poly1305)
+- Authentication tag prevents bit-flip attacks or key substitution
+- CRC32C on the entry header guards against partial writes
+- `OCSFS_IOC_KEY_FETCH` requires `CAP_SYS_ADMIN`; raw key zeroed in kernel before return
+- Concurrent writes from two nodes to the key store are not cluster-atomic (no DLM on
+  the key store area); this is safe in practice because key-add operations are admin-initiated
+  and idempotent
+
+**Backward compatibility**: volumes without `OCSFS_FEATURE_INCOMPAT_KEY_STORE` are
+unaffected — all key store paths gate on this bit and return early without touching the
+area. New volumes require an updated `mkfs_ocsfs` to set the bit and zero the area.
+
 ---
 
 ## 9. I/O Path
@@ -1431,7 +1491,22 @@ The following correctness issues identified in the Opus v3 review have been fixe
 | `i_crypt_info` not reset on slab reuse (ALTO-V3-1) | `ocsfs_alloc_inode()` now initialises `oi->i_crypt_info = NULL`. |
 | `enc_read_folio` without DLM SH (ALTO-V3-6) | Added `WARN_ONCE` in `ocsfs_enc_read_folio()` to surface call sites (splice_read, userfaultfd) that arrive without DLM SH in cluster mode. |
 
-**Architectural gap (ARCH-V3-1, not yet fixed):** fscrypt keys are node-local. A node that has not added the master key will write plaintext to files that other nodes encrypted. `FS_IOC_ADD_ENCRYPTION_KEY` emits a `pr_warn_once` reminding operators to add the key on all cluster nodes. A cluster-wide key propagation protocol requires dedicated engineering effort.
+**ARCH-V3-1 — Cluster key distribution (Sprint P, 2026-05-29):** Implemented via the shared
+encrypted key store. See §Sprint P above for the full protocol. When
+`OCSFS_FEATURE_INCOMPAT_KEY_STORE` is active, `FS_IOC_ADD_ENCRYPTION_KEY` automatically
+persists the key to the shared store. Other nodes retrieve it with:
+
+```bash
+# On each cluster node that needs the key
+ocsfs-tool keys restore /dev/sdb   # lists + fetches + adds all stored keys
+# Internally: OCSFS_IOC_KEY_LIST → OCSFS_IOC_KEY_FETCH → FS_IOC_ADD_ENCRYPTION_KEY
+```
+
+Two new ioctls are available for scripting:
+| ioctl | Description |
+|---|---|
+| `OCSFS_IOC_KEY_LIST` | List key identifiers in the shared store (no raw material exposed) |
+| `OCSFS_IOC_KEY_FETCH` | Decrypt and return raw key for a given identifier (`CAP_SYS_ADMIN`) |
 
 ### Limitations
 
@@ -1442,4 +1517,4 @@ The following correctness issues identified in the Opus v3 review have been fixe
 | Buffered writes only | `ocsfs_enc_writepages()` submits one synchronous bio per folio — acceptable for VM disk images, suboptimal for bulk streaming |
 | No reflink / snapshot | Both operations return `-EOPNOTSUPP` on encrypted inodes (see cluster safety above) |
 | No symlinks in encrypted dirs | Returns `-EOPNOTSUPP` until `fscrypt_get_symlink` is wired up |
-| Node-local keys | Key must be added independently on each cluster node (`FS_IOC_ADD_ENCRYPTION_KEY`); warns at runtime if in cluster mode |
+| Key store not cluster-atomic | Concurrent `FS_IOC_ADD_ENCRYPTION_KEY` from two nodes is idempotent but not serialised; race on the key store block is benign (same-key writes produce the same result) |

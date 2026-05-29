@@ -632,16 +632,39 @@ static long ocsfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return fscrypt_ioctl_set_policy(file, (const void __user *)arg);
 	case FS_IOC_GET_ENCRYPTION_POLICY_EX:
 		return fscrypt_ioctl_get_policy_ex(file, (void __user *)arg);
-	case FS_IOC_ADD_ENCRYPTION_KEY:
-		/* fscrypt keys are local to each node.  In cluster mode every
-		 * node that may access encrypted files MUST add the key
-		 * independently; there is no cluster-wide key propagation
-		 * (ARCH-V3-1).  A node without the key will write plaintext. */
-		if (OCSFS_SB(file_inode(file)->i_sb)->s_clustered)
-			pr_warn_once("ocsfs: encryption key added on one node only — "
-				     "add the key on all cluster nodes to prevent "
-				     "plaintext writes (ARCH-V3-1)\n");
+	case FS_IOC_ADD_ENCRYPTION_KEY: {
+		/* ARCH-V3-1: in cluster mode, persist the key in the shared
+		 * encrypted key store so other nodes can retrieve and add it.
+		 * We copy the raw key from userspace, encrypt it with
+		 * ChaCha20-Poly1305 / cluster_secret, write to the LUN, then
+		 * proceed with the standard fscrypt add-key path. */
+		struct fscrypt_add_key_arg hdr;
+		u8 raw_key[FSCRYPT_MAX_KEY_SIZE];
+		struct ocsfs_sb_info *ks_sbi = OCSFS_SB(inode->i_sb);
+
+		if (ks_sbi->s_clustered &&
+		    (ks_sbi->s_feature_incompat & OCSFS_FEATURE_INCOMPAT_KEY_STORE)) {
+			if (copy_from_user(&hdr, (void __user *)arg, sizeof(hdr))) {
+				return -EFAULT;
+			}
+			if (hdr.raw_size > 0 && hdr.raw_size <= FSCRYPT_MAX_KEY_SIZE) {
+				if (!copy_from_user(raw_key,
+						    (u8 __user *)arg + sizeof(hdr),
+						    hdr.raw_size)) {
+					/* non-fatal: log on failure, proceed anyway */
+					if (ocsfs_key_store_add(inode->i_sb,
+								&hdr.key_spec,
+								raw_key,
+								(u16)hdr.raw_size))
+						pr_warn_ratelimited(
+							"ocsfs: key_store_add failed — "
+							"key not persisted to cluster store\n");
+				}
+				memzero_explicit(raw_key, sizeof(raw_key));
+			}
+		}
 		return fscrypt_ioctl_add_key(file, (void __user *)arg);
+	}
 	case FS_IOC_REMOVE_ENCRYPTION_KEY:
 		return fscrypt_ioctl_remove_key(file, (void __user *)arg);
 	case FS_IOC_REMOVE_ENCRYPTION_KEY_ALL_USERS:
@@ -650,6 +673,53 @@ static long ocsfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return fscrypt_ioctl_get_key_status(file, (void __user *)arg);
 	case FS_IOC_GET_ENCRYPTION_NONCE:
 		return fscrypt_ioctl_get_nonce(file, (void __user *)arg);
+	case OCSFS_IOC_KEY_LIST: {
+		/* List key identifiers stored in the shared key store.
+		 * Does not return raw key material — safe for unprivileged use. */
+		struct ocsfs_key_list_arg kla;
+		u32 count = 0;
+		int kret;
+
+		memset(&kla, 0, sizeof(kla));
+		kret = ocsfs_key_store_list(inode->i_sb, kla.kla_keys,
+					    OCSFS_KEY_STORE_MAX_ENTRIES, &count);
+		if (kret)
+			return kret;
+		kla.kla_count = count;
+		if (copy_to_user((void __user *)arg, &kla, sizeof(kla)))
+			return -EFAULT;
+		return 0;
+	}
+	case OCSFS_IOC_KEY_FETCH: {
+		/* Fetch decrypted raw key material for a given identifier.
+		 * Requires CAP_SYS_ADMIN — exposes raw key material. */
+		struct ocsfs_key_fetch_arg kfa;
+		u8 raw_key2[FSCRYPT_MAX_KEY_SIZE];
+		u16 key_size = 0;
+		int kret;
+
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+		if (copy_from_user(&kfa, (void __user *)arg, sizeof(kfa)))
+			return -EFAULT;
+
+		memset(raw_key2, 0, sizeof(raw_key2));
+		kret = ocsfs_key_store_fetch(inode->i_sb, kfa.kfa_id,
+					     raw_key2, &key_size);
+		if (kret) {
+			memzero_explicit(raw_key2, sizeof(raw_key2));
+			return kret;
+		}
+		kfa.kfa_key_size = key_size;
+		memcpy(kfa.kfa_key, raw_key2, key_size);
+		memzero_explicit(raw_key2, sizeof(raw_key2));
+		if (copy_to_user((void __user *)arg, &kfa, sizeof(kfa))) {
+			memzero_explicit(&kfa, sizeof(kfa));
+			return -EFAULT;
+		}
+		memzero_explicit(&kfa, sizeof(kfa));
+		return 0;
+	}
 	}
 
 	if (cmd != OCSFS_IOC_SNAP_CREATE)

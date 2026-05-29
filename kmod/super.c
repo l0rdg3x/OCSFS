@@ -507,6 +507,10 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sync_dirty_buffer(bh);
 	ocsfs_update_super_mirror(sb);
 
+	/* ARCH-V3-1: log keys present in shared store so admins know which
+	 * FS_IOC_ADD_ENCRYPTION_KEY calls are needed on this node. */
+	ocsfs_key_store_notify_mount(sb);
+
 	pr_info("ocsfs: mounted \"%.64s\" AGs=%u free=%llu slot=%u%s%s\n",
 		ds->s_label, sbi->s_ag_count, sbi->s_free_blocks, sbi->s_node_slot,
 		sbi->s_clustered ? " clustered" : "",
