@@ -150,18 +150,7 @@ static int ocsfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 		write_blocks = max_t(u32,
 			(length + sbi->s_block_size - 1) / sbi->s_block_size,
 			1);
-		/*
-		 * Read-ahead pre-allocation is only safe for O_DIRECT, where the
-		 * extra blocks stay UNWRITTEN and are converted lazily.  For buffered
-		 * writes we allocate exactly the written range as WRITTEN (below), so
-		 * we must NOT over-allocate — extra WRITTEN-but-never-written blocks
-		 * would expose stale on-disk data.
-		 */
-		if (flags & IOMAP_DIRECT)
-			try_blocks = max_t(u32, write_blocks,
-					   OCSFS_MIN_PREALLOC_BLOCKS);
-		else
-			try_blocks = write_blocks;
+		try_blocks = max_t(u32, write_blocks, OCSFS_MIN_PREALLOC_BLOCKS);
 
 		ret = ocsfs_alloc_blocks(inode->i_sb, oi->i_ag,
 					 try_blocks, &phys);
@@ -192,26 +181,24 @@ static int ocsfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 		}
 
 		/*
-		 * O_DIRECT: insert UNWRITTEN; iomap_end (dio completion) converts
-		 * to WRITTEN only after confirmed I/O, so preallocated-but-unwritten
-		 * read-ahead blocks never expose stale data.
+		 * Insert as UNWRITTEN so that blocks not yet reached by the write are
+		 * never exposed as MAPPED.  An extent is converted to WRITTEN only
+		 * after the real data reaches disk: O_DIRECT converts in iomap_end
+		 * (dio completion, data already durable); buffered writes convert in
+		 * the writeback path (ocsfs_writeback_range) as the dirty pages are
+		 * flushed.  This preserves the no-stale-data invariant — a crash
+		 * before writeback leaves the extent UNWRITTEN, so reads return zeroes
+		 * rather than another file's freed on-disk contents.
 		 *
-		 * Buffered writes: insert WRITTEN directly and rely on IOMAP_F_NEW
-		 * (set below) so iomap zero-fills the unwritten portions of the
-		 * first/last partial blocks — no stale data is exposed.  This avoids
-		 * the UNWRITTEN→WRITTEN conversion in iomap_end, which held
-		 * i_extent_lock across extent-btree I/O at peak dirty-page pressure
-		 * and deadlocked against the writeback path (ocsfs_writepages →
-		 * iomap_begin) that needs the same lock.  We allocate exactly the
-		 * written range (no read-ahead prealloc) so every WRITTEN block is
-		 * actually written.  Trade-off: a crash after the page-cache write
-		 * but before writeback leaves the on-disk blocks with prior content
-		 * for not-yet-flushed data — the same durability window any buffered
-		 * write has before fsync; data is only guaranteed after fsync/flush.
+		 * iomap_end deliberately does NOT convert buffered writes: doing so
+		 * held i_extent_lock across extent-btree I/O right after the data was
+		 * dirtied (peak memory pressure), and the writeback worker — the only
+		 * thing that can free that memory — blocks acquiring the same lock,
+		 * deadlocking large writes.  Converting in the writeback path instead
+		 * keeps the conversion in the memory-freeing context.
 		 */
-		ret = ocsfs_extent_insert(inode, logical_block, phys, alloc_blocks,
-					  (flags & IOMAP_DIRECT) ? OCSFS_EXT_UNWRITTEN
-								 : OCSFS_EXT_WRITTEN);
+		ret = ocsfs_extent_insert(inode, logical_block, phys,
+					  alloc_blocks, OCSFS_EXT_UNWRITTEN);
 		if (ret) {
 			ocsfs_free_blocks(inode->i_sb, phys, alloc_blocks);
 			dquot_free_space_nodirty(inode,
@@ -225,8 +212,7 @@ static int ocsfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 
 		iomap->addr = phys * (u64)sbi->s_block_size;
 		iomap->length = (loff_t)alloc_blocks * sbi->s_block_size;
-		iomap->type = (flags & IOMAP_DIRECT) ? IOMAP_UNWRITTEN
-						     : IOMAP_MAPPED;
+		iomap->type = IOMAP_UNWRITTEN;
 		iomap->flags |= IOMAP_F_NEW;
 		iomap->bdev = inode->i_sb->s_bdev;
 		iomap->offset = pos;
@@ -245,27 +231,26 @@ static int ocsfs_iomap_end(struct inode *inode, loff_t pos, loff_t length,
 
 	if ((flags & IOMAP_WRITE) && written > 0) {
 		/*
-		 * Convert UNWRITTEN→WRITTEN only after confirmed I/O.
-		 * Doing this in iomap_begin was premature: if the write
-		 * failed, the extent would be WRITTEN over garbage data.
+		 * Convert UNWRITTEN→WRITTEN only after the data is confirmed on
+		 * disk, and ONLY for O_DIRECT: by the time the dio iomap_end runs
+		 * the data is already durable, and O_DIRECT builds no page-cache
+		 * pressure so there is no writeback/i_extent_lock deadlock.
+		 *
+		 * Buffered writes are deliberately NOT converted here: doing so held
+		 * i_extent_lock across extent-btree I/O at peak dirty-page pressure
+		 * and deadlocked against the writeback worker (the only thing that
+		 * can free that memory) which needs the same lock. For buffered
+		 * writes the conversion happens in ocsfs_writeback_range as the dirty
+		 * pages are flushed — i.e. in the memory-freeing context, exactly
+		 * when the real data reaches disk, so no stale data is ever exposed.
 		 */
-		if (iomap->type == IOMAP_UNWRITTEN) {
+		if (iomap->type == IOMAP_UNWRITTEN && (flags & IOMAP_DIRECT)) {
 			u64 start_block = pos / sbi->s_block_size;
 			u32 nblocks = (u32)((written + sbi->s_block_size - 1) /
 					    sbi->s_block_size);
 			unsigned int nofs;
 			int cr;
 
-			/*
-			 * DEADLOCK FIX: convert_unwritten walks/extends the extent
-			 * B+ tree, doing buffer reads that allocate memory. Under
-			 * memory pressure a GFP_KERNEL allocation here recurses into
-			 * this fs's writeback (ocsfs_writepages → iomap_begin), which
-			 * needs i_extent_lock — the very lock we hold — so the flush
-			 * worker and this write deadlock (seen as a >600s hung_task on
-			 * large buffered writes). memalloc_nofs_save() strips __GFP_FS
-			 * for the locked region so reclaim cannot re-enter writeback.
-			 */
 			mutex_lock(&oi->i_extent_lock);
 			nofs = memalloc_nofs_save();
 			cr = ocsfs_extent_convert_unwritten(inode,
