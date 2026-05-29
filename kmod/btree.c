@@ -278,6 +278,15 @@ int ocsfs_btree_find_leaf(struct ocsfs_btree *bt, u64 key, void *buf,
 			  u64 *path, int *path_len, int max_path)
 {
 	int ret = read_node(bt, bt->root_block, buf);
+	/*
+	 * Hard cap on descent depth.  A B+ tree over 64-bit keys with the minimum
+	 * order this code allows cannot exceed a few dozen levels; anything more
+	 * means the tree is corrupt (e.g. a child pointer forming a cycle).
+	 * Without this bound a cycle makes the descent loop forever — observed as
+	 * a CPU-spinning task holding i_extent_lock that wedges writeback and the
+	 * whole mount.  Fail with -EIO instead so the caller (and fsck) can react.
+	 */
+	int depth = 0;
 
 	if (ret < 0)
 		return ret;
@@ -292,6 +301,13 @@ int ocsfs_btree_find_leaf(struct ocsfs_btree *bt, u64 key, void *buf,
 		struct ocsfs_btree_ptr *ptrs = internal_ptrs(buf);
 		u64 next = le64_to_cpu(*internal_first_child(buf));
 		int i, n = le16_to_cpu(hdr->bn_count);
+
+		if (++depth > OCSFS_BTREE_MAX_DEPTH) {
+			pr_err_ratelimited("ocsfs: btree: descent exceeded %d levels at block %llu — corrupt tree (cycle?), aborting\n",
+					   OCSFS_BTREE_MAX_DEPTH,
+					   le64_to_cpu(node_hdr(buf)->bn_block_num));
+			return -EIO;
+		}
 
 		for (i = 0; i < n; i++) {
 			if (key >= le64_to_cpu(ptrs[i].key))

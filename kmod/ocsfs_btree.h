@@ -19,6 +19,12 @@
 #define OCSFS_BTREE_NODE_ROOT   0x01
 #define OCSFS_BTREE_NODE_LEAF   0x02
 
+/* Maximum root→leaf descent depth.  A B+ tree over 64-bit keys cannot legally
+ * exceed a few dozen levels; a deeper descent means the tree is corrupt (e.g. a
+ * child-pointer cycle).  ocsfs_btree_find_leaf() aborts with -EIO past this to
+ * avoid an infinite descent loop wedging the kernel. */
+#define OCSFS_BTREE_MAX_DEPTH   32
+
 struct ocsfs_btree_node_hdr {
 	__le32  bn_magic;
 	__le16  bn_flags;
