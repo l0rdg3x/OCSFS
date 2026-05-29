@@ -31,6 +31,28 @@ static int free_node(struct ocsfs_btree *bt, u64 block)
 	return bt->free_block(bt->io_ctx, block);
 }
 
+/* Diagnostic: a freshly-allocated btree node must never equal a block already
+ * on the descent path (an ancestor) or the current root — that would mean the
+ * allocator handed back a block that is still live in this tree, which creates
+ * a child→ancestor cycle.  Logs loudly so the offending allocation is caught at
+ * the moment it happens rather than later as an unexplained descent cycle. */
+static bool blk_collides(struct ocsfs_btree *bt, const u64 *path, int path_len,
+			 u64 blk, const char *what)
+{
+	int i;
+
+	if (blk == bt->root_block)
+		goto collide;
+	for (i = 0; i < path_len; i++)
+		if (path[i] == blk)
+			goto collide;
+	return false;
+collide:
+	pr_err_ratelimited("ocsfs: btree: %s alloc returned live block %llu (root=%llu, path_len=%d) — DOUBLE ALLOCATION, would corrupt tree\n",
+			   what, blk, bt->root_block, path_len);
+	return true;
+}
+
 static void internal_insert_at(void *buf, int pos, u64 key, u64 child)
 {
 	struct ocsfs_btree_node_hdr *hdr = node_hdr(buf);
@@ -129,6 +151,7 @@ int ocsfs_btree_insert(struct ocsfs_btree *bt, u64 key, u64 value)
 
 		ret = alloc_node(bt, &new_block);
 		if (ret < 0) { kfree(new_buf); kfree(tmp); goto err_free_buf; }
+		blk_collides(bt, path, path_len, new_block, "leaf-split");
 
 		ocsfs_btree_init_leaf(new_buf, bt->block_size, new_block);
 		new_hdr     = node_hdr(new_buf);
@@ -225,6 +248,7 @@ int ocsfs_btree_insert(struct ocsfs_btree *bt, u64 key, u64 value)
 
 				ret = alloc_node(bt, &new_int);
 				if (ret < 0) { kfree(tp); goto err_free_buf; }
+				blk_collides(bt, path, path_len, new_int, "internal-split");
 
 				ni_buf = kzalloc(bt->block_size, GFP_KERNEL);
 				if (!ni_buf) {
@@ -302,6 +326,7 @@ int ocsfs_btree_insert(struct ocsfs_btree *bt, u64 key, u64 value)
 
 			ret = alloc_node(bt, &new_root);
 			if (ret < 0) goto err_free_buf;
+			blk_collides(bt, path, path_len, new_root, "new-root");
 
 			ocsfs_btree_init_internal(buf, bt->block_size, new_root,
 						  (u16)bt->height);

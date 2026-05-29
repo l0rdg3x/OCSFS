@@ -279,17 +279,20 @@ int ocsfs_btree_find_leaf(struct ocsfs_btree *bt, u64 key, void *buf,
 {
 	int ret = read_node(bt, bt->root_block, buf);
 	/*
-	 * Hard cap on descent depth.  A B+ tree over 64-bit keys with the minimum
-	 * order this code allows cannot exceed a few dozen levels; anything more
-	 * means the tree is corrupt (e.g. a child pointer forming a cycle).
-	 * Without this bound a cycle makes the descent loop forever — observed as
-	 * a CPU-spinning task holding i_extent_lock that wedges writeback and the
-	 * whole mount.  Fail with -EIO instead so the caller (and fsck) can react.
+	 * Track visited blocks to detect (and abort on) a child-pointer cycle.
+	 * A B+ tree over 64-bit keys cannot legally be deeper than a few dozen
+	 * levels; a revisit or an over-deep descent means the tree is corrupt.
+	 * Without this a cycle makes the descent loop forever — observed as a
+	 * CPU-spinning task holding i_extent_lock that wedges writeback and the
+	 * whole mount.  Fail with -EIO so the caller (and fsck) can react.
 	 */
-	int depth = 0;
+	u64 visited[OCSFS_BTREE_MAX_DEPTH];
+	int depth = 0, vi;
 
 	if (ret < 0)
 		return ret;
+
+	visited[0] = bt->root_block;
 
 	if (path) {
 		path[0] = bt->root_block;
@@ -302,19 +305,27 @@ int ocsfs_btree_find_leaf(struct ocsfs_btree *bt, u64 key, void *buf,
 		u64 next = le64_to_cpu(*internal_first_child(buf));
 		int i, n = le16_to_cpu(hdr->bn_count);
 
-		if (++depth > OCSFS_BTREE_MAX_DEPTH) {
-			pr_err_ratelimited("ocsfs: btree: descent exceeded %d levels at block %llu — corrupt tree (cycle?), aborting\n",
-					   OCSFS_BTREE_MAX_DEPTH,
-					   le64_to_cpu(node_hdr(buf)->bn_block_num));
-			return -EIO;
-		}
-
 		for (i = 0; i < n; i++) {
 			if (key >= le64_to_cpu(ptrs[i].key))
 				next = le64_to_cpu(ptrs[i].child);
 			else
 				break;
 		}
+
+		if (++depth >= OCSFS_BTREE_MAX_DEPTH) {
+			pr_err_ratelimited("ocsfs: btree: descent exceeded %d levels — corrupt tree, aborting\n",
+					   OCSFS_BTREE_MAX_DEPTH);
+			return -EIO;
+		}
+		for (vi = 0; vi <= depth - 1; vi++) {
+			if (visited[vi] == next) {
+				pr_err_ratelimited("ocsfs: btree: descent CYCLE — block %llu (level vi=%d) revisited from block %llu (key=%llu); corrupt tree, aborting\n",
+						   next, vi,
+						   le64_to_cpu(hdr->bn_block_num), key);
+				return -EIO;
+			}
+		}
+		visited[depth] = next;
 
 		ret = read_node(bt, next, buf);
 		if (ret < 0)
