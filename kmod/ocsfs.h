@@ -113,6 +113,14 @@
 #define OCSFS_KEY_STORE_ENTRY_MAGIC  0x4B455953U  /* "KEYS" */
 #define OCSFS_KEY_STORE_MAX_ENTRIES  32           /* 32 × 128 bytes = 4096 */
 
+/* CRIT-O1: end of the fixed cluster-coordination metadata region.  The per-node
+ * journal array MUST start at or after this offset — otherwise node 0's journal
+ * overlaps the CAS-lease table, recovery-leader block, HB summary and key store.
+ * mkfs derives s_journal_off from the matching constant in include/ocsfs.h; the
+ * kernel rejects at mount any volume whose s_journal_off falls below this value
+ * (see ocsfs_validate_super). */
+#define OCSFS_METADATA_RESERVED_END  (OCSFS_KEY_STORE_OFF + OCSFS_KEY_STORE_SIZE)
+
 /* On-disk encrypted key entry.  Each entry is self-contained: CRC-guarded header +
  * ChaCha20-Poly1305 ciphertext.  The struct is exactly 128 bytes. */
 struct ocsfs_disk_key_store_entry {
@@ -312,6 +320,7 @@ static inline u16 ocsfs_ext_set_comp_algo(u16 flags, u8 algo)
 #define OCSFS_LOCKRES_SUPER     6
 #define OCSFS_LOCKRES_REFCOUNT  7
 #define OCSFS_LOCKRES_FREEZE    8  /* ARCH-V3-6: cluster freeze coordinator */
+#define OCSFS_LOCKRES_KEYSTORE  9  /* KS-1: serialize key store read-modify-write */
 
 /* Heartbeat constants */
 #define OCSFS_HB_INTERVAL_MS        5000   /* write every 5s */
@@ -822,6 +831,9 @@ struct ocsfs_sb_info {
 
 	/* ARCH-V3-6: cluster freeze coordinator lock */
 	struct ocsfs_lock_res s_freeze_lock_res;
+
+	/* KS-1: serializes read-modify-write of the shared key store block */
+	struct ocsfs_lock_res s_keystore_lock_res;
 
 	/* debugfs directory entry for this mount */
 	struct dentry      *s_debugfs_dir;

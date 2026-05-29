@@ -88,6 +88,24 @@ sub properties {
             enum        => ['none', 'lz4', 'zstd'],
             default     => 'none',
         },
+        cluster_secret => {
+            description => "64 hex-char (32-byte) cluster secret for membership "
+                         . "auth and key-store encryption. Prefer 'secret_file' "
+                         . "to avoid storing it in plaintext in storage.cfg.",
+            type        => 'string',
+        },
+        secret_file => {
+            description => "Path to a 0600 file whose first line is the 64 "
+                         . "hex-char cluster secret. Takes precedence over "
+                         . "'cluster_secret'.",
+            type        => 'string',
+        },
+        degraded => {
+            description => "Allow a clustered mount without SCSI-3 PR fencing "
+                         . "(zombie-node risk). Lab use only.",
+            type        => 'boolean',
+            default     => 0,
+        },
     };
 }
 
@@ -99,6 +117,9 @@ sub options {
         thin        => { optional => 1 },
         extentsize  => { optional => 1 },
         compression => { optional => 1 },
+        cluster_secret => { optional => 1 },
+        secret_file => { optional => 1 },
+        degraded    => { optional => 1 },
         content     => { optional => 1 },
         nodes       => { optional => 1 },
         shared      => { optional => 1 },
@@ -189,9 +210,26 @@ sub activate_storage {
         # Create mount point if needed
         make_path($path) if !-d $path;
 
+        # Assemble mount options. The cluster secret is required for volumes
+        # formatted with auth (mkfs -K) and for the encrypted key store; without
+        # it such volumes fail to mount. Prefer secret_file (0600) over the
+        # inline cluster_secret so the secret is not kept in storage.cfg.
+        my @opts;
+
+        my $secret = $scfg->{cluster_secret};
+        if (defined $scfg->{secret_file}) {
+            my $fs = file_read_firstline($scfg->{secret_file});
+            $secret = $fs if defined $fs && length $fs;
+        }
+        if (defined $secret) {
+            $secret =~ s/\s+//g;
+            push @opts, "cluster_secret=$secret";
+        }
+        push @opts, 'degraded' if $scfg->{degraded};
+
         # Mount the OCSFS filesystem
         my $cmd = ['mount', '-t', 'ocsfs'];
-
+        push @$cmd, '-o', join(',', @opts) if @opts;
         push @$cmd, $device, $path;
 
         run_command($cmd, errmsg => "mount ocsfs on '$path'");

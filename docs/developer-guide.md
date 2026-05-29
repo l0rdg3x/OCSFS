@@ -1079,13 +1079,63 @@ disk in plaintext.
 - Authentication tag prevents bit-flip attacks or key substitution
 - CRC32C on the entry header guards against partial writes
 - `OCSFS_IOC_KEY_FETCH` requires `CAP_SYS_ADMIN`; raw key zeroed in kernel before return
-- Concurrent writes from two nodes to the key store are not cluster-atomic (no DLM on
-  the key store area); this is safe in practice because key-add operations are admin-initiated
-  and idempotent
+- Read-modify-write of the key store block is serialized cluster-wide by a dedicated DLM
+  lock (`s_keystore_lock_res`, `OCSFS_LOCKRES_KEYSTORE`) — EX on add, SH on list/fetch
+  (hardened in Sprint R / KS-1)
 
 **Backward compatibility**: volumes without `OCSFS_FEATURE_INCOMPAT_KEY_STORE` are
 unaffected — all key store paths gate on this bit and return early without touching the
-area. New volumes require an updated `mkfs_ocsfs` to set the bit and zero the area.
+area. `mkfs_ocsfs` sets the bit only when auth is enabled (`-K`), since the store is
+meaningless without a `cluster_secret=` (Sprint R / KS-2 gates writes on it).
+
+---
+
+### Sprint R — On-disk layout fix + hardening (2026-05-29)
+
+**CRIT-O1 — journal / cluster-metadata layout collision (catastrophic).** The shared
+userspace header (`include/ocsfs.h`) computed the per-node journal offset as
+`LOCK_TABLE_OFF + LOCK_TABLE_SIZE = 1 384 448`, the same byte at which the kernel places the
+fixed cluster-coordination region: CAS-lease table (`OCSFS_CAS_LEASE_OFF`), recovery-leader
+block, HB summary block and key store. Node 0's journal (up to `max_nodes × journal_size`)
+therefore physically overlapped all four structures. In any clustered mount this caused
+immediate cross-corruption (the heartbeat summary write, recovery-leader updates and CAS
+leases all landed inside node 0's journal, and vice-versa). Single-node mounts were unaffected
+only because those structures are dormant without clustering — which is why the bug survived
+until now: cluster mode was never exercised against it.
+
+Fix:
+- Mirrored the cluster-metadata offset constants into `include/ocsfs.h` and introduced
+  `OCSFS_METADATA_RESERVED_END = OCSFS_KEY_STORE_OFF + OCSFS_KEY_STORE_SIZE` (= 1 429 504).
+  `ocsfs_journal_offset()` now returns this value, so the journal begins after the reserved
+  region. `mkfs_ocsfs` writes `s_journal_off = 1 429 504` and bumps `s_revision_level` to 2.
+- `ocsfs_validate_super()` now **rejects** any volume whose `s_journal_off` falls below
+  `OCSFS_METADATA_RESERVED_END`, with a clear "reformat required" message. **This is an
+  on-disk format change: volumes formatted before Sprint R must be recreated with the current
+  `mkfs.ocsfs`.** Since multi-node was never validated and the project carries no production
+  data, forced reformat is the safe choice.
+
+**HDR-1 — feature-bit drift between headers.** `include/ocsfs.h` had `RO_COMPAT_DEDUP_SCRUB`
+at bit 0 and was missing `SELECTIVE_INV`, `JOURNAL_HMAC`, `KEY_STORE`, so `mkfs` wrote
+`ro_compat` flags the kernel mis-interpreted (the kernel read bit 0 as `SELECTIVE_INV`).
+The two headers' INCOMPAT/RO_COMPAT bit assignments are now identical.
+
+**KS-1 — key store now DLM-serialized** (see above). **KS-2 — key store writes refuse to run
+without a real `cluster_secret=`** (otherwise keys would be "encrypted" under an all-zero key).
+`mkfs` couples `INCOMPAT_KEY_STORE` to `-K`.
+
+**SB-1 — no superblock write on read-only mounts.** `fill_super` previously bumped
+`s_mount_count` and rewrote block 0 (+ mirror) on every mount including RO and clustered, with
+no DLM — two nodes mounting concurrently raced on the shared superblock. The stamp is now
+skipped entirely when `sb_rdonly(sb)`.
+
+**Proxmox integration** (`proxmox/`):
+- `mount.ocsfs` now invokes `mount -i -t ocsfs …`. Without `-i`, `mount(8)` re-discovered the
+  helper and re-executed it → infinite recursion (PROX-1). The bug only manifested once the
+  helper was installed (i.e., on real Proxmox hosts), never in hand-mounted dev testing.
+- `OCSFSPlugin.pm` gained `cluster_secret` / `secret_file` / `degraded` storage properties and
+  passes them as `-o` mount options. Previously `activate_storage` mounted with no options, so
+  auth volumes (`mkfs -K`) could never be mounted via PVE and the key store ran under a zero
+  secret (PROX-2). `secret_file` (0600) is preferred over inline `cluster_secret`.
 
 ---
 

@@ -182,9 +182,17 @@ int ocsfs_key_store_add(struct super_block *sb,
 	u64 nonce;
 	u32 crc;
 	int i, free_slot = -1, ret = 0;
+	bool locked = false;
 
 	if (!(sbi->s_feature_incompat & OCSFS_FEATURE_INCOMPAT_KEY_STORE))
 		return 0;
+	/* KS-2: never persist a key when there is no real cluster secret — it would
+	 * be "encrypted" under an all-zero key and trivially recoverable from the LUN.
+	 * The key store is only meaningful alongside cluster_secret= (s_auth_required). */
+	if (!sbi->s_auth_required) {
+		pr_warn_once("ocsfs: key_store: cluster_secret= not set — refusing to persist key (would use zero key)\n");
+		return 0;
+	}
 	if (key_size == 0 || key_size > FSCRYPT_MAX_KEY_SIZE)
 		return -EINVAL;
 
@@ -193,6 +201,15 @@ int ocsfs_key_store_add(struct super_block *sb,
 		return -ENOMEM;
 
 	key_store_make_id(spec, key_id);
+
+	/* KS-1: serialize the read-modify-write against other nodes/threads so a
+	 * concurrent add cannot lose this entry (last-writer-wins on the 4K block). */
+	if (sbi->s_clustered) {
+		ret = ocsfs_lock_acquire(sb, &sbi->s_keystore_lock_res, OCSFS_LOCK_EX);
+		if (ret)
+			goto out;
+		locked = true;
+	}
 
 	if (key_store_read(sb, store)) {
 		ret = -EIO;
@@ -247,6 +264,8 @@ int ocsfs_key_store_add(struct super_block *sb,
 		"run 'ocsfs-tool keys restore <dev>' on other nodes\n",
 		16, key_id, (unsigned int)key_size);
 out:
+	if (locked)
+		ocsfs_lock_release(sb, &sbi->s_keystore_lock_res);
 	kfree(store);
 	return ret;
 }
@@ -262,11 +281,13 @@ int ocsfs_key_store_list(struct super_block *sb,
 			  struct ocsfs_key_list_entry *out,
 			  u32 max_entries, u32 *out_count)
 {
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	struct ocsfs_disk_key_store_entry *store;
 	u32 n = 0;
 	int i, ret = 0;
+	bool locked = false;
 
-	if (!(OCSFS_SB(sb)->s_feature_incompat & OCSFS_FEATURE_INCOMPAT_KEY_STORE)) {
+	if (!(sbi->s_feature_incompat & OCSFS_FEATURE_INCOMPAT_KEY_STORE)) {
 		*out_count = 0;
 		return 0;
 	}
@@ -274,6 +295,17 @@ int ocsfs_key_store_list(struct super_block *sb,
 	store = kmalloc(OCSFS_KEY_STORE_SIZE, GFP_NOFS);
 	if (!store)
 		return -ENOMEM;
+
+	/* KS-1: SH lock — consistent snapshot against a concurrent EX add. */
+	if (sbi->s_clustered) {
+		int lret = ocsfs_lock_acquire(sb, &sbi->s_keystore_lock_res,
+					      OCSFS_LOCK_SH);
+		if (lret) {
+			kfree(store);
+			return lret;
+		}
+		locked = true;
+	}
 
 	if (key_store_read(sb, store)) {
 		ret = -EIO;
@@ -293,6 +325,8 @@ int ocsfs_key_store_list(struct super_block *sb,
 	}
 	*out_count = n;
 out:
+	if (locked)
+		ocsfs_lock_release(sb, &sbi->s_keystore_lock_res);
 	kfree(store);
 	return ret;
 }
@@ -318,17 +352,32 @@ int ocsfs_key_store_fetch(struct super_block *sb,
 	u64 nonce;
 	u32 crc;
 	int i, ret = -ENOKEY;
+	bool locked = false;
 
 	if (!(sbi->s_feature_incompat & OCSFS_FEATURE_INCOMPAT_KEY_STORE))
 		return -EOPNOTSUPP;
+	/* KS-2: without a real cluster secret the stored ciphertext is meaningless. */
+	if (!sbi->s_auth_required)
+		return -EACCES;
 
 	store = kmalloc(OCSFS_KEY_STORE_SIZE, GFP_NOFS);
 	if (!store)
 		return -ENOMEM;
 
+	/* KS-1: SH lock — a concurrent EX add must not produce a torn read. */
+	if (sbi->s_clustered) {
+		int lret = ocsfs_lock_acquire(sb, &sbi->s_keystore_lock_res,
+					      OCSFS_LOCK_SH);
+		if (lret) {
+			kfree(store);
+			return lret;
+		}
+		locked = true;
+	}
+
 	if (key_store_read(sb, store)) {
-		kfree(store);
-		return -EIO;
+		ret = -EIO;
+		goto out;
 	}
 
 	for (i = 0; i < OCSFS_KEY_STORE_MAX_ENTRIES; i++) {
@@ -373,6 +422,9 @@ int ocsfs_key_store_fetch(struct super_block *sb,
 		ret = 0;
 		break;
 	}
+out:
+	if (locked)
+		ocsfs_lock_release(sb, &sbi->s_keystore_lock_res);
 	kfree(store);
 	return ret;
 }

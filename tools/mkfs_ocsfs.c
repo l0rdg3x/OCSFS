@@ -262,10 +262,15 @@ static void format_device(int fd, uint64_t dev_size)
     sb.s_mkfs_time = now_ns();
     sb.s_mount_count = 0;
     sb.s_last_mount_time = 0;
-    sb.s_revision_level   = 1;
+    sb.s_revision_level   = 2;  /* CRIT-O1: journal relocated past cluster-meta region */
     sb.s_feature_incompat = OCSFS_FEATURE_INCOMPAT_LOCK_TABLE_V2 |
                             OCSFS_FEATURE_INCOMPAT_RC_BTREE_PER_AG |
                             OCSFS_FEATURE_INCOMPAT_EXT_FLAGS4;
+    /* The shared encrypted key store (ARCH-V3-1) is only meaningful with a
+     * cluster secret (mount option cluster_secret=).  Couple the INCOMPAT bit to
+     * auth so plain volumes stay mountable by builds without key-store support. */
+    if (cfg.features & OCSFS_FEAT_AUTH)
+        sb.s_feature_incompat |= OCSFS_FEATURE_INCOMPAT_KEY_STORE;
     sb.s_feature_ro_compat = OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB |
                              OCSFS_FEATURE_RO_COMPAT_HB_SUMMARY;
     sb.s_lock_primary_count = OCSFS_LOCK_ENTRY_COUNT;

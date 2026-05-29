@@ -71,8 +71,12 @@ if ! grep -q "^$KMOD " /proc/modules 2>/dev/null; then
         die "failed to load '$KMOD' kernel module"
 fi
 
-# Build mount options
-MOUNT_OPTS="-t ocsfs"
+# Build mount options.
+#
+# IMPORTANT: pass -i ("internal" / do not invoke /sbin/mount.<type> helpers).
+# Without it, mount(8) would re-discover this very helper and exec it again,
+# producing infinite recursion.  -i forces the real mount(2) syscall.
+MOUNT_OPTS="-i -t ocsfs"
 if [ -n "$OPTIONS" ]; then
     MOUNT_OPTS="$MOUNT_OPTS -o $OPTIONS"
 fi

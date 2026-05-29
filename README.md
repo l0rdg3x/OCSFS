@@ -19,27 +19,42 @@ a Proxmox VE-native alternative to VMware VMFS.
 
 ## Production Readiness
 
-Sixteen rounds of correctness, security, and architectural fixes have been
+Seventeen rounds of correctness, security, and architectural fixes have been
 applied (Sprints A–H from the Opus v3 review, Sprints I–L plus M/N/O from the
-Opus 4.8 review, plus Sprint P). Sprint M adds a compression buffer mempool;
-Sprint N adds HMAC authentication to journal COMMIT records; Sprint O adds EX
-lock leases that allow waiters to use the lease deadline instead of blind
-polling; Sprint P (ARCH-V3-1) adds a cluster-wide shared encrypted key store
-for fscrypt key distribution.
+Opus 4.8 review, plus Sprints P and R). Sprint M adds a compression buffer
+mempool; Sprint N adds HMAC authentication to journal COMMIT records; Sprint O
+adds EX lock leases that allow waiters to use the lease deadline instead of
+blind polling; Sprint P (ARCH-V3-1) adds a cluster-wide shared encrypted key
+store for fscrypt key distribution.
 See [`docs/developer-guide.md`](docs/developer-guide.md) for the full
 changelog.
+
+> **Sprint R (2026-05-29) — on-disk format change.** A catastrophic layout bug
+> was fixed: the per-node journal physically overlapped the cluster-coordination
+> region (CAS leases, recovery-leader, heartbeat summary, key store), corrupting
+> any *clustered* mount (single-node was unaffected, which is why it went
+> unnoticed). The journal is now relocated past that region and the on-disk
+> revision bumped to 2. **Volumes formatted before Sprint R must be recreated
+> with the current `mkfs.ocsfs`** — the kernel now refuses the old overlapping
+> layout. The same sprint fixed the Proxmox mount helper (infinite recursion)
+> and made the plugin pass the cluster secret at mount.
 
 | Scenario | Estimated score |
 |---|---|
 | Single-node read/write | ~92% |
-| Multi-node — stable workload | ~93% |
-| Multi-node — crash + recovery | ~90% |
-| Multi-node — with encryption | ~85% |
+| Multi-node — stable workload | ~93%† |
+| Multi-node — crash + recovery | ~90%† |
+| Multi-node — with encryption | ~85%† |
 | VMFS feature parity | ~70% |
 
+† Multi-node scores are **structural estimates not yet validated on hardware**.
+Before Sprint R the clustered path was in fact non-functional (CRIT-O1 layout
+collision); it is now structurally correct but the first real-testbed run is
+still pending.
+
 The remaining gap is real-hardware integration testing (xfstests on a
-multi-node testbed with SCSI-3 PR). Known open items that could cause
-data loss under load are tracked in
+multi-node testbed with SCSI-3 PR), now unblocked by the Sprint R layout fix.
+Known open items that could cause data loss under load are tracked in
 [`docs/developer-guide.md`](docs/developer-guide.md).
 
 ---
@@ -145,7 +160,7 @@ data loss under load are tracked in
 | Area | Status |
 |---|---|
 | **Integration test suite** | No xfstests run yet — top priority. Needs a 2-node testbed with a SCSI-3 PR-capable LUN (KVM + LIO iSCSI is sufficient). |
-| **Encryption — key distribution** | fscrypt keys are stored in a shared encrypted key store on the LUN (ARCH-V3-1). When one node calls `FS_IOC_ADD_ENCRYPTION_KEY`, the key is persisted (ChaCha20-Poly1305 / cluster secret). Other nodes retrieve it via `ocsfs-tool keys restore <dev>`. Requires `OCSFS_FEATURE_INCOMPAT_KEY_STORE` (new volumes). |
+| **Encryption — key distribution** | fscrypt keys are stored in a shared encrypted key store on the LUN (ARCH-V3-1). When one node calls `FS_IOC_ADD_ENCRYPTION_KEY`, the key is persisted (ChaCha20-Poly1305 / cluster secret). Other nodes retrieve it via `ocsfs-tool keys restore <dev>`. Enabled by `mkfs.ocsfs -K` (sets `OCSFS_FEATURE_INCOMPAT_KEY_STORE`); requires `cluster_secret=` at mount — without it, key persistence is refused (Sprint R). Read-modify-write of the store is DLM-serialized cluster-wide. |
 | **Encryption — I/O restrictions** | No readahead, no O_DIRECT. Reflink, snapshot, and symlinks inside encrypted directories return `-EOPNOTSUPP`. |
 | **Compression write path** | Compression is applied on fsync for buffered files only. O_DIRECT writes are never compressed. |
 | **Shared mmap** | `MAP_SHARED|PROT_WRITE` returns `-EOPNOTSUPP` in cluster mode. Read-only and private (COW) mappings work. |

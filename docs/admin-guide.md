@@ -177,6 +177,26 @@ ocsfs: fc-shared
 | `maxnodes` | Max concurrent nodes | 64 |
 | `thin` | Enable thin provisioning for VM disks | 0 |
 | `shared` | Mark storage as shared between nodes | 0 |
+| `cluster_secret` | 64 hex-char (32-byte) cluster secret. Required for volumes formatted with `mkfs.ocsfs -K` and for the encrypted key store. Stored in `storage.cfg` — prefer `secret_file`. | (none) |
+| `secret_file` | Path to a `0600` file whose first line is the cluster secret. Takes precedence over `cluster_secret`. | (none) |
+| `degraded` | Allow clustered mount without SCSI-3 PR fencing (zombie-node risk; lab only). | 0 |
+
+> **Auth/encrypted clusters:** a volume created with `mkfs.ocsfs -K` will *not* mount
+> without a cluster secret. Set `secret_file` on every node (same secret), e.g.:
+>
+> ```
+> ocsfs: fc-shared
+>     path /mnt/pve/fc-shared
+>     device /dev/mapper/mpath0
+>     content images
+>     maxnodes 16
+>     thin 1
+>     shared 1
+>     secret_file /etc/pve/priv/ocsfs-fc-shared.secret
+> ```
+>
+> Create the secret once with `openssl rand -hex 32 > /etc/pve/priv/ocsfs-fc-shared.secret`
+> (it lands under `/etc/pve/priv`, replicated and root-only across the PVE cluster).
 
 ### Enable on all nodes
 

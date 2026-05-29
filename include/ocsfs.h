@@ -58,6 +58,19 @@
 #define OCSFS_LOCK_ENTRY_SIZE       256
 #define OCSFS_LOCK_ENTRY_COUNT      (OCSFS_LOCK_TABLE_SIZE / OCSFS_LOCK_ENTRY_SIZE)
 
+/* CRIT-O1: fixed cluster-coordination metadata region — MUST mirror the kernel
+ * definitions in kmod/ocsfs.h exactly.  The per-node journal array starts right
+ * after this region; a mismatch makes node 0's journal overlap these blocks and
+ * corrupts both in clustered mode. */
+#define OCSFS_CAS_LEASE_OFF         (OCSFS_LOCK_TABLE_OFF + OCSFS_LOCK_TABLE_SIZE) /* 1384448 */
+#define OCSFS_CAS_LEASE_SIZE        32768ULL    /* 1024 × 32-byte lease entries */
+#define OCSFS_RECOVERY_LEADER_OFF   (OCSFS_CAS_LEASE_OFF + OCSFS_CAS_LEASE_SIZE)
+#define OCSFS_HB_SUMMARY_OFF        (OCSFS_RECOVERY_LEADER_OFF + OCSFS_DEFAULT_BLOCK_SIZE)
+#define OCSFS_KEY_STORE_OFF         (OCSFS_HB_SUMMARY_OFF + OCSFS_DEFAULT_BLOCK_SIZE)
+#define OCSFS_KEY_STORE_SIZE        OCSFS_DEFAULT_BLOCK_SIZE
+/* End of reserved metadata; journal begins here (block-aligned). */
+#define OCSFS_METADATA_RESERVED_END (OCSFS_KEY_STORE_OFF + OCSFS_KEY_STORE_SIZE)
+
 #define OCSFS_MAX_NODES             256
 #define OCSFS_DEFAULT_MAX_NODES     64
 #define OCSFS_MAX_LABEL             64
@@ -95,12 +108,18 @@
 #define OCSFS_FEAT_MULTI_LUN    (1ULL << 5)
 #define OCSFS_FEAT_AUTH         (1ULL << 6)
 
-/* V2 on-disk format feature bits (ARCH-1) */
+/* V2 on-disk format feature bits (ARCH-1) — MUST match kmod/ocsfs.h exactly.
+ * Historically the RO_COMPAT bit numbers diverged between this header and the
+ * kernel (DEDUP_SCRUB was bit 0 here but bit 2 in the kernel); that made mkfs
+ * write ro_compat flags the kernel mis-interpreted.  Keep them in lockstep. */
 #define OCSFS_FEATURE_INCOMPAT_LOCK_TABLE_V2    (1ULL << 0)
 #define OCSFS_FEATURE_INCOMPAT_RC_BTREE_PER_AG  (1ULL << 1)
 #define OCSFS_FEATURE_INCOMPAT_EXT_FLAGS4       (1ULL << 2)  /* ARCH-V3-4: 4-bit extent flags */
-#define OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB     (1ULL << 0)
+#define OCSFS_FEATURE_INCOMPAT_JOURNAL_HMAC     (1ULL << 3)  /* ALTO-V3-10: HMAC on COMMIT */
+#define OCSFS_FEATURE_INCOMPAT_KEY_STORE        (1ULL << 4)  /* ARCH-V3-1: shared key store */
+#define OCSFS_FEATURE_RO_COMPAT_SELECTIVE_INV   (1ULL << 0)  /* ARCH-7 */
 #define OCSFS_FEATURE_RO_COMPAT_HB_SUMMARY      (1ULL << 1)  /* ARCH-3: HB O(1) summary block */
+#define OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB     (1ULL << 2)  /* ARCH-6 */
 
 /* ═══════════════════════════════════════════════════════════════
  * NODE SLOT STATES
@@ -423,7 +442,10 @@ static inline uint64_t ocsfs_journal_region_size(uint16_t max_nodes, uint32_t jo
 }
 
 static inline uint64_t ocsfs_journal_offset(void) {
-    return OCSFS_LOCK_TABLE_OFF + OCSFS_LOCK_TABLE_SIZE;
+    /* CRIT-O1: the journal MUST start after the cluster-coordination metadata
+     * region (CAS lease, recovery leader, HB summary, key store), not at the end
+     * of the lock table — otherwise node 0's journal overlaps those structures. */
+    return OCSFS_METADATA_RESERVED_END;
 }
 
 static inline uint64_t ocsfs_ag_desc_offset(uint16_t max_nodes, uint32_t journal_size) {

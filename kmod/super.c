@@ -122,6 +122,16 @@ static int ocsfs_validate_super(struct ocsfs_disk_super *ds,
 				pr_err("ocsfs: s_journal_off (%llu) overlaps superblock\n", j_off);
 				return -EINVAL;
 			}
+			/* CRIT-O1: the per-node journal array must start at or after the
+			 * fixed cluster-coordination metadata region (CAS lease, recovery
+			 * leader, HB summary, key store).  Older volumes placed the journal
+			 * at LOCK_TABLE end, overlapping all of them — in clustered mode this
+			 * causes immediate cross-corruption.  Reject such volumes outright. */
+			if (j_off < OCSFS_METADATA_RESERVED_END) {
+				pr_err("ocsfs: s_journal_off (%llu) overlaps cluster metadata region (ends at %llu) — volume uses the broken pre-fix layout; reformat with current mkfs.ocsfs\n",
+				       j_off, (u64)OCSFS_METADATA_RESERVED_END);
+				return -EINVAL;
+			}
 			/* per-node journal regions must fit in device */
 			if (j_size == 0 || j_off + n_nodes * j_size > bdev_size) {
 				pr_err("ocsfs: journal layout exceeds device size\n");
@@ -428,6 +438,7 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	spin_lock_init(&sbi->s_free_lock);
 	mutex_init(&sbi->s_decompress_lock);
 	ocsfs_lock_init(&sbi->s_freeze_lock_res, 0, OCSFS_LOCKRES_FREEZE);
+	ocsfs_lock_init(&sbi->s_keystore_lock_res, 0, OCSFS_LOCKRES_KEYSTORE);
 
 	sbi->s_rc_buf_pool = mempool_create_kmalloc_pool(4, sbi->s_block_size);
 	if (!sbi->s_rc_buf_pool) {
@@ -512,12 +523,18 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		goto fail_journal;
 	}
 
-	ds->s_mount_count = cpu_to_le64(le64_to_cpu(ds->s_mount_count) + 1);
-	ds->s_last_mount_time = cpu_to_le64(ktime_get_real_ns());
-	ds->s_checksum = cpu_to_le32(ocsfs_crc32c(~0U, ds, OCSFS_SUPERBLOCK_SIZE - 4));
-	mark_buffer_dirty(bh);
-	sync_dirty_buffer(bh);
-	ocsfs_update_super_mirror(sb);
+	/* SB-1: only stamp the superblock on a read-write mount.  On a read-only
+	 * mount we must not write block 0 at all; in cluster mode two nodes mounting
+	 * concurrently would otherwise race on the shared superblock without any DLM
+	 * serialization, each clobbering the other's mount_count / checksum. */
+	if (!sb_rdonly(sb)) {
+		ds->s_mount_count = cpu_to_le64(le64_to_cpu(ds->s_mount_count) + 1);
+		ds->s_last_mount_time = cpu_to_le64(ktime_get_real_ns());
+		ds->s_checksum = cpu_to_le32(ocsfs_crc32c(~0U, ds, OCSFS_SUPERBLOCK_SIZE - 4));
+		mark_buffer_dirty(bh);
+		sync_dirty_buffer(bh);
+		ocsfs_update_super_mirror(sb);
+	}
 
 	/* ARCH-V3-1: log keys present in shared store so admins know which
 	 * FS_IOC_ADD_ENCRYPTION_KEY calls are needed on this node. */
