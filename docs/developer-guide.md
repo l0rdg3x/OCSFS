@@ -1229,6 +1229,48 @@ directories, 30-file create, removal without EIO, truncate, unmount/remount
 persistence, and a clean offline fsck. This is the first confirmed end-to-end
 mount + I/O + remount of OCSFS via the kernel module.
 
+#### Large buffered writes — known critical limitation (OPEN, 2026-05-30)
+
+Stress-testing larger buffered writes (≥ ~1 MiB, i.e. files that spill past the
+16 inline extents into the extent B+ tree) on the same node exposed a chain of
+concurrency bugs in the write/writeback/extent-btree interaction. Several were
+fixed; the underlying one is **still open**:
+
+Fixed along the way (all committed, all real bugs):
+- **iomap_end UNWRITTEN→WRITTEN convert deadlock** — converting under
+  `i_extent_lock` at peak dirty-page pressure deadlocked the writeback worker.
+  Conversion moved to the writeback path (`ocsfs_writeback_range`), keeping the
+  no-stale-data invariant (allocation stays UNWRITTEN → reads as zeroes, never
+  another file's freed contents — per the security review).
+- **Forced cross-node btree re-read** — `ext_btree_read`/`dir_btree_read`/
+  `rc_bt_read` did `clear_buffer_uptodate + bh_read` on every clustered access;
+  this broke read-your-own-writes and blocked forever in `__bh_read` on a
+  dirty/locked node under `i_extent_lock`. Now they read through the buffer
+  cache; cross-node metadata-block coherence is a TODO for the multi-node
+  testbed (handle at DLM acquisition, not per-access).
+- **Background dedup scrub** now off by default (mount `-o scrub`); it added
+  extent/refcount-btree lock contention to the heavy I/O path.
+
+**Still open — extent B+ tree corruption under concurrent modify.** On a write
+large enough to trigger inline writeback (`balance_dirty_pages →
+ocsfs_writepages → writeback_range`), the writeback's UNWRITTEN→WRITTEN
+conversion interleaves with the write's own extent-tree inserts and corrupts the
+B+ tree into a state with a child-pointer cycle. `ocsfs_btree_find_leaf` then
+descended forever, spinning on CPU while holding `i_extent_lock` and wedging the
+mount (only a hard reset recovered the node). Root cause not yet fixed — it is a
+btree insert/delete/split/convert concurrency or ordering bug in the
+write↔inline-writeback path, and needs a focused fix plus a debug kernel
+(lockdep/KASAN) and ideally real SCSI-CAW hardware (the software PR-lease CAS in
+`-o degraded` is CPU-bound and may interact). **Files that stay within 16 inline
+extents (≤ ~1 MiB, or sparse) and all metadata operations are unaffected.**
+
+Safety net (committed): `ocsfs_btree_find_leaf` now caps descent at
+`OCSFS_BTREE_MAX_DEPTH` (32) and returns `-EIO` on a deeper descent. Verified on
+the node: a 32 MiB write now fails with a clean `EIO` ("btree: descent exceeded
+32 levels … corrupt tree (cycle?), aborting") instead of an unrecoverable
+kernel hang — the mount and node stay recoverable. The corruption itself is
+still a bug; the cap only prevents it from taking down the kernel.
+
 ---
 
 ## 9. I/O Path

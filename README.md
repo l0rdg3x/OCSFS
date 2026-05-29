@@ -15,9 +15,15 @@ a Proxmox VE-native alternative to VMware VMFS.
 > a real Proxmox VE 9 node (kernel 7.0.6-2-pve) via `tests/kernel_smoke_test.sh`
 > (single node, loopback, `-o degraded`): mount, 8 MiB sha256 round-trip, nested
 > directories, file removal, truncate, unmount/remount persistence, and a clean
-> offline fsck all pass. Multi-node clustering has been extensively hardened but
-> has not yet been validated against a real multi-node SCSI-PR testbed. Do not use
-> with data that matters.
+> offline fsck all pass.
+>
+> **Known critical limitation:** large buffered writes (files that spill past 16
+> inline extents into the extent B+ tree, ≈ ≥1 MiB) currently corrupt the extent
+> B+ tree under concurrent inline writeback and fail with `EIO` (a descent-depth
+> safety net prevents the former kernel hang). Files within 16 inline extents and
+> all metadata operations are fine. See `docs/developer-guide.md` (§ "Large
+> buffered writes"). Multi-node clustering is hardened but not yet validated on a
+> real multi-node SCSI-PR testbed. **Do not use with data that matters.**
 
 ---
 
