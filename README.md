@@ -11,11 +11,12 @@ An open-source cluster filesystem for Linux targeting shared block storage
 a Proxmox VE-native alternative to VMware VMFS.
 
 > **Status: Alpha / Research.**
-> The kernel module builds. The on-disk format is exercised by the FUSE
-> prototype and the offline fsck on loopback images (data round-trips, fsck is
-> clean); a single-node kernel-module smoke test is provided in
-> `tests/kernel_smoke_test.sh`. Multi-node clustering has been extensively
-> hardened but has not yet been validated against a real testbed. Do not use
+> The kernel module builds, mounts, and round-trips data — verified end to end on
+> a real Proxmox VE 9 node (kernel 7.0.6-2-pve) via `tests/kernel_smoke_test.sh`
+> (single node, loopback, `-o degraded`): mount, 8 MiB sha256 round-trip, nested
+> directories, file removal, truncate, unmount/remount persistence, and a clean
+> offline fsck all pass. Multi-node clustering has been extensively hardened but
+> has not yet been validated against a real multi-node SCSI-PR testbed. Do not use
 > with data that matters.
 
 ---

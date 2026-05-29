@@ -1189,6 +1189,46 @@ FUSE-populated volumes clean. `tests/kernel_smoke_test.sh` (run as root) perform
 the same battery through the *actual kernel module* and is the definitive check
 that CRC-1 and the Sprint R layout fix let real volumes mount.
 
+#### Real kernel-module bring-up on a Proxmox node (2026-05-29)
+
+Running `tests/kernel_smoke_test.sh` on an actual Proxmox VE 9.2.3 node
+(kernel `7.0.6-2-pve`, loopback image, single node via `-o degraded`) surfaced
+two more bugs that only the real VFS/kernel path exposes:
+
+- **MODE-1 — root inode i_mode used the dirent file-type enum.** `mkfs` wrote the
+  root inode as `(OCSFS_FT_DIR << 12) | 0755`. `OCSFS_FT_DIR` is `2`, so that is
+  `0o20755 = S_IFCHR | 0755` — a character device. The kernel reads `i_mode` as a
+  standard VFS mode, so the root looked like a chardev and every mount failed
+  (`move_mount` → `EINVAL` on the new mount API, `ENOTDIR` on the legacy one).
+  Fixed: `mkfs` writes `S_IFDIR | 0755`. The `OCSFS_FT_*` enum belongs only in the
+  dirent `de_file_type` field, never in inode `i_mode`. (The FUSE prototype had
+  masked this by interpreting the top mode bits as `OCSFS_FT_*` itself — a
+  userspace-only convention that disagreed with the kernel.)
+
+- **BTREE-1 — btree node read callbacks broke read-your-own-writes inside a
+  transaction.** `ext_btree_read` / `dir_btree_read` / `rc_bt_read` force a fresh
+  disk re-read (`clear_buffer_uptodate` + `bh_read`) for cross-node cache
+  coherence. Done unconditionally, that discards nodes written earlier in the same
+  *uncommitted* transaction: when a file grows past 16 inline extents,
+  `ocsfs_extent_btree_migrate` allocates a new btree root and writes it through the
+  txn (buffer cache only, not yet flushed), then immediately reads it back — the
+  forced re-read returned zeros from the unflushed block and failed with
+  `btree: bad magic 00000000 at block 0` (`-EIO`). The net effect: **every write
+  larger than ~64 KiB failed with EIO.** `rc_bt_read` did the forced re-read even
+  on single-node volumes, so reflink/snapshot/dedup were affected regardless of
+  clustering. Fixed: force the cross-node re-read only on the read-only path
+  (`ctx->txn == NULL`); inside a write transaction (the inode EX lock is held)
+  read from the buffer cache. *(Follow-up for the multi-node testbed: btree-node
+  blocks are not in the inode page mapping, so first-read-in-txn cross-node
+  freshness must be ensured by invalidating metadata blocks at EX-acquisition
+  time — tracked for the cluster bring-up.)*
+
+**Result:** `tests/kernel_smoke_test.sh` is **all-pass through the real kernel
+module** — superblock CRC accepted, 8 MiB data sha256 round-trip, nested
+directories, 30-file create, removal without EIO, truncate, unmount/remount
+persistence, and a clean offline fsck. This is the first confirmed end-to-end
+mount + I/O + remount of OCSFS via the kernel module.
+
 ---
 
 ## 9. I/O Path
