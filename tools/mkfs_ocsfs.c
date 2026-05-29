@@ -354,7 +354,13 @@ static void format_device(int fd, uint64_t dev_size)
             memset(&root_ino, 0, sizeof(root_ino));
             root_ino.i_magic = OCSFS_INODE_MAGIC;
             root_ino.i_ino = OCSFS_ROOT_INO;
-            root_ino.i_mode = (OCSFS_FT_DIR << 12) | 0755;
+            /* i_mode is a standard VFS mode (S_IF* in the top bits), exactly as
+             * the kernel reads/writes it.  Do NOT encode the OCSFS_FT_* dirent
+             * file-type enum here: OCSFS_FT_DIR (2) << 12 is S_IFCHR, so the
+             * kernel would treat the root as a char device and refuse to mount
+             * with -ENOTDIR.  (The OCSFS_FT_* enum is only for dirent
+             * de_file_type, never for inode i_mode.) */
+            root_ino.i_mode = S_IFDIR | 0755;
             root_ino.i_nlink = 2; /* . and .. */
             root_ino.i_uid = 0;
             root_ino.i_gid = 0;
