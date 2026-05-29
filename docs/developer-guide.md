@@ -1139,6 +1139,58 @@ skipped entirely when `sb_rdonly(sb)`.
 
 ---
 
+### Sprint S — First real bring-up: it actually mounts now (2026-05-29)
+
+This sprint is the first time the on-disk format was exercised by *running code*
+(the FUSE prototype + the offline fsck) rather than only reviewed. That immediately
+surfaced two showstoppers that no amount of static review had caught.
+
+**CRC-1 — CRC32C convention mismatch between userspace and kernel (catastrophic).**
+The userspace `ocsfs_crc32c()` (`src/crc32c.c`) returned the *standard* CRC32C
+(`init 0xFFFFFFFF`, final XOR `0xFFFFFFFF`), while the kernel module computes
+checksums with the Linux `crc32c()` primitive (`crc32c(~0U, …)`, **no** final
+inversion — the ext4/btrfs convention). The two are exact bitwise complements, so
+**every superblock, AG descriptor and inode written by `mkfs.ocsfs` would be
+rejected by the kernel** with "checksum mismatch" — i.e. an mkfs-formatted volume
+could never mount. Fix: `src/crc32c.c` now drops the final inversion (keeping the
+initial-value inversion so a caller-supplied seed of `0` still becomes
+`0xFFFFFFFF`), making userspace one-shot checksums byte-identical to the kernel's.
+All 28 userspace call sites are one-shot integrity checksums (no continuation), so
+no call-site changes were needed. The Python `ocsfs-fsck` used `binascii.crc32`
+(zlib polynomial, not Castagnoli at all) — replaced with a real CRC32C table using
+the same raw convention.
+
+**DIRENT-1 — FUSE directory record stride 288 ≠ sizeof 286 → readdir EIO after
+removal.** `OCSFS_DIRENT_FIXED_SIZE` was hard-coded to 288 while the packed
+`struct ocsfs_dirent_fixed` is 286 bytes. `write_dir_entries()` copied
+`count*288` bytes out of a 286-strided array, leaking the first two bytes of the
+following slot onto disk; after an entry removal those leaked bytes carried a
+stale `de_magic`, so the 286-strided reader saw a phantom entry with an empty
+name and the kernel FUSE layer failed the whole `getdents` with `EIO`. Fixed by
+tying the constant to `sizeof(struct ocsfs_dirent_fixed)` (with a
+`_Static_assert`), zeroing the vacated tail slot in `dir_remove_entry()`, and
+skipping empty names defensively in `readdir`.
+
+**Build + tooling fixes:** the FUSE prototype did not compile (three `pwrite`
+return values ignored under `-Werror`); `ocsfs-fsck` was reconciled to the real
+on-disk layout (superblock checksum at offset 4092, real `ocsfs_ag_desc` /
+`ocsfs_journal_header` field layouts, AG-relative→absolute bitmap/inode offsets,
+journal offsets taken from the superblock, correct `OCSFS_AG_MAGIC` = `0x41474850`,
+correct inode `i_flags` offset 64 and a safe orphan-repair write path). The legacy
+fixed refcount-table spot-check was removed (refcounts now live in a per-AG B+
+tree), and the bitmap free-count cross-check was downgraded to advisory so it can
+never drive a destructive `--repair`.
+
+**Verification (no special hardware):** with the FUSE prototype on a loopback
+image — 8 MiB random data sha256 round-trip, 50+ file create, removal without
+EIO, nested directories, truncate, and unmount/remount persistence all pass; the
+userspace test suite is 85/85; `ocsfs-fsck` validates both freshly-formatted and
+FUSE-populated volumes clean. `tests/kernel_smoke_test.sh` (run as root) performs
+the same battery through the *actual kernel module* and is the definitive check
+that CRC-1 and the Sprint R layout fix let real volumes mount.
+
+---
+
 ## 9. I/O Path
 
 ### Data (regular files) — iomap path

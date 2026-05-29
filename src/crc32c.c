@@ -40,9 +40,20 @@ uint32_t ocsfs_crc32c(uint32_t crc, const void *data, size_t len)
         crc32c_init_table();
 
     const uint8_t *buf = (const uint8_t *)data;
+    /*
+     * Match the Linux kernel's crc32c() convention used by the ocsfs kernel
+     * module.  The start seed is inverted (so a caller-supplied 0 becomes the
+     * conventional 0xFFFFFFFF initial value) but the result is NOT final-XORed.
+     * The kernel computes integrity checksums as crc32c(~0U, data, len) with no
+     * final inversion; mkfs/tools call this with seed 0, so both must produce
+     * the identical raw value or the kernel rejects every superblock, AG
+     * descriptor and inode written by userspace.  This previously returned ~crc
+     * (the standard CRC32C value) — the bitwise complement of what the kernel
+     * verifies — which made every mkfs-formatted volume unmountable.
+     */
     crc = ~crc;
     while (len--) {
         crc = crc32c_table[(crc ^ *buf++) & 0xFF] ^ (crc >> 8);
     }
-    return ~crc;
+    return crc;
 }

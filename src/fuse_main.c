@@ -137,7 +137,9 @@ static void free_inode(uint64_t ino)
     uint64_t off = ag_data_start(ag_num) +
                    fs.ag_descs[ag_num].ag_inode_table_off +
                    local * OCSFS_INODE_SIZE;
-    pwrite(fs.dev_fd, &zero, sizeof(zero), off);
+    if (pwrite(fs.dev_fd, &zero, sizeof(zero), off) != (ssize_t)sizeof(zero))
+        fprintf(stderr, "ocsfs-fuse: free_inode: pwrite failed: %s\n",
+                strerror(errno));
 }
 
 /* ─── Block allocation (simple bump allocator for prototype) ── */
@@ -170,8 +172,6 @@ static uint64_t alloc_data_block(void)
 /* ─── Directory entry storage ──────────────────────────────── */
 
 /* Fixed-size directory entry matching dir.c */
-#define OCSFS_DIRENT_FIXED_SIZE 288
-
 struct ocsfs_dirent_fixed {
     uint32_t    de_magic;
     uint64_t    de_ino;
@@ -182,6 +182,17 @@ struct ocsfs_dirent_fixed {
     uint16_t    de_checksum;
     uint8_t     de_padding[6];
 } __attribute__((packed));
+
+/* On-disk record stride MUST equal the packed struct size.  It was previously
+ * hard-coded to 288 while the packed struct is 286 bytes: write_dir_entries()
+ * copied count*288 bytes out of a 286-strided array, leaking the first 2 bytes
+ * of the following slot onto disk.  The 286-strided reader then interpreted a
+ * stale de_magic in that leak as a phantom entry with an empty name — which made
+ * the kernel FUSE layer return EIO on readdir after any entry removal.  Tie the
+ * constant to sizeof so the two can never diverge again. */
+#define OCSFS_DIRENT_FIXED_SIZE (sizeof(struct ocsfs_dirent_fixed))
+_Static_assert(sizeof(struct ocsfs_dirent_fixed) == 286,
+               "ocsfs_dirent_fixed must be 286 bytes (packed)");
 
 static uint64_t name_hash(const char *name, size_t len)
 {
@@ -219,7 +230,9 @@ static uint64_t dir_data_offset(struct ocsfs_inode *dir_ino, int allocate)
     /* Zero the new block */
     uint8_t *zbuf = calloc(1, fs.sb.s_block_size);
     if (zbuf) {
-        pwrite(fs.dev_fd, zbuf, fs.sb.s_block_size, block * fs.sb.s_block_size);
+        if (pwrite(fs.dev_fd, zbuf, fs.sb.s_block_size,
+                   block * fs.sb.s_block_size) != (ssize_t)fs.sb.s_block_size)
+            fprintf(stderr, "ocsfs-fuse: zero block failed: %s\n", strerror(errno));
         free(zbuf);
     }
 
@@ -398,6 +411,8 @@ static int dir_remove_entry(struct ocsfs_inode *dir_ino, uint64_t dir_ino_num,
                 (count - found - 1) * sizeof(struct ocsfs_dirent_fixed));
     }
     count--;
+    /* Clear the now-vacated tail slot so no stale de_magic survives on disk. */
+    memset(&entries[count], 0, sizeof(struct ocsfs_dirent_fixed));
 
     int ret = write_dir_entries(dir_ino, entries, count);
     if (ret == 0) {
@@ -574,6 +589,12 @@ static int ocsfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
             if (strcmp(entries[i].de_name, ".") == 0 ||
                 strcmp(entries[i].de_name, "..") == 0)
                 continue;
+            /* Defensive: never feed an empty name to the kernel — it rejects the
+             * dirent and fails the whole getdents with EIO.  (de_name_len is
+             * uint8_t, so it is intrinsically <= OCSFS_MAX_NAME_LEN = 255.) */
+            if (entries[i].de_name_len == 0)
+                continue;
+            entries[i].de_name[OCSFS_MAX_NAME_LEN] = '\0';
             filler(buf, entries[i].de_name, NULL, 0, 0);
         }
         free(entries);
@@ -880,7 +901,9 @@ static int ocsfs_write(const char *path __attribute__((unused)),
             /* Zero new block first */
             uint8_t *zbuf = calloc(1, bs);
             if (zbuf) {
-                pwrite(fs.dev_fd, zbuf, bs, new_block * bs);
+                if (pwrite(fs.dev_fd, zbuf, bs, new_block * bs) != (ssize_t)bs)
+                    fprintf(stderr, "ocsfs-fuse: zero new block failed: %s\n",
+                            strerror(errno));
                 free(zbuf);
             }
 

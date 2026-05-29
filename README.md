@@ -11,9 +11,12 @@ An open-source cluster filesystem for Linux targeting shared block storage
 a Proxmox VE-native alternative to VMware VMFS.
 
 > **Status: Alpha / Research.**
-> The kernel module builds and runs. Single-node I/O is stable.
-> Multi-node clustering has been extensively hardened but has not yet been
-> validated against a real testbed. Do not use with data that matters.
+> The kernel module builds. The on-disk format is exercised by the FUSE
+> prototype and the offline fsck on loopback images (data round-trips, fsck is
+> clean); a single-node kernel-module smoke test is provided in
+> `tests/kernel_smoke_test.sh`. Multi-node clustering has been extensively
+> hardened but has not yet been validated against a real testbed. Do not use
+> with data that matters.
 
 ---
 
@@ -38,6 +41,16 @@ changelog.
 > with the current `mkfs.ocsfs`** — the kernel now refuses the old overlapping
 > layout. The same sprint fixed the Proxmox mount helper (infinite recursion)
 > and made the plugin pass the cluster secret at mount.
+
+> **Sprint S (2026-05-29) — first real bring-up.** Running the format (not just
+> reviewing it) exposed two more showstoppers: the userspace CRC32C used the
+> standard final-inverted convention while the kernel uses the raw ext4/btrfs
+> convention — the bitwise complement — so the kernel would reject every
+> mkfs-written superblock/inode (volumes could never mount); and a directory
+> record stride bug (288 vs 286 bytes) corrupted directory blocks after any file
+> removal (`readdir` → EIO). Both fixed. The FUSE prototype now compiles and
+> round-trips data, `ocsfs-fsck` was reconciled to the real on-disk layout, and
+> `tests/kernel_smoke_test.sh` verifies the kernel module end to end on loopback.
 
 | Scenario | Estimated score |
 |---|---|
