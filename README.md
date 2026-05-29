@@ -33,7 +33,7 @@ changelog.
 |---|---|
 | Single-node read/write | ~92% |
 | Multi-node — stable workload | ~93% |
-| Multi-node — crash + recovery | ~88% |
+| Multi-node — crash + recovery | ~90% |
 | Multi-node — with encryption | ~85% |
 | VMFS feature parity | ~70% |
 
