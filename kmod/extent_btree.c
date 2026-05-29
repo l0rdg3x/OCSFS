@@ -55,11 +55,21 @@ static int ext_btree_read(void *ctx, u64 block, void *buf, u32 size)
 	struct ext_btree_ctx *ec = ctx;
 	struct buffer_head *bh;
 
-	if (OCSFS_SB(ec->sb)->s_clustered) {
+	if (OCSFS_SB(ec->sb)->s_clustered && !ec->txn) {
 		/*
-		 * In cluster mode the page cache is not coherent across nodes.
-		 * After another node takes EX, modifies, and flushes the btree
-		 * nodes, our next read must bypass our stale cached copy.
+		 * Read-only path (no active write transaction): in cluster mode the
+		 * page cache is not coherent across nodes, so after another node
+		 * takes EX, modifies, and flushes the btree nodes, our next read must
+		 * bypass our stale cached copy with a forced disk re-read.
+		 *
+		 * This MUST NOT happen for reads issued inside our own write
+		 * transaction (ec->txn set): a node we just wrote (e.g. a freshly
+		 * created btree root during migrate) lives only in the buffer cache
+		 * until the transaction commits, so clearing uptodate + re-reading
+		 * would read zeros from the just-allocated-but-unflushed block and
+		 * fail with "bad magic 00000000". Inside a txn we hold the inode EX
+		 * lock, so read-your-own-writes from the cache is both correct and
+		 * required.
 		 */
 		bh = sb_getblk(ec->sb, block);
 		if (!bh)

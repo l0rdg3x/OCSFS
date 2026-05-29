@@ -27,16 +27,31 @@ struct ocsfs_rc_io_ctx {
 
 static int rc_bt_read(void *ctx, u64 block, void *buf, u32 size)
 {
-	struct super_block *sb = ((struct ocsfs_rc_io_ctx *)ctx)->sb;
+	struct ocsfs_rc_io_ctx *rctx = ctx;
+	struct super_block *sb = rctx->sb;
 	struct buffer_head *bh;
 
-	bh = sb_getblk(sb, block);
-	if (!bh)
-		return -EIO;
-	clear_buffer_uptodate(bh);
-	if (bh_read(bh, 0) < 0) {
-		brelse(bh);
-		return -EIO;
+	/*
+	 * Forced fresh disk re-read is for cross-node coherence on the read-only
+	 * path only. Inside a write transaction (rctx->txn set) we must read our
+	 * own uncommitted node writes from the cache — otherwise a just-allocated
+	 * refcount-btree root/node reads back as zeros ("bad magic 00000000")
+	 * during reflink / snapshot / dedup. (The previous unconditional re-read
+	 * broke read-your-own-writes even on single-node volumes.)
+	 */
+	if (OCSFS_SB(sb)->s_clustered && !rctx->txn) {
+		bh = sb_getblk(sb, block);
+		if (!bh)
+			return -EIO;
+		clear_buffer_uptodate(bh);
+		if (bh_read(bh, 0) < 0) {
+			brelse(bh);
+			return -EIO;
+		}
+	} else {
+		bh = sb_bread(sb, block);
+		if (!bh)
+			return -EIO;
 	}
 	memcpy(buf, bh->b_data, size);
 	brelse(bh);

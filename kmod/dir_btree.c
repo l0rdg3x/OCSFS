@@ -55,7 +55,15 @@ static int dir_btree_read(void *ctx, u64 block, void *buf, u32 size)
 	struct dir_btree_ctx *dc = ctx;
 	struct buffer_head *bh;
 
-	if (OCSFS_SB(dc->sb)->s_clustered) {
+	/*
+	 * Force a fresh disk read for cross-node coherence only on the read-only
+	 * path (dc->txn == NULL). Inside our own write transaction we must read
+	 * our own uncommitted node writes from the buffer cache — a forced
+	 * re-read would return zeros from a just-allocated-but-unflushed block
+	 * (e.g. the new root during a directory btree migrate) and fail with
+	 * "bad magic 00000000". We hold the inode EX lock for the whole txn.
+	 */
+	if (OCSFS_SB(dc->sb)->s_clustered && !dc->txn) {
 		bh = sb_getblk(dc->sb, block);
 		if (!bh)
 			return -EIO;
