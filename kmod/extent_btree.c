@@ -55,35 +55,26 @@ static int ext_btree_read(void *ctx, u64 block, void *buf, u32 size)
 	struct ext_btree_ctx *ec = ctx;
 	struct buffer_head *bh;
 
-	if (OCSFS_SB(ec->sb)->s_clustered && !ec->txn) {
-		/*
-		 * Read-only path (no active write transaction): in cluster mode the
-		 * page cache is not coherent across nodes, so after another node
-		 * takes EX, modifies, and flushes the btree nodes, our next read must
-		 * bypass our stale cached copy with a forced disk re-read.
-		 *
-		 * This MUST NOT happen for reads issued inside our own write
-		 * transaction (ec->txn set): a node we just wrote (e.g. a freshly
-		 * created btree root during migrate) lives only in the buffer cache
-		 * until the transaction commits, so clearing uptodate + re-reading
-		 * would read zeros from the just-allocated-but-unflushed block and
-		 * fail with "bad magic 00000000". Inside a txn we hold the inode EX
-		 * lock, so read-your-own-writes from the cache is both correct and
-		 * required.
-		 */
-		bh = sb_getblk(ec->sb, block);
-		if (!bh)
-			return -EIO;
-		clear_buffer_uptodate(bh);
-		if (bh_read(bh, 0) < 0) {
-			brelse(bh);
-			return -EIO;
-		}
-	} else {
-		bh = sb_bread(ec->sb, block);
-		if (!bh)
-			return -EIO;
-	}
+	/*
+	 * Always read through the buffer cache (sb_bread).  The previous design
+	 * force-re-read every clustered btree node from disk (clear_uptodate +
+	 * bh_read) for cross-node coherence, but that was both incorrect and
+	 * deadlock-prone: it discarded nodes written earlier in our own
+	 * uncommitted transaction (read-your-own-writes), and — worse — under a
+	 * large buffered write it re-read a btree node whose buffer was dirty/
+	 * locked by the concurrent writeback conversion while we held
+	 * i_extent_lock, blocking forever in __bh_read and deadlocking the
+	 * writeback worker that needs the same lock.
+	 *
+	 * Cached reads are correct on a single node and within a transaction (we
+	 * just wrote the node, so the cache is authoritative).  Cross-node
+	 * coherence of btree-node *metadata* blocks must be re-established by
+	 * invalidating them at DLM lock acquisition (epoch change), NOT by a
+	 * blocking re-read on every access — TODO for the multi-node testbed.
+	 */
+	bh = sb_bread(ec->sb, block);
+	if (!bh)
+		return -EIO;
 	memcpy(buf, bh->b_data, size);
 	brelse(bh);
 	return 0;

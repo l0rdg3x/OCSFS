@@ -56,27 +56,16 @@ static int dir_btree_read(void *ctx, u64 block, void *buf, u32 size)
 	struct buffer_head *bh;
 
 	/*
-	 * Force a fresh disk read for cross-node coherence only on the read-only
-	 * path (dc->txn == NULL). Inside our own write transaction we must read
-	 * our own uncommitted node writes from the buffer cache — a forced
-	 * re-read would return zeros from a just-allocated-but-unflushed block
-	 * (e.g. the new root during a directory btree migrate) and fail with
-	 * "bad magic 00000000". We hold the inode EX lock for the whole txn.
+	 * Always read through the buffer cache.  The old forced disk re-read for
+	 * cross-node coherence broke read-your-own-writes and could block forever
+	 * in __bh_read on a dirty/locked node under i_extent_lock (deadlocking
+	 * writeback).  Cross-node btree-metadata coherence must be re-established
+	 * at DLM lock acquisition — TODO for the multi-node testbed.  See
+	 * ext_btree_read() for the full rationale.
 	 */
-	if (OCSFS_SB(dc->sb)->s_clustered && !dc->txn) {
-		bh = sb_getblk(dc->sb, block);
-		if (!bh)
-			return -EIO;
-		clear_buffer_uptodate(bh);
-		if (bh_read(bh, 0) < 0) {
-			brelse(bh);
-			return -EIO;
-		}
-	} else {
-		bh = sb_bread(dc->sb, block);
-		if (!bh)
-			return -EIO;
-	}
+	bh = sb_bread(dc->sb, block);
+	if (!bh)
+		return -EIO;
 	memcpy(buf, bh->b_data, size);
 	brelse(bh);
 	return 0;

@@ -32,27 +32,17 @@ static int rc_bt_read(void *ctx, u64 block, void *buf, u32 size)
 	struct buffer_head *bh;
 
 	/*
-	 * Forced fresh disk re-read is for cross-node coherence on the read-only
-	 * path only. Inside a write transaction (rctx->txn set) we must read our
-	 * own uncommitted node writes from the cache — otherwise a just-allocated
-	 * refcount-btree root/node reads back as zeros ("bad magic 00000000")
-	 * during reflink / snapshot / dedup. (The previous unconditional re-read
-	 * broke read-your-own-writes even on single-node volumes.)
+	 * Always read through the buffer cache.  The old forced disk re-read for
+	 * cross-node coherence broke read-your-own-writes (a just-allocated
+	 * refcount-btree node read back as zeros during reflink/snapshot/dedup)
+	 * and could block in __bh_read on a dirty/locked node while holding a
+	 * lock.  Cross-node coherence of refcount-btree metadata must be handled
+	 * at DLM acquisition — TODO for the multi-node testbed.  See
+	 * ext_btree_read() for the full rationale.
 	 */
-	if (OCSFS_SB(sb)->s_clustered && !rctx->txn) {
-		bh = sb_getblk(sb, block);
-		if (!bh)
-			return -EIO;
-		clear_buffer_uptodate(bh);
-		if (bh_read(bh, 0) < 0) {
-			brelse(bh);
-			return -EIO;
-		}
-	} else {
-		bh = sb_bread(sb, block);
-		if (!bh)
-			return -EIO;
-	}
+	bh = sb_bread(sb, block);
+	if (!bh)
+		return -EIO;
 	memcpy(buf, bh->b_data, size);
 	brelse(bh);
 	return 0;
