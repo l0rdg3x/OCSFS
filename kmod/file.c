@@ -675,10 +675,16 @@ static long ocsfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return fscrypt_ioctl_get_nonce(file, (void __user *)arg);
 	case OCSFS_IOC_KEY_LIST: {
 		/* List key identifiers stored in the shared key store.
-		 * Does not return raw key material — safe for unprivileged use. */
+		 * Requires CAP_SYS_ADMIN: enumerating which key IDs are present
+		 * reveals the cluster encryption topology without needing raw key
+		 * material, which is more powerful than fscrypt's own KEY_STATUS
+		 * ioctl (that requires prior knowledge of the ID). */
 		struct ocsfs_key_list_arg kla;
 		u32 count = 0;
 		int kret;
+
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
 
 		memset(&kla, 0, sizeof(kla));
 		kret = ocsfs_key_store_list(inode->i_sb, kla.kla_keys,
