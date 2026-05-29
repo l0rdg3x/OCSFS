@@ -9,6 +9,29 @@
 
 static int write_node(struct ocsfs_btree *bt, u64 block, const void *buf)
 {
+	/* DIAG: catch the exact write that gives an internal node a child pointer
+	 * to itself (the self-loop that makes find_leaf cycle).  Dump the stack so
+	 * the offending caller/path is identified at the source. */
+	const struct ocsfs_btree_node_hdr *h = node_hdr((void *)buf);
+
+	if (!(le16_to_cpu(h->bn_flags) & OCSFS_BTREE_NODE_LEAF)) {
+		const struct ocsfs_btree_ptr *p = internal_ptrs((void *)buf);
+		u64 fc = le64_to_cpu(*internal_first_child((void *)buf));
+		int i, n = le16_to_cpu(h->bn_count);
+
+		if (fc == block) {
+			pr_err("ocsfs: btree WRITE self-loop: block %llu first_child==self (count=%d)\n",
+			       block, n);
+			dump_stack();
+		}
+		for (i = 0; i < n; i++)
+			if (le64_to_cpu(p[i].child) == block) {
+				pr_err("ocsfs: btree WRITE self-loop: block %llu ptr[%d].child==self\n",
+				       block, i);
+				dump_stack();
+				break;
+			}
+	}
 	return bt->write_block(bt->io_ctx, block, buf, bt->block_size);
 }
 
