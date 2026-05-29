@@ -323,7 +323,17 @@ void ocsfs_dedup_scrub_start(struct super_block *sb)
 	if (!(sbi->s_feature_ro_compat & OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB))
 		return;
 
+	/* Always initialise the work so ocsfs_dedup_scrub_stop() can safely
+	 * cancel it, but only run the scrub when explicitly requested. The
+	 * background scrub walks the extent/refcount B+ trees under i_extent_lock
+	 * and competes with the write/writeback paths for those locks; running it
+	 * by default adds lock contention to an already heavy I/O path. Off by
+	 * default — enable with mount option 'scrub'. */
 	INIT_DELAYED_WORK(&sbi->s_dedup_scrub_work, ocsfs_dedup_scrub_fn);
+	if (!sbi->s_scrub_enabled) {
+		pr_info("ocsfs: background dedup scrub disabled (mount -o scrub to enable)\n");
+		return;
+	}
 	queue_delayed_work(system_wq, &sbi->s_dedup_scrub_work,
 			   OCSFS_DEDUP_SCRUB_INTERVAL_JIFFIES);
 }

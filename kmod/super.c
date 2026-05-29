@@ -16,6 +16,7 @@ struct ocsfs_fs_context {
 	u8   fc_secret[32];
 	bool fc_has_secret;
 	bool fc_degraded;
+	bool fc_scrub;
 };
 
 /* inode slab */
@@ -405,6 +406,7 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 			sbi->s_auth_required = true;
 		}
 		sbi->s_degraded = ctx->fc_degraded;
+		sbi->s_scrub_enabled = ctx->fc_scrub;
 	}
 
 	/* Cache frequently-used fields */
@@ -689,6 +691,7 @@ static int ocsfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 	int i;
 
 	if (strcmp(param->key, "degraded") == 0) { ctx->fc_degraded = true; return 0; }
+	if (strcmp(param->key, "scrub") == 0) { ctx->fc_scrub = true; return 0; }
 	if (strcmp(param->key, "cluster_secret") != 0)
 		return -ENOPARAM;
 

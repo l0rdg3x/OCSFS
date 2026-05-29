@@ -815,6 +815,7 @@ struct ocsfs_sb_info {
 	bool            s_caw_supported;
 	bool            s_pr_capable;   /* device has working SCSI PR (pr_register + pr_preempt) */
 	bool            s_degraded;     /* mount option: allow cluster without fencing */
+	bool            s_scrub_enabled; /* mount option 'scrub': run background dedup scrub */
 	enum ocsfs_cas_backend s_cas_backend;
 
 	/* ZSTD decompression workspace — lazy-allocated on first ZSTD read */
