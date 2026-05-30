@@ -11,14 +11,51 @@
 #include <linux/fileattr.h>
 #include <linux/quotaops.h>
 #include <linux/fscrypt.h>
+#include <linux/bio.h>
 #include "ocsfs.h"
 
 /* ═══════════════════════════════════════════════════════════════
  * READ INODE FROM DISK
  * ═══════════════════════════════════════════════════════════════ */
 
+/*
+ * Read one fs block straight from the device into a caller buffer, bypassing
+ * the page/buffer cache.  Needed for cross-node inode refresh: an inode block
+ * holds 8 inodes, so we must NOT clear_buffer_uptodate() the shared cached
+ * buffer — that would corrupt a concurrent local transaction modifying a
+ * co-located inode in the same block.  Reading into a private page leaves the
+ * shared cache untouched while still returning the peer's latest flushed data.
+ */
+static int ocsfs_read_block_uncached(struct super_block *sb, u64 block,
+				     void *buf)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	struct bio *bio;
+	struct page *page;
+	int ret;
+
+	page = alloc_page(GFP_NOFS);
+	if (!page)
+		return -ENOMEM;
+
+	bio = bio_alloc(sb->s_bdev, 1, REQ_OP_READ, GFP_NOFS);
+	if (!bio) {
+		__free_page(page);
+		return -ENOMEM;
+	}
+	bio->bi_iter.bi_sector = block * (sbi->s_block_size >> 9);
+	__bio_add_page(bio, page, sbi->s_block_size, 0);
+	ret = submit_bio_wait(bio);
+	bio_put(bio);
+
+	if (ret == 0)
+		memcpy(buf, page_address(page), sbi->s_block_size);
+	__free_page(page);
+	return ret;
+}
+
 static int ocsfs_read_disk_inode(struct super_block *sb, u64 ino,
-				 struct ocsfs_disk_inode *di)
+				 struct ocsfs_disk_inode *di, bool uncached)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	struct buffer_head *bh;
@@ -26,12 +63,29 @@ static int ocsfs_read_disk_inode(struct super_block *sb, u64 ino,
 	u64 block = off / sbi->s_block_size;
 	u32 boff = off % sbi->s_block_size;
 
-	bh = sb_bread(sb, block);
-	if (!bh)
-		return -EIO;
+	if (uncached) {
+		/* Cross-node refresh: read the block fresh from disk into a
+		 * private buffer (the cached copy may be a stale peer write). */
+		void *blk = kmalloc(sbi->s_block_size, GFP_NOFS);
+		int ret;
 
-	memcpy(di, bh->b_data + boff, sizeof(*di));
-	brelse(bh);
+		if (!blk)
+			return -ENOMEM;
+		ret = ocsfs_read_block_uncached(sb, block, blk);
+		if (ret) {
+			kfree(blk);
+			return -EIO;
+		}
+		memcpy(di, (u8 *)blk + boff, sizeof(*di));
+		kfree(blk);
+	} else {
+		bh = sb_bread(sb, block);
+		if (!bh)
+			return -EIO;
+
+		memcpy(di, bh->b_data + boff, sizeof(*di));
+		brelse(bh);
+	}
 
 	if (le32_to_cpu(di->i_magic) != OCSFS_INODE_MAGIC)
 		return -EINVAL;
@@ -45,28 +99,15 @@ static int ocsfs_read_disk_inode(struct super_block *sb, u64 ino,
 	return 0;
 }
 
-static void ocsfs_inode_invalidate_cache(struct super_block *sb, u64 ino)
-{
-	/*
-	 * Deliberately a no-op.
-	 *
-	 * This used to clear_buffer_uptodate() + bh_read() the inode's block to
-	 * force a fresh disk read for cross-node coherence.  That is actively
-	 * harmful: inode blocks hold 8 inodes each, so invalidating one inode's
-	 * block clears the uptodate flag of a block that a CONCURRENT transaction
-	 * (modifying a different inode in the same block) is holding — at commit
-	 * that transaction trips mark_buffer_dirty(!uptodate) and writes garbage,
-	 * corrupting data under concurrent writers.  It also discards newer
-	 * write-back-cached inode data in favour of a staler on-disk copy, which
-	 * is wrong even on a single node.
-	 *
-	 * Cross-node coherence (picking up an inode another node modified and
-	 * flushed) must instead be re-established by invalidating the specific
-	 * block at DLM SH/EX acquisition time — TODO for the multi-node testbed.
-	 */
-	(void)sb;
-	(void)ino;
-}
+/*
+ * Cross-node inode coherence is now handled by reading the inode block fresh
+ * from disk into a private buffer (ocsfs_read_block_uncached / the `uncached`
+ * arg of ocsfs_read_disk_inode) at DLM-lock acquisition (iget) and refresh
+ * time.  That avoids the old clear_buffer_uptodate()+bh_read() approach, which
+ * corrupted concurrent local transactions on the other 7 inodes sharing the
+ * block.  References to "ocsfs_inode_invalidate_cache" in nearby comments are
+ * historical.
+ */
 
 /* Parse inline extents from the on-disk inode */
 static void ocsfs_parse_extents(struct ocsfs_inode_info *oi,
@@ -126,10 +167,12 @@ struct inode *ocsfs_iget(struct super_block *sb, u64 ino)
 			iget_failed(inode);
 			return ERR_PTR(ret);
 		}
-		ocsfs_inode_invalidate_cache(sb, ino);
 	}
 
-	ret = ocsfs_read_disk_inode(sb, ino, &di);
+	/* Cross-node: read the inode fresh from disk when clustered.  A peer may
+	 * have just created this inode in a block we cached (8 inodes/block) when
+	 * its slot was still empty — the cached copy would miss it (-> EINVAL). */
+	ret = ocsfs_read_disk_inode(sb, ino, &di, sbi->s_clustered);
 	if (ret) {
 		if (sbi->s_clustered)
 			ocsfs_lock_release(sb, &oi->i_lock_res);
@@ -270,8 +313,11 @@ int ocsfs_inode_refresh(struct inode *inode)
 	if (inode_state_read(inode) & (I_DIRTY | I_SYNC))
 		return 0;
 
-	ocsfs_inode_invalidate_cache(inode->i_sb, oi->i_disk_ino);
-	ret = ocsfs_read_disk_inode(inode->i_sb, oi->i_disk_ino, &di);
+	/* Cross-node coherence: in clustered mode read the inode block fresh
+	 * from disk (bypassing the cache) so we pick up a peer's flushed changes
+	 * — the whole point of refreshing under the DLM lock. */
+	ret = ocsfs_read_disk_inode(inode->i_sb, oi->i_disk_ino, &di,
+				    sbi->s_clustered);
 	if (ret)
 		return ret;
 	mutex_lock(&oi->i_extent_lock);
@@ -289,9 +335,16 @@ int ocsfs_inode_refresh(struct inode *inode)
 	oi->i_flags            = le32_to_cpu(di.i_flags);
 	oi->i_extent_tree_root = le64_to_cpu(di.i_extent_tree_root);
 	oi->i_xattr_block      = le64_to_cpu(di.i_xattr_block);
+	/* Cross-node directory coherence: pick up dirents a peer added/removed.
+	 * Without refreshing these a peer's new files stay invisible (the in-core
+	 * btree root / entry count would point at the pre-change directory). */
+	oi->i_dir_btree_root   = le64_to_cpu(di.i_dir_btree_root);
+	oi->i_dirent_count     = le32_to_cpu(di.i_dirent_count);
 
 	if ((oi->i_extent_tree_root &&
 	     oi->i_extent_tree_root >= sbi->s_total_blocks) ||
+	    (oi->i_dir_btree_root &&
+	     oi->i_dir_btree_root >= sbi->s_total_blocks) ||
 	    (oi->i_xattr_block && oi->i_xattr_block >= sbi->s_total_blocks)) {
 		pr_err_ratelimited("ocsfs: inode %llu: corrupt block pointers on refresh\n",
 				   oi->i_disk_ino);
@@ -409,6 +462,23 @@ int ocsfs_flush_inode_locked(struct inode *inode, bool force_sync)
 		sync_dirty_buffer(bh);
 	if (ret == 0)
 		oi->i_extents_dirty = false;  /* on-disk inode now matches memory */
+	if (ret == 0 && force_sync && sbi->s_clustered) {
+		/*
+		 * Cross-node coherence: this metadata flush is write-through (done
+		 * synchronously under DLM EX), so the on-disk inode is now current.
+		 * Drop the VFS metadata-dirty flags so a later ocsfs_inode_refresh
+		 * — which skips I_DIRTY inodes to protect in-flight local changes —
+		 * can pick up a *peer's* changes instead of being stuck on our own
+		 * already-flushed (but still dirty-flagged) copy.  This is what makes
+		 * a node that has modified a directory still see a peer's later
+		 * additions to it.  I_DIRTY_PAGES is left untouched: data-page
+		 * writeback is independent of this inode metadata flush.
+		 */
+		spin_lock(&inode->i_lock);
+		inode_state_clear(inode,
+				  I_DIRTY_SYNC | I_DIRTY_DATASYNC | I_DIRTY_TIME);
+		spin_unlock(&inode->i_lock);
+	}
 	brelse(bh);
 	return ret;
 

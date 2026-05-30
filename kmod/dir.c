@@ -34,13 +34,27 @@ struct buffer_head *ocsfs_dir_bread(struct inode *dir, u64 logical_block)
 	phys_block = ext.physical_block + (logical_block - ext.logical_block);
 
 	/*
-	 * Cached read.  A forced fresh re-read clears the uptodate flag of a
-	 * directory block a concurrent transaction may be holding, and discards
-	 * our own uncommitted changes (read-your-own-writes).  Cross-node
-	 * coherence of directory blocks is a DLM-acquire-time TODO — see
-	 * ocsfs_inode_invalidate_cache().
+	 * Cross-node coherence: when clustered AND this directory has no local
+	 * uncommitted changes (clean — a local modifier would hold it I_DIRTY),
+	 * force a fresh read so a peer's added/removed dirents are visible.  The
+	 * clean check preserves read-your-own-writes and avoids clearing the
+	 * uptodate flag of a block a concurrent local transaction is mutating.
+	 * Directory data blocks are not shared between inodes, so a forced reread
+	 * here is safe (unlike inode blocks — see ocsfs_read_block_uncached()).
 	 */
-	(void)sbi;
+	if (sbi->s_clustered &&
+	    !(inode_state_read(dir) & (I_DIRTY | I_SYNC))) {
+		struct buffer_head *bh = sb_getblk(dir->i_sb, phys_block);
+
+		if (!bh)
+			return NULL;
+		clear_buffer_uptodate(bh);
+		if (bh_read(bh, 0) < 0) {
+			brelse(bh);
+			return NULL;
+		}
+		return bh;
+	}
 	return sb_bread(dir->i_sb, phys_block);
 }
 

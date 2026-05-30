@@ -41,6 +41,35 @@ static struct buffer_head *ocsfs_meta_getblk(struct super_block *sb, u64 blkno)
 	return sb_bread(sb, blkno);
 }
 
+/*
+ * Cross-node fresh read of an inode-table block for the allocator: a cached
+ * copy can miss a peer's just-committed inode allocations, so two nodes would
+ * hand out the SAME inode number (data loss — confirmed on the 2-node testbed).
+ * Each caller holds the AG EX lock, which serialises allocation across nodes,
+ * so the forced reread reflects the peer's committed state.  Only used for the
+ * inode-table scan (each slot's block is read once, then written), NOT the
+ * block bitmap (whose read-modify-write within one txn must not be re-read).
+ */
+static struct buffer_head *ocsfs_inode_getblk_fresh(struct super_block *sb,
+						    u64 blkno)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	struct buffer_head *bh;
+
+	if (!sbi->s_clustered)
+		return sb_bread(sb, blkno);
+
+	bh = sb_getblk(sb, blkno);
+	if (!bh)
+		return NULL;
+	clear_buffer_uptodate(bh);
+	if (bh_read(bh, 0) < 0) {
+		brelse(bh);
+		return NULL;
+	}
+	return bh;
+}
+
 /* ═══════════════════════════════════════════════════════════════
  * BLOCK ALLOCATION
  *
@@ -457,7 +486,7 @@ int ocsfs_alloc_inode_num(struct super_block *sb, u32 ag_hint, u64 *ino_out)
 			u32 boff = off % sbi->s_block_size;
 			struct ocsfs_disk_inode *di;
 
-			bh = ocsfs_meta_getblk(sb, block);
+			bh = ocsfs_inode_getblk_fresh(sb, block);
 			if (!bh)
 				continue;
 
@@ -551,7 +580,7 @@ void ocsfs_free_inode_num(struct super_block *sb, u64 ino)
 	block = off / sbi->s_block_size;
 	boff = off % sbi->s_block_size;
 
-	bh = ocsfs_meta_getblk(sb, block);
+	bh = ocsfs_inode_getblk_fresh(sb, block);
 	if (bh) {
 		if (ocsfs_txn_add_bh(txn, bh) == 0) {
 			di = (struct ocsfs_disk_inode *)(bh->b_data + boff);
