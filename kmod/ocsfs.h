@@ -888,13 +888,19 @@ static inline struct ocsfs_inode_info *OCSFS_I(struct inode *inode)
 
 /*
  * Assert that the caller holds DLM EX on this inode in cluster mode.
- * Fires WARN_ON when a btree write function is entered without the required
- * exclusive lock — catches missing lock acquisitions during development.
- * Silent in single-node mode (DLM not used).
+ * Catches missing lock acquisitions during development.  Silent in single-node
+ * mode (DLM not used).
+ *
+ * MUST be WARN_ON_ONCE, not WARN_ON: this sits in the hot per-extent btree
+ * write path, and a reflink/CoW of a large file calls it thousands of times.
+ * A plain WARN_ON emits a full dump_stack() on every call, which is a
+ * self-inflicted performance DoS (observed: a 32 MiB reflink timing out purely
+ * on dump_stack overhead) and floods the log.  One report is enough to flag a
+ * genuinely missing lock.
  */
 #define OCSFS_WARN_NO_EX(inode) \
-	WARN_ON(OCSFS_SB((inode)->i_sb)->s_clustered && \
-		OCSFS_I(inode)->i_lock_res.lr_mode != OCSFS_LOCK_EX)
+	WARN_ON_ONCE(OCSFS_SB((inode)->i_sb)->s_clustered && \
+		     OCSFS_I(inode)->i_lock_res.lr_mode != OCSFS_LOCK_EX)
 
 /* ═══════════════════════════════════════════════════════════════
  * UTILITY HELPERS
