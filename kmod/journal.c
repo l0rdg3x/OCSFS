@@ -327,6 +327,7 @@ struct ocsfs_txn *ocsfs_txn_begin(struct super_block *sb)
 	txn->t_nr_blocks = 0;
 	txn->t_started  = true;
 	INIT_LIST_HEAD(&txn->t_buffers);
+	INIT_LIST_HEAD(&txn->t_locks);
 
 	/*
 	 * Save journal state before modifying it so we can roll back cleanly
@@ -359,6 +360,44 @@ struct ocsfs_txn *ocsfs_txn_begin(struct super_block *sb)
 	}
 
 	return txn;
+}
+
+/* A DLM lock whose release is deferred until this txn commits/aborts. */
+struct ocsfs_txn_lock {
+	struct list_head        list;
+	struct ocsfs_lock_res  *lr;
+};
+
+/*
+ * Defer releasing @lr until this txn commits or aborts.  Used by the block
+ * allocator for the AG lock: holding it across the commit makes the allocation
+ * durable on disk before a peer can acquire the AG and read the bitmap, so two
+ * nodes never hand out the same block.  On OOM we release immediately (correct,
+ * just loses the cross-node protection for that rare case).
+ */
+void ocsfs_txn_defer_unlock(struct ocsfs_txn *txn, struct ocsfs_lock_res *lr)
+{
+	struct ocsfs_txn_lock *tl = kzalloc(sizeof(*tl), GFP_NOFS);
+
+	if (!tl) {
+		ocsfs_lock_release(txn->t_journal->j_sb, lr);
+		return;
+	}
+	tl->lr = lr;
+	list_add_tail(&tl->list, &txn->t_locks);
+}
+
+/* Release all locks deferred via ocsfs_txn_defer_unlock(). */
+static void ocsfs_txn_release_locks(struct ocsfs_txn *txn)
+{
+	struct ocsfs_txn_lock *tl, *tmp;
+	struct super_block *sb = txn->t_journal->j_sb;
+
+	list_for_each_entry_safe(tl, tmp, &txn->t_locks, list) {
+		ocsfs_lock_release(sb, tl->lr);
+		list_del(&tl->list);
+		kfree(tl);
+	}
 }
 
 int ocsfs_txn_add_bh(struct ocsfs_txn *txn, struct buffer_head *bh)
@@ -630,6 +669,10 @@ cleanup:
 		kfree(tb);
 	}
 
+	/* Release AG (and other) locks held across this txn — now that the
+	 * allocation is durable, a peer may take them and see our changes. */
+	ocsfs_txn_release_locks(txn);
+
 	txn->t_started = false;
 	kfree(txn);
 	return ret;
@@ -672,6 +715,10 @@ void ocsfs_txn_abort(struct ocsfs_txn *txn)
 
 		mutex_unlock(&j->j_lock);
 	}
+
+	/* Release locks held across the txn (the allocation was rolled back to
+	 * its pre-txn state above, so a peer taking the AG sees it as free). */
+	ocsfs_txn_release_locks(txn);
 
 	kfree(txn);
 }

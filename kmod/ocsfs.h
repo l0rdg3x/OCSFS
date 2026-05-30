@@ -722,6 +722,10 @@ struct ocsfs_txn {
 	bool                    t_started;
 	/* O(1) idempotency check: hash by block_num & 63 */
 	struct hlist_head       t_block_hash[64];
+	/* DLM locks (e.g. AG locks held by the block allocator) released only
+	 * when this txn commits/aborts — keeps a cross-node allocation invisible
+	 * to peers until it is durable, preventing double-allocation. */
+	struct list_head        t_locks;
 };
 
 /* Buffer in a transaction */
@@ -1192,6 +1196,7 @@ int ocsfs_journal_init(struct super_block *sb);
 void ocsfs_journal_exit(struct super_block *sb);
 struct ocsfs_txn *ocsfs_txn_begin(struct super_block *sb);
 int ocsfs_txn_add_bh(struct ocsfs_txn *txn, struct buffer_head *bh);
+void ocsfs_txn_defer_unlock(struct ocsfs_txn *txn, struct ocsfs_lock_res *lr);
 int ocsfs_txn_commit(struct ocsfs_txn *txn);
 void ocsfs_txn_abort(struct ocsfs_txn *txn);
 int ocsfs_journal_replay(struct super_block *sb);
@@ -1227,6 +1232,8 @@ void ocsfs_lock_init(struct ocsfs_lock_res *lr, u64 resource_id,
 struct ocsfs_lock_res *ocsfs_lock_alloc(struct super_block *sb,
 					u64 resource_id, u32 resource_type);
 void ocsfs_lock_free(struct ocsfs_lock_res *lr);
+int ocsfs_lock_acquire_fresh(struct super_block *sb, struct ocsfs_lock_res *lr,
+			     u16 mode, bool *was_fresh);
 int ocsfs_lock_acquire(struct super_block *sb, struct ocsfs_lock_res *lr,
 		       u16 mode);
 int ocsfs_lock_release(struct super_block *sb, struct ocsfs_lock_res *lr);

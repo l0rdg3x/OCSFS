@@ -368,6 +368,7 @@ int ocsfs_flush_inode_locked(struct inode *inode, bool force_sync)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
+	struct ocsfs_ag_info *ag = &sbi->s_ags[oi->i_ag];
 	struct ocsfs_txn *txn;
 	struct buffer_head *bh;
 	struct ocsfs_disk_inode *di;
@@ -375,22 +376,53 @@ int ocsfs_flush_inode_locked(struct inode *inode, bool force_sync)
 	u32 boff;
 	u16 i;
 	int ret;
+	bool fresh = false;
+
+	/*
+	 * Cross-node: an inode block packs 8 inodes.  This read-modify-write
+	 * writes the WHOLE block, so without serialisation a peer flushing a
+	 * co-located inode (read cached → missing our just-written inode → write
+	 * back) would clobber it (observed as -EINVAL on the peer's file after a
+	 * concurrent two-node write).  Hold the inode's AG EX lock across the RMW
+	 * (it also serialises inode allocation/free), and on a real cross-node
+	 * acquire re-read the block fresh so the other 7 inodes reflect the peer's
+	 * committed state.
+	 */
+	if (sbi->s_clustered) {
+		ret = ocsfs_lock_acquire_fresh(inode->i_sb, &ag->ag_lock_res,
+					       OCSFS_LOCK_EX, &fresh);
+		if (ret)
+			return ret;
+	}
 
 	txn = ocsfs_txn_begin(inode->i_sb);
-	if (IS_ERR(txn))
+	if (IS_ERR(txn)) {
+		if (sbi->s_clustered)
+			ocsfs_lock_release(inode->i_sb, &ag->ag_lock_res);
 		return PTR_ERR(txn);
+	}
 
 	off   = ocsfs_inode_disk_off(sbi, oi->i_disk_ino);
 	block = off / sbi->s_block_size;
 	boff  = off % sbi->s_block_size;
 
 	/*
-	 * Read through the buffer cache (read-your-own-writes).  Forcing a fresh
-	 * disk read here clears the uptodate flag of a block shared by 8 inodes,
-	 * racing concurrent transactions on the other inodes — see
-	 * ocsfs_inode_invalidate_cache().
+	 * On a real cross-node acquire, force a fresh read so co-located inodes a
+	 * peer modified are preserved; otherwise (same-node cache hit, or single
+	 * node) a cached read keeps read-your-own-writes for the other inodes.
 	 */
-	bh = sb_bread(inode->i_sb, block);
+	if (fresh) {
+		bh = sb_getblk(inode->i_sb, block);
+		if (bh) {
+			clear_buffer_uptodate(bh);
+			if (bh_read(bh, 0) < 0) {
+				brelse(bh);
+				bh = NULL;
+			}
+		}
+	} else {
+		bh = sb_bread(inode->i_sb, block);
+	}
 	if (!bh) {
 		ret = -EIO;
 		goto out_abort;
@@ -480,10 +512,16 @@ int ocsfs_flush_inode_locked(struct inode *inode, bool force_sync)
 		spin_unlock(&inode->i_lock);
 	}
 	brelse(bh);
+	/* Inode block committed under the AG lock — release it (a peer may now
+	 * RMW the block and will see our committed inode). */
+	if (sbi->s_clustered)
+		ocsfs_lock_release(inode->i_sb, &ag->ag_lock_res);
 	return ret;
 
 out_abort:
 	ocsfs_txn_abort(txn);
+	if (sbi->s_clustered)
+		ocsfs_lock_release(inode->i_sb, &ag->ag_lock_res);
 	return ret;
 }
 
@@ -503,14 +541,32 @@ int ocsfs_inode_journal_root(struct ocsfs_txn *txn, struct inode *inode)
 	u32 boff  = off % sbi->s_block_size;
 	int ret;
 
-	if (1) {
-		/* Cached read (read-your-own-writes); forcing a fresh read clears a
-		 * block shared by 8 inodes under concurrent txns — see
-		 * ocsfs_inode_invalidate_cache(). */
+	/*
+	 * Cross-node: this whole-block inode write would clobber a co-located
+	 * inode a peer just committed if it used a stale cached copy.  We cannot
+	 * take the AG lock here (held to the caller's commit it deadlocks against
+	 * the block allocator's per-AG locks in the same txn), so when clustered
+	 * we re-read the block fresh — preserving the peer's co-located inodes as
+	 * of read time.  Only the btree-root field (always written from the
+	 * current oi value) and the checksum change, so re-reading never loses a
+	 * within-txn update.  A residual race (peer commits between this read and
+	 * the caller's commit) remains — see the limitation note on
+	 * ocsfs_flush_inode_locked.
+	 */
+	if (sbi->s_clustered) {
+		bh = sb_getblk(inode->i_sb, block);
+		if (bh) {
+			clear_buffer_uptodate(bh);
+			if (bh_read(bh, 0) < 0) {
+				brelse(bh);
+				bh = NULL;
+			}
+		}
+	} else {
 		bh = sb_bread(inode->i_sb, block);
-		if (!bh)
-			return -EIO;
 	}
+	if (!bh)
+		return -EIO;
 
 	ret = ocsfs_txn_add_bh(txn, bh);
 	if (ret) {

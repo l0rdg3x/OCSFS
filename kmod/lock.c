@@ -47,8 +47,15 @@ static int lr_write_entry(struct super_block *sb, struct ocsfs_lock_res *lr,
  *   4. If conflict: set waiter bit, poll with exponential backoff
  * ═══════════════════════════════════════════════════════════════ */
 
-int ocsfs_lock_acquire(struct super_block *sb, struct ocsfs_lock_res *lr,
-		       u16 mode)
+/*
+ * @was_fresh (optional): set true when this call performed a real on-disk
+ * (cross-node) acquire, false on a local cache hit / non-clustered.  The
+ * allocators use it to know when to invalidate the AG's cached bitmap / inode
+ * table (a peer may have changed it) WITHOUT clobbering a concurrent same-node
+ * allocation's uncommitted marks (those come through as cache hits).
+ */
+static int lock_acquire_impl(struct super_block *sb, struct ocsfs_lock_res *lr,
+			     u16 mode, bool *was_fresh)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	struct ocsfs_disk_lock dl;
@@ -57,6 +64,9 @@ int ocsfs_lock_acquire(struct super_block *sb, struct ocsfs_lock_res *lr,
 	u32 delay_us = OCSFS_LOCK_RETRY_MIN_US;
 	ktime_t deadline = ktime_add_ms(ktime_get(),
 					OCSFS_LOCK_ACQUIRE_TIMEOUT_MS);
+
+	if (was_fresh)
+		*was_fresh = false;
 
 	if (!sbi->s_clustered) {
 		lr->lr_mode = mode;
@@ -208,6 +218,8 @@ retry:
 
 		if (mode == OCSFS_LOCK_EX && --lr->lr_ex_wait == 0)
 			wake_up_all(&lr->lr_wq);
+		if (was_fresh && ret == 0)
+			*was_fresh = true;   /* real cross-node disk acquire */
 		mutex_unlock(&lr->lr_mutex);
 		return ret;
 	}
@@ -251,6 +263,20 @@ retry:
 	delay_us = min_t(u32, delay_us * 2, OCSFS_LOCK_RETRY_MAX_US);
 	mutex_lock(&lr->lr_mutex);
 	goto retry;
+}
+
+int ocsfs_lock_acquire(struct super_block *sb, struct ocsfs_lock_res *lr,
+		       u16 mode)
+{
+	return lock_acquire_impl(sb, lr, mode, NULL);
+}
+
+/* As ocsfs_lock_acquire, but reports whether a real cross-node disk acquire
+ * happened (*was_fresh) — see lock_acquire_impl. */
+int ocsfs_lock_acquire_fresh(struct super_block *sb, struct ocsfs_lock_res *lr,
+			     u16 mode, bool *was_fresh)
+{
+	return lock_acquire_impl(sb, lr, mode, was_fresh);
 }
 
 /* ═══════════════════════════════════════════════════════════════

@@ -16,25 +16,15 @@
  * ═══════════════════════════════════════════════════════════════ */
 
 /*
- * Read a metadata (bitmap) block through the buffer cache.
+ * Read a metadata (block bitmap / inode-table) block — a plain cached read.
  *
- * This MUST be a cached read, not a forced disk re-read.  The allocator marks
- * freshly-used bits in the bitmap buffer and stages the update in the current
- * transaction (the buffer stays dirty/uptodate in cache but is NOT yet flushed
- * to disk).  A second allocation in the same transaction — e.g. the multiple
- * btree-node allocations done while converting an extent UNWRITTEN→WRITTEN —
- * then reads the bitmap again; if that read forcibly re-read from disk it would
- * miss the still-uncommitted bits and hand back the SAME block twice (a double
- * allocation).  That was observed as an extent-B+tree node whose child pointer
- * pointed to itself (new_int == new_root), making find_leaf cycle and wedging
- * the mount on large writes.  Reading from the cache gives read-your-own-writes
- * within the transaction and eliminates the double allocation.
- *
- * Cross-node coherence (discarding a stale cached bitmap from before another
- * node modified it under its own AG EX lock) must be re-established by
- * invalidating the AG's bitmap blocks at DLM EX acquisition, NOT by a per-read
- * forced re-read — TODO for the multi-node testbed.  See ext_btree_read() for
- * the same rationale on btree nodes.
+ * Cross-node coherence is NOT done here per-read (that loses uncommitted local
+ * marks and double-allocates).  Instead the allocators, on a *real* cross-node
+ * DLM acquire of the AG lock, invalidate the AG's cached bitmap / inode table
+ * once (ocsfs_ag_invalidate_bitmap / the @fresh path of ocsfs_inode_getblk),
+ * and hold the AG lock until the txn commits.  Within the held window reads are
+ * cached so read-your-own-writes (and same-node concurrent allocations, which
+ * piggyback as cache hits and must see each other's in-memory marks) work.
  */
 static struct buffer_head *ocsfs_meta_getblk(struct super_block *sb, u64 blkno)
 {
@@ -42,21 +32,18 @@ static struct buffer_head *ocsfs_meta_getblk(struct super_block *sb, u64 blkno)
 }
 
 /*
- * Cross-node fresh read of an inode-table block for the allocator: a cached
- * copy can miss a peer's just-committed inode allocations, so two nodes would
- * hand out the SAME inode number (data loss — confirmed on the 2-node testbed).
- * Each caller holds the AG EX lock, which serialises allocation across nodes,
- * so the forced reread reflects the peer's committed state.  Only used for the
- * inode-table scan (each slot's block is read once, then written), NOT the
- * block bitmap (whose read-modify-write within one txn must not be re-read).
+ * Inode-table block read for the allocator.  @fresh is set when the AG lock was
+ * just acquired cross-node (a peer may have allocated inodes since we last
+ * looked) AND no concurrent same-node allocation is in flight (we are the real
+ * acquirer, not a cache hit) — only then is it safe to drop the cached copy and
+ * re-read from disk without clobbering another local txn's uncommitted inode.
  */
-static struct buffer_head *ocsfs_inode_getblk_fresh(struct super_block *sb,
-						    u64 blkno)
+static struct buffer_head *ocsfs_inode_getblk(struct super_block *sb, u64 blkno,
+					      bool fresh)
 {
-	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	struct buffer_head *bh;
 
-	if (!sbi->s_clustered)
+	if (!fresh)
 		return sb_bread(sb, blkno);
 
 	bh = sb_getblk(sb, blkno);
@@ -68,6 +55,32 @@ static struct buffer_head *ocsfs_inode_getblk_fresh(struct super_block *sb,
 		return NULL;
 	}
 	return bh;
+}
+
+/*
+ * Invalidate the AG's cached block-bitmap blocks so the next (cached) read
+ * picks up a peer's committed allocations.  Called ONCE, right after a real
+ * cross-node DLM acquire of the AG lock, while no same-node allocation is in
+ * flight in this AG — so it cannot clobber another local txn's uncommitted
+ * marks (those acquirers get a cache hit and skip this).
+ */
+static void ocsfs_ag_invalidate_bitmap(struct super_block *sb,
+				       struct ocsfs_ag_info *ag)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	u64 first = ag->bitmap_off / sbi->s_block_size;
+	u64 nblk  = (ag->bitmap_size + sbi->s_block_size - 1) / sbi->s_block_size;
+	u64 b;
+
+	for (b = 0; b < nblk; b++) {
+		struct buffer_head *bh = sb_getblk(sb, first + b);
+
+		if (!bh)
+			continue;
+		if (!buffer_dirty(bh))   /* never drop uncommitted marks */
+			clear_buffer_uptodate(bh);
+		brelse(bh);
+	}
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -89,15 +102,21 @@ static int ocsfs_ag_alloc_blocks(struct super_block *sb, u32 ag_no,
 	u32 found = 0;
 	u64 start_bit = 0;
 	int ret;
+	bool fresh = false;   /* TEMP DEBUG */
 
 	if (ag->free_blocks < count)
 		return -ENOSPC;
 
 	/* Cross-node: DLM EX on AG prevents two nodes allocating same blocks. */
 	if (sbi->s_clustered) {
-		ret = ocsfs_lock_acquire(sb, &ag->ag_lock_res, OCSFS_LOCK_EX);
+		ret = ocsfs_lock_acquire_fresh(sb, &ag->ag_lock_res,
+					       OCSFS_LOCK_EX, &fresh);
 		if (ret)
 			return ret;
+		/* Real cross-node acquire: a peer may have allocated since we
+		 * last cached this AG's bitmap — drop the stale cache. */
+		if (fresh)
+			ocsfs_ag_invalidate_bitmap(sb, ag);
 	}
 
 	mutex_lock(&ag->ag_lock);
@@ -248,8 +267,19 @@ do_mark:
 
 out_unlock:
 	mutex_unlock(&ag->ag_lock);
-	if (sbi->s_clustered)
-		ocsfs_lock_release(sb, &ag->ag_lock_res);
+	if (sbi->s_clustered) {
+		/*
+		 * Cross-node: on a successful allocation in a journalled txn, keep
+		 * the AG DLM lock held until the caller commits — the bitmap marks
+		 * are not yet durable, so releasing now would let a peer allocate
+		 * the same blocks (double allocation / corruption).  ocsfs_txn_-
+		 * commit/abort releases it.  On failure (or no txn) release now.
+		 */
+		if (ret == 0 && txn)
+			ocsfs_txn_defer_unlock(txn, &ag->ag_lock_res);
+		else
+			ocsfs_lock_release(sb, &ag->ag_lock_res);
+	}
 	return ret;
 }
 
@@ -378,9 +408,14 @@ int ocsfs_free_blocks_txn(struct ocsfs_txn *txn, u64 block, u32 count)
 	local_block = block - ag->block_start;
 
 	if (sbi->s_clustered) {
-		ret = ocsfs_lock_acquire(sb, &ag->ag_lock_res, OCSFS_LOCK_EX);
+		bool fresh = false;
+
+		ret = ocsfs_lock_acquire_fresh(sb, &ag->ag_lock_res,
+					       OCSFS_LOCK_EX, &fresh);
 		if (ret)
 			return ret;
+		if (fresh)
+			ocsfs_ag_invalidate_bitmap(sb, ag);
 	}
 
 	mutex_lock(&ag->ag_lock);
@@ -418,8 +453,14 @@ int ocsfs_free_blocks_txn(struct ocsfs_txn *txn, u64 block, u32 count)
 
 out_unlock:
 	mutex_unlock(&ag->ag_lock);
-	if (sbi->s_clustered)
-		ocsfs_lock_release(sb, &ag->ag_lock_res);
+	if (sbi->s_clustered) {
+		/* Hold the AG lock until commit so the freed bits are durable
+		 * before a peer can reallocate them (mirrors the alloc path). */
+		if (ret == 0 && txn)
+			ocsfs_txn_defer_unlock(txn, &ag->ag_lock_res);
+		else
+			ocsfs_lock_release(sb, &ag->ag_lock_res);
+	}
 	return ret;
 }
 
@@ -461,6 +502,7 @@ int ocsfs_alloc_inode_num(struct super_block *sb, u32 ag_hint, u64 *ino_out)
 
 	for (try = 0; try < sbi->s_ag_count; try++) {
 		struct ocsfs_ag_info *ag;
+		bool fresh = false;
 		u64 i;
 
 		ag_no = (ag_hint + try) % sbi->s_ag_count;
@@ -470,8 +512,9 @@ int ocsfs_alloc_inode_num(struct super_block *sb, u32 ag_hint, u64 *ino_out)
 			continue;
 
 		if (sbi->s_clustered) {
-			int lret = ocsfs_lock_acquire(sb, &ag->ag_lock_res,
-						      OCSFS_LOCK_EX);
+			int lret = ocsfs_lock_acquire_fresh(sb,
+						&ag->ag_lock_res,
+						OCSFS_LOCK_EX, &fresh);
 			if (lret)
 				continue; /* can't lock this AG — try next */
 		}
@@ -486,7 +529,10 @@ int ocsfs_alloc_inode_num(struct super_block *sb, u32 ag_hint, u64 *ino_out)
 			u32 boff = off % sbi->s_block_size;
 			struct ocsfs_disk_inode *di;
 
-			bh = ocsfs_inode_getblk_fresh(sb, block);
+			/* Fresh disk read only on a real cross-node acquire
+			 * (peer may have allocated inodes); a same-node cache
+			 * hit reads cached to see the concurrent local marks. */
+			bh = ocsfs_inode_getblk(sb, block, fresh);
 			if (!bh)
 				continue;
 
@@ -506,9 +552,15 @@ int ocsfs_alloc_inode_num(struct super_block *sb, u32 ag_hint, u64 *ino_out)
 					*ino_out = ag_no * sbi->s_ag_size + i;
 
 					mutex_unlock(&ag->ag_lock);
-					if (sbi->s_clustered)
-						ocsfs_lock_release(sb, &ag->ag_lock_res);
 					{
+						/*
+						 * Cross-node: commit the inode allocation
+						 * BEFORE releasing the AG DLM lock, so the
+						 * new inode is durable on disk when a peer
+						 * acquires the AG and reads the (fresh) inode
+						 * table — otherwise both nodes hand out the
+						 * same inode number in the uncommitted window.
+						 */
 						int cr = ocsfs_txn_commit(txn);
 
 						if (cr) {
@@ -517,6 +569,9 @@ int ocsfs_alloc_inode_num(struct super_block *sb, u32 ag_hint, u64 *ino_out)
 							ag->free_inodes++;
 							mutex_unlock(&ag->ag_lock);
 						}
+						if (sbi->s_clustered)
+							ocsfs_lock_release(
+								sb, &ag->ag_lock_res);
 						return cr;
 					}
 				}
@@ -566,8 +621,11 @@ void ocsfs_free_inode_num(struct super_block *sb, u64 ino)
 
 	ag = &sbi->s_ags[ag_no];
 
+	bool fresh = false;
+
 	if (sbi->s_clustered &&
-	    ocsfs_lock_acquire(sb, &ag->ag_lock_res, OCSFS_LOCK_EX)) {
+	    ocsfs_lock_acquire_fresh(sb, &ag->ag_lock_res, OCSFS_LOCK_EX,
+				     &fresh)) {
 		pr_warn_ratelimited("ocsfs: free_inode_num %llu: DLM EX failed\n",
 				    ino);
 		ocsfs_txn_abort(txn);
@@ -580,7 +638,7 @@ void ocsfs_free_inode_num(struct super_block *sb, u64 ino)
 	block = off / sbi->s_block_size;
 	boff = off % sbi->s_block_size;
 
-	bh = ocsfs_inode_getblk_fresh(sb, block);
+	bh = ocsfs_inode_getblk(sb, block, fresh);
 	if (bh) {
 		if (ocsfs_txn_add_bh(txn, bh) == 0) {
 			di = (struct ocsfs_disk_inode *)(bh->b_data + boff);
