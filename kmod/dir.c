@@ -338,6 +338,15 @@ int ocsfs_add_dirent(struct inode *dir, const struct qstr *name,
 					 OCSFS_LOCK_EX);
 		if (ret)
 			return ret;
+		/*
+		 * Cross-node: pull in a peer's directory changes BEFORE we modify
+		 * the directory.  Without this, concurrent adds on different nodes
+		 * each start from their own stale cached view and overwrite each
+		 * other's entries (each node ends up seeing only its own files).
+		 * ocsfs_inode_refresh reads the inode fresh and the subsequent
+		 * ocsfs_dir_bread reads the dir blocks fresh (dir is clean here).
+		 */
+		ocsfs_inode_refresh(dir);
 	}
 
 	ret = __ocsfs_add_dirent(dir, name, ino, file_type);
@@ -453,6 +462,9 @@ int ocsfs_del_dirent(struct inode *dir, const struct qstr *name)
 					 OCSFS_LOCK_EX);
 		if (ret)
 			return ret;
+		/* Cross-node: see a peer's dir changes before modifying (as in
+		 * ocsfs_add_dirent) so concurrent ops don't clobber each other. */
+		ocsfs_inode_refresh(dir);
 	}
 
 	ret = __ocsfs_del_dirent(dir, name);
