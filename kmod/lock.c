@@ -128,6 +128,7 @@ int ocsfs_lock_acquire(struct super_block *sb, struct ocsfs_lock_res *lr,
 		    lr->lr_mode != OCSFS_LOCK_CW &&
 		    lr->lr_lock_epoch == cur_epoch) {
 			lr->lr_hold++;   /* count this nested/compatible hold */
+			lr->lr_lazy = false;  /* actively held again */
 			mutex_unlock(&lr->lr_mutex);
 			return 0;
 		}
@@ -256,7 +257,13 @@ retry:
  * LOCK RELEASE
  * ═══════════════════════════════════════════════════════════════ */
 
-int ocsfs_lock_release(struct super_block *sb, struct ocsfs_lock_res *lr)
+/*
+ * Perform the real on-disk release.  Caller holds lr->lr_mutex (NOT released
+ * here) and has already confirmed this is the last local holder (lr_hold <= 1).
+ * Shared by ocsfs_lock_release() and the lazy-revoke sweep.
+ */
+static int lock_release_ondisk_locked(struct super_block *sb,
+				      struct ocsfs_lock_res *lr)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	struct ocsfs_disk_lock dl;
@@ -264,30 +271,10 @@ int ocsfs_lock_release(struct super_block *sb, struct ocsfs_lock_res *lr)
 	int ret;
 	int retries = 0;
 
-	if (!sbi->s_clustered) {
-		lr->lr_mode = OCSFS_LOCK_NL;
-		return 0;
-	}
-
-	mutex_lock(&lr->lr_mutex);
-
-	/* Reference-counted: while any other local holder remains, keep the
-	 * on-disk lock and lr_mode untouched.  This is what stops a lockless
-	 * read's SH acquire+release from releasing the EX a concurrent write/
-	 * dedup/reflink/truncate holds (which would clobber lr_mode and, on a
-	 * peer cluster, hand the lock to another node mid-update). */
-	if (lr->lr_hold > 1) {
-		lr->lr_hold--;
-		mutex_unlock(&lr->lr_mutex);
-		return 0;
-	}
-
 retry_release:
 	ret = lr_read_entry(sb, lr, &dl, &bh);
-	if (ret) {
-		mutex_unlock(&lr->lr_mutex);
+	if (ret)
 		return ret;
-	}
 
 	if (lr->lr_mode == OCSFS_LOCK_EX) {
 		/* ARCH-7: record dirty range and bump epoch so the next SH
@@ -334,9 +321,67 @@ retry_release:
 		lr->lr_mode = OCSFS_LOCK_NL;
 		lr->lr_lock_epoch = 0;  /* invalidate cache; next acquire goes to disk */
 		lr->lr_hold = 0;        /* last holder released */
+		lr->lr_lazy = false;    /* really released now */
 	}
+	return ret;
+}
+
+int ocsfs_lock_release(struct super_block *sb, struct ocsfs_lock_res *lr)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	int ret;
+
+	if (!sbi->s_clustered) {
+		lr->lr_mode = OCSFS_LOCK_NL;
+		return 0;
+	}
+
+	mutex_lock(&lr->lr_mutex);
+
+	/* Reference-counted: while any other local holder remains, keep the
+	 * on-disk lock and lr_mode untouched.  This is what stops a lockless
+	 * read's SH acquire+release from releasing the EX a concurrent write/
+	 * dedup/reflink/truncate holds (which would clobber lr_mode and, on a
+	 * peer cluster, hand the lock to another node mid-update). */
+	if (lr->lr_hold > 1) {
+		lr->lr_hold--;
+		mutex_unlock(&lr->lr_mutex);
+		return 0;
+	}
+
+	ret = lock_release_ondisk_locked(sb, lr);
 	mutex_unlock(&lr->lr_mutex);
 	return ret;
+}
+
+/*
+ * Lazy release (PERF): keep the on-disk lock held when this is the last local
+ * holder, so the next acquire by this node is a cache hit with no disk
+ * round-trip.  Used by the write_iter inode-EX path — the sustained VM-disk
+ * write workload re-takes the same inode EX thousands of times.  A peer that
+ * starts waiting is served by the lazy-revoke sweep within one interval;
+ * evict / unmount / crash-recovery all really-release, so the lock is never
+ * stranded.
+ */
+int ocsfs_lock_release_lazy(struct super_block *sb, struct ocsfs_lock_res *lr)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+
+	if (!sbi->s_clustered) {
+		lr->lr_mode = OCSFS_LOCK_NL;
+		return 0;
+	}
+
+	mutex_lock(&lr->lr_mutex);
+	if (lr->lr_hold > 1) {
+		lr->lr_hold--;
+		mutex_unlock(&lr->lr_mutex);
+		return 0;
+	}
+	lr->lr_hold = 0;
+	lr->lr_lazy = true;
+	mutex_unlock(&lr->lr_mutex);
+	return 0;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -581,4 +626,92 @@ int ocsfs_lock_renew_lease(struct super_block *sb, struct ocsfs_lock_res *lr)
 	brelse(bh);
 	mutex_unlock(&lr->lr_mutex);
 	return ret;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * LAZY-LOCK REVOCATION SWEEP (PERF)
+ *
+ * write_iter releases the inode EX lazily (ocsfs_lock_release_lazy): the
+ * on-disk lock stays held so the next write is a cache hit with no disk
+ * round-trip.  This sweep is what lets a *peer* eventually get the lock: every
+ * interval it scans in-core regular-file inodes whose lock is lazily held and,
+ * if a peer has set a waiter bit on disk, performs the real release.  Bounds a
+ * peer's wait (e.g. VM live-migration) to one sweep interval.  A crashed
+ * holder's lazy locks are reclaimed by the normal recovery lock-cleanup; evict
+ * and unmount really-release via ocsfs_lock_release.
+ * ═══════════════════════════════════════════════════════════════ */
+
+#define OCSFS_LAZY_REVOKE_INTERVAL_JIFFIES  msecs_to_jiffies(2000)
+#define OCSFS_LAZY_REVOKE_BATCH             64
+
+static void ocsfs_lazy_revoke_fn(struct work_struct *work)
+{
+	struct ocsfs_sb_info *sbi = container_of(to_delayed_work(work),
+						 struct ocsfs_sb_info,
+						 s_lazy_revoke_work);
+	struct super_block *sb = sbi->s_sb;
+	struct inode *batch[OCSFS_LAZY_REVOKE_BATCH];
+	struct inode *inode;
+	int n = 0, i;
+
+	if (!sbi->s_clustered || !(sb->s_flags & SB_ACTIVE))
+		goto reschedule;
+
+	/* Collect a batch of inodes holding their lock lazily (racy peek;
+	 * re-checked under lr_mutex below). */
+	spin_lock(&sb->s_inode_list_lock);
+	list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
+		if (n >= OCSFS_LAZY_REVOKE_BATCH)
+			break;
+		if (!S_ISREG(inode->i_mode))
+			continue;
+		if (!OCSFS_I(inode)->i_lock_res.lr_lazy)
+			continue;
+		if (igrab(inode))
+			batch[n++] = inode;
+	}
+	spin_unlock(&sb->s_inode_list_lock);
+
+	for (i = 0; i < n; i++) {
+		struct ocsfs_lock_res *lr = &OCSFS_I(batch[i])->i_lock_res;
+		struct ocsfs_disk_lock dl;
+		struct buffer_head *bh;
+
+		mutex_lock(&lr->lr_mutex);
+		/* Still lazily held with no active local holder, and a peer is
+		 * waiting on disk?  Then really release — under lr_mutex so no
+		 * local acquire can race the handoff. */
+		if (lr->lr_lazy && lr->lr_hold == 0 &&
+		    lr_read_entry(sb, lr, &dl, &bh) == 0) {
+			bool waited = has_waiters(&dl);
+
+			brelse(bh);
+			if (waited)
+				lock_release_ondisk_locked(sb, lr);
+		}
+		mutex_unlock(&lr->lr_mutex);
+		iput(batch[i]);
+	}
+
+reschedule:
+	if (sbi->s_clustered)
+		queue_delayed_work(system_wq, &sbi->s_lazy_revoke_work,
+				   OCSFS_LAZY_REVOKE_INTERVAL_JIFFIES);
+}
+
+void ocsfs_lazy_revoke_start(struct super_block *sb)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+
+	INIT_DELAYED_WORK(&sbi->s_lazy_revoke_work, ocsfs_lazy_revoke_fn);
+	if (sbi->s_clustered)
+		queue_delayed_work(system_wq, &sbi->s_lazy_revoke_work,
+				   OCSFS_LAZY_REVOKE_INTERVAL_JIFFIES);
+}
+
+void ocsfs_lazy_revoke_stop(struct super_block *sb)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+
+	cancel_delayed_work_sync(&sbi->s_lazy_revoke_work);
 }

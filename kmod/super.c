@@ -564,6 +564,7 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		sbi->s_degraded  ? " degraded"  : "");
 
 	ocsfs_dedup_scrub_start(sb);
+	ocsfs_lazy_revoke_start(sb);
 	ocsfs_debugfs_init(sb);
 	return 0;
 
@@ -601,6 +602,7 @@ void ocsfs_put_super(struct super_block *sb)
 
 	ocsfs_debugfs_exit(sb);
 	ocsfs_dedup_scrub_stop(sb);
+	ocsfs_lazy_revoke_stop(sb);
 	ocsfs_journal_exit(sb);   /* flush journal before releasing cluster slot */
 	ocsfs_cluster_exit(sb);
 	ocsfs_comp_pool_destroy(sbi);

@@ -647,6 +647,12 @@ struct ocsfs_lock_res {
 					  * starved by a continuous reader stream
 					  * (protected by lr_mutex) */
 	bool            lr_dynamic;      /* allocated via kzalloc; safe to kfree */
+	bool            lr_lazy;         /* PERF: lock held on-disk but with no
+					  * active local holder (lr_hold==0) — kept
+					  * cached for a fast cache-hit re-acquire
+					  * instead of an on-disk release+reacquire
+					  * round-trip per write_iter.  A waiting peer
+					  * is served by the lazy-revoke sweep. */
 	struct mutex    lr_mutex;        /* local serialization */
 	wait_queue_head_t lr_wq;         /* wakes SH/CW acquirers deferring to a
 					  * pending EX waiter (writer priority) */
@@ -858,6 +864,10 @@ struct ocsfs_sb_info {
 
 	/* ARCH-6: background dedup scrub daemon */
 	struct delayed_work s_dedup_scrub_work;
+
+	/* PERF: lazy-lock revocation sweep — releases an inode lock that this
+	 * node holds lazily (lr_lazy) once a peer starts waiting for it. */
+	struct delayed_work s_lazy_revoke_work;
 
 	/* ARCH-V3-6: cluster freeze coordinator lock */
 	struct ocsfs_lock_res s_freeze_lock_res;
@@ -1220,6 +1230,9 @@ void ocsfs_lock_free(struct ocsfs_lock_res *lr);
 int ocsfs_lock_acquire(struct super_block *sb, struct ocsfs_lock_res *lr,
 		       u16 mode);
 int ocsfs_lock_release(struct super_block *sb, struct ocsfs_lock_res *lr);
+int ocsfs_lock_release_lazy(struct super_block *sb, struct ocsfs_lock_res *lr);
+void ocsfs_lazy_revoke_start(struct super_block *sb);
+void ocsfs_lazy_revoke_stop(struct super_block *sb);
 int ocsfs_lock_downgrade(struct super_block *sb, struct ocsfs_lock_res *lr,
 			 u16 new_mode);
 int ocsfs_lock_renew_lease(struct super_block *sb, struct ocsfs_lock_res *lr);

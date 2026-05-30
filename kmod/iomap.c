@@ -483,7 +483,15 @@ out:
 			}
 		}
 
-		ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
+		/*
+		 * PERF: lazy release.  Keep the inode EX held on-disk so the next
+		 * write is a cache-hit re-acquire with no DLM round-trip — the win
+		 * for a VM doing sustained writes to one disk image.  A peer that
+		 * needs the lock (e.g. live migration) is handed it by the
+		 * lazy-revoke sweep within one interval.  The accumulated dirty
+		 * range (lr_inv_lo/hi) is published on the eventual real release.
+		 */
+		ocsfs_lock_release_lazy(inode->i_sb, &oi->i_lock_res);
 	}
 
 out_unlock:
