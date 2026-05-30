@@ -89,20 +89,37 @@ static int journal_replay_j(struct super_block *sb, struct ocsfs_journal *j)
 		type = le32_to_cpu(jt.jt_type);
 
 		if (type != OCSFS_JTYPE_BEGIN) {
-			pr_err("ocsfs: journal replay: unexpected record type %u "
-			       "at pos %llu — aborting, filesystem requires fsck\n",
-			       type, scan_pos);
-			return -EUCLEAN;
+			/*
+			 * No valid BEGIN at this txn boundary marks the end of the
+			 * durable committed records.  A crash tears the final
+			 * in-flight txn (leaving a zeroed/garbage header), and the
+			 * on-disk tail can legitimately lag into already-checkpointed
+			 * journal space after a crash (the tail is only persisted at
+			 * commit time, before the matching checkpoint advances it).
+			 * Everything from here to head is therefore either never
+			 * committed (no durable COMMIT) or already applied at its
+			 * final location, so stop cleanly and mark the journal clean
+			 * (tail = head, below) instead of refusing the mount.  This is
+			 * how jbd2/xfs recover; the per-record CRC check above means we
+			 * never apply garbage.  fsck can still be run out of band.
+			 */
+			pr_warn("ocsfs: journal replay: end of valid records at pos %llu "
+				"(type %u) — stopping replay, journal recovered\n",
+				scan_pos, type);
+			break;
 		}
 
 		/* Verify BEGIN record integrity before trusting its fields */
 		crc_exp = le32_to_cpu(jt.jt_checksum);
 		crc_got = ocsfs_crc32c(~0U, &jt, sizeof(jt) - sizeof(__le32));
 		if (crc_got != crc_exp) {
-			pr_err("ocsfs: journal replay: BEGIN CRC mismatch at pos %llu "
-			       "(exp=%08x got=%08x) — aborting\n",
-			       scan_pos, crc_exp, crc_got);
-			return -EUCLEAN;
+			/* Torn BEGIN = the crash interrupted this txn's header write.
+			 * No COMMIT can follow a half-written BEGIN, so this is the end
+			 * of the durable log — stop cleanly (see comment above). */
+			pr_warn("ocsfs: journal replay: torn BEGIN at pos %llu "
+				"(exp=%08x got=%08x) — stopping replay, journal recovered\n",
+				scan_pos, crc_exp, crc_got);
+			break;
 		}
 
 		tid = le64_to_cpu(jt.jt_id);

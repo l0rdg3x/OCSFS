@@ -515,7 +515,10 @@ int main(int argc, char *argv[])
         if (scanf(" %c", &answer) != 1 || (answer != 'y' && answer != 'Y')) {
             printf("Aborted.\n");
             close(fd);
-            exit(0);
+            /* Non-zero so scripted callers (`mkfs ... || fail`) detect that
+             * the device was NOT formatted instead of silently reusing a
+             * stale filesystem.  Use -f to skip this prompt entirely. */
+            exit(1);
         }
     }
 

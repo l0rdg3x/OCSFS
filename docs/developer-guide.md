@@ -266,7 +266,11 @@ Called by read/write/stat paths when the caller holds DLM SH. Re-reads the
 inode from disk and populates all VFS fields. **Sprint D (ALTO-V3-3):** now
 refreshes `i_mode`, `i_nlink`, `i_uid`, `i_gid`, and `i_atime` in addition
 to the previously-refreshed size/timestamps/extents, so a remote `chmod` or
-`chown` is visible without remounting.
+`chown` is visible without remounting. **Sprint V2:** returns early (no
+clobber) when `inode_state_read(inode) & (I_DIRTY | I_SYNC)` — while the inode
+holds uncommitted local changes the in-memory copy is newer than the cached
+on-disk block, and overwriting `i_nlink` from it dropped concurrent
+`inc_nlink`/`drop_nlink` updates (see §8, Sprint V2).
 
 ---
 
@@ -463,6 +467,14 @@ do not survive an abort.
 - AFTER-images are applied only when the on-disk block content matches the
   stored BEFORE-image hash, preventing replay from overwriting concurrent writes
   from surviving nodes.
+- **Sprint V2 — tolerant tail.** When the scan finds a non-`BEGIN` record or a
+  `BEGIN` whose CRC fails, it stops cleanly (resetting `tail = head`) instead of
+  returning `-EUCLEAN`. A crash always leaves a torn/zeroed record at the head of
+  the log, and the on-disk `tail` can lag the in-memory one (it is only persisted
+  at commit, before the matching checkpoint advances it), so the old fatal-abort
+  behaviour made a single crash render the volume unmountable. The per-record CRC
+  guarantees garbage is never *applied*; stopping at the first invalid record
+  recovers the durable committed prefix, the same strategy as jbd2/xfs.
 
 **Sprint E (CRIT-V3-3) — 62-bit BEFORE-image hash:**
 The previous 32-bit CRC32C (`jbr_checksum`) could produce false-positive
@@ -1286,6 +1298,61 @@ Open follow-ups (not blocking single-node use):
 - The `WARN_ON_ONCE(no EX)` fires once during reflink even though
   `remap_file_range` acquires EX on both inodes; harmless single-node, worth
   confirming the lock-state on a real cluster.
+
+### Sprint V2 — Concurrency & crash recovery on the real kernel (2026-05-30)
+
+Aggressive concurrent and panic-injected (`echo c > /proc/sysrq-trigger`) testing
+on the loopback testbed surfaced five more critical bugs. The crash→reboot→remount
+path went from broken (deadlock + unmountable) to validated end to end.
+
+- **`inode_refresh` nlink clobber.** `ocsfs_inode_refresh()` re-read the on-disk
+  inode (now via the cached `sb_bread`) and `set_nlink()` from it. Under concurrent
+  `mkdir`/`rmdir` the buffer-cache copy lags the VFS `i_nlink` that `inc_nlink`/
+  `drop_nlink` just bumped (the bump is only flushed asynchronously), so increments
+  were lost and `inc_nlink(0)`/`drop_nlink(0)` warnings fired. **Fix:** skip the
+  refresh entirely when `inode_state_read(inode) & (I_DIRTY | I_SYNC)` — the
+  in-memory inode is authoritative while it holds uncommitted changes. Single-node
+  never loses cross-node updates; multi-node degrades to last-writer-wins (true
+  cross-node refresh remains a DLM-acquire-time TODO).
+
+- **Dirent checksum not recomputed on rename.** The per-dirent CRC (`de_checksum`,
+  the last field, covers the whole record) was recomputed by `add`/`del` but **not**
+  by the three in-place `rename` paths (`__ocsfs_update_dirent_ino`,
+  `rename_replace_atomic`, the `..` reparent in `ocsfs_rename_update_dotdot`), which
+  rewrite `de_ino`/`de_file_type`. `readdir` then recomputed the CRC, saw a mismatch
+  and **skipped the entry** — the renamed file vanished from the listing. **Fix:** a
+  shared `ocsfs_dirent_set_checksum()` inline in `ocsfs.h`, called after every
+  in-place dirent mutation.
+
+- **Crashed node slot never reclaimed.** A clean unmount marks the slot `DEAD`; a
+  crash leaves it `ACTIVE`. `ocsfs_node_claim_slot()` only reused `DEAD`/`FREE`
+  slots, so each post-crash remount grabbed a new slot and leaked the old one
+  (→ `-ENOSPC` after `s_max_nodes` crashes; `fsck` flagged stale `ACTIVE` slots).
+  **Fix:** the own-UUID priority now also reclaims an `ACTIVE` slot whose heartbeat
+  is older than `OCSFS_HB_DEAD_MS` — the node UUID is host-stable
+  (`ocsfs_node_derive_uuid`) so such a slot is always our own dead incarnation.
+
+- **Journal replay aborted on the torn tail.** Replay required a valid `BEGIN` at
+  every transaction boundary and returned `-EUCLEAN` ("requires fsck") otherwise.
+  A crash always leaves a torn/zeroed record at the head of the log (and the on-disk
+  tail lags the in-memory tail, which only advances at checkpoint), so a single
+  crash could make the volume unmountable. **Fix:** on the first non-`BEGIN` or
+  CRC-invalid record, `break` cleanly and let the loop reset `tail = head` — the
+  per-record CRC guarantees garbage is never applied, so this recovers the durable
+  prefix exactly like jbd2/xfs.
+
+- **Self-deadlock against own stale DLM locks.** On-disk lock release is
+  asynchronous, so a crash leaves the lock table showing our EX locks still held.
+  No peer runs recovery for a node that crashes and remounts itself, so every
+  operation touching such a resource blocked for `OCSFS_LOCK_ACQUIRE_TIMEOUT_MS`.
+  **Fix:** `ocsfs_node_claim_slot()` records the dead generation in
+  `sbi->s_self_recover_gen` when it reclaims its own crashed slot; the mount path
+  (after journal replay) calls `ocsfs_lock_recover_node(sb, slot, dead_gen)` to
+  release those locks.
+
+Tooling: `mkfs.ocsfs` now `exit(1)`s when the `Continue? (y/N)` prompt is declined
+(previously `exit(0)`, which let `mkfs … || fail` silently reuse a stale volume).
+Always pass `-f` in test scripts.
 
 ---
 

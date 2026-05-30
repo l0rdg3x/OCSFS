@@ -252,6 +252,24 @@ int ocsfs_inode_refresh(struct inode *inode)
 	struct ocsfs_disk_inode di;
 	int ret;
 
+	/*
+	 * Skip the refresh when this inode has uncommitted local changes
+	 * (I_DIRTY) or is being written back (I_SYNC).  In those windows the
+	 * in-memory VFS state — most importantly i_nlink, maintained by
+	 * inc_nlink()/drop_nlink() in mkdir/rmdir/link — is NEWER than what the
+	 * on-disk inode block (read via the cached sb_bread below) reflects.
+	 * Clobbering it with set_nlink(stale) silently drops increments under
+	 * concurrent directory churn and eventually trips the
+	 * inc_nlink(nlink==0) / drop_nlink(nlink==0) WARN_ONs in fs/inode.c.
+	 *
+	 * On a single node the in-memory inode is always authoritative, so
+	 * this never loses cross-node updates.  On multiple nodes it is a
+	 * best-effort last-writer-wins that protects local uncommitted work;
+	 * true cross-node refresh belongs at DLM-lock acquisition time (TODO).
+	 */
+	if (inode_state_read(inode) & (I_DIRTY | I_SYNC))
+		return 0;
+
 	ocsfs_inode_invalidate_cache(inode->i_sb, oi->i_disk_ino);
 	ret = ocsfs_read_disk_inode(inode->i_sb, oi->i_disk_ino, &di);
 	if (ret)

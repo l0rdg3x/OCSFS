@@ -500,6 +500,7 @@ int __ocsfs_update_dirent_ino(struct inode *dir, const struct qstr *name,
 				if (tr) { ocsfs_txn_abort(txn); brelse(bh); return tr; }
 				de->de_ino       = cpu_to_le64(new_ino);
 				de->de_file_type = new_ft;
+				ocsfs_dirent_set_checksum(de);
 				brelse(bh);
 				tr = ocsfs_txn_commit(txn);
 				if (tr) return tr;

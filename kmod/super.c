@@ -512,6 +512,19 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		goto fail_journal;
 	}
 
+	/* If we reclaimed our own slot left ACTIVE by a crash, release the DLM
+	 * locks the dead incarnation never unlocked.  No peer runs recovery for
+	 * a node that crashes and remounts itself, so without this we deadlock
+	 * for OCSFS_LOCK_ACQUIRE_TIMEOUT_MS against our own stale EX locks on
+	 * every inode/dir the crash had held. */
+	if (sbi->s_self_recover_gen) {
+		pr_info("ocsfs: releasing stale locks from crashed gen %u\n",
+			sbi->s_self_recover_gen);
+		ocsfs_lock_recover_node(sb, sbi->s_node_slot,
+					sbi->s_self_recover_gen);
+		sbi->s_self_recover_gen = 0;
+	}
+
 	ocsfs_orphan_scan(sb);
 	root_inode = ocsfs_iget(sb, OCSFS_ROOT_INO);
 	if (IS_ERR(root_inode)) {

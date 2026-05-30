@@ -244,14 +244,33 @@ int ocsfs_node_claim_slot(struct super_block *sb)
 		if (ret)
 			return ret;
 
+		u64 now     = ktime_get_real_ns();
+		u64 dead_ns = (u64)OCSFS_HB_DEAD_MS * 1000000ULL;
+		bool crash_reclaim = false;
+
 		spin_lock(&sbi->s_node_lock);
 		i = sbi->s_max_nodes;  /* sentinel: nessuno slot trovato */
 
-		/* Prima: slot DEAD del nostro stesso UUID (remount dopo crash) */
+		/* Prima: il NOSTRO slot (stesso UUID) lasciato da un mount
+		 * precedente — DEAD (release pulito) oppure ancora ACTIVE ma con
+		 * heartbeat scaduto (la nostra incarnazione è crashata senza
+		 * rilasciarlo). Recuperarlo evita di consumare uno slot nuovo ad
+		 * ogni remount post-crash: senza questo, dopo s_max_nodes crash
+		 * non recuperati il claim fallisce con -ENOSPC e fsck segnala slot
+		 * ACTIVE orfani. L'UUID è derivato in modo stabile dall'host
+		 * (ocsfs_node_derive_uuid), quindi uno slot col nostro UUID è
+		 * sempre una nostra incarnazione precedente, mai un altro nodo. */
 		for (u16 k = 0; k < sbi->s_max_nodes; k++) {
 			ni = &sbi->s_nodes[k];
-			if (ni->ni_state == OCSFS_NODE_DEAD &&
-			    memcmp(ni->ni_uuid, sbi->s_node_uuid, 16) == 0) {
+			if (memcmp(ni->ni_uuid, sbi->s_node_uuid, 16) != 0)
+				continue;
+			if (ni->ni_state == OCSFS_NODE_DEAD ||
+			    (ni->ni_state == OCSFS_NODE_ACTIVE &&
+			     (now - ni->ni_last_hb) > dead_ns)) {
+				/* ACTIVE = our previous incarnation crashed without
+				 * releasing its DLM locks; flag it so the mount path
+				 * runs lock recovery for the dead generation. */
+				crash_reclaim = (ni->ni_state == OCSFS_NODE_ACTIVE);
 				i = k;
 				break;
 			}
@@ -289,6 +308,11 @@ int ocsfs_node_claim_slot(struct super_block *sb)
 		/* Prepara il nuovo stato in memoria */
 		ni               = &sbi->s_nodes[i];
 		sbi->s_node_slot = i;
+		/* Reclaiming our own crash-orphaned slot: remember the dead
+		 * incarnation's generation so the mount path can release the DLM
+		 * locks it never unlocked (otherwise we deadlock against our own
+		 * stale EX locks).  Reset to 0 on a clean FREE/DEAD claim. */
+		sbi->s_self_recover_gen = crash_reclaim ? ni->ni_mount_gen : 0;
 		ni->ni_state     = OCSFS_NODE_ACTIVE;
 		ni->ni_mount_gen++;
 		sbi->s_mount_gen = ni->ni_mount_gen;

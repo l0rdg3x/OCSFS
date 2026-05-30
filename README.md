@@ -57,6 +57,29 @@ changelog.
 > round-trips data, `ocsfs-fsck` was reconciled to the real on-disk layout, and
 > `tests/kernel_smoke_test.sh` verifies the kernel module end to end on loopback.
 
+> **Sprint V2 (2026-05-30) — concurrency & crash recovery, exercised on the real
+> kernel.** Aggressive concurrent and crash testing (panic-injected power loss via
+> sysrq, auto-reboot, remount) found and fixed five more critical bugs: (1)
+> `ocsfs_inode_refresh` clobbered the VFS-maintained `i_nlink` with a stale
+> buffer-cache value under concurrent `mkdir`/`rmdir`, tripping `inc_nlink`/
+> `drop_nlink` warnings — now skips the refresh while the inode is dirty/in
+> writeback; (2) the three in-place `rename` paths updated `de_ino`/`de_file_type`
+> without recomputing the per-dirent checksum, so renamed entries were silently
+> skipped by `readdir` (files vanished from listings) — a shared
+> `ocsfs_dirent_set_checksum()` helper now runs after every in-place edit; (3) a
+> crashed node's slot stayed `ACTIVE` and was never reclaimed on remount (slot
+> leak → eventual `-ENOSPC`) — remount now reclaims its own stale-heartbeat slot;
+> (4) journal replay aborted the whole mount (`EUCLEAN`, "requires fsck") on the
+> torn record a crash leaves at the journal tail — it now stops cleanly at the
+> first invalid record like jbd2/xfs, so a crash never renders the volume
+> unmountable; (5) a self-remounting node deadlocked for 30 s/op against the DLM
+> locks its own pre-crash incarnation never flushed as released — the mount path
+> now releases the dead generation's locks. The full crash→reboot→remount path
+> (reclaim slot · tolerant journal replay · stale-lock recovery · full data
+> access · clean fsck) is now validated end to end on a single node. Also: `mkfs`
+> now exits non-zero when the confirmation prompt is declined (use `-f` in
+> scripts).
+
 | Scenario | Estimated score |
 |---|---|
 | Single-node read/write | ~92% |

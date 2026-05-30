@@ -780,6 +780,9 @@ struct ocsfs_sb_info {
 	/* This node's identity */
 	u16             s_node_slot;            /* our slot in node table */
 	u32             s_mount_gen;            /* our mount generation */
+	u32             s_self_recover_gen;     /* prev gen to lock-recover after
+						 * reclaiming our own crashed slot
+						 * (0 = clean mount, nothing to do) */
 	u8              s_node_uuid[16];        /* machine UUID */
 	char            s_node_name[64];        /* hostname */
 	bool            s_clustered;            /* multi-node mode active */
@@ -911,6 +914,21 @@ static inline struct ocsfs_inode_info *OCSFS_I(struct inode *inode)
 static inline u32 ocsfs_crc32c(u32 crc, const void *data, size_t len)
 {
 	return crc32c(crc, data, len);
+}
+
+/*
+ * Recompute the per-dirent CRC32c over every field preceding de_checksum.
+ * MUST be called after ANY in-place modification of a directory entry
+ * (de_ino, de_file_type, de_name, …) — otherwise readdir/lookup recompute a
+ * fresh checksum, see it disagree with the stale stored value, and silently
+ * skip the entry, making the file vanish from the listing.  The add path and
+ * the rename in-place repoint paths all funnel through here.
+ */
+static inline void ocsfs_dirent_set_checksum(struct ocsfs_disk_dirent *de)
+{
+	de->de_checksum = 0;
+	de->de_checksum = cpu_to_le16((u16)ocsfs_crc32c(
+		~0U, de, offsetof(struct ocsfs_disk_dirent, de_checksum)));
 }
 
 /*

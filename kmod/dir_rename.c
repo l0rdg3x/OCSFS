@@ -234,6 +234,7 @@ static int ocsfs_rename_update_dotdot(struct inode *inode, u64 new_parent_ino)
 				tr = ocsfs_txn_add_bh(txn, bh);
 				if (tr) { ocsfs_txn_abort(txn); brelse(bh); return tr; }
 				de->de_ino = cpu_to_le64(new_parent_ino);
+				ocsfs_dirent_set_checksum(de);
 				brelse(bh);
 				return ocsfs_txn_commit(txn);
 			}
@@ -298,6 +299,7 @@ static int rename_replace_atomic(struct inode *old_dir, const struct qstr *old_n
 	new_de = (struct ocsfs_disk_dirent *)(new_bh->b_data + new_off);
 	new_de->de_ino       = cpu_to_le64(old_ino);
 	new_de->de_file_type = old_ft;
+	ocsfs_dirent_set_checksum(new_de);
 
 	/* Zero the old_dir entry */
 	old_de = (struct ocsfs_disk_dirent *)(old_bh->b_data + old_off);
