@@ -825,14 +825,32 @@ int ocsfs_extent_btree_punch_hole(struct inode *inode,
 
 	saved_blocks = inode->i_blocks;
 
-	/* search_from: may need to find an extent starting just before start_block */
-	search_from = start_block > 0 ? start_block - 1 : 0;
+	/*
+	 * Start scanning from the extent that *contains* start_block (the largest
+	 * key <= start_block), so an extent straddling the start of the hole is
+	 * found and split — search_le also correctly handles a single large extent
+	 * spanning the whole hole, which a fixed "start_block - 1" window missed.
+	 */
+	{
+		u64 skey, sval;
+
+		if (ocsfs_btree_search_le(&bt, start_block, &skey, &sval) == 0)
+			search_from = skey;
+		else
+			search_from = start_block;
+	}
 
 	do {
 		u64 key, val;
+		bool progress = false;
 
 		tc.count = 0;
-		ocsfs_btree_range_scan(&bt, search_from, end_block,
+		/*
+		 * Scan is EXCLUSIVE of end_block (end key = end_block - 1): a tail
+		 * record re-inserted at end_block is outside the hole and must never
+		 * be re-collected, otherwise the loop spins forever (-EUCLEAN).
+		 */
+		ocsfs_btree_range_scan(&bt, search_from, end_block - 1,
 				       ext_trunc_collect, &tc);
 		if (tc.count == 0)
 			break;
@@ -847,10 +865,13 @@ int ocsfs_extent_btree_punch_hole(struct inode *inode,
 				u64 phys    = ext_phys(val);
 				u16 flags   = ext_flags(f4, val);
 
-				/* Skip extents entirely before start_block */
-				if (ext_end <= start_block)
+				/* Skip extents entirely before the hole or at/after its
+				 * end (e.g. a tail we re-inserted at end_block) — these
+				 * make no progress and would loop forever if reprocessed. */
+				if (ext_end <= start_block || key >= end_block)
 					continue;
 
+				progress = true;
 				ret = ocsfs_btree_delete(&bt, key);
 				if (ret)
 					goto abort;
@@ -902,6 +923,10 @@ int ocsfs_extent_btree_punch_hole(struct inode *inode,
 				}
 			}
 		}
+		/* A pass that collected keys but processed none (all outside the
+		 * hole) means there is nothing left to punch — stop, don't spin. */
+		if (!progress)
+			break;
 		if (--safety <= 0) {
 			WARN_ON(1);
 			ret = -EUCLEAN;
