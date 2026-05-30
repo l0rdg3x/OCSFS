@@ -263,7 +263,21 @@ static int ocsfs_open(struct inode *inode, struct file *file)
 
 	if (ret)
 		return ret;
-	return generic_file_open(inode, file);
+	ret = generic_file_open(inode, file);
+	if (ret)
+		return ret;
+	/*
+	 * Advertise O_DIRECT support.  Our read/write iterators dispatch to
+	 * iomap_dio_rw() on IOCB_DIRECT, but since we have no legacy
+	 * a_ops->direct_IO method the VFS would reject every O_DIRECT open with
+	 * -EINVAL unless we set FMODE_CAN_ODIRECT here (same as ext4/xfs/btrfs).
+	 * Encrypted inodes have no inline-crypto path here, so we leave the flag
+	 * clear (O_DIRECT on them keeps returning -EINVAL) rather than risk
+	 * leaking plaintext to the block device.
+	 */
+	if (!IS_ENCRYPTED(inode))
+		file->f_mode |= FMODE_CAN_ODIRECT;
+	return 0;
 }
 
 /*

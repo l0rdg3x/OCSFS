@@ -76,9 +76,17 @@ changelog.
 > locks its own pre-crash incarnation never flushed as released — the mount path
 > now releases the dead generation's locks. The full crash→reboot→remount path
 > (reclaim slot · tolerant journal replay · stale-lock recovery · full data
-> access · clean fsck) is now validated end to end on a single node. Also: `mkfs`
-> now exits non-zero when the confirmation prompt is declined (use `-f` in
-> scripts).
+> access · clean fsck) is now validated end to end on a single node. A second
+> testing round added two more: **(6)** O_DIRECT was dead code — the iomap dio path
+> existed but `open(O_DIRECT)` returned `-EINVAL` because `FMODE_CAN_ODIRECT` was
+> never set, so direct I/O silently never worked; and **(7)** any volume whose
+> journal had cycled past its 32 MB size once became *unmountable* after a crash,
+> because replay's `head > size` check misread the monotonic ring counters as
+> corruption — now checks the un-checkpointed window against the ring size
+> instead. Crash-torture (crash mid-reflink/btree-split with a wrapped journal),
+> reflink CoW integrity, O_DIRECT⇄buffered coherence, dedup, and offline
+> `fsck -r` repair all validated. Also: `mkfs` now exits non-zero when the
+> confirmation prompt is declined (use `-f` in scripts).
 
 | Scenario | Estimated score |
 |---|---|

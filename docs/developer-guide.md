@@ -1350,9 +1350,29 @@ path went from broken (deadlock + unmountable) to validated end to end.
   (after journal replay) calls `ocsfs_lock_recover_node(sb, slot, dead_gen)` to
   release those locks.
 
+- **O_DIRECT was non-functional.** `ocsfs_file_read_iter`/`write_iter` already
+  dispatch `IOCB_DIRECT` to `iomap_dio_rw()`, but because we expose no legacy
+  `a_ops->direct_IO` the VFS rejected every `open(O_DIRECT)` with `-EINVAL` before
+  the iterators ran — the dio path was dead code. **Fix:** `ocsfs_open()` sets
+  `file->f_mode |= FMODE_CAN_ODIRECT` for non-encrypted inodes (as ext4/xfs/btrfs
+  do); encrypted inodes keep returning `-EINVAL` since there is no inline-crypto
+  path. Validated: O_DIRECT read/write round-trips and is coherent with buffered
+  I/O in both directions.
+
+- **Wrapped journal unmountable after crash.** `j->head`/`j->tail` are *monotonic*
+  byte counters that `journal_read`/`journal_write` map into the ring modulo the
+  data size, so `j->head` legitimately exceeds `j->size` once the journal has
+  cycled even once. Replay's sanity check `j->head > j->size` therefore flagged
+  every long-lived volume's post-crash journal as corrupt (`-EUCLEAN`, "run fsck")
+  — only crashes on a still-fresh (<32 MB written) journal escaped it. **Fix:** the
+  check is now `tail > head || (head - tail) > journal_data_size` — the real
+  invariants (tail never past head; the un-checkpointed window fits the ring).
+  Validated on the exact over-size image that previously refused to mount.
+
 Tooling: `mkfs.ocsfs` now `exit(1)`s when the `Continue? (y/N)` prompt is declined
 (previously `exit(0)`, which let `mkfs … || fail` silently reuse a stale volume).
-Always pass `-f` in test scripts.
+Always pass `-f` in test scripts. `ocsfs-fsck -r` was confirmed to repair stale
+post-crash state offline (EX locks → NL, ACTIVE node slots → DEAD).
 
 ---
 

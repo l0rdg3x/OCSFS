@@ -64,11 +64,24 @@ static int journal_replay_j(struct super_block *sb, struct ocsfs_journal *j)
 		return 0;
 	}
 
-	/* Wrap-around sanity: tail must not exceed head */
-	if (j->tail > j->head || j->head > j->size) {
-		pr_err("ocsfs: journal corrupt (tail=%llu head=%llu size=%llu) — run fsck to repair\n",
-		       j->tail, j->head, j->size);
-		return -EUCLEAN;
+	/* Wrap-around sanity. j->head/j->tail are MONOTONIC byte counters that
+	 * journal_read()/journal_write() map into the ring modulo the data size,
+	 * so j->head routinely exceeds j->size once the journal has cycled even
+	 * once — comparing head against size wrongly flagged every long-lived
+	 * volume's post-crash journal as corrupt and made it unmountable. The real
+	 * invariants are: tail never past head, and the un-checkpointed window
+	 * (head - tail) fits in the ring (a larger window means the ring
+	 * overwrote live records = genuine corruption). */
+	{
+		u64 journal_start     = sizeof(struct ocsfs_disk_journal_hdr);
+		u64 journal_data_size = j->size - journal_start;
+
+		if (j->tail > j->head ||
+		    (j->head - j->tail) > journal_data_size) {
+			pr_err("ocsfs: journal corrupt (tail=%llu head=%llu size=%llu) — run fsck to repair\n",
+			       j->tail, j->head, j->size);
+			return -EUCLEAN;
+		}
 	}
 
 	pr_info("ocsfs: replaying journal (tail=%llu head=%llu)\n",
