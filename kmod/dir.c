@@ -34,22 +34,39 @@ struct buffer_head *ocsfs_dir_bread(struct inode *dir, u64 logical_block)
 	phys_block = ext.physical_block + (logical_block - ext.logical_block);
 
 	/*
-	 * Cross-node coherence: when clustered AND this directory has no local
-	 * uncommitted changes (clean — a local modifier would hold it I_DIRTY),
-	 * force a fresh read so a peer's added/removed dirents are visible.  The
-	 * clean check preserves read-your-own-writes and avoids clearing the
-	 * uptodate flag of a block a concurrent local transaction is mutating.
-	 * Directory data blocks are not shared between inodes, so a forced reread
-	 * here is safe (unlike inode blocks — see ocsfs_read_block_uncached()).
+	 * Cross-node coherence.  Every caller holds the directory's EX DLM lock
+	 * (modify paths) or is a read-only scan, and ocsfs_dir_bread is only ever
+	 * called BEFORE a modify opens its transaction — never to re-read a block
+	 * that the current op is mid-txn mutating.  Combined with the synchronous
+	 * checkpoint in ocsfs_txn_commit (committed dirents are always written to
+	 * their home location before the next op), this gives a clean buffer-level
+	 * rule for clustered mode:
+	 *
+	 *   - A clean, unlocked buffer either matches the on-disk image or is stale
+	 *     from a peer's earlier commit — force a fresh disk read so a peer's
+	 *     added/removed dirents become visible.  THIS is what stops concurrent
+	 *     multi-node adds from each scanning a stale block, colliding on the
+	 *     "free" slot a peer already filled, and diverging i_dirent_count from
+	 *     i_size (which trips the EUCLEAN consistency check at iget).
+	 *   - A dirty or locked buffer holds an in-flight local write (open txn or
+	 *     writeback in progress); serve it from cache to preserve
+	 *     read-your-own-writes and avoid clobbering the to-be-committed image.
+	 *
+	 * The old guard keyed off I_DIRTY, which includes I_DIRTY_PAGES.  The
+	 * write-through inode flush clears only I_DIRTY_INODE, so after the first
+	 * local add the directory stays I_DIRTY_PAGES forever and every later scan
+	 * read cached/stale — the root of the lost-update.  Directory data blocks
+	 * are not shared between inodes, so a forced reread is safe (unlike inode
+	 * blocks — see ocsfs_read_block_uncached()).
 	 */
-	if (sbi->s_clustered &&
-	    !(inode_state_read(dir) & (I_DIRTY | I_SYNC))) {
+	if (sbi->s_clustered) {
 		struct buffer_head *bh = sb_getblk(dir->i_sb, phys_block);
 
 		if (!bh)
 			return NULL;
-		clear_buffer_uptodate(bh);
-		if (bh_read(bh, 0) < 0) {
+		if (!buffer_dirty(bh) && !buffer_locked(bh))
+			clear_buffer_uptodate(bh);
+		if (!buffer_uptodate(bh) && bh_read(bh, 0) < 0) {
 			brelse(bh);
 			return NULL;
 		}
@@ -343,10 +360,15 @@ int ocsfs_add_dirent(struct inode *dir, const struct qstr *name,
 		 * the directory.  Without this, concurrent adds on different nodes
 		 * each start from their own stale cached view and overwrite each
 		 * other's entries (each node ends up seeing only its own files).
-		 * ocsfs_inode_refresh reads the inode fresh and the subsequent
-		 * ocsfs_dir_bread reads the dir blocks fresh (dir is clean here).
+		 * ocsfs_inode_refresh_forced reads the inode fresh and the
+		 * subsequent ocsfs_dir_bread reads the dir blocks fresh.  Forced
+		 * (not the plain refresh) because after our own previous add the dir
+		 * is metadata-clean but still I_DIRTY_PAGES, which the conservative
+		 * refresh would skip — leaving us growing from a stale i_size and
+		 * clobbering a peer's block growth.  Safe here: EX held, no local
+		 * mutation in flight yet.
 		 */
-		ocsfs_inode_refresh(dir);
+		ocsfs_inode_refresh_forced(dir);
 	}
 
 	ret = __ocsfs_add_dirent(dir, name, ino, file_type);
@@ -463,8 +485,11 @@ int ocsfs_del_dirent(struct inode *dir, const struct qstr *name)
 		if (ret)
 			return ret;
 		/* Cross-node: see a peer's dir changes before modifying (as in
-		 * ocsfs_add_dirent) so concurrent ops don't clobber each other. */
-		ocsfs_inode_refresh(dir);
+		 * ocsfs_add_dirent) so concurrent ops don't clobber each other.
+		 * Forced for the same reason — skip the stale-protecting
+		 * I_DIRTY_PAGES guard at this known-safe point (EX held, no local
+		 * mutation in flight). */
+		ocsfs_inode_refresh_forced(dir);
 	}
 
 	ret = __ocsfs_del_dirent(dir, name);

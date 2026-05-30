@@ -56,16 +56,39 @@ static int dir_btree_read(void *ctx, u64 block, void *buf, u32 size)
 	struct buffer_head *bh;
 
 	/*
-	 * Always read through the buffer cache.  The old forced disk re-read for
-	 * cross-node coherence broke read-your-own-writes and could block forever
-	 * in __bh_read on a dirty/locked node under i_extent_lock (deadlocking
-	 * writeback).  Cross-node btree-metadata coherence must be re-established
-	 * at DLM lock acquisition — TODO for the multi-node testbed.  See
-	 * ext_btree_read() for the full rationale.
+	 * Cross-node B+ tree coherence.  Every directory mutation/lookup runs
+	 * while this node holds the directory inode's EX DLM lock, so no peer can
+	 * mutate these nodes underneath us for the duration of the operation.
+	 *
+	 * That gives a clean rule for clustered mode:
+	 *   - A node that is NOT in our current transaction's write-set is either
+	 *     identical to the on-disk image or stale in our buffer cache from a
+	 *     peer's earlier commit.  Force a fresh disk read so we pick up the
+	 *     peer's committed state (this is what fixes lost dirents when several
+	 *     nodes grow the same directory concurrently).
+	 *   - A node that IS in our write-set holds our own uncommitted write.
+	 *     Serve it from the cache to preserve read-your-own-writes and to
+	 *     avoid clobbering the to-be-committed image with the stale disk copy.
+	 *
+	 * Unlike the extent tree, dir btree nodes are addressed by absolute block
+	 * number from the parent pointers (never via i_extent_lock), so the forced
+	 * read here cannot deadlock writeback.
 	 */
-	bh = sb_bread(dc->sb, block);
-	if (!bh)
-		return -EIO;
+	if (OCSFS_SB(dc->sb)->s_clustered &&
+	    !ocsfs_txn_has_block(dc->txn, block)) {
+		bh = sb_getblk(dc->sb, block);
+		if (!bh)
+			return -EIO;
+		clear_buffer_uptodate(bh);
+		if (bh_read(bh, 0) < 0) {
+			brelse(bh);
+			return -EIO;
+		}
+	} else {
+		bh = sb_bread(dc->sb, block);
+		if (!bh)
+			return -EIO;
+	}
 	memcpy(buf, bh->b_data, size);
 	brelse(bh);
 	return 0;

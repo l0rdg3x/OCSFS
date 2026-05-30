@@ -288,29 +288,45 @@ struct inode *ocsfs_iget(struct super_block *sb, u64 ino)
 }
 
 /* Re-read inode metadata from disk. Caller holds DLM SH. */
-int ocsfs_inode_refresh(struct inode *inode)
+/*
+ * Re-read the on-disk inode into the in-core VFS inode.
+ *
+ * `forced` selects how aggressively we override local state:
+ *
+ *  - false (ocsfs_inode_refresh): skip whenever the inode is I_DIRTY (any of
+ *    SYNC/DATASYNC/TIME/PAGES) or under writeback (I_SYNC).  This is the
+ *    conservative default used on read paths and from within an operation: it
+ *    protects the in-flight window inside __ocsfs_add_dirent where i_size and
+ *    the extent list are grown in-core *before* mark_inode_dirty(), which a
+ *    blind re-read would clobber into a corrupt directory.
+ *
+ *  - true (ocsfs_inode_refresh_forced): skip only on I_DIRTY_INODE / I_SYNC,
+ *    i.e. genuinely-newer-in-memory *metadata* (i_nlink from mkdir/rmdir/link,
+ *    or an as-yet-unflushed size change) or an in-progress writeback.  A bare
+ *    I_DIRTY_PAGES does NOT block it: ocsfs_flush_inode_locked() write-through
+ *    clears only I_DIRTY_INODE and leaves I_DIRTY_PAGES set, so after every
+ *    committed directory op the inode is metadata-clean-but-pages-dirty.  The
+ *    conservative refresh would then refuse forever and the node would keep
+ *    growing the directory from its own STALE i_size/extents — under concurrent
+ *    multi-node churn that rolls back a peer's block growth and orphans ~one
+ *    node's worth of dirents (40/60 visible, i_size stuck).  Callers must only
+ *    use the forced form at a known-safe point: holding the inode's DLM EX with
+ *    no local mutation in flight (e.g. right after the EX acquire in
+ *    ocsfs_add_dirent/ocsfs_del_dirent).
+ *
+ * In both cases the on-disk inode is read fresh (cache-bypassing) in clustered
+ * mode so a peer's flushed changes are picked up — the whole point of
+ * refreshing under the DLM lock.  Single-node: in-memory is authoritative.
+ */
+static int inode_refresh_impl(struct inode *inode, bool forced)
 {
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
 	struct ocsfs_sb_info *sbi   = OCSFS_SB(inode->i_sb);
 	struct ocsfs_disk_inode di;
+	unsigned int skip = forced ? (I_DIRTY_INODE | I_SYNC) : (I_DIRTY | I_SYNC);
 	int ret;
 
-	/*
-	 * Skip the refresh when this inode has uncommitted local changes
-	 * (I_DIRTY) or is being written back (I_SYNC).  In those windows the
-	 * in-memory VFS state — most importantly i_nlink, maintained by
-	 * inc_nlink()/drop_nlink() in mkdir/rmdir/link — is NEWER than what the
-	 * on-disk inode block (read via the cached sb_bread below) reflects.
-	 * Clobbering it with set_nlink(stale) silently drops increments under
-	 * concurrent directory churn and eventually trips the
-	 * inc_nlink(nlink==0) / drop_nlink(nlink==0) WARN_ONs in fs/inode.c.
-	 *
-	 * On a single node the in-memory inode is always authoritative, so
-	 * this never loses cross-node updates.  On multiple nodes it is a
-	 * best-effort last-writer-wins that protects local uncommitted work;
-	 * true cross-node refresh belongs at DLM-lock acquisition time (TODO).
-	 */
-	if (inode_state_read(inode) & (I_DIRTY | I_SYNC))
+	if (inode_state_read(inode) & skip)
 		return 0;
 
 	/* Cross-node coherence: in clustered mode read the inode block fresh
@@ -355,6 +371,21 @@ int ocsfs_inode_refresh(struct inode *inode)
 	ocsfs_parse_extents(oi, &di);
 	mutex_unlock(&oi->i_extent_lock);
 	return 0;
+}
+
+/* Conservative refresh — see inode_refresh_impl(). */
+int ocsfs_inode_refresh(struct inode *inode)
+{
+	return inode_refresh_impl(inode, false);
+}
+
+/* Forced refresh for the directory write paths — bypasses I_DIRTY_PAGES so a
+ * node re-reads a peer's committed i_size/extents between directory ops.  ONLY
+ * safe under the inode's DLM EX with no local mutation in flight.  See
+ * inode_refresh_impl(). */
+int ocsfs_inode_refresh_forced(struct inode *inode)
+{
+	return inode_refresh_impl(inode, true);
 }
 
 /* ═══════════════════════════════════════════════════════════════

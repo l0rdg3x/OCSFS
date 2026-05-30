@@ -70,6 +70,17 @@ static int ocsfs_unlink(struct inode *dir, struct dentry *dentry)
 			ocsfs_lock_release(dir->i_sb, &first->i_lock_res);
 			return ret;
 		}
+		/*
+		 * Cross-node: pull in a peer's committed directory state (i_size,
+		 * extents, dirent_count) BEFORE removing the entry.  Without this the
+		 * unlink flushes this node's stale in-core i_size and rolls back a
+		 * peer's concurrent block growth, orphaning ~a block of the peer's
+		 * dirents.  Forced refresh because the dir is metadata-clean but
+		 * I_DIRTY_PAGES after earlier ops.  Refresh the victim too so a peer's
+		 * hardlink/size change is seen before we drop its link count.
+		 */
+		ocsfs_inode_refresh_forced(dir);
+		ocsfs_inode_refresh_forced(inode);
 	}
 
 	ret = __ocsfs_del_dirent(dir, &dentry->d_name);
@@ -149,6 +160,13 @@ static int ocsfs_rmdir(struct inode *dir, struct dentry *dentry)
 			ocsfs_lock_release(dir->i_sb, &first->i_lock_res);
 			return ret;
 		}
+		/*
+		 * Cross-node: refresh the child dir so a peer's just-added entry is
+		 * seen by the emptiness check, and the parent so we don't roll back a
+		 * peer's concurrent block growth when flushing it (see ocsfs_unlink).
+		 */
+		ocsfs_inode_refresh_forced(inode);
+		ocsfs_inode_refresh_forced(dir);
 	}
 
 	if (!__ocsfs_empty_dir(inode)) {
@@ -402,6 +420,15 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 				return ret;
 			}
 		}
+		/*
+		 * Cross-node: refresh every EX-locked inode to its peer-committed
+		 * state before mutating, so rename does not flush a stale in-core
+		 * i_size/extents and roll back a peer's concurrent directory growth
+		 * (the same lost-update fixed in ocsfs_unlink).  Safe: EX held, no
+		 * local mutation in flight yet.
+		 */
+		for (i = 0; i < n_locks; i++)
+			ocsfs_inode_refresh_forced(&lock_arr[i]->vfs_inode);
 	}
 
 	/* RENAME_EXCHANGE: swap the two directory entries in-place */

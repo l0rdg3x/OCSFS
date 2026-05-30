@@ -88,6 +88,11 @@ either node**:
   and sees the new data (validates the VM-disk write optimizations cluster-wide)
 - ✅ **directory coherence** both ways — files created on one node are listed on
   the other, with no inode-number collisions between nodes
+- ✅ **3-node concurrent directory modification** — three nodes hammering the
+  *same* directory at once (concurrent create, concurrent delete, and
+  interleaved create+delete churn) all converge to the correct entry set with a
+  consistent on-disk `i_size`, both below and above the directory-B+tree
+  threshold; survives remount with a clean `fsck`
 - ✅ 10-round **ping-pong overwrite** with a stable cross-node lock hand-off
 
 ### What's *not* validated yet
@@ -96,8 +101,9 @@ either node**:
   SCSI-PR preempt-and-abort, and journal replay of a peer are implemented but
   not yet exercised by killing a live node in a two-node cluster
 - ❌ **xfstests** `quick`/`auto` on a clustered LUN
-- ❌ **Cross-node block-bitmap coherence** and the inode-block co-located-write
-  race under heavy concurrent cross-node metadata churn (known follow-ups)
+- ❌ Concurrent cross-node **rename** churn on the same directories (the
+  lost-update class is fixed and `rename` now refreshes every locked inode, but
+  it has not yet had its own dedicated 3-node stress run)
 - ❌ Long-haul soak / performance tuning
 
 ### Indicative scores
@@ -300,7 +306,7 @@ sudo ./tools/ocsfs-fsck --repair /dev/sdb
 
 | Area | Status |
 |---|---|
-| **Multi-node coherence** | Basic 2-node read/write/overwrite/directory coherence **validated on real hardware**. Cross-node block-bitmap coherence and the inode-block co-located-write race under heavy concurrent cross-node churn are open follow-ups |
+| **Multi-node coherence** | 2- and 3-node read/write/overwrite plus **concurrent same-directory create/delete/churn coherence validated on real hardware** (the directory lost-update class — stale `i_size`/extent rollback and stale dirent/B+tree reads — is fixed). Cross-node **rename** churn lacks a dedicated 3-node stress run |
 | **Cluster recovery & fencing** | Implemented; not yet exercised by killing a live node in a 2-node cluster |
 | **Integration tests** | No xfstests run yet |
 | **Encryption — I/O** | No readahead, no O_DIRECT; reflink/snapshot/symlink inside encrypted dirs return `-EOPNOTSUPP` |

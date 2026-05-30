@@ -273,6 +273,28 @@ holds uncommitted local changes the in-memory copy is newer than the cached
 on-disk block, and overwriting `i_nlink` from it dropped concurrent
 `inc_nlink`/`drop_nlink` updates (see §8, Sprint V2).
 
+**Sprint X (3-node directory coherence)** — two variants now exist:
+
+- `ocsfs_inode_refresh()` keeps the conservative `(I_DIRTY | I_SYNC)` skip.
+- `ocsfs_inode_refresh_forced()` skips only on `(I_DIRTY_INODE | I_SYNC)`.
+
+The directory write paths use the **forced** form right after taking the
+directory EX lock, before any local mutation. The reason: a committed directory
+op leaves the inode *metadata-clean but `I_DIRTY_PAGES`* (the write-through
+`ocsfs_flush_inode_locked()` clears only `I_DIRTY_INODE`). The conservative
+refresh would then skip forever and the node would keep growing the directory
+from its **own stale `i_size`/extents**, and a concurrent peer op would roll
+that growth back — orphaning ~a block of dirents (seen as 40/60 visible,
+`i_size` stuck). Forcing the refresh at that known-safe point fixes it. Crucial
+companion fix: **`ocsfs_unlink`/`ocsfs_rmdir`/`ocsfs_rename` call
+`__ocsfs_del_dirent`/`__ocsfs_add_dirent` directly** (not the
+`ocsfs_del_dirent`/`ocsfs_add_dirent` wrappers), so they did **no** cross-node
+refresh at all — they now `ocsfs_inode_refresh_forced()` every EX-locked inode
+after acquiring the locks. Companion reader fixes: `ocsfs_dir_bread()` and the
+dir-B+tree reader now force a fresh disk read of any clean / not-in-txn buffer
+(keyed off the buffer state / the txn write-set via `ocsfs_txn_has_block()`),
+not off `I_DIRTY` — same `I_DIRTY_PAGES` trap.
+
 ---
 
 ## 5. Distributed Locking Protocol

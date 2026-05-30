@@ -475,6 +475,28 @@ undo_tb:
 	}
 }
 
+/*
+ * True if `block` is already part of this transaction's write-set.  Used by the
+ * cluster btree readers to decide whether a node may be force-reread from disk
+ * (peer-fresh) or must be served from the buffer cache (our own uncommitted
+ * write — preserve read-your-own-writes).  The block hash mirrors the keying in
+ * ocsfs_txn_add_bh.  A NULL txn (read-only op) owns no uncommitted writes.
+ */
+bool ocsfs_txn_has_block(struct ocsfs_txn *txn, u64 block)
+{
+	struct ocsfs_txn_buf *tb;
+	u32 hslot = (u32)(block & 63U);
+
+	if (!txn)
+		return false;
+
+	hlist_for_each_entry(tb, &txn->t_block_hash[hslot], hash_node) {
+		if (tb->block_num == block)
+			return true;
+	}
+	return false;
+}
+
 int ocsfs_txn_commit(struct ocsfs_txn *txn)
 {
 	struct ocsfs_journal *j = txn->t_journal;
