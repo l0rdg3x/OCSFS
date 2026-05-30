@@ -33,23 +33,14 @@ struct buffer_head *ocsfs_dir_bread(struct inode *dir, u64 logical_block)
 
 	phys_block = ext.physical_block + (logical_block - ext.logical_block);
 
-	if (sbi->s_clustered) {
-		/*
-		 * In cluster mode, another node may have written to this
-		 * directory block since our cached copy was loaded.  Force a
-		 * fresh read so we see the latest entries.
-		 */
-		struct buffer_head *bh = sb_getblk(dir->i_sb, phys_block);
-
-		if (!bh)
-			return NULL;
-		clear_buffer_uptodate(bh);
-		if (bh_read(bh, 0) < 0) {
-			brelse(bh);
-			return NULL;
-		}
-		return bh;
-	}
+	/*
+	 * Cached read.  A forced fresh re-read clears the uptodate flag of a
+	 * directory block a concurrent transaction may be holding, and discards
+	 * our own uncommitted changes (read-your-own-writes).  Cross-node
+	 * coherence of directory blocks is a DLM-acquire-time TODO — see
+	 * ocsfs_inode_invalidate_cache().
+	 */
+	(void)sbi;
 	return sb_bread(dir->i_sb, phys_block);
 }
 
@@ -397,17 +388,11 @@ int __ocsfs_del_dirent(struct inode *dir, const struct qstr *name)
 	if (!ocsfs_dir_btree_locate(dir, name, &phys_block, &phys_off)) {
 		struct buffer_head *bh;
 
-		if (sbi->s_clustered) {
-			bh = sb_getblk(dir->i_sb, phys_block);
-			if (!bh)
-				return -EIO;
-			clear_buffer_uptodate(bh);
-			if (bh_read(bh, 0) < 0) { brelse(bh); return -EIO; }
-		} else {
-			bh = sb_bread(dir->i_sb, phys_block);
-			if (!bh)
-				return -EIO;
-		}
+		/* Cached read (see ocsfs_inode_invalidate_cache for why no forced
+		 * re-read). */
+		bh = sb_bread(dir->i_sb, phys_block);
+		if (!bh)
+			return -EIO;
 		return del_dirent_at(dir, bh, phys_off, name);
 	}
 

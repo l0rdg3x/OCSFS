@@ -58,20 +58,13 @@ static struct buffer_head *xattr_read_bh(struct inode *inode)
 	struct ocsfs_disk_xattr_block *xb;
 	struct buffer_head *bh;
 
-	if (OCSFS_SB(inode->i_sb)->s_clustered) {
-		bh = sb_getblk(inode->i_sb, oi->i_xattr_block);
-		if (!bh)
-			return ERR_PTR(-EIO);
-		clear_buffer_uptodate(bh);
-		if (bh_read(bh, 0) < 0) {
-			brelse(bh);
-			return ERR_PTR(-EIO);
-		}
-	} else {
-		bh = sb_bread(inode->i_sb, oi->i_xattr_block);
-		if (!bh)
-			return ERR_PTR(-EIO);
-	}
+	/* Cached read: a forced fresh re-read clears the uptodate flag of a block
+	 * a concurrent txn may hold and breaks read-your-own-writes (see
+	 * ocsfs_inode_invalidate_cache).  Cross-node coherence is a DLM-acquire
+	 * TODO. */
+	bh = sb_bread(inode->i_sb, oi->i_xattr_block);
+	if (!bh)
+		return ERR_PTR(-EIO);
 
 	xb = (struct ocsfs_disk_xattr_block *)bh->b_data;
 	if (le32_to_cpu(xb->xb_magic) != OCSFS_XATTR_MAGIC) {

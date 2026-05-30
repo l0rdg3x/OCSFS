@@ -267,26 +267,16 @@ static int rename_replace_atomic(struct inode *old_dir, const struct qstr *old_n
 	if (ocsfs_dir_btree_locate(new_dir, new_name, &new_block, &new_off))
 		return -ENOENT;
 
-	if (sbi->s_clustered) {
-		old_bh = sb_getblk(old_dir->i_sb, old_block);
-		if (!old_bh)
-			return -EIO;
-		clear_buffer_uptodate(old_bh);
-		if (bh_read(old_bh, 0) < 0) { brelse(old_bh); return -EIO; }
-	} else {
-		old_bh = sb_bread(old_dir->i_sb, old_block);
-		if (!old_bh)
-			return -EIO;
-	}
+	/* Cached reads (see ocsfs_inode_invalidate_cache): a forced fresh re-read
+	 * clears the uptodate flag of a block a concurrent txn holds and breaks
+	 * read-your-own-writes. */
+	old_bh = sb_bread(old_dir->i_sb, old_block);
+	if (!old_bh)
+		return -EIO;
 
 	if (new_block == old_block) {
 		new_bh = old_bh;
 		get_bh(new_bh);
-	} else if (sbi->s_clustered) {
-		new_bh = sb_getblk(new_dir->i_sb, new_block);
-		if (!new_bh) { brelse(old_bh); return -EIO; }
-		clear_buffer_uptodate(new_bh);
-		if (bh_read(new_bh, 0) < 0) { brelse(new_bh); brelse(old_bh); return -EIO; }
 	} else {
 		new_bh = sb_bread(new_dir->i_sb, new_block);
 		if (!new_bh) { brelse(old_bh); return -EIO; }

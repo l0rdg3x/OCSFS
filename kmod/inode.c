@@ -47,19 +47,25 @@ static int ocsfs_read_disk_inode(struct super_block *sb, u64 ino,
 
 static void ocsfs_inode_invalidate_cache(struct super_block *sb, u64 ino)
 {
-	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
-	u64 off   = ocsfs_inode_disk_off(sbi, ino);
-	u64 block = off / sbi->s_block_size;
-	struct buffer_head *bh;
-
-	bh = sb_getblk(sb, block);
-	if (!bh)
-		return;
-	clear_buffer_uptodate(bh);
-	if (bh_read(bh, 0) < 0)
-		pr_warn_ratelimited("ocsfs: inode cache invalidate I/O error "
-				    "for ino %llu\n", ino);
-	brelse(bh);
+	/*
+	 * Deliberately a no-op.
+	 *
+	 * This used to clear_buffer_uptodate() + bh_read() the inode's block to
+	 * force a fresh disk read for cross-node coherence.  That is actively
+	 * harmful: inode blocks hold 8 inodes each, so invalidating one inode's
+	 * block clears the uptodate flag of a block that a CONCURRENT transaction
+	 * (modifying a different inode in the same block) is holding — at commit
+	 * that transaction trips mark_buffer_dirty(!uptodate) and writes garbage,
+	 * corrupting data under concurrent writers.  It also discards newer
+	 * write-back-cached inode data in favour of a staler on-disk copy, which
+	 * is wrong even on a single node.
+	 *
+	 * Cross-node coherence (picking up an inode another node modified and
+	 * flushed) must instead be re-established by invalidating the specific
+	 * block at DLM SH/EX acquisition time — TODO for the multi-node testbed.
+	 */
+	(void)sb;
+	(void)ino;
 }
 
 /* Parse inline extents from the on-disk inode */
@@ -308,25 +314,15 @@ int ocsfs_flush_inode_locked(struct inode *inode, bool force_sync)
 	boff  = off % sbi->s_block_size;
 
 	/*
-	 * In cluster mode force a fresh disk read so the journal captures the
-	 * true on-disk BEFORE-image.  The caller holds DLM EX, guaranteeing the
-	 * previous holder already flushed; our page cache may lag behind.
+	 * Read through the buffer cache (read-your-own-writes).  Forcing a fresh
+	 * disk read here clears the uptodate flag of a block shared by 8 inodes,
+	 * racing concurrent transactions on the other inodes — see
+	 * ocsfs_inode_invalidate_cache().
 	 */
-	if (sbi->s_clustered) {
-		bh = sb_getblk(inode->i_sb, block);
-		if (!bh) { ret = -EIO; goto out_abort; }
-		clear_buffer_uptodate(bh);
-		if (bh_read(bh, 0) < 0) {
-			brelse(bh);
-			ret = -EIO;
-			goto out_abort;
-		}
-	} else {
-		bh = sb_bread(inode->i_sb, block);
-		if (!bh) {
-			ret = -EIO;
-			goto out_abort;
-		}
+	bh = sb_bread(inode->i_sb, block);
+	if (!bh) {
+		ret = -EIO;
+		goto out_abort;
 	}
 
 	ret = ocsfs_txn_add_bh(txn, bh);
@@ -417,16 +413,10 @@ int ocsfs_inode_journal_root(struct ocsfs_txn *txn, struct inode *inode)
 	u32 boff  = off % sbi->s_block_size;
 	int ret;
 
-	if (sbi->s_clustered) {
-		bh = sb_getblk(inode->i_sb, block);
-		if (!bh)
-			return -EIO;
-		clear_buffer_uptodate(bh);
-		if (bh_read(bh, 0) < 0) {
-			brelse(bh);
-			return -EIO;
-		}
-	} else {
+	if (1) {
+		/* Cached read (read-your-own-writes); forcing a fresh read clears a
+		 * block shared by 8 inodes under concurrent txns — see
+		 * ocsfs_inode_invalidate_cache(). */
 		bh = sb_bread(inode->i_sb, block);
 		if (!bh)
 			return -EIO;

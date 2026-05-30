@@ -69,37 +69,17 @@ static bool dedup_blocks_equal(struct super_block *sb, u64 a, u64 b)
 	struct buffer_head *bha, *bhb;
 	bool eq;
 
-	/* In cluster mode use forced reads so we never compare stale page-cache
-	 * content that a peer has already overwritten (MEDIO-V3-11). */
-	if (OCSFS_SB(sb)->s_clustered) {
-		bha = sb_getblk(sb, a);
-		if (!bha)
-			return false;
-		clear_buffer_uptodate(bha);
-		if (bh_read(bha, 0) < 0) {
-			brelse(bha);
-			return false;
-		}
-		bhb = sb_getblk(sb, b);
-		if (!bhb) {
-			brelse(bha);
-			return false;
-		}
-		clear_buffer_uptodate(bhb);
-		if (bh_read(bhb, 0) < 0) {
-			brelse(bha);
-			brelse(bhb);
-			return false;
-		}
-	} else {
-		bha = sb_bread(sb, a);
-		if (!bha)
-			return false;
-		bhb = sb_bread(sb, b);
-		if (!bhb) {
-			brelse(bha);
-			return false;
-		}
+	/* Cached reads: the page cache holds the authoritative latest content; a
+	 * forced disk re-read would compare STALER on-disk data and clear the
+	 * uptodate flag of a block a concurrent txn holds (see
+	 * ocsfs_inode_invalidate_cache). */
+	bha = sb_bread(sb, a);
+	if (!bha)
+		return false;
+	bhb = sb_bread(sb, b);
+	if (!bhb) {
+		brelse(bha);
+		return false;
 	}
 	eq = memcmp(bha->b_data, bhb->b_data, bha->b_size) == 0;
 	brelse(bhb);

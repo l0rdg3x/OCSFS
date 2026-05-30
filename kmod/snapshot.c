@@ -450,19 +450,10 @@ int ocsfs_cow_extent(struct inode *inode, u64 logical, u32 len)
 		 * to this extent before triggering our CoW.  Copying stale data
 		 * to the new blocks would silently lose the other node's writes.
 		 */
-		if (sbi->s_clustered) {
-			old_bh = sb_getblk(sb, old_phys + i);
-			if (!old_bh) {
-				ocsfs_free_blocks(sb, new_phys, len);
-				return -EIO;
-			}
-			clear_buffer_uptodate(old_bh);
-			if (bh_read(old_bh, 0) < 0) {
-				brelse(old_bh);
-				ocsfs_free_blocks(sb, new_phys, len);
-				return -EIO;
-			}
-		} else {
+		if (1) {
+			/* Cached read: the page cache is the authoritative latest copy
+			 * (a forced disk re-read would copy STALER on-disk data and lose
+			 * our own un-flushed writes); see ocsfs_inode_invalidate_cache. */
 			old_bh = sb_bread(sb, old_phys + i);
 			if (!old_bh) {
 				ocsfs_free_blocks(sb, new_phys, len);
