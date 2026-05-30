@@ -353,6 +353,8 @@ ssize_t ocsfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
 	ssize_t ret;
 	loff_t start_pos = 0; /* ARCH-7: write start for dirty range tracking */
+	loff_t i_size_before = 0;
+	bool   meta_changed = false;
 
 	/*
 	 * Lock ordering: inode_lock → DLM EX.
@@ -400,6 +402,7 @@ ssize_t ocsfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		goto out;
 
 	start_pos = iocb->ki_pos; /* capture before write advances ki_pos */
+	i_size_before = i_size_read(inode);
 
 	if (iocb->ki_flags & IOCB_DIRECT) {
 		ret = iomap_dio_rw(iocb, from, &ocsfs_dio_iomap_ops,
@@ -440,13 +443,27 @@ out:
 		 * ocsfs_iget reads the inode from disk after acquiring SH; if
 		 * the updated extent map is not on disk yet it will see stale
 		 * block mappings and silently read wrong data.
+		 *
+		 * PERF (VM-disk fast path): a *pure overwrite* — no extent-map
+		 * change (oi->i_extents_dirty) and no i_size growth — leaves the
+		 * on-disk inode already correct for a peer: the data went to the
+		 * same WRITTEN blocks the existing map points at (O_DIRECT writes
+		 * them synchronously; buffered ones are flushed just above).  Skip
+		 * the synchronous journal-txn inode flush entirely; only mtime/
+		 * ctime changed and that rides normal async writeback.  This is the
+		 * dominant pattern for random writes into a pre-allocated VM image.
 		 */
-		if (ret > 0) {
+		meta_changed = oi->i_extents_dirty ||
+			       i_size_read(inode) > i_size_before;
+
+		if (ret > 0 && meta_changed) {
 			int fr = ocsfs_flush_inode_locked(inode, true);
 			if (fr)
 				pr_warn_ratelimited(
 					"ocsfs: write_iter inode flush failed (%d)\n",
 					fr);
+		}
+		if (ret > 0) {
 
 			/* ARCH-7: update dirty range in lock_res so lock_release
 			 * can store it on disk for the next SH acquirer. */

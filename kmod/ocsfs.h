@@ -889,6 +889,15 @@ struct ocsfs_inode_info {
 	struct mutex            i_extent_lock;
 	struct ocsfs_lock_res   i_lock_res;     /* cross-node DLM inode lock */
 	u16                     i_last_writer_slot; /* ARCH-7: OCSFS_INVALID_WRITER_SLOT if none */
+	/*
+	 * PERF: set whenever the in-memory extent map (alloc / CoW /
+	 * UNWRITTEN→WRITTEN) diverges from the on-disk inode, cleared by
+	 * ocsfs_flush_inode_locked.  write_iter uses it to skip the synchronous
+	 * cross-node inode flush for a *pure overwrite* (no extent-map change,
+	 * no i_size growth) — the dominant VM-disk pattern — since a peer
+	 * reading existing WRITTEN blocks already gets correct data.
+	 */
+	bool                    i_extents_dirty;
 	/* directory B+ tree index */
 	u64                     i_dir_btree_root; /* 0 = flat-list dir */
 	u32                     i_dirent_count;   /* live entry count */

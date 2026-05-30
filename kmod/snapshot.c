@@ -418,6 +418,10 @@ int ocsfs_cow_extent(struct inode *inode, u64 logical, u32 len)
 	u32 i;
 	int ret;
 
+	/* PERF: CoW remaps logical→new physical; a peer must see the new
+	 * mapping.  Force the synchronous cross-node inode flush in write_iter. */
+	oi->i_extents_dirty = true;
+
 	/* Look up the current extent */
 	ret = ocsfs_extent_lookup(inode, logical, &ext);
 	if (ret)

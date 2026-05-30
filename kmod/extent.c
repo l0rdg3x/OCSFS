@@ -65,6 +65,11 @@ int ocsfs_extent_insert(struct inode *inode, u64 logical, u64 physical,
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
 	u16 i, pos;
 
+	/* PERF: the on-disk inode extent map now diverges from memory; the next
+	 * write_iter must do the synchronous cross-node inode flush (it is no
+	 * longer a pure overwrite). */
+	oi->i_extents_dirty = true;
+
 	if (oi->i_extent_tree_root)
 		return ocsfs_extent_btree_insert(inode, logical, physical,
 						 len, flags);
@@ -261,6 +266,10 @@ int ocsfs_extent_convert_unwritten(struct inode *inode, u64 logical_block,
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
 	u16 i;
 	int ret;
+
+	/* PERF: UNWRITTEN→WRITTEN changes the on-disk extent map — a peer must
+	 * see WRITTEN (else it reads zeros).  Force the cross-node inode flush. */
+	oi->i_extents_dirty = true;
 
 	if (oi->i_extent_tree_root)
 		return ocsfs_extent_btree_convert_unwritten(inode,

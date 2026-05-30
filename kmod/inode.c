@@ -407,6 +407,8 @@ int ocsfs_flush_inode_locked(struct inode *inode, bool force_sync)
 	ret = ocsfs_txn_commit(txn);
 	if (ret == 0 && force_sync)
 		sync_dirty_buffer(bh);
+	if (ret == 0)
+		oi->i_extents_dirty = false;  /* on-disk inode now matches memory */
 	brelse(bh);
 	return ret;
 
