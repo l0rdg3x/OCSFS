@@ -316,9 +316,17 @@ int ocsfs_dedup_index_gc(struct super_block *sb, u64 *bytes_freed)
 					if (bt.root_block != sbi->s_dedup_index_root)
 						didx_persist_root(sb, bt.root_block, txn);
 					if (ocsfs_txn_commit(txn) == 0) {
+						bool sf = false;
+
 						mutex_unlock(&sbi->s_dedup_index_lock);
+						/* Drop the index reference; the block
+						 * had refcount 1 (index-only) so this
+						 * reaches 0 and we free the bitmap. */
 						ocsfs_refcount_dec(sb, col->blks[i],
-								   1, NULL);
+								   1, &sf);
+						if (sf)
+							ocsfs_free_blocks(sb,
+								col->blks[i], 1);
 						freed += sb->s_blocksize;
 						continue;
 					}

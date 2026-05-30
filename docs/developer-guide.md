@@ -533,11 +533,31 @@ stale refcount / orphan block that fsck reclaims, never corruption.
 Locking: a single `s_dedup_index_lock` serialises all index access; the order is
 always `s_dedup_index_lock → j_lock` (refcount/insert open their own
 transactions sequentially, never nested), so it cannot deadlock against the
-write/checkpoint paths, which never take the index lock. Known follow-ups:
-`ocsfs-fsck` is not yet dedup-index-aware, so an index-only canonical that the
-scrub has not GC'd yet is reported as an allocated-but-unreferenced block; and
-cross-node coherence of the index tree is a DLM-acquire-time TODO like the other
-shared B+ trees.
+write/checkpoint paths, which never take the index lock.
+
+**Refcount-aware truncate (the deletion side).** Validating the GC exposed a
+pre-existing bug: `ocsfs_extent_truncate` (and the btree variant) freed every
+extent's blocks straight through `ocsfs_free_blocks_txn`, *ignoring refcount*.
+Deleting or truncating a file with shared blocks — a reflink copy, a snapshot,
+or a deduped file — therefore cleared the bitmap of a block its other owners
+still pointed at (latent corruption once that block was reallocated) and left
+the refcount entry stale, so a canonical never fell back to refcount 1 and the
+GC could never reclaim it. Both paths now collect the freed ranges and release
+them with `ocsfs_free_blocks_rc()` *after* the btree/inode update commits:
+refcount-aware (a shared block is dropped by one reference and survives; only the
+last reference frees the bitmap) and outside the truncate transaction (the
+refcount lock is taken before its own txn, the opposite order to the truncate's
+`j_lock`). A run of consecutive non-shared blocks is freed in one bulk call, so
+the common never-shared file keeps deleting at bulk speed. Validated: deleting a
+reflink copy leaves the original intact; deleting every file referencing a
+canonical drops it to refcount 1, after which GC frees it.
+
+GC can be triggered on demand by the `OCSFS_IOC_DEDUP_GC` ioctl (CAP_SYS_ADMIN,
+returns bytes reclaimed) in addition to the periodic scrub. `ocsfs-fsck` is now
+dedup-index-aware: it walks the DDT B+ tree and verifies every canonical block
+is allocated (a dangling entry pointing at a free block is reported for the
+scrub GC to prune). Remaining follow-up: cross-node coherence of the index tree
+is a DLM-acquire-time TODO like the other shared B+ trees.
 
 ### Ordered checkpoint
 

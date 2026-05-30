@@ -56,7 +56,7 @@ NODE_STATES = {0: "FREE", 1: "ACTIVE", 2: "EVICTING", 3: "SUSPECTED", 0xFF: "DEA
 # Superblock header (struct ocsfs_superblock, __packed, 4096 bytes).
 # s_checksum lives at the very end (offset OCSFS_SUPERBLOCK_SIZE - 4 = 4092),
 # NOT inside this header — read it separately. CRC32C covers bytes 0..4091.
-SB_HDR_FMT = "<IHH16s64sIIQQIQHQIIIQQQQQQQIQQQI"
+SB_HDR_FMT = "<IHH16s64sIIQQIQHQIIIQQQQQQQIQQQIQ"
 SB_HDR_FIELDS = [
     "s_magic","s_version_major","s_version_minor","s_uuid","s_label",
     "s_block_size","s_extent_size","s_total_blocks","s_free_blocks",
@@ -65,8 +65,20 @@ SB_HDR_FIELDS = [
     "s_lock_table_off","s_journal_off","s_ag_desc_off","s_data_off",
     "s_mkfs_time","s_mount_count","s_last_mount_time","s_revision_level",
     "s_feature_compat","s_feature_incompat","s_feature_ro_compat",
-    "s_lock_primary_count",
+    "s_lock_primary_count","s_dedup_index_root",
 ]
+
+# B+ tree on-disk node header (struct ocsfs_btree_node_hdr, __packed, 56 bytes).
+BTREE_HDR_FMT = "<IHHHHIQQQQII"
+BTREE_HDR_FIELDS = [
+    "bn_magic","bn_flags","bn_count","bn_level","bn_reserved",
+    "bn_block_size","bn_block_num","bn_parent","bn_left_sibling",
+    "bn_right_sibling","bn_checksum","bn_padding",
+]
+BTREE_HDR_SIZE          = 56
+OCSFS_BTREE_LEAF_MAGIC     = 0x42544E4C   # 'BTNL'
+OCSFS_BTREE_INTERNAL_MAGIC = 0x42544E49   # 'BTNI'
+OCSFS_FEATURE_RO_COMPAT_DEDUP_INDEX = (1 << 3)
 
 # AG descriptor header (struct ocsfs_ag_desc, __packed, occupies a 4096-byte
 # block). ag_checksum is at offset 4092; CRC32C covers bytes 0..4091.
@@ -314,9 +326,86 @@ class Fsck:
 
         # ── 5+. Extended checks ───────────────────────────────────────────────
         self._check_inodes(f, ags, bs)
+        self._check_dedup_index(f, fields, ags, bs)
         self._check_heartbeat(f, bs, fields["s_max_nodes"])
         self._check_lock_table(f, bs)
         self._check_node_slots(f, fields["s_max_nodes"])
+
+    def _block_allocated(self, f, ags, bs, block):
+        """Return True if `block` is marked allocated in its AG bitmap."""
+        for ag in ags:
+            start = ag["block_start"]
+            cnt   = ag["block_count"]
+            if start <= block < start + cnt:
+                bit = block - start
+                byte = read_at(f, ag["bitmap_off"] + bit // 8, 1)
+                return bool((byte[0] >> (bit % 8)) & 1)
+        return False  # block outside every AG range
+
+    def _walk_dedup_index(self, f, root, bs, total_blocks):
+        """Collect all (fingerprint, canonical_block) leaf entries of the
+        global dedup B+ tree by an iterative descent with a cycle guard."""
+        entries = []
+        visited = set()
+        stack   = [root]
+        while stack:
+            blk = stack.pop()
+            if blk in visited or blk == 0 or blk >= total_blocks:
+                continue
+            visited.add(blk)
+            if len(visited) > 1_000_000:
+                self.error("dedup index: node count exceeds sanity cap — aborting walk")
+                break
+            raw = read_block(f, blk, bs)
+            hdr = dict(zip(BTREE_HDR_FIELDS,
+                           struct.unpack_from(BTREE_HDR_FMT, raw)))
+            magic = hdr["bn_magic"]
+            count = hdr["bn_count"]
+            if magic not in (OCSFS_BTREE_LEAF_MAGIC, OCSFS_BTREE_INTERNAL_MAGIC):
+                self.error(f"dedup index: node {blk} bad magic 0x{magic:08X}")
+                continue
+            if hdr["bn_level"] == 0:        # leaf: key/value pairs
+                for i in range(count):
+                    k, v = struct.unpack_from("<QQ", raw, BTREE_HDR_SIZE + i * 16)
+                    entries.append((k, v))
+            else:                           # internal: first_child + (key,child) ptrs
+                child0, = struct.unpack_from("<Q", raw, BTREE_HDR_SIZE)
+                stack.append(child0)
+                for i in range(count):
+                    _, child = struct.unpack_from(
+                        "<QQ", raw, BTREE_HDR_SIZE + 8 + i * 16)
+                    stack.append(child)
+        return entries
+
+    def _check_dedup_index(self, f, fields, ags, bs):
+        """Audit the cross-file dedup index (DDT): every canonical block it
+        references must be allocated. An entry pointing at a free block is a
+        dangling reference (kernel scrub GC prunes these; report only)."""
+        if not (fields.get("s_feature_ro_compat", 0) &
+                OCSFS_FEATURE_RO_COMPAT_DEDUP_INDEX):
+            return
+        print("Checking cross-file dedup index...")
+        root = fields.get("s_dedup_index_root", 0)
+        if root == 0:
+            self.log("  dedup index: empty (no cross-file canonicals)")
+            return
+        total_blocks = fields["s_total_blocks"]
+        entries  = self._walk_dedup_index(f, root, bs, total_blocks)
+        dangling = invalid = 0
+        for fp, blk in entries:
+            if blk == 0 or blk >= total_blocks:
+                self.error(f"  dedup index: fp={fp:016x} -> out-of-range block {blk}")
+                invalid += 1
+            elif not self._block_allocated(f, ags, bs, blk):
+                self.warn(f"  dedup index: fp={fp:016x} -> FREE block {blk} (dangling)")
+                dangling += 1
+        msg = (f"  dedup index: {len(entries)} canonical block(s)"
+               f"{f', {dangling} dangling' if dangling else ''}"
+               f"{f', {invalid} invalid' if invalid else ''}")
+        if dangling or invalid:
+            self.warn(msg + " — remount writable to let the kernel scrub GC prune them")
+        else:
+            self.log(msg + " — all referenced blocks allocated")
 
     def _check_inodes(self, f, ags, bs):
         """Check every inode slot in each AG's inode table."""

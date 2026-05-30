@@ -606,6 +606,34 @@ static long ocsfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return 0;
 	}
 
+	if (cmd == OCSFS_IOC_DEDUP_GC) {
+		u64 total = 0;
+		int passes = 0;
+
+		/* Whole-FS reclaim of index-only cross-file canonicals. */
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+		if (!(OCSFS_SB(inode->i_sb)->s_feature_ro_compat &
+		      OCSFS_FEATURE_RO_COMPAT_DEDUP_INDEX))
+			return -EOPNOTSUPP;
+
+		/* Each call reclaims one bounded batch; loop until a pass frees
+		 * nothing.  Cap the pass count as a runaway backstop. */
+		for (passes = 0; passes < 100000; passes++) {
+			u64 freed = 0;
+
+			ret = ocsfs_dedup_index_gc(inode->i_sb, &freed);
+			if (ret)
+				return ret;
+			if (freed == 0)
+				break;
+			total += freed;
+		}
+		if (copy_to_user((void __user *)arg, &total, sizeof(total)))
+			return -EFAULT;
+		return 0;
+	}
+
 	/* ARCH-V3-6: cluster-wide filesystem freeze / thaw */
 	if (cmd == OCSFS_IOC_FREEZE_FS) {
 		if (!capable(CAP_SYS_ADMIN))

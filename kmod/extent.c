@@ -165,16 +165,17 @@ int ocsfs_extent_truncate(struct inode *inode, u64 from_block)
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
 	struct super_block *sb = inode->i_sb;
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
-	struct ocsfs_txn *txn;
 	u64 saved_blocks;
-	int i, ret;
+	int i;
+
+	/* Collected physical ranges to release after the in-memory extent map is
+	 * updated.  Each loop iteration frees at most one range, so the inline
+	 * extent count bounds it. */
+	struct { u64 phys; u32 len; } frees[OCSFS_INLINE_EXTENTS];
+	int nfrees = 0;
 
 	if (oi->i_extent_tree_root)
 		return ocsfs_extent_btree_truncate(inode, from_block);
-
-	txn = ocsfs_txn_begin(sb);
-	if (IS_ERR(txn))
-		return PTR_ERR(txn);
 
 	saved_blocks = inode->i_blocks;
 
@@ -192,10 +193,9 @@ int ocsfs_extent_truncate(struct inode *inode, u64 from_block)
 				    e->phys_length)
 				   ? (u32)e->phys_length : e->length;
 
-			ret = ocsfs_free_blocks_txn(txn, e->physical_block,
-						    phys);
-			if (ret)
-				goto abort;
+			frees[nfrees].phys = e->physical_block;
+			frees[nfrees].len  = phys;
+			nfrees++;
 			inode->i_blocks -= (u64)phys * (sbi->s_block_size / 512);
 			oi->i_extent_count--;
 		} else if (e->logical_block + e->length > from_block) {
@@ -208,10 +208,8 @@ int ocsfs_extent_truncate(struct inode *inode, u64 from_block)
 			if (e->flags & OCSFS_EXT_COMPRESSED) {
 				int dr = ocsfs_extent_decompress_for_write(
 					inode, e->logical_block);
-				if (dr) {
-					ret = dr;
-					goto abort;
-				}
+				if (dr)
+					return dr;
 				i++; /* re-visit this index, now uncompressed */
 				continue;
 			}
@@ -220,11 +218,9 @@ int ocsfs_extent_truncate(struct inode *inode, u64 from_block)
 				u32 keep  = (u32)(from_block - e->logical_block);
 				u32 freed = e->length - keep;
 
-				ret = ocsfs_free_blocks_txn(txn,
-							    e->physical_block +
-							    keep, freed);
-				if (ret)
-					goto abort;
+				frees[nfrees].phys = e->physical_block + keep;
+				frees[nfrees].len  = freed;
+				nfrees++;
 				inode->i_blocks -= (u64)freed *
 						   (sbi->s_block_size / 512);
 				e->length = keep;
@@ -232,20 +228,21 @@ int ocsfs_extent_truncate(struct inode *inode, u64 from_block)
 		}
 	}
 
-	ret = ocsfs_txn_commit(txn);
-	if (!ret) {
+	/* Release the blocks refcount-aware, AFTER the in-memory extent map no
+	 * longer references them.  Shared (reflink/dedup/snapshot) blocks are
+	 * dropped by one reference and survive for their other owners; only the
+	 * last reference actually frees the bitmap. */
+	for (i = 0; i < nfrees; i++)
+		ocsfs_free_blocks_rc(sb, frees[i].phys, frees[i].len);
+
+	{
 		u64 freed_bytes = (saved_blocks - inode->i_blocks) * 512;
 
 		if (freed_bytes)
 			dquot_free_space_nodirty(inode, freed_bytes);
-		mark_inode_dirty(inode);
 	}
-	return ret;
-
-abort:
-	ocsfs_txn_abort(txn);
-	inode->i_blocks = saved_blocks;
-	return ret;
+	mark_inode_dirty(inode);
+	return 0;
 }
 
 /* ═══════════════════════════════════════════════════════════════

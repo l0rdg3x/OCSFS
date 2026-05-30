@@ -1323,6 +1323,7 @@ bool ocsfs_needs_cow(struct super_block *sb, u64 phys_block);
 int ocsfs_refcount_get(struct super_block *sb, u64 phys_block,
 		       u32 *refcount_out);
 int ocsfs_refcount_inc(struct super_block *sb, u64 phys_block, u32 len);
+void ocsfs_free_blocks_rc(struct super_block *sb, u64 phys, u32 len);
 int ocsfs_refcount_dec(struct super_block *sb, u64 phys_block, u32 len,
 		       bool *should_free);
 int ocsfs_refcount_init_ag(struct super_block *sb, u32 ag_no);
@@ -1353,6 +1354,9 @@ struct ocsfs_dedup_result {
 	__u64 bytes_deduped;
 };
 #define OCSFS_IOC_DEDUP  _IOR('O', 3, struct ocsfs_dedup_result)
+/* Admin-triggered cross-file dedup index GC; returns total bytes reclaimed.
+ * Whole-FS operation, requires CAP_SYS_ADMIN. */
+#define OCSFS_IOC_DEDUP_GC  _IOR('O', 4, __u64)
 
 int ocsfs_dedup_file(struct inode *inode, u64 *bytes_deduped);
 

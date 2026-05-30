@@ -356,6 +356,53 @@ int ocsfs_refcount_dec(struct super_block *sb, u64 phys_block, u32 len,
 }
 
 /*
+ * ocsfs_free_blocks_rc — refcount-aware free of an extent's physical blocks.
+ *
+ * For a SHARED block (refcount > 1, i.e. reflinked / deduped / snapshotted) it
+ * drops one reference and leaves the block allocated for the other owners.  A
+ * non-shared block is freed normally.  Callers (truncate / unlink) used to call
+ * ocsfs_free_blocks() directly, which cleared the bitmap of shared canonical
+ * blocks out from under their other owners (latent corruption once the block
+ * was reallocated) and left the refcount entry stale so the dedup GC could
+ * never reclaim it.
+ *
+ * MUST be called WITHOUT an open journal transaction: refcount_dec acquires the
+ * AG refcount lock before beginning its own txn, the opposite order to a
+ * truncate that already holds j_lock — so callers collect the extents and free
+ * them after committing the btree/inode update (see ocsfs_extent_truncate).
+ *
+ * Fast path: a run of consecutive non-shared blocks is freed in one bulk call,
+ * and on a volume with no sharing in this AG refcount_get is O(1), so the common
+ * (never-shared) file keeps deleting at bulk speed.
+ */
+void ocsfs_free_blocks_rc(struct super_block *sb, u64 phys, u32 len)
+{
+	u32 i = 0;
+
+	while (i < len) {
+		u32 rc = 1;
+
+		if (ocsfs_refcount_get(sb, phys + i, &rc) == 0 && rc > 1) {
+			ocsfs_refcount_dec(sb, phys + i, 1, NULL);
+			i++;
+		} else {
+			u32 run = 1;
+
+			while (i + run < len) {
+				u32 rc2 = 1;
+
+				if (ocsfs_refcount_get(sb, phys + i + run,
+						       &rc2) == 0 && rc2 > 1)
+					break;
+				run++;
+			}
+			ocsfs_free_blocks(sb, phys + i, run);
+			i += run;
+		}
+	}
+}
+
+/*
  * ocsfs_refcount_init_ag — crea il B+ tree radice per un AG.
  * Chiamato da mkfs o al primo montaggio con INCOMPAT_RC_BTREE_PER_AG.
  */

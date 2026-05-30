@@ -340,6 +340,18 @@ int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block)
 	/* i_blocks at the start of the current uncommitted batch; used to
 	 * restore in-memory state on abort and to compute per-batch quota. */
 	u64 batch_start_blocks;
+	/* Physical ranges whose extents have been removed from the btree but not
+	 * yet released.  We free them refcount-aware (ocsfs_free_blocks_rc) AFTER
+	 * the batch commits — so a shared reflink/dedup/snapshot block is never
+	 * bitmap-freed out from under its other owners, and its btree removal is
+	 * durable before we drop the reference (a crash in between leaves a stale
+	 * refcount / orphan that fsck reclaims, never corruption). */
+	struct { u64 phys; u32 len; } *fb;
+	u32 fb_n = 0, fb_cap;
+	u64 est_extents;
+	u32 batches_per_commit;
+	u32 inner_count = 0;
+	int safety = 65536;
 
 	OCSFS_WARN_NO_EX(inode);
 	u32 i;
@@ -349,12 +361,23 @@ int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block)
 	if (ret)
 		return ret;
 
+	/* MEDIO-V3-2: commit every `batches_per_commit` inner 64-extent cycles
+	 * (logarithmic in extent count) to bound txn overhead on large files. */
+	est_extents = (inode->i_blocks * 512) /
+		      max_t(u64, sbi->s_block_size, 1) + 1;
+	batches_per_commit = max_t(u32, 1U, order_base_2(est_extents));
+	fb_cap = 64U * batches_per_commit + 1U;   /* +1 for the straddling extent */
+	fb = kmalloc_array(fb_cap, sizeof(*fb), GFP_KERNEL);
+	if (!fb)
+		return -ENOMEM;
+
 	batch_start_blocks = inode->i_blocks;
 
 	txn = ocsfs_txn_begin(sb);
-	if (IS_ERR(txn))
+	if (IS_ERR(txn)) {
+		kfree(fb);
 		return PTR_ERR(txn);
-
+	}
 	ec.txn = txn;
 
 	/* Shrink any extent that straddles from_block */
@@ -366,10 +389,9 @@ int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block)
 			u32 keep  = (u32)(from_block - key);
 			u32 freed = elen - keep;
 
-			ret = ocsfs_free_blocks_txn(txn,
-						    ext_phys(val) + keep, freed);
-			if (ret)
-				goto abort;
+			fb[fb_n].phys = ext_phys(val) + keep;
+			fb[fb_n].len  = freed;
+			fb_n++;
 			inode->i_blocks -= (u64)freed * (sbi->s_block_size / 512);
 			ret = ocsfs_btree_delete(&bt, key);
 			if (ret)
@@ -383,81 +405,77 @@ int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block)
 		}
 	}
 
-	/* Delete all extents fully beyond from_block.
-	 * MEDIO-V3-2: commit every `batches_per_commit` inner 64-extent cycles
-	 * instead of every single cycle.  Scaling logarithmically with the
-	 * estimated extent count reduces txn overhead for large files:
-	 *   64 extents  → commit every  1 cycle  (~64  extents/txn)
-	 *   4K extents  → commit every  6 cycles (~384 extents/txn)
-	 *   1M extents  → commit every 20 cycles (~1280 extents/txn)
-	 * Journal space is still bounded: 64 × batches_per_commit × sizeof(bref). */
-	{
-		u64 est_extents = (inode->i_blocks * 512) /
-				  max_t(u64, sbi->s_block_size, 1) + 1;
-		u32 batches_per_commit = max_t(u32, 1U, order_base_2(est_extents));
-		u32 inner_count = 0;
-		int safety = 65536;
+	do {
+		tc.count = 0;
+		ocsfs_btree_range_scan(&bt, from_block, U64_MAX,
+				       ext_trunc_collect, &tc);
+		for (i = 0; i < tc.count; i++) {
+			u64 v;
 
-		do {
-			tc.count = 0;
-			ocsfs_btree_range_scan(&bt, from_block, U64_MAX,
-					       ext_trunc_collect, &tc);
-			for (i = 0; i < tc.count; i++) {
-				u64 v;
-
-				if (!ocsfs_btree_search(&bt, tc.keys[i], &v)) {
-					ret = ocsfs_free_blocks_txn(txn,
-								    ext_phys(v),
-								    ext_len(f4, v));
-					if (ret)
-						goto abort;
-					inode->i_blocks -= (u64)ext_len(f4, v) *
-							   (sbi->s_block_size / 512);
-					ret = ocsfs_btree_delete(&bt, tc.keys[i]);
-					if (ret)
-						goto abort;
-					oi->i_extent_tree_root = bt.root_block;
-				}
-			}
-
-			if (tc.count > 0) {
-				if (--safety <= 0) {
-					WARN_ON(1);
-					pr_err("ocsfs: extent_btree_truncate: loop limit reached "
-					       "(inode %llu) — btree may be corrupt, run fsck\n",
-					       oi->i_disk_ino);
+			if (!ocsfs_btree_search(&bt, tc.keys[i], &v)) {
+				if (fb_n >= fb_cap) {   /* sizing invariant */
 					ret = -EUCLEAN;
 					goto abort;
 				}
-
-				inner_count++;
-				if (inner_count >= batches_per_commit || tc.count < 64) {
-					/* Commit this batch and charge freed blocks to quota */
-					ret = ocsfs_inode_journal_root(txn, inode);
-					if (ret)
-						goto abort;
-					ret = ocsfs_txn_commit(txn);
-					if (ret)
-						return ret;
-					{
-						u64 freed_bytes = (batch_start_blocks -
-								   inode->i_blocks) * 512;
-						if (freed_bytes)
-							dquot_free_space_nodirty(inode,
-										 freed_bytes);
-					}
-					mark_inode_dirty(inode);
-					batch_start_blocks = inode->i_blocks;
-					inner_count = 0;
-
-					txn = ocsfs_txn_begin(sb);
-					if (IS_ERR(txn))
-						return PTR_ERR(txn);
-					ec.txn = txn;
-				}
+				fb[fb_n].phys = ext_phys(v);
+				fb[fb_n].len  = ext_len(f4, v);
+				fb_n++;
+				inode->i_blocks -= (u64)ext_len(f4, v) *
+						   (sbi->s_block_size / 512);
+				ret = ocsfs_btree_delete(&bt, tc.keys[i]);
+				if (ret)
+					goto abort;
+				oi->i_extent_tree_root = bt.root_block;
 			}
-		} while (tc.count > 0);
-	}
+		}
+
+		if (tc.count > 0) {
+			if (--safety <= 0) {
+				WARN_ON(1);
+				pr_err("ocsfs: extent_btree_truncate: loop limit reached "
+				       "(inode %llu) — btree may be corrupt, run fsck\n",
+				       oi->i_disk_ino);
+				ret = -EUCLEAN;
+				goto abort;
+			}
+
+			inner_count++;
+			if (inner_count >= batches_per_commit || tc.count < 64) {
+				/* Commit this batch and charge freed blocks to quota */
+				ret = ocsfs_inode_journal_root(txn, inode);
+				if (ret)
+					goto abort;
+				ret = ocsfs_txn_commit(txn);
+				if (ret) {
+					kfree(fb);
+					return ret;
+				}
+				/* btree removals are now durable — release the
+				 * blocks refcount-aware (no txn held). */
+				for (i = 0; i < fb_n; i++)
+					ocsfs_free_blocks_rc(sb, fb[i].phys,
+							     fb[i].len);
+				fb_n = 0;
+				{
+					u64 freed_bytes = (batch_start_blocks -
+							   inode->i_blocks) * 512;
+					if (freed_bytes)
+						dquot_free_space_nodirty(inode,
+									 freed_bytes);
+				}
+				mark_inode_dirty(inode);
+				batch_start_blocks = inode->i_blocks;
+				inner_count = 0;
+
+				txn = ocsfs_txn_begin(sb);
+				if (IS_ERR(txn)) {
+					kfree(fb);
+					return PTR_ERR(txn);
+				}
+				ec.txn = txn;
+			}
+		}
+	} while (tc.count > 0);
 
 	/* Final commit covers the straddling extent (if any) and cleans up */
 	ret = ocsfs_inode_journal_root(txn, inode);
@@ -465,17 +483,25 @@ int ocsfs_extent_btree_truncate(struct inode *inode, u64 from_block)
 		goto abort;
 	ret = ocsfs_txn_commit(txn);
 	if (!ret) {
-		u64 freed_bytes = (batch_start_blocks - inode->i_blocks) * 512;
+		u64 freed_bytes;
 
+		for (i = 0; i < fb_n; i++)
+			ocsfs_free_blocks_rc(sb, fb[i].phys, fb[i].len);
+		fb_n = 0;
+		freed_bytes = (batch_start_blocks - inode->i_blocks) * 512;
 		if (freed_bytes)
 			dquot_free_space_nodirty(inode, freed_bytes);
 		mark_inode_dirty(inode);
 	}
+	kfree(fb);
 	return ret;
 
 abort:
+	/* Uncommitted btree deletes roll back, so the blocks collected in fb are
+	 * still referenced — do NOT free them. */
 	inode->i_blocks = batch_start_blocks;
 	ocsfs_txn_abort(txn);
+	kfree(fb);
 	return ret;
 }
 
