@@ -439,6 +439,7 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	init_rwsem(&sbi->s_global_lock);
 	spin_lock_init(&sbi->s_free_lock);
 	mutex_init(&sbi->s_decompress_lock);
+	mutex_init(&sbi->s_cas_mutex);
 	ocsfs_lock_init(&sbi->s_freeze_lock_res, 0, OCSFS_LOCKRES_FREEZE);
 	ocsfs_lock_init(&sbi->s_keystore_lock_res, 0, OCSFS_LOCKRES_KEYSTORE);
 

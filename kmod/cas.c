@@ -291,10 +291,22 @@ int ocsfs_atomic_cas(struct super_block *sb, u64 block, u32 boff,
 		}
 	}
 
-	/* PR-lease path */
+	/*
+	 * PR-lease path.  Serialize this node's software-CAS operations with
+	 * s_cas_mutex so our own concurrent operations (e.g. a foreground write
+	 * and the writeback flusher) never contend for the per-block lease — many
+	 * lock blocks hash onto the 1024 lease slots, so that false intra-node
+	 * contention exhausted CAS_MAX_ATTEMPTS and returned -EBUSY, stranding
+	 * locks under heavy lock churn (thousands of file creates).  The on-disk
+	 * lease still provides cross-node exclusion; the mutex only removes the
+	 * pointless self-contention and also reduces concurrent loop-device I/O.
+	 */
+	mutex_lock(&sbi->s_cas_mutex);
+	ret = -EBUSY;
 	for (attempt = 0; attempt < CAS_MAX_ATTEMPTS; attempt++) {
-		ret = cas_acquire_lease(sb, block, &lease_bh, &lease_eidx);
-		if (ret == -EAGAIN) {
+		int lret = cas_acquire_lease(sb, block, &lease_bh, &lease_eidx);
+
+		if (lret == -EAGAIN) {
 			u32 delay_us = min_t(u32,
 					     1U << min_t(u32, attempt,
 							 CAS_BACKOFF_SHIFT_MAX),
@@ -302,27 +314,29 @@ int ocsfs_atomic_cas(struct super_block *sb, u64 block, u32 boff,
 			usleep_range(delay_us, delay_us + delay_us / 4);
 			continue;
 		}
-		if (ret < 0)
-			return ret;
+		if (lret < 0) { ret = lret; break; }
 
 		/* Leggi block target (forced-read dentro il lease) */
 		data_bh = sb_getblk(sb, block);
 		if (!data_bh) {
 			cas_release_lease(lease_bh, lease_eidx);
-			return -ENOMEM;
+			ret = -ENOMEM;
+			break;
 		}
 		clear_buffer_uptodate(data_bh);
-		ret = bh_read(data_bh, 0);
-		if (ret < 0) {
+		lret = bh_read(data_bh, 0);
+		if (lret < 0) {
 			brelse(data_bh);
 			cas_release_lease(lease_bh, lease_eidx);
-			return ret;
+			ret = lret;
+			break;
 		}
 
 		if (memcmp(data_bh->b_data + boff, expected, len) != 0) {
 			brelse(data_bh);
 			cas_release_lease(lease_bh, lease_eidx);
-			return -EAGAIN;
+			ret = -EAGAIN;
+			break;
 		}
 
 		lock_buffer(data_bh);
@@ -330,7 +344,7 @@ int ocsfs_atomic_cas(struct super_block *sb, u64 block, u32 boff,
 		set_buffer_uptodate(data_bh);
 		mark_buffer_dirty(data_bh);
 		unlock_buffer(data_bh);
-		ret = sync_dirty_buffer(data_bh);
+		lret = sync_dirty_buffer(data_bh);
 		brelse(data_bh);
 
 		/*
@@ -341,7 +355,7 @@ int ocsfs_atomic_cas(struct super_block *sb, u64 block, u32 boff,
 		 * Re-read the lease block and confirm ownership; if stolen,
 		 * return -EAGAIN so the caller retries from a clean state.
 		 */
-		if (ret == 0) {
+		if (lret == 0) {
 			struct ocsfs_disk_cas_lease *vcl;
 
 			clear_buffer_uptodate(lease_bh);
@@ -353,14 +367,16 @@ int ocsfs_atomic_cas(struct super_block *sb, u64 block, u32 boff,
 				    le16_to_cpu(vcl->cl_owner_slot) !=
 					(u16)sbi->s_node_slot) {
 					cas_release_lease(lease_bh, lease_eidx);
-					return -EAGAIN;
+					ret = -EAGAIN;
+					break;
 				}
 			}
 		}
 
 		cas_release_lease(lease_bh, lease_eidx);
-		return ret;
+		ret = lret;
+		break;
 	}
-
-	return -EBUSY;
+	mutex_unlock(&sbi->s_cas_mutex);
+	return ret;
 }

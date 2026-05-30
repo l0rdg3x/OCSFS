@@ -817,6 +817,8 @@ struct ocsfs_sb_info {
 	bool            s_degraded;     /* mount option: allow cluster without fencing */
 	bool            s_scrub_enabled; /* mount option 'scrub': run background dedup scrub */
 	enum ocsfs_cas_backend s_cas_backend;
+	struct mutex    s_cas_mutex;    /* serializes this node's software-CAS ops so the
+					 * per-block lease is never contended intra-node */
 
 	/* ZSTD decompression workspace — lazy-allocated on first ZSTD read */
 	struct mutex    s_decompress_lock;
