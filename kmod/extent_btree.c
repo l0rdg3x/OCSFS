@@ -957,6 +957,7 @@ int ocsfs_extent_btree_zero_range(struct inode *inode,
 	struct ext_btree_ctx ec;
 	struct ext_trunc_ctx tc;
 	struct ocsfs_txn *txn;
+	u64 search_from;
 	int safety = 65536;
 	u32 i;
 	int ret;
@@ -970,13 +971,24 @@ int ocsfs_extent_btree_zero_range(struct inode *inode,
 		return PTR_ERR(txn);
 	ec.txn = txn;
 
+	/* Start from the extent containing start_block (see punch_hole). */
+	{
+		u64 skey, sval;
+
+		if (ocsfs_btree_search_le(&bt, start_block, &skey, &sval) == 0)
+			search_from = skey;
+		else
+			search_from = start_block;
+	}
+
 	do {
 		u64 key, val;
+		bool progress = false;
 
 		tc.count = 0;
-		ocsfs_btree_range_scan(&bt,
-				       start_block > 0 ? start_block - 1 : 0,
-				       end_block, ext_trunc_collect, &tc);
+		/* Exclusive of end_block so a re-inserted tail is never re-collected. */
+		ocsfs_btree_range_scan(&bt, search_from, end_block - 1,
+				       ext_trunc_collect, &tc);
 		if (tc.count == 0)
 			break;
 
@@ -988,9 +1000,18 @@ int ocsfs_extent_btree_zero_range(struct inode *inode,
 			{
 				u64 ext_end = key + ext_len(f4, val);
 				u64 phys    = ext_phys(val);
+				u16 cur_flags = ext_flags(f4, val);
 
-				if (ext_end <= start_block)
+				/* Nothing to do for extents before/after the range, or for
+				 * a portion already marked UNWRITTEN and fully inside it —
+				 * skipping the latter is what lets the loop converge (the
+				 * split below re-inserts the middle at the same key). */
+				if (ext_end <= start_block || key >= end_block)
 					continue;
+				if ((cur_flags & OCSFS_EXT_UNWRITTEN) &&
+				    key >= start_block && ext_end <= end_block)
+					continue;
+				progress = true;
 
 				ret = ocsfs_btree_delete(&bt, key);
 				if (ret)
@@ -1037,6 +1058,8 @@ int ocsfs_extent_btree_zero_range(struct inode *inode,
 				}
 			}
 		}
+		if (!progress)
+			break;
 		if (--safety <= 0) {
 			WARN_ON(1);
 			ret = -EUCLEAN;
