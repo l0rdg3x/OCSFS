@@ -639,8 +639,17 @@ struct ocsfs_lock_res {
 					  * reflink holds EX) cannot release the lock or
 					  * clobber lr_mode out from under the EX holder */
 	u32             lr_slot;         /* lock table slot index (u16→u32 for ARCH-2) */
+	u32             lr_ex_wait;      /* writer-priority: nr of local threads
+					  * currently blocked acquiring EX. While
+					  * > 0, new SH/CW acquires defer so the
+					  * pending writer's lr_hold can drain to 0
+					  * and it gets granted instead of being
+					  * starved by a continuous reader stream
+					  * (protected by lr_mutex) */
 	bool            lr_dynamic;      /* allocated via kzalloc; safe to kfree */
 	struct mutex    lr_mutex;        /* local serialization */
+	wait_queue_head_t lr_wq;         /* wakes SH/CW acquirers deferring to a
+					  * pending EX waiter (writer priority) */
 	struct list_head lr_list;        /* link in sb's active lock list */
 	/* ARCH-7: dirty range captured at last SH acquire; used by read path */
 	u64             lr_inv_lo;

@@ -77,6 +77,35 @@ int ocsfs_lock_acquire(struct super_block *sb, struct ocsfs_lock_res *lr,
 	mutex_lock(&lr->lr_mutex);
 
 	/*
+	 * Writer priority (fixes EX starvation under a continuous reader
+	 * stream).  A shared acquire defers while a local EX waiter is pending
+	 * so the existing SH holders' lr_hold can drain to 0 — clearing the
+	 * on-disk SH holder bit — and the writer is granted instead of being
+	 * starved by back-to-back readers.
+	 *
+	 * This MUST run before the cache fast-path: under continuous reads
+	 * lr_mode stays SH, so every fresh reader would otherwise hit the
+	 * cache and bump lr_hold without ever deferring, and lr_hold would
+	 * never reach 0.  No i_lock_res / ag_rc_lock_res / keystore path
+	 * acquires SH recursively or SH-under-EX on the same resource, so
+	 * blocking a fresh shared acquirer here cannot deadlock a thread that
+	 * already holds this lock.
+	 *
+	 * Bounded by the acquire deadline: the writer decrements lr_ex_wait
+	 * and wakes us when it is granted or times out; past our own deadline
+	 * we fall through and try the disk so the reader is not starved either.
+	 */
+	if (mode == OCSFS_LOCK_SH || mode == OCSFS_LOCK_CW) {
+		while (lr->lr_ex_wait > 0 &&
+		       !ktime_after(ktime_get(), deadline)) {
+			mutex_unlock(&lr->lr_mutex);
+			wait_event_timeout(lr->lr_wq, lr->lr_ex_wait == 0,
+					   msecs_to_jiffies(1000));
+			mutex_lock(&lr->lr_mutex);
+		}
+	}
+
+	/*
 	 * Epoch-based lock cache (MEDIO-V3-1, ARCH-V3-7).
 	 *
 	 * Cache hit: we already hold a compatible mode AND s_lock_epoch hasn't
@@ -110,9 +139,17 @@ int ocsfs_lock_acquire(struct super_block *sb, struct ocsfs_lock_res *lr,
 		return ret;
 	}
 
+	/* Register as a pending writer so concurrent shared acquirers defer
+	 * (writer priority).  Decremented + waiters woken on every exit path
+	 * below: read error, grant, and deadline timeout. */
+	if (mode == OCSFS_LOCK_EX)
+		lr->lr_ex_wait++;
+
 retry:
 	ret = lr_read_entry(sb, lr, &dl, &bh);
 	if (ret) {
+		if (mode == OCSFS_LOCK_EX && --lr->lr_ex_wait == 0)
+			wake_up_all(&lr->lr_wq);
 		mutex_unlock(&lr->lr_mutex);
 		return ret;
 	}
@@ -168,6 +205,8 @@ retry:
 			lr->lr_lock_epoch = (u32)atomic_read(&sbi->s_lock_epoch);
 		}
 
+		if (mode == OCSFS_LOCK_EX && --lr->lr_ex_wait == 0)
+			wake_up_all(&lr->lr_wq);
 		mutex_unlock(&lr->lr_mutex);
 		return ret;
 	}
@@ -182,6 +221,8 @@ retry:
 			OCSFS_LOCK_ACQUIRE_TIMEOUT_MS,
 			lr->lr_resource_id, mode, cur_mode,
 			le16_to_cpu(dl.le_holder_slot));
+		if (mode == OCSFS_LOCK_EX && --lr->lr_ex_wait == 0)
+			wake_up_all(&lr->lr_wq);
 		mutex_unlock(&lr->lr_mutex);
 		return -ETIMEDOUT;
 	}
@@ -196,8 +237,18 @@ retry:
 			delay_us = min_t(u32, (u32)((lease - now) / 1000),
 					 OCSFS_LOCK_RETRY_MAX_US);
 	}
+	/*
+	 * Drop lr_mutex while we back off.  Critical for a same-node EX
+	 * waiter: otherwise readers calling ocsfs_lock_release() would block
+	 * on lr_mutex, lr_hold could never reach 0, the on-disk SH holder bit
+	 * would never clear, and this EX acquire would deadlock against its
+	 * own node's readers until the 30s deadline.  lr_ex_wait stays
+	 * incremented across the retry so new shared acquirers keep deferring.
+	 */
+	mutex_unlock(&lr->lr_mutex);
 	usleep_range(delay_us, delay_us * 2);
 	delay_us = min_t(u32, delay_us * 2, OCSFS_LOCK_RETRY_MAX_US);
+	mutex_lock(&lr->lr_mutex);
 	goto retry;
 }
 

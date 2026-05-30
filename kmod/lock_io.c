@@ -435,6 +435,7 @@ void ocsfs_lock_init(struct ocsfs_lock_res *lr, u64 resource_id,
 	/* lr_slot is overwritten by lock_probe_slot; use legacy default here */
 	lr->lr_slot          = ocsfs_lock_table_slot(resource_id, OCSFS_LOCK_ENTRY_COUNT);
 	mutex_init(&lr->lr_mutex);
+	init_waitqueue_head(&lr->lr_wq);
 	INIT_LIST_HEAD(&lr->lr_list);
 }
 
@@ -495,6 +496,7 @@ struct ocsfs_lock_res *ocsfs_lock_alloc(struct super_block *sb,
 					ocsfs_lock_primary_count(sbi));
 	lr->lr_dynamic       = true;
 	mutex_init(&lr->lr_mutex);
+	init_waitqueue_head(&lr->lr_wq);
 
 	spin_lock(&sbi->s_lock_list_lock);
 	list_add(&lr->lr_list, &sbi->s_lock_list);
