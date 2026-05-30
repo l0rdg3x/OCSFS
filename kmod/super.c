@@ -578,6 +578,16 @@ fail:
 	mempool_destroy(sbi->s_rc_buf_pool);
 	kfree(sbi);
 	sb->s_fs_info = NULL;
+	/*
+	 * Defense in depth: fill_super must return a negative errno on failure.
+	 * A positive value (e.g. a leaked SCSI status like RESERVATION CONFLICT)
+	 * makes get_tree_bdev report bogus success, tripping the BUG() in
+	 * vfs_get_tree ("didn't set fc->root, returned N") and oopsing the kernel.
+	 */
+	if (ret > 0)
+		ret = -EIO;
+	if (ret == 0)
+		ret = -EINVAL;   /* never reach the success path via fail: */
 	return ret;
 }
 

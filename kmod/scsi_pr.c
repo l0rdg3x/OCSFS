@@ -110,6 +110,17 @@ static const struct pr_ops *ocsfs_pr_ops(struct super_block *sb)
 	return bdev->bd_disk->fops->pr_ops;
 }
 
+/*
+ * Block PR ops may return a positive SCSI status (e.g. RESERVATION CONFLICT
+ * = 0x18) rather than a negative errno.  Returning a positive value to the VFS
+ * mount path oopses the kernel (vfs_get_tree BUG()).  Normalise every PR
+ * wrapper's result through this.
+ */
+static inline int ocsfs_pr_norm(int ret)
+{
+	return ret > 0 ? -EBUSY : ret;
+}
+
 int ocsfs_pr_register(struct super_block *sb, u64 key)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
@@ -117,10 +128,27 @@ int ocsfs_pr_register(struct super_block *sb, u64 key)
 	int ret = 0;
 
 	if (ops && ops->pr_register)
-		ret = ops->pr_register(sb->s_bdev, 0, key, 0);
+		/*
+		 * REGISTER_AND_IGNORE_EXISTING_KEY (PR_FL_IGNORE_KEY): a node that
+		 * rejoins after a crash finds its previous registration still on
+		 * the LUN (targets such as LIO persist registrations by initiator
+		 * IQN, which survives the reboot), so a plain REGISTER returns
+		 * RESERVATION CONFLICT and the node can never remount.  Each node
+		 * uses a unique key, so ignoring the existing key only refreshes
+		 * *this* node's own registration; peers are untouched.
+		 */
+		ret = ops->pr_register(sb->s_bdev, 0, key, PR_FL_IGNORE_KEY);
 	else
 		pr_debug("ocsfs: PR not supported by device, skipping\n");
 
+	/*
+	 * Block PR ops may return a positive SCSI status (e.g. RESERVATION
+	 * CONFLICT = 0x18 = 24) instead of a negative errno.  A positive value
+	 * propagated up to fill_super/get_tree makes the VFS BUG() ("didn't set
+	 * fc->root, returned 24") and oopses the kernel — normalise to -EBUSY.
+	 */
+	if (ret > 0)
+		ret = -EBUSY;
 	if (ret)
 		return ret;
 
@@ -140,7 +168,8 @@ int ocsfs_pr_unregister(struct super_block *sb)
 		return 0;
 
 	if (ops && ops->pr_register)
-		ret = ops->pr_register(sb->s_bdev, sbi->s_pr.pr_key, 0, 0);
+		ret = ocsfs_pr_norm(ops->pr_register(sb->s_bdev,
+						     sbi->s_pr.pr_key, 0, 0));
 
 	if (ret == 0) {
 		sbi->s_pr.pr_registered = false;
@@ -156,8 +185,8 @@ int ocsfs_pr_reserve(struct super_block *sb, u8 type)
 
 	if (!ops || !ops->pr_reserve)
 		return 0;
-	return ops->pr_reserve(sb->s_bdev, sbi->s_pr.pr_key,
-				ocsfs_to_pr_type(type), 0);
+	return ocsfs_pr_norm(ops->pr_reserve(sb->s_bdev, sbi->s_pr.pr_key,
+					     ocsfs_to_pr_type(type), 0));
 }
 
 int ocsfs_pr_release(struct super_block *sb, u8 type)
@@ -167,8 +196,8 @@ int ocsfs_pr_release(struct super_block *sb, u8 type)
 
 	if (!ops || !ops->pr_release)
 		return 0;
-	return ops->pr_release(sb->s_bdev, sbi->s_pr.pr_key,
-				ocsfs_to_pr_type(type));
+	return ocsfs_pr_norm(ops->pr_release(sb->s_bdev, sbi->s_pr.pr_key,
+					     ocsfs_to_pr_type(type)));
 }
 
 int ocsfs_pr_preempt(struct super_block *sb, u64 victim_key, u8 type)
@@ -179,8 +208,9 @@ int ocsfs_pr_preempt(struct super_block *sb, u64 victim_key, u8 type)
 	pr_info("ocsfs: PR PREEMPT victim key 0x%016llx\n", victim_key);
 	if (!ops || !ops->pr_preempt)
 		return 0;
-	return ops->pr_preempt(sb->s_bdev, sbi->s_pr.pr_key, victim_key,
-				ocsfs_to_pr_type(type), false);
+	return ocsfs_pr_norm(ops->pr_preempt(sb->s_bdev, sbi->s_pr.pr_key,
+					     victim_key,
+					     ocsfs_to_pr_type(type), false));
 }
 
 int ocsfs_pr_preempt_abort(struct super_block *sb, u64 victim_key, u8 type)
@@ -192,8 +222,9 @@ int ocsfs_pr_preempt_abort(struct super_block *sb, u64 victim_key, u8 type)
 		"key 0x%016llx\n", victim_key);
 	if (!ops || !ops->pr_preempt)
 		return -EOPNOTSUPP;
-	return ops->pr_preempt(sb->s_bdev, sbi->s_pr.pr_key, victim_key,
-				ocsfs_to_pr_type(type), true);
+	return ocsfs_pr_norm(ops->pr_preempt(sb->s_bdev, sbi->s_pr.pr_key,
+					     victim_key,
+					     ocsfs_to_pr_type(type), true));
 }
 
 bool ocsfs_pr_probe(struct super_block *sb)
