@@ -49,19 +49,20 @@ locking and SCSI-3 Persistent Reservations for fencing.
 ## 🚦 Status & validation
 
 > [!WARNING]
-> **Alpha / Research.** The single-node data path is heavily validated on real
-> hardware; **multi-node clustering is hardened in code but not yet validated on
-> a real two-node testbed.** Not production-ready.
+> **Alpha / Research.** Both the single-node data path and **basic two-node
+> cross-node coherence are now validated on real hardware.** Cluster recovery,
+> fencing under real failures, and xfstests are still pending. Not
+> production-ready.
 
 ### What's validated on real hardware
 
-The kernel module is exercised on a **Proxmox VE 9 node (kernel 7.0.x-pve)**
+The kernel module is exercised on **Proxmox VE 9 nodes (kernel 7.0.x-pve)**
 against a **real iSCSI LUN from TrueNAS SCALE** that supports **SCSI Persistent
 Reservations + Compare-And-Write** — so OCSFS runs in **full cluster mode with
 hardware CAS**, not a degraded single-node fallback.
 
-The following all pass end-to-end through the kernel module, full-cluster, on the
-SAN LUN, with a clean `fsck` and **zero kernel warnings**:
+**Single node**, full-cluster, end-to-end through the kernel module, with a
+clean `fsck` and **zero kernel warnings**:
 
 - ✅ 64 MiB buffered + **O_DIRECT** write/read with sha256 round-trip across `drop_caches`
 - ✅ **reflink** (`FICLONE`) with copy-on-write isolation
@@ -69,18 +70,34 @@ SAN LUN, with a clean `fsck` and **zero kernel warnings**:
 - ✅ **cross-file deduplication** (global DDT) with GC reclaim and delete-integrity
 - ✅ extended attributes, POSIX ACLs, hard/symlinks, nested directories
 - ✅ `fallocate` **punch-hole** / **zero-range**, sparse files, truncate grow/shrink
-- ✅ **mmap** `MAP_SHARED` write + `msync` round-trip *(non-clustered)*
+- ✅ **mmap** `MAP_SHARED` write + `msync` round-trip
 - ✅ large directories (thousands of entries) via the directory B+ tree
 - ✅ **crash recovery**: panic-injected power loss → reboot → remount → full data
   access → clean `fsck`, including crashes mid-reflink and with a wrapped journal
 - ✅ **writer-priority fairness**: an exclusive writer is never starved by a
   continuous reader stream (worst lock-acquire ≤ 8 ms vs. a former 30 s timeout)
 
+**Two nodes**, both mounting the same LUN read-write concurrently (slot 0 +
+slot 1, distinct PR keys, hardware CAW), clean `fsck`, **zero warnings on
+either node**:
+
+- ✅ **cross-node write → read coherence** (both directions): a file written on
+  one node reads back identically on the other
+- ✅ **cross-node overwrite coherence** with **lazy-lock revocation hand-off** —
+  a peer that needs a lazily-held lock gets it within the revoke-sweep interval
+  and sees the new data (validates the VM-disk write optimizations cluster-wide)
+- ✅ **directory coherence** both ways — files created on one node are listed on
+  the other, with no inode-number collisions between nodes
+- ✅ 10-round **ping-pong overwrite** with a stable cross-node lock hand-off
+
 ### What's *not* validated yet
 
-- ❌ **Real multi-node concurrency** — cross-node metadata cache coherence, peer
-  recovery, and SCSI-PR fencing are implemented but await a two-node SAN testbed
+- ❌ **Cluster recovery & fencing under real failures** — node-crash recovery,
+  SCSI-PR preempt-and-abort, and journal replay of a peer are implemented but
+  not yet exercised by killing a live node in a two-node cluster
 - ❌ **xfstests** `quick`/`auto` on a clustered LUN
+- ❌ **Cross-node block-bitmap coherence** and the inode-block co-located-write
+  race under heavy concurrent cross-node metadata churn (known follow-ups)
 - ❌ Long-haul soak / performance tuning
 
 ### Indicative scores
@@ -88,12 +105,12 @@ SAN LUN, with a clean `fsck` and **zero kernel warnings**:
 | Scenario | Score | Basis |
 |---|--:|---|
 | Single-node read/write (real SAN, full cluster) | ~94% | validated on hardware |
-| Multi-node — stable workload | ~93% † | structural estimate |
-| Multi-node — crash + recovery | ~90% † | structural estimate |
+| Multi-node — coherence, stable workload | ~90% | basic 2-node validated on hardware |
+| Multi-node — crash + recovery | ~85% † | structural estimate |
 | Multi-node — with encryption | ~85% † | structural estimate |
 | VMFS feature parity | ~72% | feature comparison |
 
-† Not yet validated on a real multi-node testbed. See
+† Not yet validated under real node failures. See
 [`docs/developer-guide.md`](docs/developer-guide.md) for the full changelog and
 the per-sprint correctness history.
 
@@ -283,7 +300,8 @@ sudo ./tools/ocsfs-fsck --repair /dev/sdb
 
 | Area | Status |
 |---|---|
-| **Multi-node validation** | Implemented but unverified on real hardware — top priority once a 2-node SAN testbed is available |
+| **Multi-node coherence** | Basic 2-node read/write/overwrite/directory coherence **validated on real hardware**. Cross-node block-bitmap coherence and the inode-block co-located-write race under heavy concurrent cross-node churn are open follow-ups |
+| **Cluster recovery & fencing** | Implemented; not yet exercised by killing a live node in a 2-node cluster |
 | **Integration tests** | No xfstests run yet |
 | **Encryption — I/O** | No readahead, no O_DIRECT; reflink/snapshot/symlink inside encrypted dirs return `-EOPNOTSUPP` |
 | **Encryption — keys** | fscrypt keys live in a shared encrypted key store on the LUN (ChaCha20-Poly1305 / cluster secret); peers fetch via `ocsfs-tool keys restore`. Enable with `mkfs.ocsfs -K`; requires `cluster_secret=` at mount |
@@ -315,11 +333,11 @@ ocsfs/
 
 ## 🗺️ Roadmap
 
-1. **Real two-node validation** — cross-node cache coherence, peer recovery, SCSI-PR fencing on a shared LUN
-2. **xfstests** `quick`+`auto` on a clustered testbed
-3. Writer/reader fairness tuning and performance work on the journal hot path
-4. Out-of-band STONITH integration
-5. Online `fsck` / scrub hardening
+1. ✅ ~~Real two-node cross-node coherence~~ — **done, validated on hardware**
+2. **Cluster recovery & fencing under real node failure** — kill a live node, verify peer recovery + SCSI-PR fencing
+3. Cross-node **block-bitmap coherence** (DLM-acquire-time invalidation) and inode-block write serialisation
+4. **xfstests** `quick`+`auto` on a clustered testbed
+5. Out-of-band STONITH integration; online `fsck` / scrub hardening
 
 ---
 

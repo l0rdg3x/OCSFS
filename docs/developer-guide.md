@@ -1364,9 +1364,14 @@ Hardening kept from the investigation:
   btree lock contention off the hot I/O path.
 
 Open follow-ups (not blocking single-node use):
-- Cross-node coherence of *metadata* blocks (bitmap, btree nodes) must be
-  re-established by invalidating them at DLM EX acquisition rather than the old
-  per-read forced re-read — to validate on a real multi-node SCSI-PR testbed.
+- Cross-node coherence of inodes and directory blocks is **implemented and
+  validated on a real 2-node cluster** (Sprint W): fresh private-buffer inode
+  reads, directory-field refresh, fresh dir-block reads, write-through metadata
+  (clear-dirty after the synchronous cluster flush), and fresh inode-table reads
+  in the allocator. Still open: cross-node coherence of the **block bitmap** and
+  **extent/refcount/dir btree nodes** (re-establish by invalidating at DLM EX
+  acquisition, not a per-read forced re-read), and serialising inode-block writes
+  to close the co-located-write race under heavy concurrent cross-node churn.
 - The `WARN_ON_ONCE(no EX)` fires once during reflink even though
   `remap_file_range` acquires EX on both inodes; harmless single-node, worth
   confirming the lock-state on a real cluster.
@@ -1445,6 +1450,77 @@ Tooling: `mkfs.ocsfs` now `exit(1)`s when the `Continue? (y/N)` prompt is declin
 (previously `exit(0)`, which let `mkfs … || fail` silently reuse a stale volume).
 Always pass `-f` in test scripts. `ocsfs-fsck -r` was confirmed to repair stale
 post-crash state offline (EX locks → NL, ACTIVE node slots → DEAD).
+
+### Sprint W — Fairness, VM-disk performance, and first real 2-node coherence (2026-05-30)
+
+Validated on a **real two-node cluster** (two Proxmox VE 9 nodes sharing one
+TrueNAS iSCSI LUN with SCSI PR + hardware CAW).
+
+- **Writer-priority fairness (DLM).** With reference-counted lock holds, a
+  continuous gap-free reader stream kept the on-disk SH alive so an EX writer
+  starved to the 30 s acquire deadline. Added a per-`lock_res` `lr_ex_wait`
+  counter + `lr_wq`: a fresh SH/CW acquirer defers (before the cache fast-path)
+  while a local EX is pending, and the EX poll loop drops `lr_mutex` during its
+  back-off sleep. Worst EX acquire under 8 readers: 30 s timeout → ≤ 8 ms.
+
+- **AG-descriptor corruption (`sb_getblk` → `sb_bread`).** `ocsfs_sync_fs` and
+  `rc_btree_persist_root` did a read-modify-write of the 4 KiB AG descriptor with
+  an *uninitialised* `sb_getblk` buffer and re-CRC'd the whole block, so after a
+  `drop_caches` every AG descriptor was overwritten with garbage carrying a valid
+  CRC ("AG bad magic" at next mount). Fixed by reading the block first.
+
+- **Kernel oops on cluster mount after a node crash.** The block-layer PR ops
+  return a *positive* SCSI status (RESERVATION CONFLICT = 0x18) that leaked up
+  through `fill_super`; `get_tree_bdev` handed a positive value to the VFS, which
+  `BUG()`s. `ocsfs_pr_norm()` normalises every PR wrapper to a negative errno and
+  `fill_super` clamps as defence in depth; registration now uses
+  `REGISTER_AND_IGNORE_EXISTING_KEY` so a node refreshes its own stale PR key on
+  rejoin instead of being locked out.
+
+- **VM-disk write optimizations.** (1) *Skip the synchronous inode flush for pure
+  overwrites* — `oi->i_extents_dirty` is set at every extent-map mutation
+  (`extent_insert` / `cow_extent` / `convert_unwritten`) and write_iter flushes
+  only when it is set or `i_size` grew; a peer still gets correct data via the
+  existing `lr_inv` range published at lock release. (2) *Lazy DLM release* —
+  `ocsfs_lock_release_lazy` keeps the inode EX cached so the next write is a
+  cache-hit re-acquire with no disk round-trip; a peer is served by a 2 s
+  `s_lazy_revoke_work` sweep (separate from the heartbeat). 1 MiB O_DIRECT
+  overwrite 16 → 13.7 ms (N=1 floor 12 ms; larger relative win on small writes /
+  durability-enabled devices). `lock_release_ondisk_locked` is factored out of
+  `ocsfs_lock_release` for reuse by the lazy path and the sweep.
+
+- **Cross-node metadata coherence (the long-deferred TODO, now done).** Five
+  buffer-cache staleness bugs that made each node see only its own writes:
+  1. Inode reads were cached → a peer's new inode in a co-located block read as
+     `-EINVAL`. `ocsfs_read_disk_inode(..., uncached)` now reads the inode block
+     fresh into a **private** bio buffer (`ocsfs_read_block_uncached`) at
+     `iget()` / refresh when clustered — private because inode blocks pack 8
+     inodes, so clobbering the shared buffer corrupts the other 7.
+  2. `ocsfs_inode_refresh` did not refresh `i_dir_btree_root` / `i_dirent_count`
+     → peer directory changes invisible. Now refreshed.
+  3. Directory data blocks were cached. `ocsfs_dir_bread` forces a fresh read
+     when clustered and the directory is clean (preserving read-your-own-writes).
+  4. A node that had modified a directory could not see a peer's later changes:
+     the synchronous cluster flush leaves the inode on-disk current but still
+     VFS-`I_DIRTY`, and refresh skips dirty inodes. Since cluster metadata writes
+     are write-through, `ocsfs_flush_inode_locked` now clears the
+     metadata-dirty flags (keeping `I_DIRTY_PAGES`) after a synchronous clustered
+     flush, so a later refresh picks up the peer's state.
+  5. Inode-number allocation collided (both nodes handed out 241, 242, 243 from a
+     cached inode table). The allocator now reads inode-table blocks fresh
+     (`ocsfs_inode_getblk_fresh`) under the AG EX lock. The block **bitmap** keeps
+     its cached read (within-txn read-modify-write must not be re-read); its
+     cross-node coherence stays a follow-up (DLM-acquire-time invalidation).
+
+  Validated 2-node: cross-node write→read both ways, overwrite coherence with the
+  lazy-revoke hand-off, directory entries visible both ways, 10-round ping-pong,
+  `fsck` clean, zero WARN/BUG on both nodes; single-node feature suite unchanged.
+
+**Performance note (real 1 GbE iSCSI, SSD-backed zvol, `sync=disabled`):** raw
+device ~100 MB/s; OCSFS single-node ~95 MB/s sequential, ~12 ms / 1 MiB
+overwrite, ~170 file creates/s; N=2 full-cluster ~90 MB/s sequential, ~14 ms
+overwrite, ~56 creates/s. The earlier "very low speed" was the AG-descriptor
+corruption above (garbage I/O saturating the link), not an inherent limit.
 
 ---
 
