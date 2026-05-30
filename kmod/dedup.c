@@ -32,14 +32,23 @@ struct dedup_pair {
 	struct dedup_pair *next;
 };
 
+/* First-seen block to register in the global cross-file index (phase 2). */
+struct dedup_canon {
+	u64                fp;
+	u64                phys;
+	struct dedup_canon *next;
+};
+
 /* ── Per-call context (ht heap-allocated to avoid large stack frame) ──────── */
 
 struct dedup_ctx {
 	struct inode       *inode;
 	struct dedup_entry **ht;    /* kzalloc'd: DEDUP_HT_SIZE pointers */
 	struct dedup_pair   *pairs; /* singly-linked, newest first */
+	struct dedup_canon  *canon; /* new canonicals for the global index */
 	u32                 n_pairs;
 	u32                 io_errs;
+	bool                global; /* true: consult the cross-file index */
 };
 
 /* ── Helpers ─────────────────────────────────────────────────────────────── */
@@ -121,6 +130,19 @@ static void dedup_free_pairs(struct dedup_ctx *dc)
 	dc->pairs = NULL;
 }
 
+static void dedup_free_canon(struct dedup_ctx *dc)
+{
+	struct dedup_canon *c = dc->canon;
+
+	while (c) {
+		struct dedup_canon *tmp = c->next;
+
+		kfree(c);
+		c = tmp;
+	}
+	dc->canon = NULL;
+}
+
 /* ── Phase 1: extent scan callback ─────────────────────────────────────────
  * Called by ocsfs_extent_btree_iterate for each (logical, physical, length, flags).
  * Hashes each block; on match, records a dedup_pair. Does NOT modify btree.
@@ -162,6 +184,51 @@ static int dedup_scan_extent(u64 logical, u64 physical, u32 length,
 				dc->pairs        = p;
 				dc->n_pairs++;
 				goto next_block;
+			}
+		}
+
+		/* Per-file miss.  In cross-file mode, consult the global index:
+		 * a hit means an identical block already exists in another file. */
+		if (dc->global) {
+			u64 gcan;
+
+			if (ocsfs_dedup_index_lookup(sb, hash, &gcan) == 0 &&
+			    gcan != phys &&
+			    dedup_blocks_equal(sb, gcan, phys)) {
+				struct dedup_pair *p = kmalloc(sizeof(*p),
+							       GFP_KERNEL);
+
+				if (!p)
+					return -ENOMEM;
+				p->logical_block = logical + i;
+				p->dup_phys      = phys;
+				p->can_phys      = gcan;
+				p->next          = dc->pairs;
+				dc->pairs        = p;
+				dc->n_pairs++;
+				/* Cache the global canonical so later same-content
+				 * blocks in this file pair against it directly. */
+				e = kmalloc(sizeof(*e), GFP_KERNEL);
+				if (e) {
+					e->hash = hash;
+					e->phys_block = gcan;
+					e->next = dc->ht[slot];
+					dc->ht[slot] = e;
+				}
+				goto next_block;
+			}
+			/* Global miss: this block becomes a new canonical to be
+			 * registered in the global index in phase 2. */
+			{
+				struct dedup_canon *c = kmalloc(sizeof(*c),
+								GFP_KERNEL);
+
+				if (c) {
+					c->fp = hash;
+					c->phys = phys;
+					c->next = dc->canon;
+					dc->canon = c;
+				}
 			}
 		}
 
@@ -291,6 +358,16 @@ static void ocsfs_dedup_scrub_fn(struct work_struct *work)
 		pr_debug("ocsfs: scrub pass freed %llu bytes via dedup\n",
 			 bytes_total);
 
+	/* Reclaim cross-file canonicals no file references any more. */
+	if (sbi->s_feature_ro_compat & OCSFS_FEATURE_RO_COMPAT_DEDUP_INDEX) {
+		u64 gc_freed = 0;
+
+		ocsfs_dedup_index_gc(sb, &gc_freed);
+		if (gc_freed)
+			pr_debug("ocsfs: scrub GC reclaimed %llu index-only bytes\n",
+				 gc_freed);
+	}
+
 reschedule:
 	queue_delayed_work(system_wq, &sbi->s_dedup_scrub_work,
 			   OCSFS_DEDUP_SCRUB_INTERVAL_JIFFIES);
@@ -346,6 +423,8 @@ int ocsfs_dedup_file(struct inode *inode, u64 *bytes_deduped)
 		return -EOPNOTSUPP; /* inline extents; file too small for dedup */
 
 	dc.inode = inode;
+	dc.global = !!(sbi->s_feature_ro_compat &
+		       OCSFS_FEATURE_RO_COMPAT_DEDUP_INDEX);
 	dc.ht = kzalloc(DEDUP_HT_SIZE * sizeof(struct dedup_entry *), GFP_KERNEL);
 	if (!dc.ht)
 		return -ENOMEM;
@@ -381,6 +460,18 @@ int ocsfs_dedup_file(struct inode *inode, u64 *bytes_deduped)
 					    oi->i_disk_ino, p->logical_block, r);
 	}
 
+	/* Phase 3 (cross-file only): publish this file's first-seen blocks into
+	 * the global index so other files can dedup against them.  The blocks are
+	 * stable here (we still hold the inode EX lock).  Best-effort: failures
+	 * just miss a future dedup opportunity, never corrupt. */
+	if (dc.global) {
+		struct dedup_canon *c;
+
+		for (c = dc.canon; c; c = c->next)
+			ocsfs_dedup_index_insert_canonical(inode->i_sb,
+							   c->fp, c->phys);
+	}
+
 	inode->i_blocks -= saved / 512;
 	mark_inode_dirty(inode);
 
@@ -394,6 +485,7 @@ out_unlock:
 
 out_free_ht:
 	dedup_free_pairs(&dc);
+	dedup_free_canon(&dc);
 	dedup_free_ht(&dc);
 
 	*bytes_deduped = saved;

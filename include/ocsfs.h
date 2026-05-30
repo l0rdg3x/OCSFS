@@ -120,6 +120,7 @@
 #define OCSFS_FEATURE_RO_COMPAT_SELECTIVE_INV   (1ULL << 0)  /* ARCH-7 */
 #define OCSFS_FEATURE_RO_COMPAT_HB_SUMMARY      (1ULL << 1)  /* ARCH-3: HB O(1) summary block */
 #define OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB     (1ULL << 2)  /* ARCH-6 */
+#define OCSFS_FEATURE_RO_COMPAT_DEDUP_INDEX     (1ULL << 3)  /* cross-file dedup DDT */
 
 /* ═══════════════════════════════════════════════════════════════
  * NODE SLOT STATES
@@ -227,7 +228,8 @@ struct ocsfs_superblock {
     uint64_t    s_feature_incompat;
     uint64_t    s_feature_ro_compat;
     uint32_t    s_lock_primary_count; /* 0 = use legacy 4096 */
-    uint8_t     s_reserved[3858];    /* was 3890; 32 bytes carved for V2 fields */
+    uint64_t    s_dedup_index_root;  /* cross-file dedup DDT root, 0 = empty */
+    uint8_t     s_reserved[3850];    /* was 3858; 8 carved for s_dedup_index_root */
     uint32_t    s_checksum;         /* CRC32C of bytes 0..4091 */
 } __attribute__((packed));
 

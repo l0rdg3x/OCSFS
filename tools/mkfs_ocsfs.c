@@ -272,8 +272,10 @@ static void format_device(int fd, uint64_t dev_size)
     if (cfg.features & OCSFS_FEAT_AUTH)
         sb.s_feature_incompat |= OCSFS_FEATURE_INCOMPAT_KEY_STORE;
     sb.s_feature_ro_compat = OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB |
-                             OCSFS_FEATURE_RO_COMPAT_HB_SUMMARY;
+                             OCSFS_FEATURE_RO_COMPAT_HB_SUMMARY |
+                             OCSFS_FEATURE_RO_COMPAT_DEDUP_INDEX;
     sb.s_lock_primary_count = OCSFS_LOCK_ENTRY_COUNT;
+    sb.s_dedup_index_root = 0;   /* cross-file dedup index created lazily */
     sb.s_checksum = ocsfs_crc32c(0, &sb, sizeof(sb) - sizeof(uint32_t));
 
     write_at(fd, OCSFS_SUPERBLOCK_OFFSET, &sb, sizeof(sb));

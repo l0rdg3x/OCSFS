@@ -424,6 +424,7 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sbi->s_feature_ro_compat = le64_to_cpu(ds->s_feature_ro_compat);
 	sbi->s_lock_table_off_cached = le64_to_cpu(ds->s_lock_table_off);
 	sbi->s_lock_primary_count    = le32_to_cpu(ds->s_lock_primary_count);
+	sbi->s_dedup_index_root      = le64_to_cpu(ds->s_dedup_index_root);
 	sbi->s_data_off = le64_to_cpu(ds->s_data_off);
 	sbi->s_ag_desc_off = le64_to_cpu(ds->s_ag_desc_off);
 	sbi->s_ext_flags4 = !!(sbi->s_feature_incompat &
@@ -440,6 +441,7 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	spin_lock_init(&sbi->s_free_lock);
 	mutex_init(&sbi->s_decompress_lock);
 	mutex_init(&sbi->s_cas_mutex);
+	mutex_init(&sbi->s_dedup_index_lock);
 	ocsfs_lock_init(&sbi->s_freeze_lock_res, 0, OCSFS_LOCKRES_FREEZE);
 	ocsfs_lock_init(&sbi->s_keystore_lock_res, 0, OCSFS_LOCKRES_KEYSTORE);
 

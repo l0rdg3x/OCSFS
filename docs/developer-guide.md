@@ -82,6 +82,7 @@ management network.
 | `compress.c` | Inline LZ4/ZSTD compression (read path + fsync write path) |
 | `compress_file.c` | Compress-on-fsync for buffered files |
 | `dedup.c` | Content-based deduplication via OCSFS_IOC_DEDUP ioctl |
+| `dedup_index.c` | Global cross-file dedup index (DDT) + garbage collection |
 | `xattr.c` | Extended attributes with DLM SH protection in cluster mode |
 | `acl.c` | POSIX ACL (getfacl/setfacl) |
 | `btree.c` | Generic B+ tree: search, insert, delete, range scan |
@@ -501,6 +502,42 @@ comparison. In cluster mode, a peer may have modified one of the blocks
 since it was cached, producing a false content match and causing dedup to
 collapse two logically distinct files onto the same physical blocks. Now uses
 `sb_getblk` + `bh_read` (forced disk read) in cluster mode.
+
+### Cross-file dedup — global DDT (`dedup_index.c`)
+
+`OCSFS_IOC_DEDUP`/the scrub originally deduplicated only *within* one inode (a
+per-file hash table), so identical blocks in different files — the dominant case
+for VM disk images cloned from a template — were never shared. The cross-file
+path adds a persistent **dedup index** ("DDT"): one global B+ tree keyed by a
+64-bit block fingerprint (`xxh64`), mapping fingerprint → canonical physical
+block, rooted at `s_dedup_index_root` in the superblock and gated by
+`OCSFS_FEATURE_RO_COMPAT_DEDUP_INDEX`. `ocsfs_dedup_file()` consults it on every
+per-file hash-table miss: a hit (after a full byte-compare to defeat the rare
+hash collision) records a cross-file dedup pair; a miss publishes the block as a
+new canonical in phase 3.
+
+**The index-reference invariant** is what makes it safe. When a block is
+recorded as canonical the index takes one extra refcount reference, so a
+canonical's refcount is always `(file extents pointing at it) + 1`. Therefore:
+it is never freed while indexed (no entry can dangle onto a free/reused block);
+once a *second* reference exists (refcount ≥ 2) every write is forced through
+CoW, so its content is immutable — eliminating the read-then-share race with a
+concurrent in-place write to the canonical's owner; and when the last *file*
+reference goes away the refcount collapses to the implicit-1 state, which
+`ocsfs_dedup_index_gc()` (run from the scrub) detects as "index-only" and
+reclaims (remove entry → drop reference → free). Crash ordering is: take the
+index reference *before* inserting the entry, and in GC remove the entry
+*before* dropping the reference — a crash in either window leaves at worst a
+stale refcount / orphan block that fsck reclaims, never corruption.
+
+Locking: a single `s_dedup_index_lock` serialises all index access; the order is
+always `s_dedup_index_lock → j_lock` (refcount/insert open their own
+transactions sequentially, never nested), so it cannot deadlock against the
+write/checkpoint paths, which never take the index lock. Known follow-ups:
+`ocsfs-fsck` is not yet dedup-index-aware, so an index-only canonical that the
+scrub has not GC'd yet is reported as an allocated-but-unreferenced block; and
+cross-node coherence of the index tree is a DLM-acquire-time TODO like the other
+shared B+ trees.
 
 ### Ordered checkpoint
 

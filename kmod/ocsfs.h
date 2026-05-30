@@ -230,6 +230,7 @@ enum ocsfs_cas_backend {
 #define OCSFS_FEATURE_RO_COMPAT_SELECTIVE_INV   (1ULL << 0)  /* ARCH-7 */
 #define OCSFS_FEATURE_RO_COMPAT_HB_SUMMARY      (1ULL << 1)  /* ARCH-3 */
 #define OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB     (1ULL << 2)  /* ARCH-6 */
+#define OCSFS_FEATURE_RO_COMPAT_DEDUP_INDEX     (1ULL << 3)  /* cross-file dedup DDT */
 
 /* Masks of features this build understands.  Update as features land. */
 #define OCSFS_FEATURE_INCOMPAT_SUPP     (OCSFS_FEATURE_INCOMPAT_LOCK_TABLE_V2 | \
@@ -239,7 +240,8 @@ enum ocsfs_cas_backend {
 					 OCSFS_FEATURE_INCOMPAT_KEY_STORE)
 #define OCSFS_FEATURE_RO_COMPAT_SUPP    (OCSFS_FEATURE_RO_COMPAT_SELECTIVE_INV | \
 					 OCSFS_FEATURE_RO_COMPAT_HB_SUMMARY | \
-					 OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB)
+					 OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB | \
+					 OCSFS_FEATURE_RO_COMPAT_DEDUP_INDEX)
 #define OCSFS_FEATURE_COMPAT_SUPP       0ULL
 
 /* Inode flags */
@@ -416,7 +418,11 @@ struct ocsfs_disk_super {
 	/* ARCH-2: dynamic lock table — carved from s_reserved (4 bytes).
 	 * 0 means legacy (OCSFS_LOCK_ENTRY_COUNT entries); new FS default 65536. */
 	__le32  s_lock_primary_count;
-	__u8    s_reserved[3858];   /* was 3890; reduced by 32 total (ARCH-1: 28, ARCH-2: 4) */
+	/* Cross-file dedup: root block of the global fingerprint->canonical B+ tree
+	 * (OCSFS_FEATURE_RO_COMPAT_DEDUP_INDEX). 0 = empty/not yet created.
+	 * Carved from s_reserved (8 bytes). */
+	__le64  s_dedup_index_root;
+	__u8    s_reserved[3850];   /* was 3858; reduced 8 for s_dedup_index_root */
 	__le32  s_checksum;
 } __packed;
 
@@ -754,6 +760,9 @@ struct ocsfs_sb_info {
 	u64             s_feature_compat;
 	u64             s_feature_incompat;
 	u64             s_feature_ro_compat;
+	/* Cross-file dedup DDT (OCSFS_FEATURE_RO_COMPAT_DEDUP_INDEX) */
+	u64             s_dedup_index_root;      /* global fingerprint->canonical btree root */
+	struct mutex    s_dedup_index_lock;      /* serialises all index access */
 	/* ARCH-2: dynamic lock table */
 	u64             s_lock_table_off_cached; /* from ds->s_lock_table_off */
 	u32             s_lock_primary_count;    /* 0 = legacy (OCSFS_LOCK_ENTRY_COUNT) */
@@ -1346,6 +1355,11 @@ struct ocsfs_dedup_result {
 #define OCSFS_IOC_DEDUP  _IOR('O', 3, struct ocsfs_dedup_result)
 
 int ocsfs_dedup_file(struct inode *inode, u64 *bytes_deduped);
+
+/* Cross-file dedup index (DDT) — dedup_index.c */
+int ocsfs_dedup_index_lookup(struct super_block *sb, u64 fp, u64 *canonical);
+int ocsfs_dedup_index_insert_canonical(struct super_block *sb, u64 fp, u64 phys);
+int ocsfs_dedup_index_gc(struct super_block *sb, u64 *bytes_freed);
 void ocsfs_dedup_scrub_start(struct super_block *sb);
 void ocsfs_dedup_scrub_stop(struct super_block *sb);
 
