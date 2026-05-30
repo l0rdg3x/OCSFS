@@ -300,6 +300,21 @@ on-disk block, and overwriting `i_nlink` from it dropped concurrent
 layer; hardware atomicity via SCSI CAW (opcode 0x89) is used when a SCSI
 device is detected. `ocsfs_bsg_execute_cdb()` is the entry point — see §13.
 
+**Reference-counted holds (`lr_hold`).** `lr_mode` is a single per-resource field
+recording the strongest mode held on this node, but several local holders can
+hold the same resource at once: the lockless read path (`ocsfs_file_read_iter`)
+takes DLM SH on the inode *without* `i_rwsem`, so it runs concurrently with a
+write/dedup/reflink/truncate holding EX. Its SH acquire cache-hits (lr_mode is
+already EX ≥ SH), but a naive `ocsfs_lock_release()` releases by `lr_mode` — so
+the read's release would run the EX-release branch, write the on-disk lock to NL
+(handing the EX away mid-update, corrupting a peer cluster) and reset
+`lr_mode = NL` (tripping `OCSFS_WARN_NO_EX` on the EX holder's next btree write).
+`lr_hold` counts active local holders: acquire increments it, release decrements
+and only performs the real on-disk release + `lr_mode` reset at zero, so a weaker
+nested/concurrent acquire+release can never release a stronger hold. (Pathological
+gap-free concurrent reads can still starve an EX waiter to its 30 s timeout;
+writer-priority fairness is a separate TODO.)
+
 **DLM EX invariant:** All B+ tree write functions (`extent_btree_insert`,
 `extent_btree_truncate`, `extent_btree_replace`, `dir_btree_insert`,
 `dir_btree_delete`) assert `OCSFS_WARN_NO_EX(inode)` at entry. In cluster
