@@ -1,237 +1,208 @@
+<div align="center">
+
 # OCSFS — Open Cluster Shared FileSystem
 
-> **This project is entirely AI-generated.**
-> Every line of code, documentation, and tooling was written by
-> [Claude](https://claude.ai) (Anthropic) through an iterative conversation
-> with a human operator. No human has written or reviewed the source code
-> directly. Treat it accordingly.
+**A clustered filesystem for Linux on shared block storage — a Proxmox-native alternative to VMware VMFS.**
 
-An open-source cluster filesystem for Linux targeting shared block storage
-(iSCSI / Fibre Channel SAN) in virtualized environments. Primary goal:
-a Proxmox VE-native alternative to VMware VMFS.
+[![License: GPL-2.0](https://img.shields.io/badge/License-GPL--2.0--only-blue.svg)](LICENSE)
+[![Status: Alpha](https://img.shields.io/badge/status-alpha%20%2F%20research-orange.svg)]()
+[![Platform: Linux](https://img.shields.io/badge/platform-Linux%20kernel%206.x%2F7.x-informational.svg)]()
+[![On-disk rev](https://img.shields.io/badge/on--disk%20rev-2-lightgrey.svg)]()
+[![AI-generated](https://img.shields.io/badge/code-100%25%20AI%20generated-ff69b4.svg)]()
 
-> **Status: Alpha / Research.**
-> The kernel module builds, mounts, and round-trips data — validated end to end
-> on a real Proxmox VE 9 node (kernel 7.0.6-2-pve, single node, loopback,
-> `-o degraded`): a 64 MiB buffered write sha256 round-trip, fallocate,
-> punch-hole, zero-range, sparse files, rename, hardlink, symlink, xattr, reflink
-> (FICLONE), 40-file create + unmount/remount persistence, and a clean offline
-> fsck all pass. The large-file data path (extent B+ tree, > ~1 MiB) and the
-> snapshot/reflink path were brought up and debugged on real hardware this round
-> — see `docs/developer-guide.md` (§ "Large files & data path — full bring-up").
-> Multi-node clustering is hardened but **not yet validated on a real multi-node
-> SCSI-PR testbed** (metadata cross-node cache coherence is the main open item).
-> **Do not use with data that matters.**
+</div>
+
+> [!IMPORTANT]
+> **This project is entirely AI-generated.** Every line of code, documentation,
+> and tooling was written by [Claude](https://claude.ai) (Anthropic) through an
+> iterative conversation with a human operator. No human has written or reviewed
+> the source code directly. Treat it accordingly — **do not use it with data that
+> matters.**
 
 ---
 
-## Production Readiness
+OCSFS lets **multiple Linux nodes mount the same SAN LUN at the same time**,
+read-write, with cache coherence, crash recovery, and hardware fencing — the
+same job VMware VMFS does for ESXi, but open-source and built for **Proxmox VE**.
 
-Seventeen rounds of correctness, security, and architectural fixes have been
-applied (Sprints A–H from the Opus v3 review, Sprints I–L plus M/N/O from the
-Opus 4.8 review, plus Sprints P and R). Sprint M adds a compression buffer
-mempool; Sprint N adds HMAC authentication to journal COMMIT records; Sprint O
-adds EX lock leases that allow waiters to use the lease deadline instead of
-blind polling; Sprint P (ARCH-V3-1) adds a cluster-wide shared encrypted key
-store for fscrypt key distribution.
-See [`docs/developer-guide.md`](docs/developer-guide.md) for the full
-changelog.
+It needs no lock-manager daemon and no cluster network: **all coordination lives
+on the shared device itself**, using SCSI Compare-And-Write for distributed
+locking and SCSI-3 Persistent Reservations for fencing.
 
-> **Sprint R (2026-05-29) — on-disk format change.** A catastrophic layout bug
-> was fixed: the per-node journal physically overlapped the cluster-coordination
-> region (CAS leases, recovery-leader, heartbeat summary, key store), corrupting
-> any *clustered* mount (single-node was unaffected, which is why it went
-> unnoticed). The journal is now relocated past that region and the on-disk
-> revision bumped to 2. **Volumes formatted before Sprint R must be recreated
-> with the current `mkfs.ocsfs`** — the kernel now refuses the old overlapping
-> layout. The same sprint fixed the Proxmox mount helper (infinite recursion)
-> and made the plugin pass the cluster secret at mount.
+## ✨ Highlights
 
-> **Sprint S (2026-05-29) — first real bring-up.** Running the format (not just
-> reviewing it) exposed two more showstoppers: the userspace CRC32C used the
-> standard final-inverted convention while the kernel uses the raw ext4/btrfs
-> convention — the bitwise complement — so the kernel would reject every
-> mkfs-written superblock/inode (volumes could never mount); and a directory
-> record stride bug (288 vs 286 bytes) corrupted directory blocks after any file
-> removal (`readdir` → EIO). Both fixed. The FUSE prototype now compiles and
-> round-trips data, `ocsfs-fsck` was reconciled to the real on-disk layout, and
-> `tests/kernel_smoke_test.sh` verifies the kernel module end to end on loopback.
-
-> **Sprint V2 (2026-05-30) — concurrency & crash recovery, exercised on the real
-> kernel.** Aggressive concurrent and crash testing (panic-injected power loss via
-> sysrq, auto-reboot, remount) found and fixed five more critical bugs: (1)
-> `ocsfs_inode_refresh` clobbered the VFS-maintained `i_nlink` with a stale
-> buffer-cache value under concurrent `mkdir`/`rmdir`, tripping `inc_nlink`/
-> `drop_nlink` warnings — now skips the refresh while the inode is dirty/in
-> writeback; (2) the three in-place `rename` paths updated `de_ino`/`de_file_type`
-> without recomputing the per-dirent checksum, so renamed entries were silently
-> skipped by `readdir` (files vanished from listings) — a shared
-> `ocsfs_dirent_set_checksum()` helper now runs after every in-place edit; (3) a
-> crashed node's slot stayed `ACTIVE` and was never reclaimed on remount (slot
-> leak → eventual `-ENOSPC`) — remount now reclaims its own stale-heartbeat slot;
-> (4) journal replay aborted the whole mount (`EUCLEAN`, "requires fsck") on the
-> torn record a crash leaves at the journal tail — it now stops cleanly at the
-> first invalid record like jbd2/xfs, so a crash never renders the volume
-> unmountable; (5) a self-remounting node deadlocked for 30 s/op against the DLM
-> locks its own pre-crash incarnation never flushed as released — the mount path
-> now releases the dead generation's locks. The full crash→reboot→remount path
-> (reclaim slot · tolerant journal replay · stale-lock recovery · full data
-> access · clean fsck) is now validated end to end on a single node. A second
-> testing round added two more: **(6)** O_DIRECT was dead code — the iomap dio path
-> existed but `open(O_DIRECT)` returned `-EINVAL` because `FMODE_CAN_ODIRECT` was
-> never set, so direct I/O silently never worked; and **(7)** any volume whose
-> journal had cycled past its 32 MB size once became *unmountable* after a crash,
-> because replay's `head > size` check misread the monotonic ring counters as
-> corruption — now checks the un-checkpointed window against the ring size
-> instead. Crash-torture (crash mid-reflink/btree-split with a wrapped journal),
-> reflink CoW integrity, O_DIRECT⇄buffered coherence, dedup, and offline
-> `fsck -r` repair all validated. Also: `mkfs` now exits non-zero when the
-> confirmation prompt is declined (use `-f` in scripts).
-
-| Scenario | Estimated score |
+| | |
 |---|---|
-| Single-node read/write | ~92% |
-| Multi-node — stable workload | ~93%† |
-| Multi-node — crash + recovery | ~90%† |
-| Multi-node — with encryption | ~85%† |
-| VMFS feature parity | ~70% |
-
-† Multi-node scores are **structural estimates not yet validated on hardware**.
-Before Sprint R the clustered path was in fact non-functional (CRIT-O1 layout
-collision); it is now structurally correct but the first real-testbed run is
-still pending.
-
-The remaining gap is real-hardware integration testing (xfstests on a
-multi-node testbed with SCSI-3 PR), now unblocked by the Sprint R layout fix.
-Known open items that could cause data loss under load are tracked in
-[`docs/developer-guide.md`](docs/developer-guide.md).
+| 🔗 **Shared-disk, multi-writer** | Many nodes, one LUN, concurrent read-write — coordinated entirely on-disk |
+| 🧩 **No external dependencies** | No DLM daemon, no corosync, no cluster LAN — just the SAN |
+| 🛡️ **Hardware fencing** | SCSI-3 Persistent Reservations evict a failed node at the fabric |
+| 💓 **Storage-path heartbeat** | Liveness proven by writes to the LUN, immune to network partitions |
+| 📓 **Crash-safe journaling** | WAL with redo; replay on mount reconstructs committed transactions |
+| 🌳 **Modern data path** | iomap, extent B+ trees, O_DIRECT, sparse files, `FIEMAP`, `SEEK_HOLE/DATA` |
+| 🪞 **Space efficiency** | Reflink (`FICLONE`), CoW snapshots, inline LZ4/ZSTD compression, **cross-file dedup** |
+| 🔐 **Encryption** | fscrypt per-directory encryption with cluster-wide key distribution |
+| ⚡ **VAAI offload** | `WRITE SAME`, `UNMAP`, `EXTENDED COPY` for array-accelerated VM ops |
+| 🧱 **Proxmox-native** | Storage plugin, mount helper, DKMS, Debian packaging |
 
 ---
 
-## Architecture
+## 🚦 Status & validation
+
+> [!WARNING]
+> **Alpha / Research.** The single-node data path is heavily validated on real
+> hardware; **multi-node clustering is hardened in code but not yet validated on
+> a real two-node testbed.** Not production-ready.
+
+### What's validated on real hardware
+
+The kernel module is exercised on a **Proxmox VE 9 node (kernel 7.0.x-pve)**
+against a **real iSCSI LUN from TrueNAS SCALE** that supports **SCSI Persistent
+Reservations + Compare-And-Write** — so OCSFS runs in **full cluster mode with
+hardware CAS**, not a degraded single-node fallback.
+
+The following all pass end-to-end through the kernel module, full-cluster, on the
+SAN LUN, with a clean `fsck` and **zero kernel warnings**:
+
+- ✅ 64 MiB buffered + **O_DIRECT** write/read with sha256 round-trip across `drop_caches`
+- ✅ **reflink** (`FICLONE`) with copy-on-write isolation
+- ✅ **CoW snapshots** with source/clone isolation
+- ✅ **cross-file deduplication** (global DDT) with GC reclaim and delete-integrity
+- ✅ extended attributes, POSIX ACLs, hard/symlinks, nested directories
+- ✅ `fallocate` **punch-hole** / **zero-range**, sparse files, truncate grow/shrink
+- ✅ **mmap** `MAP_SHARED` write + `msync` round-trip *(non-clustered)*
+- ✅ large directories (thousands of entries) via the directory B+ tree
+- ✅ **crash recovery**: panic-injected power loss → reboot → remount → full data
+  access → clean `fsck`, including crashes mid-reflink and with a wrapped journal
+- ✅ **writer-priority fairness**: an exclusive writer is never starved by a
+  continuous reader stream (worst lock-acquire ≤ 8 ms vs. a former 30 s timeout)
+
+### What's *not* validated yet
+
+- ❌ **Real multi-node concurrency** — cross-node metadata cache coherence, peer
+  recovery, and SCSI-PR fencing are implemented but await a two-node SAN testbed
+- ❌ **xfstests** `quick`/`auto` on a clustered LUN
+- ❌ Long-haul soak / performance tuning
+
+### Indicative scores
+
+| Scenario | Score | Basis |
+|---|--:|---|
+| Single-node read/write (real SAN, full cluster) | ~94% | validated on hardware |
+| Multi-node — stable workload | ~93% † | structural estimate |
+| Multi-node — crash + recovery | ~90% † | structural estimate |
+| Multi-node — with encryption | ~85% † | structural estimate |
+| VMFS feature parity | ~72% | feature comparison |
+
+† Not yet validated on a real multi-node testbed. See
+[`docs/developer-guide.md`](docs/developer-guide.md) for the full changelog and
+the per-sprint correctness history.
+
+---
+
+## 🏗️ Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                 Shared block device                  │
-│         (iSCSI LUN / FC LUN / loopback)              │
-│                                                      │
-│  SB │ AGs │ Inode table │ Lock table │ Journal │ HB  │
-└─────┬───────────────────────────────────────────────┘
-      │  SCSI-3 PR (fencing)  │  CAS (on-disk locking)
-      │
-┌─────▼──────┐  ┌────────────┐  ┌────────────┐
-│  node-1    │  │  node-2    │  │  node-3    │
-│  ocsfs.ko  │  │  ocsfs.ko  │  │  ocsfs.ko  │
-└────────────┘  └────────────┘  └────────────┘
+        ┌──────────────────────────────────────────────────────────────┐
+        │                    Shared block device (LUN)                  │
+        │              iSCSI / Fibre Channel / loopback                 │
+        │                                                               │
+        │  SB │ AG descriptors │ Inode tables │ Bitmaps │ Lock table    │
+        │     │ Journal (per node) │ Heartbeat │ CAS leases │ Key store │
+        └───────┬───────────────────────────────────────────┬──────────┘
+                │   SCSI-3 PR (fencing)                       │
+                │   SCSI CAW / Compare-And-Write (locking)    │
+       ┌────────┴────────┐   ┌─────────────────┐   ┌──────────┴──────┐
+       │     node-1      │   │     node-2      │   │     node-N      │
+       │    ocsfs.ko     │   │    ocsfs.ko     │   │    ocsfs.ko     │
+       │  VFS · iomap ·  │   │  VFS · iomap ·  │   │  VFS · iomap ·  │
+       │  DLM · journal  │   │  DLM · journal  │   │  DLM · journal  │
+       └─────────────────┘   └─────────────────┘   └─────────────────┘
 ```
 
-**Key design choices:**
+**Key design choices**
 
-- **No DLM daemon.** All lock state lives on the shared LUN as versioned
-  on-disk entries; acquire/release use Compare-And-Write (CAS) via SCSI.
+- **No lock-manager daemon.** All lock state lives on the shared LUN as
+  versioned on-disk entries; acquire/release use **Compare-And-Write (CAS)** via
+  SCSI — hardware-atomic where the array supports CAW, with a Persistent-
+  Reservation lease fallback otherwise.
 - **Storage-path heartbeat.** Node liveness is proven by writes to the shared
-  device — not through the management network — so a network partition does
-  not cause false positives.
-- **SCSI-3 Persistent Reservations.** Hardware fencing: the SAN fabric rejects
-  I/O from a fenced node's HBA before recovery begins.
-- **WAL journal with redo.** AFTER-images in the commit record; replay on
-  mount reconstructs any committed-but-not-flushed transaction.
+  device, *not* the management network, so a LAN partition cannot cause false
+  positives.
+- **SCSI-3 Persistent Reservations.** Hardware fencing: the SAN rejects I/O from
+  a fenced node's HBA before recovery begins.
+- **WAL journal with redo.** AFTER-images in the commit record; replay on mount
+  reconstructs any committed-but-not-flushed transaction and stops cleanly at the
+  torn tail a crash leaves behind (jbd2/xfs-style).
+- **Reference-counted, writer-priority DLM.** Local lock holds are
+  reference-counted so a lockless read can never release a writer's exclusive
+  lock; pending writers take priority so readers can't starve them.
 
 ---
 
-## What is implemented
+## 🧬 What's implemented
 
 ### Kernel module (`kmod/`)
 
-| File | Description |
+| File | Responsibility |
 |---|---|
-| `super.c` | Mount/unmount, fill_super, statfs, module init/exit |
+| `super.c` | Mount/unmount, `fill_super`, statfs, `sync_fs`, module init/exit |
 | `inode.c` | Inode read/write/alloc/free, setattr, CRC32c verification |
-| `dir.c` | lookup, create, mkdir, rmdir, readdir, hard link, mknod |
-| `dir_btree.c` | B+ tree-backed directory index (O(log N) lookup/delete) |
-| `dir_rename.c` | rename, RENAME_NOREPLACE, RENAME_EXCHANGE |
-| `file.c` | read/write iter, fsync, FIEMAP, reflink (FICLONE), ioctl |
-| `iomap.c` | iomap I/O path: O_DIRECT, buffered, readahead, UNWRITTEN conversion |
-| `extent.c` | Inline extent manager (up to 16 extents): lookup, insert, truncate, merge |
-| `extent_btree.c` | B+ tree overflow for files with >16 extents; 4-bit flags encoding (v2) |
-| `alloc.c` | Block allocator: goal-oriented, prealloc, AG affinity |
-| `bitmap.c` | Per-AG block/inode bitmap; two-phase lockless allocation |
-| `thin.c` | fallocate, PUNCH_HOLE, ZERO_RANGE, DISCARD |
-| `journal.c` | WAL with ordered checkpoint; BEFORE/AFTER images; txn abort rollback |
-| `journal_replay.c` | Forward-scan replay; 62-bit CRC-gated COMMIT detection; redo on mount |
-| `lock.c` | On-disk DLM: EX/SH acquire/release, downgrade, epoch-based cache |
-| `lock_io.c` | Forced disk read/write for lock table (bypasses page cache) |
-| `scsi_pr.c` | SCSI-3 PR: register, preempt-and-abort; CAW via BSG-direct + kprobe fallback |
-| `heartbeat.c` | Storage-path heartbeat kthread; CRC-validated entries; O(1) summary block |
-| `node.c` | Node slot table: claim, release, HMAC-SHA256 auth, replay-attack protection |
+| `dir.c` · `dir_btree.c` · `dir_rename.c` | Directory ops, B+ tree index, rename / `RENAME_EXCHANGE` |
+| `file.c` · `iomap.c` | read/write iter, fsync, `FIEMAP`, reflink, ioctls; O_DIRECT + buffered iomap path |
+| `extent.c` · `extent_btree.c` | Inline extents (≤16) with B+ tree overflow; 4-bit flag encoding (v2) |
+| `alloc.c` · `bitmap.c` | Goal-oriented allocator, prealloc, AG affinity; two-phase lockless bitmap |
+| `thin.c` | `fallocate`, `PUNCH_HOLE`, `ZERO_RANGE`, `DISCARD` |
+| `journal.c` · `journal_replay.c` | WAL with ordered checkpoint; CRC-gated COMMIT detection; redo on mount |
+| `lock.c` · `lock_io.c` | On-disk DLM: EX/SH acquire/release, downgrade, epoch cache, writer priority |
+| `scsi_pr.c` | SCSI-3 PR register / preempt-and-abort; CAW via BSG-direct |
+| `heartbeat.c` · `node.c` | Storage-path heartbeat; node-slot table with HMAC-SHA256 auth |
 | `recovery.c` | 5-phase recovery: leader election, PR fencing, journal replay, lock cleanup |
-| `snapshot.c` | CoW file snapshots: create, delete, CoW-on-write trigger |
-| `refcount.c` | Per-AG extent reference counting for CoW/dedup (B+ tree, V2 volumes) |
-| `compress.c` | Inline LZ4/ZSTD compression (read path); decompression on demand |
-| `compress_file.c` | Compress-on-fsync for buffered files; journal-before-free |
-| `dedup.c` | Content-based deduplication via `OCSFS_IOC_DEDUP` ioctl (intra- and cross-file) |
-| `dedup_index.c` | Global cross-file dedup index (DDT) + garbage collection |
-| `xattr.c` | Extended attributes with DLM SH protection in cluster mode |
-| `acl.c` | POSIX ACL (getfacl/setfacl) |
-| `btree.c` | Generic B+ tree (search, insert, delete, range scan) |
-| `btree_mod.c` | B+ tree structural modifications (split, merge, rebalance) |
-| `debugfs.c` | Debugfs: `/sys/kernel/debug/ocsfs/<dev>/lock_table`, `journal_stats` |
-| `vaai.c` | VAAI offload: WRITE SAME (0x93), UNMAP (0x42), EXTENDED COPY (0x83) via BSG |
-| `flock.c` | Distributed POSIX file locking: fcntl(F_SETLK) → DLM SH/EX |
-| `crypto.c` | fscrypt integration: per-directory encryption, bounce-page I/O, cluster safety |
-| `test_lock.c` | KUnit tests: B+ tree search, dir btree threshold |
-| `test_cas.c` | KUnit tests: CAS lock protocol |
+| `snapshot.c` · `refcount.c` | CoW snapshots; per-AG extent refcount B+ tree (CoW/dedup) |
+| `compress.c` · `compress_file.c` | Inline LZ4/ZSTD compression (read path); compress-on-fsync |
+| `dedup.c` · `dedup_index.c` | Content dedup ioctl + global cross-file index (DDT) with GC |
+| `xattr.c` · `acl.c` | Extended attributes (DLM-protected) and POSIX ACLs |
+| `crypto.c` | fscrypt: per-directory encryption, bounce-page I/O, cluster key safety |
+| `btree.c` · `btree_mod.c` | Generic B+ tree (search/insert/delete/range) + structural ops |
+| `flock.c` | Distributed POSIX locks: `fcntl(F_SETLK)` → DLM SH/EX |
+| `vaai.c` | VAAI offload: `WRITE SAME` (0x93), `UNMAP` (0x42), `EXTENDED COPY` (0x83) |
+| `debugfs.c` | `/sys/kernel/debug/ocsfs/<dev>/{lock_table,journal_stats}` |
+| `test_lock.c` · `test_cas.c` | KUnit tests: B+ tree, directory threshold, CAS protocol |
 
 ### Userspace tools (`tools/`, `src/`)
 
 | Tool | Description |
 |---|---|
-| `tools/mkfs_ocsfs.c` | Volume formatter |
-| `tools/ocsfs_tool.c` | Admin CLI: info, nodes, locks, df, check |
-| `tools/ocsfs_defrag.c` | Online defragmentation daemon (FIEMAP-based, bandwidth-limited) |
-| `tools/ocsfs-fsck` | Offline fsck (Python): 9 checks + repair mode |
-| `src/` | FUSE3 prototype — validates on-disk format; not for production use |
+| `mkfs.ocsfs` | Volume formatter (`tools/mkfs_ocsfs.c`) |
+| `ocsfs-tool` | Admin CLI: info, nodes, locks, df, check, key restore |
+| `ocsfs_defrag` | Online defragmentation daemon (FIEMAP-based, bandwidth-limited) |
+| `ocsfs-fsck` | Offline fsck (Python): structural + refcount + dedup-index checks, repair mode |
+| `src/` | FUSE3 prototype — validates the on-disk format; **not for production** |
 
 ### Platform integration
 
 | Component | Description |
 |---|---|
 | `proxmox/OCSFSPlugin.pm` | Proxmox VE storage plugin (all content types) |
-| `proxmox/mount.ocsfs` | Mount helper called by `mount -t ocsfs` |
+| `proxmox/mount.ocsfs` | Mount helper invoked by `mount -t ocsfs` |
 | `proxmox/install.sh` | One-step installer (DKMS + plugin + tools) |
 | `conf/` | systemd template units + udev rules for SAN auto-detection |
-| `debian/` | Debian packaging: ocsfs-tools, ocsfs-dkms, ocsfs-proxmox |
+| `debian/` | Packaging: `ocsfs-tools`, `ocsfs-dkms`, `ocsfs-proxmox` |
 | `man/` | Man pages for all CLI tools |
 
 ---
 
-## Known limitations
-
-| Area | Status |
-|---|---|
-| **Integration test suite** | No xfstests run yet — top priority. Needs a 2-node testbed with a SCSI-3 PR-capable LUN (KVM + LIO iSCSI is sufficient). |
-| **Encryption — key distribution** | fscrypt keys are stored in a shared encrypted key store on the LUN (ARCH-V3-1). When one node calls `FS_IOC_ADD_ENCRYPTION_KEY`, the key is persisted (ChaCha20-Poly1305 / cluster secret). Other nodes retrieve it via `ocsfs-tool keys restore <dev>`. Enabled by `mkfs.ocsfs -K` (sets `OCSFS_FEATURE_INCOMPAT_KEY_STORE`); requires `cluster_secret=` at mount — without it, key persistence is refused (Sprint R). Read-modify-write of the store is DLM-serialized cluster-wide. |
-| **Encryption — I/O restrictions** | No readahead, no O_DIRECT. Reflink, snapshot, and symlinks inside encrypted directories return `-EOPNOTSUPP`. |
-| **Compression write path** | Compression is applied on fsync for buffered files only. O_DIRECT writes are never compressed. |
-| **Shared mmap** | `MAP_SHARED|PROT_WRITE` returns `-EOPNOTSUPP` in cluster mode. Read-only and private (COW) mappings work. |
-| **STONITH** | Fencing uses SCSI PR. Out-of-band STONITH (PDU, iDRAC) is not wired — the Proxmox API can serve as soft STONITH in lab setups. |
-| **Journal COMMIT HMAC** | HMAC-SHA256/128 authentication on COMMIT records (Sprint N, `OCSFS_FEATURE_INCOMPAT_JOURNAL_HMAC`). |
-| **Single recovery target** | Only one dead node is recovered at a time. If two nodes fail simultaneously, the second is queued until the first recovery completes. |
-
----
-
-## Building
+## 🔨 Building
 
 ```bash
-# Userspace tools and FUSE prototype
+# Userspace tools + FUSE prototype
 make all
 
-# Kernel module (requires linux-headers for the running kernel)
-cd kmod && make -j$(nproc)
+# Kernel module (needs linux-headers for the running kernel)
+cd kmod && make -j"$(nproc)"
 
 # DKMS
-sudo dkms add kmod/
-sudo dkms build ocsfs/0.1.0
+sudo dkms add    kmod/
+sudo dkms build  ocsfs/0.1.0
 sudo dkms install ocsfs/0.1.0
 
 # Debian packages
@@ -240,90 +211,133 @@ dpkg-buildpackage -us -uc -b
 
 ---
 
-## Quick start (single node, loopback)
+## 🚀 Quick start
+
+### Single node (loopback)
 
 ```bash
-dd if=/dev/zero of=/tmp/test.img bs=1M count=2048
-./mkfs.ocsfs -L my-datastore -v /tmp/test.img
-./ocsfs-tool info /tmp/test.img
+truncate -s 2G /tmp/ocsfs.img
+./mkfs.ocsfs -L my-datastore -f /tmp/ocsfs.img
+./ocsfs-tool info /tmp/ocsfs.img
 
-sudo losetup /dev/loop0 /tmp/test.img
+sudo modprobe lz4_compress
 sudo insmod kmod/ocsfs.ko
-sudo mount -t ocsfs /dev/loop0 /mnt/ocsfs
+sudo losetup /dev/loop0 /tmp/ocsfs.img
+sudo mount -t ocsfs -o degraded /dev/loop0 /mnt/ocsfs   # 'degraded' = single-node, no PR
 
-echo "hello" | sudo tee /mnt/ocsfs/test.txt
-sudo umount /mnt/ocsfs
-sudo losetup -d /dev/loop0
-sudo rmmod ocsfs
+echo hello | sudo tee /mnt/ocsfs/test.txt
+sudo umount /mnt/ocsfs && sudo losetup -d /dev/loop0 && sudo rmmod ocsfs
 ```
 
----
-
-## Testbed setup (multi-node)
-
-See [`docs/developer-guide.md`](docs/developer-guide.md) for the full
-step-by-step guide. The minimum viable testbed:
-
-- 2–3 nodes (VMs or bare metal) connected to a shared iSCSI LUN
-- `targetcli-fb` / TrueNAS SCALE as the iSCSI target (`emulate_pr=1` for SCSI-3 PR)
-- `open-iscsi` on each node
-
-TrueNAS SCALE (LIO backend) is the recommended target when a NAS is available —
-SCSI-3 PR works out of the box.
-
----
-
-## Proxmox VE usage
+### Full cluster mode (real SAN LUN with SCSI-3 PR + CAW)
 
 ```bash
-# Install plugin and module on each PVE node
+# Format for up to N nodes
+sudo ./mkfs.ocsfs -L vmstore -N 2 -J 16M -f /dev/sdb
+
+sudo insmod kmod/ocsfs.ko
+# No 'degraded' → full cluster mode: claims a node slot, registers an SCSI PR key,
+# and uses hardware Compare-And-Write for on-disk locking.
+sudo mount -t ocsfs /dev/sdb /mnt/ocsfs
+```
+
+A volume that requires the cluster secret (encryption / journal HMAC) additionally
+needs `-o cluster_secret=<64 hex chars>` at mount.
+
+---
+
+## 🧪 Multi-node testbed
+
+The minimum viable testbed is two nodes sharing one SCSI-3 PR-capable LUN:
+
+- 2–3 nodes (VMs or bare metal) attached to the same iSCSI LUN
+- **TrueNAS SCALE** (LIO backend) or `targetcli-fb` as the iSCSI target —
+  SCSI-3 PR and CAW work out of the box; a zvol-backed extent gives hardware CAS
+- `open-iscsi` initiator on each node
+
+See [`docs/developer-guide.md`](docs/developer-guide.md) for the full step-by-step
+guide, and `tests/` for the kernel smoke test and cluster scenario scripts.
+
+---
+
+## 🖥️ Proxmox VE usage
+
+```bash
+# On each PVE node: install plugin + module
 sudo proxmox/install.sh
 
-# Add storage
-pvesm add ocsfs fc-shared \
+# Register the shared LUN as storage
+pvesm add ocsfs vmstore \
   --device /dev/disk/by-path/<your-lun> \
   --content images,iso,vztmpl,backup \
   --maxnodes 16 --shared 1
 
-# Offline fsck
-sudo python3 tools/ocsfs-fsck /dev/sdb
-sudo python3 tools/ocsfs-fsck --repair /dev/sdb
+# Offline integrity check / repair
+sudo ./tools/ocsfs-fsck /dev/sdb
+sudo ./tools/ocsfs-fsck --repair /dev/sdb
 ```
 
 ---
 
-## Project structure
+## ⚠️ Known limitations
+
+| Area | Status |
+|---|---|
+| **Multi-node validation** | Implemented but unverified on real hardware — top priority once a 2-node SAN testbed is available |
+| **Integration tests** | No xfstests run yet |
+| **Encryption — I/O** | No readahead, no O_DIRECT; reflink/snapshot/symlink inside encrypted dirs return `-EOPNOTSUPP` |
+| **Encryption — keys** | fscrypt keys live in a shared encrypted key store on the LUN (ChaCha20-Poly1305 / cluster secret); peers fetch via `ocsfs-tool keys restore`. Enable with `mkfs.ocsfs -K`; requires `cluster_secret=` at mount |
+| **Compression write path** | Applied on fsync for buffered files only; O_DIRECT writes are never compressed |
+| **Shared writable mmap** | `MAP_SHARED\|PROT_WRITE` returns `-EOPNOTSUPP` in *cluster* mode (works single-node); read-only and private COW mappings always work |
+| **STONITH** | Fencing uses SCSI PR; out-of-band STONITH (PDU/iDRAC) is not wired |
+| **Recovery concurrency** | One dead node recovered at a time; a second simultaneous failure is queued |
+
+---
+
+## 📁 Project structure
 
 ```
 ocsfs/
-├── kmod/           Kernel module (C, GPL-2.0)
-├── src/            FUSE3 prototype (format validation only)
-├── tools/          mkfs, admin CLI, defrag daemon, fsck
-├── proxmox/        Proxmox VE storage plugin (Perl)
-├── tests/          KUnit tests + xfstests config
-├── conf/           systemd units + udev rules
-├── man/            Man pages
-├── docs/           Developer guide, admin guide
-├── debian/         Debian packaging
-├── include/        Shared headers (on-disk format)
-└── LICENSE         GPL-2.0-only
+├── kmod/      Kernel module (C, GPL-2.0)
+├── src/       FUSE3 prototype (format validation only)
+├── tools/     mkfs, admin CLI, defrag daemon, fsck
+├── proxmox/   Proxmox VE storage plugin (Perl)
+├── tests/     KUnit + kernel smoke + cluster scenarios
+├── conf/      systemd units + udev rules
+├── man/       Man pages
+├── docs/      Developer guide, admin guide
+├── debian/    Debian packaging
+├── include/   Shared on-disk-format headers
+└── LICENSE    GPL-2.0-only
 ```
 
 ---
 
-## License
+## 🗺️ Roadmap
 
-GPL-2.0-only — compatible with Linux kernel inclusion.
+1. **Real two-node validation** — cross-node cache coherence, peer recovery, SCSI-PR fencing on a shared LUN
+2. **xfstests** `quick`+`auto` on a clustered testbed
+3. Writer/reader fairness tuning and performance work on the journal hot path
+4. Out-of-band STONITH integration
+5. Online `fsck` / scrub hardening
 
-## Contributing
+---
+
+## 🤝 Contributing
 
 The project is looking for:
 
 - Kernel filesystem developers (VFS, block layer, crash safety)
-- SCSI/FC storage engineers (PR, CAW, multipath)
+- SCSI / FC storage engineers (PR, CAW, multipath)
 - Proxmox / PVE integration developers
 - QA engineers who can run xfstests on a real cluster
 
-The most impactful open task is running `xfstests quick+auto` on a 2-node
-testbed with LIO iSCSI. SCSI CAW is implemented via BSG-direct
-(`ocsfs_bsg_execute_cdb()`) — no kernel patch required.
+The single most impactful open task is **running xfstests on a 2-node LIO iSCSI
+testbed**. SCSI CAW is implemented via BSG-direct (`ocsfs_bsg_execute_cdb()`) —
+no kernel patch required.
+
+---
+
+## 📜 License
+
+**GPL-2.0-only** — compatible with Linux kernel inclusion.
