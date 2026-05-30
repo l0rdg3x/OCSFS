@@ -169,7 +169,8 @@ Known open items that could cause data loss under load are tracked in
 | `refcount.c` | Per-AG extent reference counting for CoW/dedup (B+ tree, V2 volumes) |
 | `compress.c` | Inline LZ4/ZSTD compression (read path); decompression on demand |
 | `compress_file.c` | Compress-on-fsync for buffered files; journal-before-free |
-| `dedup.c` | Content-based deduplication via `OCSFS_IOC_DEDUP` ioctl |
+| `dedup.c` | Content-based deduplication via `OCSFS_IOC_DEDUP` ioctl (intra- and cross-file) |
+| `dedup_index.c` | Global cross-file dedup index (DDT) + garbage collection |
 | `xattr.c` | Extended attributes with DLM SH protection in cluster mode |
 | `acl.c` | POSIX ACL (getfacl/setfacl) |
 | `btree.c` | Generic B+ tree (search, insert, delete, range scan) |
