@@ -600,20 +600,16 @@ int ocsfs_orphan_scan(struct super_block *sb)
 			u32 boff  = off % sbi->s_block_size;
 			struct ocsfs_disk_inode *di;
 
-			if (sbi->s_clustered) {
-				bh = sb_getblk(sb, block);
-				if (!bh)
-					continue;
-				clear_buffer_uptodate(bh);
-				if (bh_read(bh, 0) < 0) {
-					brelse(bh);
-					continue;
-				}
-			} else {
-				bh = sb_bread(sb, block);
-				if (!bh)
-					continue;
-			}
+			/* Cached read.  The old clustered forced re-read
+			 * (clear_buffer_uptodate + bh_read) issued one disk read
+			 * per inode slot — 8× per block, defeating the page cache —
+			 * which made mounting a large multi-AG volume on a SAN/iSCSI
+			 * target take minutes in __bh_read.  Cross-node coherence of
+			 * the inode tables belongs at DLM-acquire time (TODO), like
+			 * the other metadata reads. */
+			bh = sb_bread(sb, block);
+			if (!bh)
+				continue;
 
 			di = (struct ocsfs_disk_inode *)(bh->b_data + boff);
 

@@ -632,6 +632,12 @@ struct ocsfs_lock_res {
 	u64             lr_resource_id;
 	u32             lr_resource_type;
 	u16             lr_mode;         /* currently held mode */
+	u32             lr_hold;         /* nr of active local holders; the on-disk
+					  * lock is only released when this hits 0, so a
+					  * concurrent weaker acquire+release (e.g. a
+					  * lockless read taking SH while a write/dedup/
+					  * reflink holds EX) cannot release the lock or
+					  * clobber lr_mode out from under the EX holder */
 	u32             lr_slot;         /* lock table slot index (u16→u32 for ARCH-2) */
 	bool            lr_dynamic;      /* allocated via kzalloc; safe to kfree */
 	struct mutex    lr_mutex;        /* local serialization */

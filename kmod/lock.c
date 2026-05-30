@@ -98,6 +98,7 @@ int ocsfs_lock_acquire(struct super_block *sb, struct ocsfs_lock_res *lr,
 		if (lr->lr_mode >= mode &&
 		    lr->lr_mode != OCSFS_LOCK_CW &&
 		    lr->lr_lock_epoch == cur_epoch) {
+			lr->lr_hold++;   /* count this nested/compatible hold */
 			mutex_unlock(&lr->lr_mutex);
 			return 0;
 		}
@@ -153,6 +154,7 @@ retry:
 
 		if (ret == 0) {
 			lr->lr_mode = mode;
+			lr->lr_hold++;   /* count this hold (first acquire or upgrade) */
 			/* ARCH-7: snapshot the previous EX holder's dirty range/epoch
 			 * for both SH and EX mode.
 			 * SH: read path uses it for selective page cache invalidation.
@@ -218,6 +220,17 @@ int ocsfs_lock_release(struct super_block *sb, struct ocsfs_lock_res *lr)
 
 	mutex_lock(&lr->lr_mutex);
 
+	/* Reference-counted: while any other local holder remains, keep the
+	 * on-disk lock and lr_mode untouched.  This is what stops a lockless
+	 * read's SH acquire+release from releasing the EX a concurrent write/
+	 * dedup/reflink/truncate holds (which would clobber lr_mode and, on a
+	 * peer cluster, hand the lock to another node mid-update). */
+	if (lr->lr_hold > 1) {
+		lr->lr_hold--;
+		mutex_unlock(&lr->lr_mutex);
+		return 0;
+	}
+
 retry_release:
 	ret = lr_read_entry(sb, lr, &dl, &bh);
 	if (ret) {
@@ -269,6 +282,7 @@ retry_release:
 	} else {
 		lr->lr_mode = OCSFS_LOCK_NL;
 		lr->lr_lock_epoch = 0;  /* invalidate cache; next acquire goes to disk */
+		lr->lr_hold = 0;        /* last holder released */
 	}
 	mutex_unlock(&lr->lr_mutex);
 	return ret;
