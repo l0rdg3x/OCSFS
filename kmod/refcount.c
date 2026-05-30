@@ -80,6 +80,17 @@ static int rc_bt_alloc(void *ctx, u64 *out_block)
 {
 	struct ocsfs_rc_io_ctx *rctx = ctx;
 
+	/*
+	 * When invoked inside a transaction (the normal case — rc_apply_delta
+	 * opens one), allocate through that transaction.  Using the plain
+	 * ocsfs_alloc_blocks() here would call ocsfs_txn_begin() again while the
+	 * caller already holds the journal lock for the open transaction, which
+	 * self-deadlocks (observed as cp + the writeback worker stuck in
+	 * ocsfs_txn_begin during reflink/snapshot/dedup).
+	 */
+	if (rctx->txn)
+		return ocsfs_alloc_blocks_txn(rctx->txn, rctx->sb, rctx->ag_no,
+					      1, out_block);
 	return ocsfs_alloc_blocks(rctx->sb, rctx->ag_no, 1, out_block);
 }
 
@@ -87,6 +98,8 @@ static int rc_bt_free(void *ctx, u64 block)
 {
 	struct ocsfs_rc_io_ctx *rctx = ctx;
 
+	if (rctx->txn)
+		return ocsfs_free_blocks_txn(rctx->txn, block, 1);
 	ocsfs_free_blocks(rctx->sb, block, 1);
 	return 0;
 }
@@ -192,6 +205,7 @@ int ocsfs_refcount_get(struct super_block *sb, u64 phys_block,
 
 	rctx.sb    = sb;
 	rctx.ag_no = ag->ag_no;
+	rctx.txn   = NULL;   /* read-only path: rc_bt_alloc must not see a stale txn */
 
 	ret = ocsfs_lock_acquire(sb, &ag->ag_rc_lock_res, OCSFS_LOCK_SH);
 	if (ret)
