@@ -1229,47 +1229,63 @@ directories, 30-file create, removal without EIO, truncate, unmount/remount
 persistence, and a clean offline fsck. This is the first confirmed end-to-end
 mount + I/O + remount of OCSFS via the kernel module.
 
-#### Large buffered writes — known critical limitation (OPEN, 2026-05-30)
+#### Large files & data path — full bring-up (RESOLVED, 2026-05-30)
 
-Stress-testing larger buffered writes (≥ ~1 MiB, i.e. files that spill past the
-16 inline extents into the extent B+ tree) on the same node exposed a chain of
-concurrency bugs in the write/writeback/extent-btree interaction. Several were
-fixed; the underlying one is **still open**:
+Stress-testing larger writes (files that spill past the 16 inline extents into
+the extent B+ tree) and the snapshot/reflink path on the Proxmox node exposed a
+chain of bugs in the write / writeback / B+ tree / allocator interaction. **All
+are now fixed and validated on the real kernel module** — a 64 MiB buffered
+write round-trips by sha256, and punch-hole, zero-range, sparse, rename,
+hardlink, symlink, xattr, reflink (FICLONE), 40-file create + remount
+persistence and a clean offline fsck all pass.
 
-Fixed along the way (all committed, all real bugs):
-- **iomap_end UNWRITTEN→WRITTEN convert deadlock** — converting under
-  `i_extent_lock` at peak dirty-page pressure deadlocked the writeback worker.
-  Conversion moved to the writeback path (`ocsfs_writeback_range`), keeping the
-  no-stale-data invariant (allocation stays UNWRITTEN → reads as zeroes, never
-  another file's freed contents — per the security review).
-- **Forced cross-node btree re-read** — `ext_btree_read`/`dir_btree_read`/
-  `rc_bt_read` did `clear_buffer_uptodate + bh_read` on every clustered access;
-  this broke read-your-own-writes and blocked forever in `__bh_read` on a
-  dirty/locked node under `i_extent_lock`. Now they read through the buffer
-  cache; cross-node metadata-block coherence is a TODO for the multi-node
-  testbed (handle at DLM acquisition, not per-access).
-- **Background dedup scrub** now off by default (mount `-o scrub`); it added
-  extent/refcount-btree lock contention to the heavy I/O path.
+Root causes found and fixed (each its own commit):
 
-**Still open — extent B+ tree corruption under concurrent modify.** On a write
-large enough to trigger inline writeback (`balance_dirty_pages →
-ocsfs_writepages → writeback_range`), the writeback's UNWRITTEN→WRITTEN
-conversion interleaves with the write's own extent-tree inserts and corrupts the
-B+ tree into a state with a child-pointer cycle. `ocsfs_btree_find_leaf` then
-descended forever, spinning on CPU while holding `i_extent_lock` and wedging the
-mount (only a hard reset recovered the node). Root cause not yet fixed — it is a
-btree insert/delete/split/convert concurrency or ordering bug in the
-write↔inline-writeback path, and needs a focused fix plus a debug kernel
-(lockdep/KASAN) and ideally real SCSI-CAW hardware (the software PR-lease CAS in
-`-o degraded` is CPU-bound and may interact). **Files that stay within 16 inline
-extents (≤ ~1 MiB, or sparse) and all metadata operations are unaffected.**
+1. **Block-allocator double allocation (the headline bug).** `ocsfs_meta_getblk`
+   force-re-read bitmap blocks from disk in cluster mode, so a second allocation
+   in the same transaction missed the first one's still-uncommitted bitmap bits
+   and returned the *same block twice*. The doubly-allocated block became both
+   `new_int` and `new_root` in one `btree_insert`, so the new root's child
+   pointer pointed at itself — `find_leaf` then cycled forever holding
+   `i_extent_lock` and wedged the mount on any write > ~1 MiB. Fixed by reading
+   the bitmap through the buffer cache (read-your-own-writes within the txn).
+2. **iomap_end UNWRITTEN→WRITTEN convert deadlock.** Converting under
+   `i_extent_lock` at peak dirty-page pressure deadlocked the writeback worker.
+   The conversion now happens in the writeback path (`ocsfs_writeback_range`),
+   preserving the no-stale-data invariant (allocation stays UNWRITTEN → reads as
+   zeroes, never another file's freed contents — per the security review).
+3. **Forced cross-node btree re-read.** `ext_btree_read` / `dir_btree_read` /
+   `rc_bt_read` did `clear_buffer_uptodate + bh_read` on every clustered access,
+   breaking read-your-own-writes and blocking in `__bh_read` on a dirty/locked
+   node under `i_extent_lock`. They now read through the buffer cache.
+4. **Refcount-btree nested transaction (reflink/snapshot/dedup hang).**
+   `rc_bt_alloc`/`rc_bt_free` called the non-transactional allocators while
+   `rc_apply_delta` already held an open transaction, so `ocsfs_txn_begin`
+   re-took the journal lock and self-deadlocked. They now route through the txn.
+5. **PUNCH_HOLE / ZERO_RANGE infinite loop (`-EUCLEAN`).** Both re-scanned the
+   range inclusively, re-collecting a re-inserted tail (and an already-processed
+   head/already-UNWRITTEN middle) forever. Fixed with an exclusive scan,
+   `search_le` start (catches a straddling/large extent), and a no-progress
+   break.
+6. **`OCSFS_WARN_NO_EX` dump_stack DoS.** A plain `WARN_ON` in the per-extent
+   btree write path fired a full `dump_stack()` on every one of thousands of
+   reflink inserts — enough to make a 32 MiB reflink time out. Now `WARN_ON_ONCE`.
 
-Safety net (committed): `ocsfs_btree_find_leaf` now caps descent at
-`OCSFS_BTREE_MAX_DEPTH` (32) and returns `-EIO` on a deeper descent. Verified on
-the node: a 32 MiB write now fails with a clean `EIO` ("btree: descent exceeded
-32 levels … corrupt tree (cycle?), aborting") instead of an unrecoverable
-kernel hang — the mount and node stay recoverable. The corruption itself is
-still a bug; the cap only prevents it from taking down the kernel.
+Hardening kept from the investigation:
+- `ocsfs_btree_find_leaf` detects a child-pointer cycle / caps descent at
+  `OCSFS_BTREE_MAX_DEPTH` and returns `-EIO` instead of spinning the CPU.
+- `btree_insert` asserts an allocation never returns a block already live on the
+  descent path (double-allocation detector).
+- Background dedup scrub is **off by default** (mount `-o scrub`) to keep its
+  btree lock contention off the hot I/O path.
+
+Open follow-ups (not blocking single-node use):
+- Cross-node coherence of *metadata* blocks (bitmap, btree nodes) must be
+  re-established by invalidating them at DLM EX acquisition rather than the old
+  per-read forced re-read — to validate on a real multi-node SCSI-PR testbed.
+- The `WARN_ON_ONCE(no EX)` fires once during reflink even though
+  `remap_file_range` acquires EX on both inodes; harmless single-node, worth
+  confirming the lock-state on a real cluster.
 
 ---
 

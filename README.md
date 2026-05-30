@@ -11,19 +11,17 @@ An open-source cluster filesystem for Linux targeting shared block storage
 a Proxmox VE-native alternative to VMware VMFS.
 
 > **Status: Alpha / Research.**
-> The kernel module builds, mounts, and round-trips data — verified end to end on
-> a real Proxmox VE 9 node (kernel 7.0.6-2-pve) via `tests/kernel_smoke_test.sh`
-> (single node, loopback, `-o degraded`): mount, 8 MiB sha256 round-trip, nested
-> directories, file removal, truncate, unmount/remount persistence, and a clean
-> offline fsck all pass.
->
-> **Known critical limitation:** large buffered writes (files that spill past 16
-> inline extents into the extent B+ tree, ≈ ≥1 MiB) currently corrupt the extent
-> B+ tree under concurrent inline writeback and fail with `EIO` (a descent-depth
-> safety net prevents the former kernel hang). Files within 16 inline extents and
-> all metadata operations are fine. See `docs/developer-guide.md` (§ "Large
-> buffered writes"). Multi-node clustering is hardened but not yet validated on a
-> real multi-node SCSI-PR testbed. **Do not use with data that matters.**
+> The kernel module builds, mounts, and round-trips data — validated end to end
+> on a real Proxmox VE 9 node (kernel 7.0.6-2-pve, single node, loopback,
+> `-o degraded`): a 64 MiB buffered write sha256 round-trip, fallocate,
+> punch-hole, zero-range, sparse files, rename, hardlink, symlink, xattr, reflink
+> (FICLONE), 40-file create + unmount/remount persistence, and a clean offline
+> fsck all pass. The large-file data path (extent B+ tree, > ~1 MiB) and the
+> snapshot/reflink path were brought up and debugged on real hardware this round
+> — see `docs/developer-guide.md` (§ "Large files & data path — full bring-up").
+> Multi-node clustering is hardened but **not yet validated on a real multi-node
+> SCSI-PR testbed** (metadata cross-node cache coherence is the main open item).
+> **Do not use with data that matters.**
 
 ---
 
