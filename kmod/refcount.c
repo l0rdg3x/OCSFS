@@ -154,7 +154,15 @@ static int rc_btree_persist_root(struct super_block *sb,
 	struct ocsfs_disk_ag *dag;
 	int ret;
 
-	bh = sb_getblk(sb, blk);
+	/*
+	 * Read-modify-write of the AG descriptor: we touch only ag_rc_btree_root
+	 * but recompute the CRC over the whole block, so every other field must
+	 * already be valid.  sb_bread (not sb_getblk) guarantees the buffer is
+	 * uptodate — otherwise an uncached AG descriptor (e.g. after drop_caches)
+	 * would be overwritten with garbage carrying a valid CRC, corrupting the
+	 * AG ("bad magic" at next mount).
+	 */
+	bh = sb_bread(sb, blk);
 	if (!bh)
 		return -EIO;
 

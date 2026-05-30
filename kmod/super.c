@@ -657,7 +657,17 @@ int ocsfs_sync_fs(struct super_block *sb, int wait)
 		struct ocsfs_ag_info *ag = &sbi->s_ags[i];
 		u64 off  = sbi->s_ag_desc_off + (u64)i * sizeof(struct ocsfs_disk_ag);
 		u64 blk  = ocsfs_byte_to_block(sbi, off);
-		struct buffer_head *bh = sb_getblk(sb, blk);
+		/*
+		 * Read-modify-write: we only update the mutable counters but
+		 * recompute the CRC over the WHOLE descriptor, so the immutable
+		 * fields (ag_magic, geometry, bitmap/inode offsets, reserved)
+		 * must already be present.  sb_bread guarantees the buffer is
+		 * uptodate; sb_getblk would hand us an uninitialised buffer when
+		 * the block is not cached (e.g. after drop_caches), and we would
+		 * then write garbage with a valid CRC over every AG descriptor —
+		 * corrupting the whole filesystem ("AG bad magic" at next mount).
+		 */
+		struct buffer_head *bh = sb_bread(sb, blk);
 		struct ocsfs_disk_ag *dag;
 
 		if (!bh)
