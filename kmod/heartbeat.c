@@ -524,7 +524,30 @@ static int ocsfs_heartbeat_thread(void *data)
 
 		/* Write our heartbeat */
 		if (time_after_eq(now, next_write)) {
-			ocsfs_heartbeat_write(sb);
+			int wr = ocsfs_heartbeat_write(sb);
+
+			/*
+			 * Self-fencing.  If our heartbeat write succeeds we are
+			 * provably alive — record it and lift any self-fence.
+			 * If it keeps failing and our last success is older than
+			 * HB_TIMEOUT (the same staleness at which a peer declares
+			 * us dead and starts fencing/recovering us), pause new EX
+			 * acquisitions: stop mutating shared state before a peer
+			 * tears it out from under us.  This also self-regulates —
+			 * a node that backs off its writes lets the heartbeat I/O
+			 * (and a congested SAN/CAW path) recover.
+			 */
+			if (wr == 0) {
+				sbi->s_hb.hb_last_ok = jiffies;
+				if (atomic_xchg(&sbi->s_hb.hb_self_fenced, 0))
+					pr_info("ocsfs: heartbeat recovered — resuming EX acquisition\n");
+			} else if (time_after(jiffies,
+					      sbi->s_hb.hb_last_ok +
+					      msecs_to_jiffies(OCSFS_HB_TIMEOUT_MS))) {
+				if (!atomic_xchg(&sbi->s_hb.hb_self_fenced, 1))
+					pr_warn("ocsfs: heartbeat write failing for >%ums — self-fencing (pausing new EX acquires)\n",
+						OCSFS_HB_TIMEOUT_MS);
+			}
 			next_write = jiffies + write_jiffies;
 			/*
 			 * Recheck stop after potentially long I/O (up to
@@ -568,11 +591,14 @@ int ocsfs_heartbeat_start(struct super_block *sb)
 
 	atomic64_set(&sbi->s_hb.hb_sequence, 0);
 	init_waitqueue_head(&sbi->s_hb.hb_waitq);
+	atomic_set(&sbi->s_hb.hb_self_fenced, 0);
+	sbi->s_hb.hb_last_ok = jiffies;
 
 	/* Write initial heartbeat */
 	ret = ocsfs_heartbeat_write(sb);
 	if (ret)
 		return ret;
+	sbi->s_hb.hb_last_ok = jiffies;
 
 	/* Start background thread */
 	sbi->s_hb.hb_thread = kthread_run(ocsfs_heartbeat_thread, sb,

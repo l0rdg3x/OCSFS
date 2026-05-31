@@ -81,7 +81,8 @@ static int lock_acquire_impl(struct super_block *sb, struct ocsfs_lock_res *lr,
 	 */
 	if (mode == OCSFS_LOCK_EX &&
 	    (atomic_read(&sbi->s_recovery_barrier) ||
-	     atomic_read(&sbi->s_remote_recovery_barrier)))
+	     atomic_read(&sbi->s_remote_recovery_barrier) ||
+	     atomic_read(&sbi->s_hb.hb_self_fenced)))
 		return -EAGAIN;
 
 	mutex_lock(&lr->lr_mutex);

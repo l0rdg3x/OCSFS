@@ -757,6 +757,11 @@ struct ocsfs_heartbeat_info {
 	wait_queue_head_t        hb_waitq;
 	bool                    hb_running;
 	atomic64_t              hb_sequence;     /* our monotonic counter */
+	unsigned long           hb_last_ok;      /* jiffies of last successful HB write */
+	atomic_t                hb_self_fenced;  /* 1 = HB starved >HB_TIMEOUT: pause new
+						  * EX acquires (self-quiesce) so we stop
+						  * mutating shared state before a peer
+						  * may fence us */
 };
 
 /* SCSI PR state */
