@@ -498,6 +498,72 @@ bool ocsfs_node_is_alive(struct super_block *sb, u16 slot)
 	return alive;
 }
 
+/*
+ * Zombie self-detection (gen-change self-recovery).
+ *
+ * hb_self_fenced only catches the case where *we* notice our heartbeat I/O has
+ * stopped.  A subtler split-brain hazard: our heartbeat is merely *slow* (not
+ * stopped), a peer declares us dead and recovers us — fencing our PR key,
+ * replaying our journal and handing our on-disk locks to others — while we are
+ * still running with cached lock grants.  Writing now would corrupt the volume.
+ *
+ * We detect this by reading our OWN node slot fresh and checking it still says
+ * ACTIVE/SUSPECTED with our mount generation.  If a peer changed it
+ * (DEAD/FREE/EVICTING, or the slot was reused with a new gen) we lost the race:
+ * hard self-fence — invalidate every cached lock grant (epoch bump, so any
+ * cache-hit re-acquire revalidates against disk and finds it lost), refuse new
+ * EX (-EROFS, see lock_acquire_impl), and force the FS read-only.  Recovery is
+ * by remount, which rejoins with a fresh generation.
+ */
+static void ocsfs_heartbeat_check_self(struct super_block *sb)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	struct ocsfs_disk_node_slot dns;
+	struct buffer_head *bh;
+	u64 off, block;
+	u32 boff, disk_gen;
+	u8  disk_state;
+
+	if (!sbi->s_clustered || atomic_read(&sbi->s_hb.hb_zombie))
+		return;
+
+	off   = OCSFS_NODE_SLOT_TABLE_OFF +
+		(u64)sbi->s_node_slot * sizeof(struct ocsfs_disk_node_slot);
+	block = off / sbi->s_block_size;
+	boff  = off % sbi->s_block_size;
+
+	bh = sb_getblk(sb, block);
+	if (!bh)
+		return;
+	clear_buffer_uptodate(bh);
+	if (bh_read(bh, 0) < 0) {
+		brelse(bh);
+		return;
+	}
+	memcpy(&dns, bh->b_data + boff, sizeof(dns));
+	brelse(bh);
+
+	disk_state = dns.ns_state;
+	disk_gen   = le32_to_cpu(dns.ns_mount_gen);
+
+	/* Still us and healthy?  ACTIVE/SUSPECTED with our generation.  SUSPECTED
+	 * is transient (a peer suspects but has not recovered us); our HB writes
+	 * will clear it, so do not act on it. */
+	if (disk_gen == sbi->s_mount_gen &&
+	    (disk_state == OCSFS_NODE_ACTIVE ||
+	     disk_state == OCSFS_NODE_SUSPECTED))
+		return;
+
+	/* A peer recovered/fenced us. */
+	atomic_set(&sbi->s_hb.hb_zombie, 1);
+	atomic_inc(&sbi->s_lock_epoch);   /* invalidate every cached lock grant */
+	sb->s_flags |= SB_RDONLY;
+	pr_emerg("ocsfs: ═══ ZOMBIE FENCE ═══ slot %u was recovered by a peer "
+		 "(on-disk state 0x%02x gen %u vs our gen %u). Forcing read-only "
+		 "to avoid split-brain — unmount and remount to rejoin.\n",
+		 sbi->s_node_slot, disk_state, disk_gen, sbi->s_mount_gen);
+}
+
 /* ═══════════════════════════════════════════════════════════════
  * HEARTBEAT THREAD
  *
@@ -561,6 +627,9 @@ static int ocsfs_heartbeat_thread(void *data)
 		/* Check peers */
 		if (time_after_eq(now, next_check)) {
 			ocsfs_heartbeat_check_peers(sb);
+			/* gen-change self-recovery: did a peer recover us while
+			 * we are still alive?  Hard self-fence if so. */
+			ocsfs_heartbeat_check_self(sb);
 			next_check = jiffies + check_jiffies;
 			if (kthread_should_stop())
 				break;
@@ -592,6 +661,7 @@ int ocsfs_heartbeat_start(struct super_block *sb)
 	atomic64_set(&sbi->s_hb.hb_sequence, 0);
 	init_waitqueue_head(&sbi->s_hb.hb_waitq);
 	atomic_set(&sbi->s_hb.hb_self_fenced, 0);
+	atomic_set(&sbi->s_hb.hb_zombie, 0);
 	sbi->s_hb.hb_last_ok = jiffies;
 
 	/* Write initial heartbeat */

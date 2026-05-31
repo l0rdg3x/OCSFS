@@ -77,6 +77,17 @@ static int lock_acquire_impl(struct super_block *sb, struct ocsfs_lock_res *lr,
 	}
 
 	/*
+	 * Zombie self-fence (gen-change): a peer recovered/fenced us while we
+	 * were still alive — our on-disk locks were handed to others, so any new
+	 * mutation would split-brain the volume.  Refuse EX *hard* (-EROFS, not
+	 * -EAGAIN): retrying never helps, the node must be remounted to rejoin
+	 * with a fresh generation.  Reads (SH) are left alone — they cannot
+	 * corrupt and let the node keep reporting status.
+	 */
+	if (mode == OCSFS_LOCK_EX && atomic_read(&sbi->s_hb.hb_zombie))
+		return -EROFS;
+
+	/*
 	 * Recovery barrier: while the leader is replaying journal AFTER-images
 	 * (Phase 3), block any local EX acquisition to avoid overwriting data
 	 * that the replay is about to restore.  Return -EAGAIN so callers retry

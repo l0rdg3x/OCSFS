@@ -775,6 +775,12 @@ struct ocsfs_heartbeat_info {
 						  * EX acquires (self-quiesce) so we stop
 						  * mutating shared state before a peer
 						  * may fence us */
+	atomic_t                hb_zombie;       /* 1 = a peer recovered/fenced us while
+						  * we are still alive (our slot went
+						  * DEAD/EVICTING/FREE or our mount-gen
+						  * changed under us).  HARD self-fence:
+						  * refuse all EX, force the FS read-only,
+						  * require a remount to rejoin cleanly */
 };
 
 /* SCSI PR state */
