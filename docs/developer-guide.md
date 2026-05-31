@@ -343,6 +343,54 @@ writer-priority fairness is a separate TODO.)
 mode this fires `WARN_ON` if EX is not held, catching callers that bypass
 the protocol.
 
+### Data-path performance: keeping per-I/O work off the SAN
+
+A clustered volume must stay coherent across nodes, but on a **single active
+node** (a running VM writing its disk image) re-doing that coherence work on
+*every* 4 KiB I/O caps throughput at the SAN's single-op round-trip rate. Three
+mechanisms keep the hot path CAW-free while preserving coherence; together they
+took clustered random 4 KiB O_DIRECT from **247→26 600** write IOPS and
+**692→23 100** read IOPS at QD32 (≈ raw device).
+
+1. **Lazy lock + cache-hit re-acquire.** `ocsfs_file_write_iter` (EX) and
+   `ocsfs_file_read_iter` (SH) release the inode lock with
+   `ocsfs_lock_release_lazy()`: the on-disk grant is kept, so the next I/O
+   re-acquires it as an epoch-cache hit with **no CAW**. A peer that needs the
+   lock sets its waiter bit and the lazy-revoke sweep (`ocsfs_lazy_revoke_fn`)
+   performs the real release within one interval.
+
+2. **`was_fresh`-gated refresh / invalidation.** Both iter paths use
+   `ocsfs_lock_acquire_fresh(&fresh)` and only re-read the inode
+   (`ocsfs_inode_refresh`) and invalidate the page cache **when the acquire was a
+   real cross-node grant** (`fresh == true`). A cache-hit re-acquire proves we
+   held the lock continuously since our last access, so nothing on disk changed —
+   the per-I/O forced inode read is skipped entirely. *Coherence rule:* on a
+   fresh acquire we **always** invalidate (range from `lr_inv_lo/hi`, else full);
+   we must **not** short-circuit on `i_last_writer_slot == s_node_slot`, because
+   that node-local hint is not cleared by a peer's write and would serve stale
+   buffered reads after a peer EX.
+
+3. **CoW check short-circuit (`refcount.c:ocsfs_refcount_get`).** `needs_cow()`
+   runs once per write. It now returns refcount = 1 **without taking the per-AG
+   refcount DLM lock** when `rc_btree_root == 0` (no shared blocks in the AG — the
+   common case for an un-snapshotted VM image). This is behaviourally identical to
+   taking the SH lock and finding the root empty — the lock never refreshed
+   `rc_btree_root` anyway, it only serialised a tree *walk* — but removes two
+   forced lock-block reads per write.
+
+**Self SH→EX upgrade (`lock.c:lock_acquire_impl`).** Because reads now hold SH
+lazily, a subsequent write on the same inode may find this node still owning its
+own on-disk SH holder bit. Requesting EX would otherwise conflict with our own
+SH and block to the acquire deadline, so the acquire path first does a real
+release of a lazily-held self SH (`lr_lazy && lr_hold == 0 && lr_mode == SH`)
+before granting EX. Note that holding EX lazily from a write makes a following
+read a cache hit (EX ≥ SH), so a mixed-r/w VM workload settles on a lazily-held
+EX with no per-I/O CAW.
+
+Validated two-node: a buffered read/write **ping-pong** (node A writes → node B
+reads the new data → B writes → A reads it, both directions) plus
+`fio --verify=crc32c` and a clean `fsck`.
+
 ### Resource hashing
 
 ```c
