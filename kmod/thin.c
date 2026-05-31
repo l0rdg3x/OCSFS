@@ -27,26 +27,96 @@
  * have been zeroed or trimmed can return blocks to the pool.
  * ═══════════════════════════════════════════════════════════════ */
 
+/*
+ * Zero a sub-block byte range [byte_off, byte_off+byte_len) that lies entirely
+ * within ONE logical block, physically (the block stays allocated).  Used for
+ * the partial edges of a punch/zero range.  Caller holds i_extent_lock.  A hole
+ * or an UNWRITTEN block already reads as zero, so those are no-ops.
+ */
+static int ocsfs_zero_within_block(struct inode *inode, loff_t byte_off,
+				   loff_t byte_len)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
+	u64 lblk = (u64)byte_off / sbi->s_block_size;
+	u32 boff = (u32)((u64)byte_off % sbi->s_block_size);
+	struct ocsfs_extent ext;
+	struct buffer_head *bh;
+	u64 phys;
+	int ret;
+
+	if (byte_len <= 0)
+		return 0;
+	if (boff + byte_len > sbi->s_block_size)        /* defensive: keep in-block */
+		byte_len = sbi->s_block_size - boff;
+
+	ret = ocsfs_extent_lookup(inode, lblk, &ext);
+	if (ret || ext.physical_block == 0)
+		return 0;                               /* hole — already zero */
+	if (ext.flags & OCSFS_EXT_UNWRITTEN)
+		return 0;                               /* unwritten — reads zero */
+	if (ext.flags & OCSFS_EXT_COMPRESSED) {
+		ret = ocsfs_extent_decompress_for_write(inode, lblk);
+		if (ret)
+			return ret;
+		ret = ocsfs_extent_lookup(inode, lblk, &ext);
+		if (ret || ext.physical_block == 0)
+			return ret;
+	}
+	phys = ext.physical_block + (lblk - ext.logical_block);
+	bh = sb_bread(inode->i_sb, phys);
+	if (!bh)
+		return -EIO;
+	lock_buffer(bh);
+	memset(bh->b_data + boff, 0, byte_len);
+	mark_buffer_dirty(bh);
+	unlock_buffer(bh);
+	sync_dirty_buffer(bh);
+	brelse(bh);
+	return 0;
+}
+
 int ocsfs_punch_hole(struct inode *inode, loff_t offset, loff_t len)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
-	u64 start_block = offset / sbi->s_block_size;
-	u64 end_block = (offset + len) / sbi->s_block_size;
+	u64 bs = sbi->s_block_size;
+	loff_t pend = offset + len;
+	/* Whole-block range that is FULLY inside the punch: [full_start, full_end).
+	 * Partially-covered blocks at the edges stay allocated; their punched bytes
+	 * are zeroed in place below (the previous code used floor()/floor() for
+	 * both ends, which (a) did nothing for a sub-block punch within one block
+	 * and (b) could deallocate a partially-covered edge block, losing data
+	 * outside the hole). */
+	u64 full_start = (u64)(offset + bs - 1) / bs;
+	u64 full_end   = (u64)pend / bs;
+	u64 start_block = full_start;
+	u64 end_block = full_end;
+	loff_t head_end = (loff_t)full_start * bs;
+	loff_t tail_start = (loff_t)full_end * bs;
 	int i;
 	int ret = 0;
 
-	if (start_block >= end_block)
+	if (len <= 0)
 		return 0;
 
-	if (oi->i_extent_tree_root) {
-		truncate_pagecache_range(inode, offset, offset + len - 1);
-		return ocsfs_extent_btree_punch_hole(inode, start_block, end_block);
-	}
-
 	/* Invalidate page cache for the punched region */
-	truncate_pagecache_range(inode, offset,
-				 offset + len - 1);
+	truncate_pagecache_range(inode, offset, pend - 1);
+
+	/* Zero the partial (sub-block) bytes at the head and tail. */
+	mutex_lock(&oi->i_extent_lock);
+	if (offset < head_end)
+		ocsfs_zero_within_block(inode, offset,
+					min_t(loff_t, pend, head_end) - offset);
+	if (pend > tail_start && tail_start >= head_end)
+		ocsfs_zero_within_block(inode, max_t(loff_t, offset, tail_start),
+					pend - max_t(loff_t, offset, tail_start));
+	mutex_unlock(&oi->i_extent_lock);
+
+	if (oi->i_extent_tree_root)
+		return ocsfs_extent_btree_punch_hole(inode, full_start, full_end);
+
+	if (start_block >= end_block)
+		return 0;   /* only partial bytes punched — no whole blocks to free */
 
 	/* ALTO-N1: journal-before-free — collect blocks to free, modify extents
 	 * in memory, journal the inode, THEN free.  Prevents cross-link on crash
