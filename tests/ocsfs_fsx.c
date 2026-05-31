@@ -33,6 +33,7 @@ static unsigned long opnum = 0;
 static int do_direct = 0;
 static unsigned blksz = 4096;
 static int verbose = 0;
+static int no_mmap = 0;   /* -M: run mmap ops as buffered pwrite/pread (same off/len) */
 static unsigned long watch = ~0UL;   /* watched file offset, logged when touched */
 
 static void logop(const char *t, unsigned long off, unsigned long len)
@@ -158,6 +159,14 @@ static void op_mapwrite(void)
 	if (!len) return;
 	maplen = (off - pg) + len;
 	logop("mapwrite", off, len);
+	if (no_mmap) {
+		unsigned char *buf = malloc(len);
+		memset(buf, pat, len);
+		if (pwrite(fd, buf, len, off) != (ssize_t)len) { free(buf); fail("pwrite(mw)", off, len); }
+		free(buf);
+		memset(good + off, pat, len);
+		return;
+	}
 	m = mmap(NULL, maplen, PROT_READ | PROT_WRITE, MAP_SHARED, fd, pg);
 	if (m == MAP_FAILED) fail("mmap(w)", pg, maplen);
 	memset(m + (off - pg), pat, len);
@@ -178,6 +187,13 @@ static void op_mapread(void)
 	if (!len) return;
 	maplen = (off - pg) + len;
 	logop("mapread", off, len);
+	if (no_mmap) {
+		unsigned char *buf = malloc(len);
+		if (pread(fd, buf, len, off) != (ssize_t)len) { free(buf); fail("pread(mr)", off, len); }
+		check(buf, off, len, "mapread");
+		free(buf);
+		return;
+	}
 	m = mmap(NULL, maplen, PROT_READ, MAP_SHARED, fd, pg);
 	if (m == MAP_FAILED) fail("mmap(r)", pg, maplen);
 	check(m + (off - pg), off, len, "mapread");
@@ -243,7 +259,7 @@ int main(int argc, char **argv)
 	unsigned long nops = 50000;
 	unsigned seed = (unsigned)time(NULL);
 	int c;
-	while ((c = getopt(argc, argv, "N:l:o:S:dvw:")) != -1) {
+	while ((c = getopt(argc, argv, "N:l:o:S:dvw:M")) != -1) {
 		switch (c) {
 		case 'N': nops = strtoul(optarg, NULL, 0); break;
 		case 'l': fsxsize = strtoul(optarg, NULL, 0); break;
@@ -252,6 +268,7 @@ int main(int argc, char **argv)
 		case 'd': do_direct = 1; break;
 		case 'v': verbose = 1; break;
 		case 'w': watch = strtoul(optarg, NULL, 0); break;
+		case 'M': no_mmap = 1; break;
 		default: fprintf(stderr, "usage: %s [-N ops][-l size][-o oplen][-S seed][-d] file\n", argv[0]); return 2;
 		}
 	}
