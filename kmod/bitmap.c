@@ -102,9 +102,17 @@ static int ocsfs_ag_alloc_blocks(struct super_block *sb, u32 ag_no,
 	u32 found = 0;
 	u64 start_bit = 0;
 	int ret;
-	bool fresh = false;   /* TEMP DEBUG */
+	bool fresh = false;
 
-	if (ag->free_blocks < count)
+	/*
+	 * Single node: the in-memory counter is authoritative, so bail early to
+	 * skip a pointless bitmap scan of a full AG.  Clustered: the counter
+	 * drifts (peers alloc/free without touching it), so it must NOT gate
+	 * ENOSPC — we acquire the AG lock, recount from the fresh on-disk bitmap,
+	 * then let the bitmap scan be the source of truth.  This is what stops the
+	 * allocator from reporting a false ENOSPC on a near-empty clustered fs.
+	 */
+	if (!sbi->s_clustered && ag->free_blocks < count)
 		return -ENOSPC;
 
 	/* Cross-node: DLM EX on AG prevents two nodes allocating same blocks. */
@@ -114,7 +122,8 @@ static int ocsfs_ag_alloc_blocks(struct super_block *sb, u32 ag_no,
 		if (ret)
 			return ret;
 		/* Real cross-node acquire: a peer may have allocated since we
-		 * last cached this AG's bitmap — drop the stale cache. */
+		 * last cached this AG's bitmap — drop the stale cache so the scan
+		 * below reads the committed on-disk bitmap (the source of truth). */
 		if (fresh)
 			ocsfs_ag_invalidate_bitmap(sb, ag);
 	}
@@ -311,8 +320,18 @@ int ocsfs_alloc_blocks(struct super_block *sb, u32 ag_hint, u32 count,
 		}
 	}
 
-	if (chosen == sbi->s_ag_count)
-		return -ENOSPC;
+	/*
+	 * Single node: the counters are authoritative, so "no AG has room" really
+	 * means ENOSPC.  Clustered: the counters drift under cross-node churn, so
+	 * a sentinel here does NOT imply the fs is full — fall through to the
+	 * exhaustive bitmap-confirmed pass below.  Pick the hint (or AG 0) as the
+	 * starting point so the fast path is still tried first.
+	 */
+	if (chosen == sbi->s_ag_count) {
+		if (!sbi->s_clustered)
+			return -ENOSPC;
+		chosen = (ag_hint < sbi->s_ag_count) ? ag_hint : 0;
+	}
 
 	/* Phase 2: open txn only for the chosen AG. */
 	txn = ocsfs_txn_begin(sb);
@@ -327,11 +346,17 @@ int ocsfs_alloc_blocks(struct super_block *sb, u32 ag_hint, u32 count,
 	if (ret != -ENOSPC)
 		return ret; /* hard I/O or DLM error — do not retry */
 
-	/* Stale lockless read — fall back to remaining AGs. */
+	/*
+	 * Fall back to the remaining AGs.  In clustered mode do NOT skip on the
+	 * (drifting) in-memory counter: only the per-AG fresh-bitmap scan inside
+	 * ocsfs_ag_alloc_blocks can confirm a real ENOSPC, so we try every AG.
+	 * Single node trusts the counter and skips genuinely-full AGs.
+	 */
 	for (i = 0; i < sbi->s_ag_count; i++) {
 		if (i == chosen)
 			continue;
-		if (READ_ONCE(sbi->s_ags[i].free_blocks) < count)
+		if (!sbi->s_clustered &&
+		    READ_ONCE(sbi->s_ags[i].free_blocks) < count)
 			continue;
 		txn = ocsfs_txn_begin(sb);
 		if (IS_ERR(txn))

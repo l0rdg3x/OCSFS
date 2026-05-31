@@ -174,6 +174,32 @@ retry:
 
 	u16 cur_mode = le16_to_cpu(dl.le_mode);
 
+	/*
+	 * Self-held re-adoption.  The on-disk lock is still recorded as held EX by
+	 * THIS node (our slot+gen) but our in-memory cache missed — typically
+	 * because a peer's recovery bumped s_lock_epoch (ocsfs_lock_recover_node),
+	 * invalidating lr_lock_epoch while we genuinely still hold the grant.
+	 * Without this, the compatibility test below treats our OWN exclusive grant
+	 * as a conflict and we block on ourselves until the 30s acquire deadline —
+	 * an observed self-deadlock under heavy churn that then strands every AG /
+	 * block lock we hold and starves the other nodes (cascading 30s timeouts).
+	 * Re-adopt the grant (it is ours; a real revoke would have rewritten
+	 * le_holder_slot) and refresh the cache instead of conflicting.  Only valid
+	 * for a request that our held EX already covers (mode <= EX).
+	 */
+	if (cur_mode == OCSFS_LOCK_EX && mode <= OCSFS_LOCK_EX &&
+	    le16_to_cpu(dl.le_holder_slot) == sbi->s_node_slot &&
+	    le32_to_cpu(dl.le_holder_gen) == sbi->s_mount_gen) {
+		brelse(bh);
+		lr->lr_mode = OCSFS_LOCK_EX;
+		lr->lr_hold++;
+		lr->lr_lock_epoch = (u32)atomic_read(&sbi->s_lock_epoch);
+		if (mode == OCSFS_LOCK_EX && --lr->lr_ex_wait == 0)
+			wake_up_all(&lr->lr_wq);
+		mutex_unlock(&lr->lr_mutex);
+		return 0;
+	}
+
 	if (cur_mode == OCSFS_LOCK_NL || lock_modes_compatible(cur_mode, mode)) {
 		if (mode == OCSFS_LOCK_EX) {
 			dl.le_mode        = cpu_to_le16(OCSFS_LOCK_EX);

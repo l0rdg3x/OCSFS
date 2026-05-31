@@ -32,7 +32,15 @@ static int heartbeat_write_timeout(struct buffer_head *bh)
 	}
 	get_bh(bh);
 	bh->b_end_io = end_buffer_write_sync;
-	submit_bh(REQ_OP_WRITE | REQ_SYNC, bh);
+	/*
+	 * REQ_META | REQ_PRIO: the heartbeat is a tiny, latency-critical metadata
+	 * write whose deadline (OCSFS_HB_IO_TIMEOUT_MS) gates liveness.  Under heavy
+	 * data/journal churn the block queue fills with bulk REQ_SYNC writes; without
+	 * a priority hint the heartbeat queues behind them, blows its deadline, and a
+	 * busy-but-healthy node gets falsely declared dead — triggering recovery,
+	 * a lock-epoch bump, and a cascading self-deadlock.  Prioritise it.
+	 */
+	submit_bh(REQ_OP_WRITE | REQ_SYNC | REQ_META | REQ_PRIO, bh);
 	if (wait_on_bit_timeout(&bh->b_state, BH_Lock, TASK_UNINTERRUPTIBLE,
 				msecs_to_jiffies(OCSFS_HB_IO_TIMEOUT_MS))) {
 		pr_warn_ratelimited(

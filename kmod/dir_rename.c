@@ -876,7 +876,9 @@ static int ocsfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	oi->i_symlink = kmalloc(slen + 1, GFP_KERNEL);
 	if (!oi->i_symlink) {
 		inode_dec_link_count(inode);
-		discard_new_inode(inode);
+		iput(inode);   /* new_inode()/d_instantiate protocol: no I_NEW set,
+				* so plain iput (discard_new_inode would WARN_ON
+				* the missing I_NEW and do the same iput). */
 		return -ENOMEM;
 	}
 	memcpy(oi->i_symlink, symname, slen + 1);
@@ -896,7 +898,9 @@ symlink_fail:
 		kfree(oi->i_symlink);
 		oi->i_symlink = NULL;
 		inode_dec_link_count(inode);
-		discard_new_inode(inode);
+		iput(inode);   /* new_inode()/d_instantiate protocol: no I_NEW set,
+				* so plain iput (discard_new_inode would WARN_ON
+				* the missing I_NEW and do the same iput). */
 		return ret;
 	}
 

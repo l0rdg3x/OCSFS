@@ -793,7 +793,9 @@ struct inode *ocsfs_new_inode(struct inode *dir, umode_t mode)
 		inode->i_flags |= S_NOQUOTA;
 		if (sbi->s_clustered)
 			ocsfs_lock_release(sb, &oi->i_lock_res);
-		discard_new_inode(inode);
+		/* new_inode()/d_instantiate protocol: no I_NEW set, so plain iput
+		 * (discard_new_inode would WARN_ON the missing I_NEW). */
+		iput(inode);
 		return ERR_PTR(ret);
 	}
 
