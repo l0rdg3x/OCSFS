@@ -1651,6 +1651,29 @@ testbed: `repro13` FULL 6/6 + NOPUNCH 6/6 (was 6/6 FAIL on FULL), `fsck` clean,
 (O_DIRECT random read +25%, random write within noise — the read-hole and
 allocate paths are not on the steady-state VM-disk I/O hot path).
 
+### #7 — Inode-before-free ordering in the inline truncate path (2026-06-01)
+
+OCSFS keeps the block bitmap and the inode's extent map crash-consistent by
+*ordering*, not a single compound transaction (true atomicity in the buffered
+write path deadlocks `i_extent_lock` against the writeback worker). The rule:
+**allocate bitmap-first** (a crash leaks blocks, which `fsck` reclaims) and
+**free inode-first** (persist the extent map that dropped the reference, *then*
+free the bitmap — a crash again only leaks).
+
+`ocsfs_punch_hole` (ALTO-N1) and `ocsfs_extent_btree_truncate` already journaled
+the inode before freeing, but the **inline `ocsfs_extent_truncate`** path still
+freed the bitmap first (`ocsfs_free_blocks_rc`, which commits its own txn) and
+only `mark_inode_dirty()`-ed the inode. A crash in that window left the on-disk
+inode pointing at a now-free block; the allocator could hand it to another file,
+**cross-linking** them. The `evict` path made this worse — it then freed the
+inode number, so a survivor's next allocation could collide with a half-deleted
+file's stale extents.
+
+Fix: call `ocsfs_flush_inode_locked(inode, false)` before the free loop, under
+`i_extent_lock`, matching the punch ordering. Benefits all three callers
+(setattr shrink, evict/delete, rename-over). Validated on a real iSCSI LUN with a
+truncate/delete stress plus `repro13` FULL and a clean `fsck`.
+
 ---
 
 ## 9. I/O Path
