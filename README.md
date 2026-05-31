@@ -112,6 +112,12 @@ warnings**:
 - ✅ **Heartbeat self-fencing** — a node that can't write its heartbeat for the
   death threshold quiesces (refuses new exclusive locks) instead of being torn
   out by a peer mid-mutation
+- ✅ **Zombie self-fence (gen-change self-recovery)** — a node *falsely* declared
+  dead and recovered while still alive (slow, not stopped, heartbeat) detects it
+  by reading its own slot, hard-fences itself (invalidates cached locks, forces
+  read-only) and rejoins cleanly on remount; validated by marking a live node's
+  slot dead and confirming it goes read-only with `-EROFS` on writes, with no
+  spurious fence under normal two-node load
 
 ### What's *not* validated yet
 
@@ -481,9 +487,9 @@ sudo ./tools/ocsfs-fsck --repair /dev/sdb
 |---|---|
 | **Metadata-op scaling under cross-node contention** | The on-disk DLM does a SCSI CAW per *cross-node* lock acquire/release. Under sustained concurrent metadata churn on a *hot, contended* lock (e.g. a shared directory) acquires can hit the 30 s timeout as the target's CAW path saturates (the op fails, the node stays up). **The data path is not affected** — an uncontended lock is held lazily and re-taken from cache with no CAW, so single-node random VM-disk I/O runs at near-raw speed (see [Performance](#-performance)). The per-block CAW storm on delete/truncate is fixed; reducing per-op CAW on genuinely contended metadata locks is the open scaling item |
 | **Multi-node coherence** | ✅ Validated on real hardware (2- and 3-node): read/write/overwrite, concurrent same-directory create/delete/churn, and concurrent rename (within-dir, cross-dir, mixed) all converge correctly with a clean `fsck` |
-| **Cluster recovery & fencing** | ✅ Real node-crash recovery validated: a survivor detects the death, **SCSI-PR preempt-and-abort** fences the dead node, replays its journal and recovers its locks; survivors stay online with data intact, and the crashed node reboots and rejoins. **Self-fencing** quiesces a node that can't write its heartbeat. *Open:* a falsely-recovered-then-rejoining node can be left with stale previous-generation locks under extreme load |
+| **Cluster recovery & fencing** | ✅ Real node-crash recovery validated: a survivor detects the death, **SCSI-PR preempt-and-abort** fences the dead node, replays its journal and recovers its locks; survivors stay online with data intact, and the crashed node reboots and rejoins. **Self-fencing** quiesces a node that can't write its heartbeat; **zombie self-fence** catches the inverse — a node *falsely* recovered while still alive reads its own slot, sees it was recovered (DEAD / generation changed), invalidates its cached locks and forces itself read-only (remount to rejoin), preventing split-brain |
 | **Fencing method** | SCSI-3 Persistent Reservations only; out-of-band STONITH (PDU / iDRAC / IPMI) is not wired |
-| **Recovery concurrency** | One dead node recovered at a time; a second simultaneous failure is queued |
+| **Recovery concurrency** | Multiple dead nodes are tracked in a pending bitmask and recovered one at a time (sequential drain, none dropped); concurrent multi-node recovery is not parallelised |
 | **Slot-claim / refcount TOCTOU** | Node-table slot claim and cross-node refcount updates are CAW-serialised but retain a small TOCTOU window (architectural) |
 | **Crash atomicity** | Extent-map and bitmap updates commit as two separate journal transactions (tiny crash window between them); `fsck` reconciles |
 | **Filesystem grow** | ✅ Online (mounted) and offline grow implemented via `ocsfs-grow` (`INCOMPAT_AG_GROW`); validated 3-node. *Open:* a single grow per volume (re-growing an already-grown volume is rejected); rescan the LUN on every node before peers use the new space |
@@ -524,7 +530,7 @@ ocsfs/
 4. ✅ ~~Online filesystem grow when the backing LUN is expanded~~ — implemented (`ocsfs-grow`), validated 3-node
 5. **Metadata-op throughput under cross-node contention** — reduce the per-op SCSI CAW on genuinely contended locks so a hot shared lock can't saturate the target's CAW path
 6. **xfstests** `quick`+`auto` on a clustered testbed
-7. Recovery hardening (parallel multi-node recovery, self-recovery of own stale locks) and out-of-band STONITH
+7. Recovery hardening — ✅ ~~self-recovery of a falsely-recovered node (zombie self-fence)~~; remaining: *parallelised* multi-node recovery (currently sequential) and out-of-band STONITH
 
 ---
 

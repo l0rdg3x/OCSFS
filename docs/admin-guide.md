@@ -503,8 +503,16 @@ Use only FC SAN or LIO/TrueNAS SCALE iSCSI for multi-node deployments.
 | Snapshot for large files | Supported on V2 volumes (requires `INCOMPAT_RC_BTREE_PER_AG`; format with `mkfs.ocsfs` or upgrade with `ocsfs-tool tune --upgrade`) | Returns `-EOPNOTSUPP` on V1 volumes only |
 | Shared mmap unsupported in cluster mode | `MAP_SHARED\|PROT_WRITE` returns `-EOPNOTSUPP` in cluster mode | Private and read-only mappings work; single-node works |
 | Single grow per volume | `ocsfs-grow` adds space once (online or offline) | Re-growing an already-grown volume is rejected; rescan the LUN on every node first |
-| Single recovery at a time | If two nodes die simultaneously, the second is queued | `s_recovery_target` is a single u16; a bitmask queue is the fix |
+| Sequential multi-node recovery | Multiple dead nodes are recovered one at a time | Pending failures are tracked in a bitmask (`s_recovery_pending`) and drained in sequence — none are dropped; concurrent recovery is just not parallelised |
 | No out-of-band STONITH | SCSI PR fencing works; hardware PDU/iDRAC not wired | Proxmox API can serve as soft STONITH in lab environments |
+
+> **Zombie self-fence (gen-change self-recovery).** If a node's heartbeat is
+> merely *slow* and a peer recovers it while it is still alive, the node detects
+> this on its next heartbeat check (its own slot reads DEAD or its mount
+> generation changed), invalidates its cached locks and forces itself
+> **read-only** — writes then fail with `EROFS`. Recover by unmounting and
+> remounting that node (it rejoins with a fresh generation). Watch for
+> `ocsfs: ═══ ZOMBIE FENCE ═══` in `dmesg`.
 
 > **Alpha status:** OCSFS is under active development. Do not deploy with
 > critical data without a tested backup plan and thorough evaluation in your

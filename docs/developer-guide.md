@@ -489,6 +489,26 @@ timestamp.
 `kthread_stop()` triggers immediate wakeup via `wake_up(&hb_waitq)` rather
 than waiting for the next timer expiry.
 
+**Two self-fences (a node protecting *itself*).** Symmetric to peer detection:
+
+- `hb_self_fenced` — set when *our* heartbeat write keeps failing for
+  `HB_TIMEOUT`. Pauses new EX acquires (`-EAGAIN`) so we stop mutating shared
+  state before a peer fences us; cleared automatically when the HB write
+  succeeds again.
+- `hb_zombie` (gen-change self-recovery, `ocsfs_heartbeat_check_self()`) — the
+  inverse hazard: our heartbeat is merely *slow*, a peer declares us dead and
+  recovers us (PR-fenced, journal replayed, locks handed to others) while we are
+  still running with cached lock grants. Each heartbeat check we read our **own**
+  node slot fresh; if it is no longer `ACTIVE/SUSPECTED` with our mount
+  generation (i.e. `DEAD/FREE/EVICTING`, or the slot was reused with a new gen)
+  we lost the race. We then **hard** self-fence: `atomic_inc(s_lock_epoch)`
+  invalidates every cached lock grant (a cache-hit re-acquire now revalidates
+  against disk and finds it lost), `lock_acquire_impl` returns `-EROFS` for EX,
+  and `SB_RDONLY` is forced. Recovery is by remount (rejoins with a fresh
+  generation). This is the backstop against split-brain from a false-positive
+  fence; the double detection window above is what makes false positives rare in
+  the first place.
+
 ---
 
 ## 7. 5-Phase Recovery
