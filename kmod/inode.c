@@ -203,6 +203,18 @@ struct inode *ocsfs_iget(struct super_block *sb, u64 ino)
 		inode->i_flags |= S_IMMUTABLE;
 	if (oi->i_flags & OCSFS_IFLAG_APPEND)
 		inode->i_flags |= S_APPEND;
+	/*
+	 * Restore the encrypted flag from disk.  Without this an encrypted inode
+	 * read back from disk has IS_ENCRYPTED == false, so the write path skips
+	 * ocsfs_enc_writepages() and stores PLAINTEXT, and the read path does not
+	 * decrypt.  fscrypt loads the per-inode crypt_info lazily on first access
+	 * (open / prepare_new_inode); we only need the S_ENCRYPTED flag here, set
+	 * from our persistent OCSFS_IFLAG_ENCRYPTED — the ext4/f2fs pattern.
+	 */
+#ifdef CONFIG_FS_ENCRYPTION
+	if (oi->i_flags & OCSFS_IFLAG_ENCRYPTED)
+		inode->i_flags |= S_ENCRYPTED;
+#endif
 	oi->i_ag = le32_to_cpu(di.i_ag);
 	oi->i_extent_tree_root = le64_to_cpu(di.i_extent_tree_root);
 

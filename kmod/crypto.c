@@ -63,8 +63,22 @@ static int ocsfs_fscrypt_get_context(struct inode *inode, void *ctx, size_t len)
 static int ocsfs_fscrypt_set_context(struct inode *inode, const void *ctx,
 				      size_t len, void *fs_data)
 {
-	return ocsfs_xattr_set_internal(inode, OCSFS_XATTR_NS_SECURITY, "c",
-					ctx, len, 0);
+	int r = ocsfs_xattr_set_internal(inode, OCSFS_XATTR_NS_SECURITY, "c",
+					 ctx, len, 0);
+	if (r)
+		return r;
+	/*
+	 * Mark the inode encrypted right now (in-memory S_ENCRYPTED) AND persist
+	 * OCSFS_IFLAG_ENCRYPTED.  Without this the inode/directory we just gave a
+	 * policy to still reads IS_ENCRYPTED == false, so a child created in this
+	 * directory does not inherit encryption (fscrypt_prepare_new_inode sees an
+	 * "unencrypted" parent) and its data is written in PLAINTEXT.  This is the
+	 * ext4 set_context pattern.
+	 */
+	OCSFS_I(inode)->i_flags |= OCSFS_IFLAG_ENCRYPTED;
+	inode->i_flags |= S_ENCRYPTED;
+	mark_inode_dirty(inode);
+	return 0;
 }
 
 /* ─── empty_dir check ───────────────────────────────────────────────────── */
