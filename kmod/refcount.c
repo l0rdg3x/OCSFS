@@ -385,7 +385,32 @@ int ocsfs_refcount_dec(struct super_block *sb, u64 phys_block, u32 len,
  */
 void ocsfs_free_blocks_rc(struct super_block *sb, u64 phys, u32 len)
 {
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	struct ocsfs_ag_info *ag;
 	u32 i = 0;
+
+	/*
+	 * Fast path: if this extent's AG has no refcount B+ tree then no block in
+	 * it is shared (reflink / snapshot / dedup), so free the whole run in one
+	 * shot.  The per-block loop below otherwise calls ocsfs_refcount_get() for
+	 * EVERY block, and each call acquires AND releases the AG refcount DLM lock
+	 * — each acquire/release a SCSI CAW to the SAN.  That made cluster
+	 * delete/truncate O(len) lock round-trips (a GB-sized VM disk = millions of
+	 * CAWs) and, under concurrent churn, swamped the target's CAW path until
+	 * commands stalled and the node hung in SCSI error recovery.  Reading the
+	 * tree root without the lock is correctness-equivalent to the slow path,
+	 * which already uses this same in-memory ag->rc_btree_root (it is not
+	 * re-read from disk on the SH acquire).
+	 */
+	if (!(sbi->s_feature_incompat & OCSFS_FEATURE_INCOMPAT_RC_BTREE_PER_AG)) {
+		ocsfs_free_blocks(sb, phys, len);
+		return;
+	}
+	ag = ocsfs_block_to_ag(sbi, phys);
+	if (!ag || !READ_ONCE(ag->rc_btree_root)) {
+		ocsfs_free_blocks(sb, phys, len);
+		return;
+	}
 
 	while (i < len) {
 		u32 rc = 1;
