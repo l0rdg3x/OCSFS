@@ -394,13 +394,25 @@ static int remap_extent_cb(u64 logical, u64 physical, u32 length,
 	log_dst = rc->dst_blk + (ov_s - rc->src_blk);
 	clip    = (u32)(ov_e - ov_s);
 
-	ret = ocsfs_refcount_inc(rc->dst->i_sb, phys, clip);
+	/* Charge the clone's block quota (logical accounting) before sharing. */
+	ret = dquot_alloc_space_nodirty(rc->dst,
+				(u64)clip * rc->sbi->s_block_size);
 	if (ret) { rc->ret = ret; return ret; }
+
+	ret = ocsfs_refcount_inc(rc->dst->i_sb, phys, clip);
+	if (ret) {
+		dquot_free_space_nodirty(rc->dst,
+				(u64)clip * rc->sbi->s_block_size);
+		rc->ret = ret;
+		return ret;
+	}
 
 	ret = ocsfs_extent_insert(rc->dst, log_dst, phys, clip,
 				  OCSFS_EXT_WRITTEN);
 	if (ret) {
 		ocsfs_refcount_dec(rc->dst->i_sb, phys, clip, NULL);
+		dquot_free_space_nodirty(rc->dst,
+				(u64)clip * rc->sbi->s_block_size);
 		rc->ret = ret;
 		return ret;
 	}
@@ -427,6 +439,12 @@ static loff_t ocsfs_remap_file_range(struct file *src_file, loff_t pos_in,
 	 * (different ino or key) produces unreadable ciphertext. */
 	if (IS_ENCRYPTED(src) || IS_ENCRYPTED(dst))
 		return -EOPNOTSUPP;
+
+	/* Reflink charges the destination's block quota for every shared block
+	 * (logical accounting, like XFS): the clone counts at full size even
+	 * though the blocks are physically shared.  Load dst's dquots so the
+	 * per-extent dquot_alloc_space below can enforce the limit. */
+	dquot_initialize(dst);
 
 	lock_two_nondirectories(src, dst);
 
@@ -513,12 +531,21 @@ static loff_t ocsfs_remap_file_range(struct file *src_file, loff_t pos_in,
 			log_dst = dst_blk + (ov_s - src_blk);
 			clip    = (u32)(ov_e - ov_s);
 
-			ret = ocsfs_refcount_inc(src->i_sb, phys, clip);
+			ret = dquot_alloc_space_nodirty(dst,
+					(u64)clip * sbi->s_block_size);
 			if (ret) break;
+			ret = ocsfs_refcount_inc(src->i_sb, phys, clip);
+			if (ret) {
+				dquot_free_space_nodirty(dst,
+					(u64)clip * sbi->s_block_size);
+				break;
+			}
 			ret = ocsfs_extent_insert(dst, log_dst, phys, clip,
 						  OCSFS_EXT_WRITTEN);
 			if (ret) {
 				ocsfs_refcount_dec(src->i_sb, phys, clip, NULL);
+				dquot_free_space_nodirty(dst,
+					(u64)clip * sbi->s_block_size);
 				break;
 			}
 			dst->i_blocks += (u64)clip * (sbi->s_block_size / 512);

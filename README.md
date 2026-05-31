@@ -491,13 +491,14 @@ sudo ./tools/ocsfs-fsck --repair /dev/sdb
 | **Fencing method** | SCSI-3 Persistent Reservations only; out-of-band STONITH (PDU / iDRAC / IPMI) is not wired |
 | **Recovery concurrency** | Multiple dead nodes are tracked in a pending bitmask and recovered one at a time (sequential drain, none dropped); concurrent multi-node recovery is not parallelised |
 | **Slot-claim / refcount TOCTOU** | Node-table slot claim and cross-node refcount updates are CAW-serialised but retain a small TOCTOU window (architectural) |
-| **Crash atomicity** | Extent-map and bitmap updates commit as two separate journal transactions (tiny crash window between them); `fsck` reconciles |
+| **Crash atomicity (allocation)** | The block bitmap is committed *before* the extent map references the new blocks, so a crash between the two transactions can only **leak** space (blocks marked used with no owner) — never double-allocate. `fsck` reclaims the leak; collapsing the two updates into a single transaction (no transient leak) is a future cleanup, not a correctness fix |
 | **Filesystem grow** | ✅ Online (mounted) and offline grow implemented via `ocsfs-grow` (`INCOMPAT_AG_GROW`); validated 3-node. *Open:* a single grow per volume (re-growing an already-grown volume is rejected); rescan the LUN on every node before peers use the new space |
 | **Integration tests** | No xfstests run yet; no long-haul soak |
 | **Encryption — I/O** | No readahead, no O_DIRECT on encrypted files; reflink/snapshot/symlink inside encrypted dirs return `-EOPNOTSUPP` |
 | **Encryption — keys** | fscrypt keys live in a shared encrypted key store on the LUN (ChaCha20-Poly1305 / cluster secret); enable with `mkfs.ocsfs -K`, requires `cluster_secret=` at mount; peers fetch via `ocsfs-tool keys restore` |
 | **Compression** | Write path runs on fsync for buffered files only; O_DIRECT writes are never compressed; a file with >16 compressed extents is decompressed on B+tree migration |
-| **Quota** | Block quota does not account for CoW/snapshot sharing or directory/metadata blocks |
+| **Reflink + fsck (cosmetic)** | After `cp --reflink` the offline `fsck` flags the involved inodes with a zero stored CRC (`stored=00000000`). The data is intact — the kernel reads the files back correctly across `drop_caches` (verified by md5) — so it is an fsck-strictness/CRC-write issue on the clone path, not data loss. A fix to write the inode CRC on the reflink flush is pending |
+| **Quota** | Quota *hooks* are present — block/inode charges fire on the data path and on reflink (logical accounting, like XFS) — but quota *enforcement* is not wired: there are no on-disk quota inodes and no `quotaon` path, so limits cannot be set yet (the charges are effectively dormant). Directory/extent-btree/xattr **metadata** blocks are also not charged. Wiring quota-file enablement (cluster-coherent) is the remaining work |
 | **Shared writable mmap** | `MAP_SHARED\|PROT_WRITE` returns `-EOPNOTSUPP` in *cluster* mode (works single-node); read-only and private-COW mappings always work |
 | **Maturity** | Alpha / research — not production-ready |
 
