@@ -49,7 +49,7 @@ management network.
 │ lock.c  lock_io.c  heartbeat.c  node.c  recovery.c         │
 │ scsi_pr.c  dedup.c  compress.c  xattr.c  acl.c             │
 ├────────────────────────────────────────────────────────────┤
-│  Linux block layer — FC LUN / iSCSI / loopback             │
+│  Linux block layer — shared FC / iSCSI SAN LUN             │
 └────────────────────────────────────────────────────────────┘
 ```
 
@@ -1355,7 +1355,7 @@ fixed refcount-table spot-check was removed (refcounts now live in a per-AG B+
 tree), and the bitmap free-count cross-check was downgraded to advisory so it can
 never drive a destructive `--repair`.
 
-**Verification (no special hardware):** with the FUSE prototype on a loopback
+**Verification (no special hardware):** with the FUSE prototype on a local test
 image — 8 MiB random data sha256 round-trip, 50+ file create, removal without
 EIO, nested directories, truncate, and unmount/remount persistence all pass; the
 userspace test suite is 85/85; `ocsfs-fsck` validates both freshly-formatted and
@@ -1366,7 +1366,7 @@ that CRC-1 and the Sprint R layout fix let real volumes mount.
 #### Real kernel-module bring-up on a Proxmox node (2026-05-29)
 
 Running `tests/kernel_smoke_test.sh` on an actual Proxmox VE 9.2.3 node
-(kernel `7.0.6-2-pve`, loopback image, single node via `-o degraded`) surfaced
+(kernel `7.0.6-2-pve`, local test device, single node via `-o degraded`) surfaced
 two more bugs that only the real VFS/kernel path exposes:
 
 - **MODE-1 — root inode i_mode used the dirent file-type enum.** `mkfs` wrote the
@@ -1469,7 +1469,7 @@ Open follow-ups (not blocking single-node use):
 ### Sprint V2 — Concurrency & crash recovery on the real kernel (2026-05-30)
 
 Aggressive concurrent and panic-injected (`echo c > /proc/sysrq-trigger`) testing
-on the loopback testbed surfaced five more critical bugs. The crash→reboot→remount
+on the kernel testbed surfaced five more critical bugs. The crash→reboot→remount
 path went from broken (deadlock + unmountable) to validated end to end.
 
 - **`inode_refresh` nlink clobber.** `ocsfs_inode_refresh()` re-read the on-disk
@@ -1611,6 +1611,45 @@ device ~100 MB/s; OCSFS single-node ~95 MB/s sequential, ~12 ms / 1 MiB
 overwrite, ~170 file creates/s; N=2 full-cluster ~90 MB/s sequential, ~14 ms
 overwrite, ~56 creates/s. The earlier "very low speed" was the AG-descriptor
 corruption above (garbage I/O saturating the link), not an inherent limit.
+
+### #13 — Buffered stale-data on hole + block-reuse + sub-block write (2026-06-01)
+
+A data-integrity fuzzer (`tests/repro13.c`: in-memory mirror, explicit
+`drop_caches`, cold-read verify; cross-checked on ext4 with identical seeds)
+deterministically corrupted a block after a `PUNCH_HOLE` + realloc + sub-block
+partial write. Root cause was in **`ocsfs_iomap_begin`, the read-from-hole
+branch**: the hole length was computed to *end of file*, ignoring the next
+allocated extent. A read or readahead that started in a leading hole (e.g. block
+0 just punched) returned a single `IOMAP_HOLE` spanning the **following MAPPED
+blocks** too; `iomap` then filled those blocks' page-cache folios with zeroes and
+marked them **uptodate** — stale, because those blocks held real on-disk data. A
+later sub-block write to such a block found the uptodate-zero folio, skipped the
+read-modify-write disk read, and wrote the zeroed folio back, destroying the
+previously persisted bytes.
+
+The pre-existing comment already claimed "hole length to next extent **or** end of
+file" — only the end-of-file half was implemented.
+
+- **Fix (read-hole):** probe forward and clamp the hole to the first allocated
+  block (mapped *or* unwritten), bounded by the request size so a small read in a
+  large sparse region does not scan to EOF.
+- **Related mapping fixes folded in:** the *allocating* write branch set
+  `iomap->offset = pos` (unaligned for a sub-block partial write — must be
+  `logical_block * block_size`, like the existing-extent branch); the writeback
+  path now re-maps per folio instead of caching `wpc->iomap` across folios (the
+  `UNWRITTEN→WRITTEN` split otherwise left a following folio mapped `MAPPED` and
+  skipping its own conversion); speculative prealloc is clamped to the run of
+  consecutive holes; and `ocsfs_extent_convert_unwritten` re-scans after a split
+  because `ocsfs_extent_insert` can `memmove`/merge the inline array.
+
+Found and fixed with `bpftrace`-free targeted `pr_info` instrumentation (a wrapper
+around `iomap_begin` logging every call whose result range covered the victim
+block, plus `kmap_local_folio` to read the live folio bytes and alloc/free probes
+keyed on the physical block). Validated on a **real iSCSI LUN** and on the local
+testbed: `repro13` FULL 6/6 + NOPUNCH 6/6 (was 6/6 FAIL on FULL), `fsck` clean,
+`fio --verify=crc32c err=0`. Performance unchanged or better than the prior code
+(O_DIRECT random read +25%, random write within noise — the read-hole and
+allocate paths are not on the steady-state VM-disk I/O hot path).
 
 ---
 
@@ -1784,7 +1823,7 @@ apt install libfuse3-dev
 make all          # userspace tools + FUSE prototype
 make test         # run userspace test suite (36 tests)
 make kmod         # kernel module (alias for: cd kmod && make)
-make demo         # format a 1 GiB loopback image and inspect it
+make demo         # format a 1 GiB image file and inspect it with the userspace tools
 
 sudo dkms add kmod/ && sudo dkms build ocsfs/0.1.0 && sudo dkms install ocsfs/0.1.0
 dpkg-buildpackage -us -uc -b   # build Debian packages
@@ -1816,19 +1855,19 @@ dmesg | grep -E "KTAP|PASS|FAIL|ocsfs"
 
 ### Quick single-node test
 
-```bash
-dd if=/dev/zero of=/tmp/test.img bs=1M count=2048
-./mkfs.ocsfs -L test -N 4 -f /tmp/test.img
+OCSFS mounts a shared block device (a SAN/iSCSI LUN, `/dev/sdb` here). For a
+single host, format for one node and mount `-o degraded` (no SCSI-PR).
 
-sudo losetup /dev/loop0 /tmp/test.img
+```bash
+sudo ./mkfs.ocsfs -L test -N 1 -f /dev/sdb
+
 sudo insmod kmod/ocsfs.ko
-sudo mount -t ocsfs /dev/loop0 /mnt/ocsfs
+sudo mount -t ocsfs -o degraded /dev/sdb /mnt/ocsfs
 
 ls /mnt/ocsfs && df /mnt/ocsfs
 
 sudo umount /mnt/ocsfs
 sudo rmmod ocsfs
-sudo losetup -d /dev/loop0
 ```
 
 ---

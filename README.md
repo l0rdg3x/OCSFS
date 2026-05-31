@@ -72,6 +72,12 @@ clean `fsck` and **zero kernel warnings**:
 - ✅ **cross-file deduplication** (global DDT) with GC reclaim and delete-integrity
 - ✅ extended attributes, POSIX ACLs, hard/symlinks, nested directories
 - ✅ `fallocate` **punch-hole** / **zero-range**, sparse files, truncate grow/shrink
+- ✅ **data-path integrity fuzzer** — aggressive punch + block-reuse + sub-block
+  partial-write churn with cold-read verification (`tests/repro13.c`,
+  `tests/ocsfs_fsx.c`) passes against an in-memory mirror, on a real LUN, with a
+  clean `fsck` and `fio --verify=crc32c err=0`; cross-checked on ext4 with the
+  same seeds (closes the buffered stale-data bug where a read of a leading hole
+  mapped following allocated blocks as zero)
 - ✅ **mmap** `MAP_SHARED` write + `msync` round-trip
 - ✅ large directories (thousands of entries) via the directory B+ tree
 - ✅ **crash recovery**: panic-injected power loss → reboot → remount → full data
@@ -192,7 +198,7 @@ two-node buffered read/write ping-pong). Integrity is verified end-to-end with
 ```
         ┌──────────────────────────────────────────────────────────────┐
         │                    Shared block device (LUN)                  │
-        │              iSCSI / Fibre Channel / loopback                 │
+        │                 iSCSI / Fibre Channel SAN                     │
         │                                                               │
         │  SB │ AG descriptors │ Inode tables │ Bitmaps │ Lock table    │
         │     │ Journal (per node) │ Heartbeat │ CAS leases │ Key store │
@@ -301,20 +307,23 @@ dpkg-buildpackage -us -uc -b
 
 ## 🚀 Quick start
 
-### Single node (loopback)
+### Single node (one host on a shared LUN)
+
+OCSFS is a **shared-disk** filesystem: it always runs on a block device that is a
+SAN/iSCSI LUN (`/dev/sdb` below). For a single host, format for one node and mount
+`-o degraded` (skips SCSI-PR registration — use only when no other host will touch
+the LUN).
 
 ```bash
-truncate -s 2G /tmp/ocsfs.img
-./mkfs.ocsfs -L my-datastore -f /tmp/ocsfs.img
-./ocsfs-tool info /tmp/ocsfs.img
+sudo ./mkfs.ocsfs -L my-datastore -N 1 -f /dev/sdb
+./ocsfs-tool info /dev/sdb
 
 sudo modprobe lz4_compress
 sudo insmod kmod/ocsfs.ko
-sudo losetup /dev/loop0 /tmp/ocsfs.img
-sudo mount -t ocsfs -o degraded /dev/loop0 /mnt/ocsfs   # 'degraded' = single-node, no PR
+sudo mount -t ocsfs -o degraded /dev/sdb /mnt/ocsfs   # 'degraded' = single-node, no PR
 
 echo hello | sudo tee /mnt/ocsfs/test.txt
-sudo umount /mnt/ocsfs && sudo losetup -d /dev/loop0 && sudo rmmod ocsfs
+sudo umount /mnt/ocsfs && sudo rmmod ocsfs
 ```
 
 ### Full cluster mode (real SAN LUN with SCSI-3 PR + CAW)
@@ -385,7 +394,7 @@ mount -t ocsfs [-o <options>] <device> <mountpoint>
 | Mount option | When to use |
 |---|---|
 | *(none)* | **Full cluster mode.** The node claims a slot, registers an SCSI-3 PR key and uses hardware Compare-And-Write for locking. This is the correct mode for a shared LUN with PR + CAW. |
-| `degraded` | **Single-node only.** Skips PR registration and the "no PR support" safety refusal. Use for loopback images or PR-less iSCSI. **Never mount the same device from two nodes with `degraded`** — there is no fencing and you *will* corrupt the volume. |
+| `degraded` | **Single-node only.** Skips PR registration and the "no PR support" safety refusal. Use for a single host on a LUN, or a target without SCSI-PR support. **Never mount the same device from two nodes with `degraded`** — there is no fencing and you *will* corrupt the volume. |
 | `cluster_secret=<64 hex>` | **Required** for a volume formatted with `-K` (cluster-auth HMAC). 64 hexadecimal characters = the 32-byte cluster secret. Generate once with `openssl rand -hex 32`; it must be identical on every node. |
 | `heartbeat_timeout=<ms>` | Override the heartbeat death threshold (diagnostics / slow targets). |
 
@@ -393,8 +402,8 @@ mount -t ocsfs [-o <options>] <device> <mountpoint>
 # Full cluster mount (shared LUN, PR + CAW)
 mount -t ocsfs /dev/sdb /mnt/ocsfs
 
-# Single-node loopback (no PR)
-mount -t ocsfs -o degraded /dev/loop0 /mnt/ocsfs
+# Single host on a LUN (no PR)
+mount -t ocsfs -o degraded /dev/sdb /mnt/ocsfs
 
 # Authenticated volume (-K)
 mount -t ocsfs -o cluster_secret=$(cat /etc/ocsfs.secret) /dev/sdb /mnt/ocsfs

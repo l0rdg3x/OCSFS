@@ -478,7 +478,7 @@ ocsfs-tool locks /mnt/ocsfs
 ocsfs-tool recover /mnt/ocsfs --node <slot>
 ```
 
-### SCSI PR not supported (loopback, basic iSCSI)
+### SCSI PR not supported (basic iSCSI target without PR)
 
 OCSFS detects automatically when the device does not support PR and operates
 in **degraded single-node mode**. The kernel log shows:

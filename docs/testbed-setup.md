@@ -709,16 +709,15 @@ make install
 ### 7.2 Configure for OCSFS
 
 xfstests requires a TEST device (where tests run) and a SCRATCH device (wiped
-between tests). For the cluster test setup, provide the shared iSCSI LUN as
-TEST and a separate scratch LUN or loopback device as SCRATCH.
-
-**Create a scratch loopback device on node1:**
+between tests). OCSFS is a shared-disk filesystem, so both must be real block
+devices: provide the shared iSCSI LUN as TEST (`/dev/sdb`) and a **second iSCSI
+LUN** as SCRATCH (`/dev/sdc` — export a separate 20 GB zvol/LUN from the same
+target and log in to it on node1).
 
 ```bash
-# 20 GB loopback file for scratch
-dd if=/dev/zero of=/var/tmp/ocsfs-scratch.img bs=1M count=20480
-SCRATCH_DEV=$(losetup --find --show /var/tmp/ocsfs-scratch.img)
-echo "SCRATCH_DEV=${SCRATCH_DEV}"  # e.g. /dev/loop0
+# Confirm both LUNs are present after iSCSI login
+lsblk /dev/sdb /dev/sdc
+SCRATCH_DEV=/dev/sdc
 ```
 
 **Create /usr/local/src/xfstests/local.config:**
@@ -730,7 +729,7 @@ cat > /usr/local/src/xfstests/local.config << 'EOF'
 
 TEST_DEV=/dev/sdb
 TEST_DIR=/mnt/ocsfs
-SCRATCH_DEV=/dev/loop0
+SCRATCH_DEV=/dev/sdc
 SCRATCH_MNT=/mnt/scratch
 
 FSTYP=ocsfs
@@ -747,15 +746,15 @@ export MOUNT_OPTIONS
 export MKFS_PROG=/path/to/OCSFS/tools/mkfs.ocsfs
 export FSCK_PROG=/path/to/OCSFS/tools/ocsfs-fsck
 
-# Scratch fs type — use ext4 for scratch until ocsfs loopback is stable
+# Scratch fs type — use ext4 for scratch until the ocsfs scratch path is stable
 SCRATCH_FSTYPE=ext4
 EOF
 ```
 
 > **Tip:** Until a dedicated xfstests group for `ocsfs` exists, use `ext4` on
 > SCRATCH to avoid cascading failures in tests that re-format scratch between
-> runs. Set `SCRATCH_FSTYPE=ocsfs` only once single-node loopback is verified
-> stable.
+> runs. Set `SCRATCH_FSTYPE=ocsfs` only once the single-node scratch path is
+> verified stable on the second LUN.
 
 ### 7.3 Run subset of tests
 
@@ -1001,7 +1000,7 @@ not be attempted without code changes to support them:
 | **Multi-LUN spanning** | A single OCSFS volume cannot span multiple block devices. Do not attempt RAID-0 or dm-linear across two LUNs. |
 | **More than 4 nodes simultaneously** | The test format uses `--max-nodes 4`. Mounting a fifth node will fail. Re-format with `--max-nodes N` (max 256) to increase the limit. |
 | **Simultaneous dual-node failure** | Only one recovery target is tracked at a time (`s_recovery_target` is a single `u16`). If two nodes fail simultaneously, the second is not recovered until the first completes. |
-| **Non-PR devices (degraded mode)** | Mounting on a target that does not support SCSI-3 PR (e.g., a raw loopback) is allowed in degraded mode, but fencing is skipped. Do not use degraded mode for split-brain correctness testing. |
+| **Non-PR devices (degraded mode)** | Mounting on a target that does not support SCSI-3 PR (e.g., a basic iSCSI target without PR) is allowed in degraded mode, but fencing is skipped. Do not use degraded mode for split-brain correctness testing. |
 | **Snapshot + cluster** | Snapshot creation (`OCSFS_IOC_SNAPSHOT`) is implemented but not tested in multi-node mode. Use snapshots only in single-node mode during this alpha. |
 | **Dedup in cluster mode** | `OCSFS_IOC_DEDUP` ioctl acquires a per-inode EX lock but does not yet coordinate AG-level refcount updates across nodes. Avoid running dedup while other nodes are writing. |
 | **Online resize** | `ocsfs_tool --resize` is not implemented. Resizing requires unmounting all nodes, using `ocsfs_tool` offline, then remounting. |
