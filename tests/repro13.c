@@ -63,6 +63,50 @@ int main(int argc, char **argv)
 	if (fd < 0) { perror("open"); return 1; }
 	if (ftruncate(fd, fsize)) { perror("ftruncate"); return 1; }
 
+	if (getenv("REPRO_PMINI")) {
+		/* Minimal reproducer mirroring seed-6 ops #41/53/54/58/77.
+		 * The decisive missing ingredient vs the old PMINI is the
+		 * fsync+drop_caches BETWEEN the two partial writes (op#54): it
+		 * flushes 0xb2 to disk and evicts the clean folio, so op#58's
+		 * partial RMW must re-read the on-disk 0xb2 — which it doesn't. */
+		unsigned char b[BS];
+		long tb = 1;			/* target block (blk1) */
+
+		for (long blk = 0; blk < nblocks; blk++) {
+			memset(b, 0xA0 + blk, BS);
+			pwrite(fd, b, BS, blk * BS);
+			memset(mirror + blk * BS, 0xA0 + blk, BS);
+		}
+		fsync(fd);
+		/* op#41: punch blk1 (and blk2, so the realloc gets nb>=2) */
+		fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, tb * BS, 2 * BS);
+		memset(mirror + tb * BS, 0, 2 * BS);
+		/* op#53: partial write blk1 [4028,4074)=0xb2 (allocates blk1) */
+		memset(b, 0xb2, 46);
+		pwrite(fd, b, 46, tb * BS + 4028);
+		memset(mirror + tb * BS + 4028, 0xb2, 46);
+		/* op#54: fsync + drop_caches — flush 0xb2, evict clean folio */
+		fsync(fd); dropcaches();
+		/* op#55: partial write blk5 [2569,4026)=0xcc (neighbor write) */
+		memset(b, 0xcc, 4026 - 2569);
+		pwrite(fd, b, 4026 - 2569, 5 * BS + 2569);
+		memset(mirror + 5 * BS + 2569, 0xcc, 4026 - 2569);
+		/* op#56/57: punch blk4 twice (neighbor punch) */
+		fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 4 * BS, BS);
+		memset(mirror + 4 * BS, 0, BS);
+		fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 4 * BS, BS);
+		memset(mirror + 4 * BS, 0, BS);
+		/* op#58: partial write blk1 [0,1319)=0xf3 (must preserve 4028) */
+		memset(b, 0xf3, 1319);
+		pwrite(fd, b, 1319, tb * BS + 0);
+		memset(mirror + tb * BS + 0, 0xf3, 1319);
+		/* op#77: cold verify — byte 4028 must still be 0xb2 */
+		fsync(fd); dropcaches();
+		verify_block(tb, "pmini-read", 58);
+		printf("PMINI: OK\n");
+		return 0;
+	}
+
 	printf("repro13: file=%s seed=%u iters=%ld nblocks=%ld\n", fn, seed, iters, nblocks);
 	for (long op = 1; op <= iters; op++) {
 		long blk = random() % nblocks;

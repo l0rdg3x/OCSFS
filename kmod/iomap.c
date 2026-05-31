@@ -101,9 +101,19 @@ static int ocsfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 		mapped_len = (loff_t)remaining_blocks * sbi->s_block_size;
 		iomap->addr = (ext.physical_block + offset_in_ext) *
 			      (u64)sbi->s_block_size;
-		iomap->length = min_t(loff_t, length, mapped_len);
+		iomap->length = mapped_len;
 		iomap->bdev = inode->i_sb->s_bdev;
-		iomap->offset = pos;
+		/*
+		 * #13: iomap->offset MUST be the file offset that corresponds to
+		 * iomap->addr — i.e. the start of the mapped block — not the
+		 * (possibly unaligned) request pos.  iomap_sector() computes the
+		 * device sector as addr + (block_start - iomap->offset); with
+		 * offset=pos on a sub-block partial write that sector is misaligned,
+		 * so the read-modify-write of the unwritten part reads garbage/zero
+		 * instead of the on-disk data, and the next writeback persists the
+		 * zeroed folio — destroying previously written bytes.
+		 */
+		iomap->offset = (loff_t)logical_block * sbi->s_block_size;
 
 		if (ext.flags & OCSFS_EXT_UNWRITTEN)
 			iomap->type = IOMAP_UNWRITTEN;
@@ -116,17 +126,58 @@ static int ocsfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 
 	/* No mapping exists */
 	if (!(flags & IOMAP_WRITE)) {
+		u64 hole_blocks;
+		u64 k;
+
 		/* Read from hole — return zeroes */
 		iomap->type = IOMAP_HOLE;
 		iomap->addr = IOMAP_NULL_ADDR;
 		iomap->offset = pos;
 
-		/* Calculate hole length to next extent or end of file */
+		/* Tentative hole length: to end of file, but never more than the
+		 * caller asked for — iomap re-enters for the rest, and this bounds
+		 * the forward probe below to the request size (so a small read in a
+		 * huge sparse region does not scan every block to EOF). */
 		end_block = (inode->i_size + sbi->s_block_size - 1) /
 			    sbi->s_block_size;
+		hole_blocks = (end_block > logical_block) ?
+			      (end_block - logical_block) : 1;
+		{
+			u64 req_blocks = (length + sbi->s_block_size - 1) /
+					 sbi->s_block_size;
+
+			if (req_blocks < 1)
+				req_blocks = 1;
+			if (hole_blocks > req_blocks)
+				hole_blocks = req_blocks;
+		}
+
+		/*
+		 * #13: the hole MUST stop at the next allocated extent.  The old
+		 * code extended the hole straight to end-of-file, so a read or
+		 * readahead starting in a leading hole (e.g. blk0 punched) returned
+		 * one IOMAP_HOLE spanning the following MAPPED blocks too.  iomap
+		 * then populated their page-cache folios with zeroes and marked
+		 * them uptodate — stale, since those blocks hold real on-disk data.
+		 * A later sub-block write to such a block finds the uptodate-zero
+		 * folio, skips the read-modify-write disk read, and writes the
+		 * zeroed folio back, destroying the previously written bytes.
+		 * Probe forward and clamp the hole to the first mapped/unwritten
+		 * block (same idea as the speculative-prealloc clamp below).
+		 */
+		for (k = 1; k < hole_blocks; k++) {
+			struct ocsfs_extent probe;
+
+			if (ocsfs_extent_lookup(inode, logical_block + k,
+						&probe) == 0 &&
+			    probe.physical_block != 0) {
+				hole_blocks = k;
+				break;
+			}
+		}
+
 		iomap->length = min_t(loff_t, length,
-				      (loff_t)(end_block - logical_block) *
-				      sbi->s_block_size);
+				      (loff_t)hole_blocks * sbi->s_block_size);
 		if (iomap->length <= 0)
 			iomap->length = sbi->s_block_size;
 
@@ -239,7 +290,17 @@ static int ocsfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 		iomap->type = IOMAP_UNWRITTEN;
 		iomap->flags |= IOMAP_F_NEW;
 		iomap->bdev = inode->i_sb->s_bdev;
-		iomap->offset = pos;
+		/*
+		 * #13: iomap->offset must be the file offset of the START of the
+		 * mapped/allocated region (logical_block * block_size), NOT the
+		 * unaligned request pos.  iomap_sector() derives the device sector
+		 * as addr + (block_start - iomap->offset); with offset=pos on a
+		 * sub-block partial allocating write the mapping is skewed by the
+		 * intra-block offset, so a later read-modify-write or writeback
+		 * lands on the wrong sector.  (Same fix as the existing-extent
+		 * branch above.)
+		 */
+		iomap->offset = (loff_t)logical_block * sbi->s_block_size;
 	}
 
 	mutex_unlock(&oi->i_extent_lock);
@@ -728,15 +789,20 @@ static ssize_t ocsfs_writeback_range(struct iomap_writepage_ctx *wpc,
 {
 	int ret;
 
-	/* Remap solo se il blocco corrente non copre pos */
-	if (!wpc->iomap.length || pos < wpc->iomap.offset ||
-	    pos >= wpc->iomap.offset + wpc->iomap.length) {
-		ret = ocsfs_iomap_begin(wpc->inode, pos,
-					wpc->inode->i_sb->s_blocksize,
-					0, &wpc->iomap, NULL);
-		if (ret < 0)
-			return ret;
-	}
+	/*
+	 * #13: always remap per folio.  Caching wpc->iomap across folios is
+	 * unsafe in OCSFS: the UNWRITTEN→WRITTEN conversion below splits the
+	 * extent and sets wpc->iomap.type=MAPPED for the whole old range, so a
+	 * following folio still inside that range would reuse type=MAPPED and
+	 * SKIP its own conversion — leaving its block UNWRITTEN with the data
+	 * already on disk, which reads back as zero (silent data loss).  The
+	 * lookup is an in-memory extent search, so per-folio remap is cheap.
+	 */
+	ret = ocsfs_iomap_begin(wpc->inode, pos,
+				wpc->inode->i_sb->s_blocksize,
+				0, &wpc->iomap, NULL);
+	if (ret < 0)
+		return ret;
 
 	/* ALTO-N2: writeback path does not call iomap_end, so UNWRITTEN extents
 	 * would remain UNWRITTEN after data reaches disk — subsequent reads

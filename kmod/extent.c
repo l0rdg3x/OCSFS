@@ -271,6 +271,7 @@ int ocsfs_extent_convert_unwritten(struct inode *inode, u64 logical_block,
 	 * see WRITTEN (else it reads zeros).  Force the cross-node inode flush. */
 	oi->i_extents_dirty = true;
 
+rescan:
 	if (oi->i_extent_tree_root)
 		return ocsfs_extent_btree_convert_unwritten(inode,
 							    logical_block, len);
@@ -348,7 +349,14 @@ int ocsfs_extent_convert_unwritten(struct inode *inode, u64 logical_block,
 				return ret;
 			}
 			mark_inode_dirty(inode);
-			continue;
+			/*
+			 * #13: ocsfs_extent_insert may memmove/merge the inline
+			 * array, invalidating `e` and the index `i`.  Re-scan from a
+			 * consistent state instead of continuing with stale indices
+			 * (which corrupted the extent map). Converges: each split
+			 * converts part of the range to WRITTEN.
+			 */
+			goto rescan;
 		}
 
 		/*
