@@ -56,7 +56,7 @@ NODE_STATES = {0: "FREE", 1: "ACTIVE", 2: "EVICTING", 3: "SUSPECTED", 0xFF: "DEA
 # Superblock header (struct ocsfs_superblock, __packed, 4096 bytes).
 # s_checksum lives at the very end (offset OCSFS_SUPERBLOCK_SIZE - 4 = 4092),
 # NOT inside this header — read it separately. CRC32C covers bytes 0..4091.
-SB_HDR_FMT = "<IHH16s64sIIQQIQHQIIIQQQQQQQIQQQIQ"
+SB_HDR_FMT = "<IHH16s64sIIQQIQHQIIIQQQQQQQIQQQIQIQ"
 SB_HDR_FIELDS = [
     "s_magic","s_version_major","s_version_minor","s_uuid","s_label",
     "s_block_size","s_extent_size","s_total_blocks","s_free_blocks",
@@ -66,6 +66,7 @@ SB_HDR_FIELDS = [
     "s_mkfs_time","s_mount_count","s_last_mount_time","s_revision_level",
     "s_feature_compat","s_feature_incompat","s_feature_ro_compat",
     "s_lock_primary_count","s_dedup_index_root",
+    "s_ag_desc_primary_count","s_ag_desc_ext_off",
 ]
 
 # B+ tree on-disk node header (struct ocsfs_btree_node_hdr, __packed, 56 bytes).
@@ -209,6 +210,10 @@ class Fsck:
         ag_count = fields["s_ag_count"]
         ag_size  = fields["s_ag_size"]
         ag_desc_off = fields.get("s_ag_desc_off", 0)
+        # AG-grow: AGs >= primary_count have their descriptor in the extension
+        # region (ext_off); 0 = legacy / no grow -> all in the primary region.
+        ag_prim     = fields.get("s_ag_desc_primary_count", 0)
+        ag_ext_off  = fields.get("s_ag_desc_ext_off", 0)
 
         if bs not in (512, 1024, 2048, 4096, 8192):
             self.error(f"Unreasonable block size {bs}")
@@ -225,7 +230,10 @@ class Fsck:
         print("Checking AG descriptors...")
         ags = []
         for ag_no in range(ag_count):
-            ag_block = ag_desc_off // bs + ag_no
+            if ag_prim and ag_no >= ag_prim:
+                ag_block = ag_ext_off // bs + (ag_no - ag_prim)
+            else:
+                ag_block = ag_desc_off // bs + ag_no
             ag_raw   = read_block(f, ag_block, bs)
             try:
                 ag = dict(zip(AG_HDR_FIELDS, struct.unpack_from(AG_HDR_FMT, ag_raw)))
