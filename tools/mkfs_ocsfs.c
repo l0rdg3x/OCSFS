@@ -354,6 +354,15 @@ static void format_device(int fd, uint64_t dev_size)
                  bitmap_blocks * cfg.block_size);
         free(bitmap);
 
+        /* Zero this AG's inode table.  mkfs only zeroes the global region
+         * [0, data_start); the per-AG metadata lives inside the AG, so without
+         * this a stale inode (valid OCSFS magic + a now-wrong CRC) left in the
+         * table by a *previous* filesystem on the same LUN survives the format
+         * and fsck flags it as "CRC mismatch — needs repair".  Zeroing clears
+         * the magic so every unused slot reads as empty. */
+        zero_region(fd, ag_data_start + agd.ag_inode_table_off,
+                    inode_table_blocks * cfg.block_size);
+
         /* Root directory inode: only in AG 0 */
         if (ag == 0) {
             struct ocsfs_inode root_ino;
