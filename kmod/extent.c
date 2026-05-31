@@ -233,10 +233,30 @@ int ocsfs_extent_truncate(struct inode *inode, u64 from_block)
 		}
 	}
 
-	/* Release the blocks refcount-aware, AFTER the in-memory extent map no
-	 * longer references them.  Shared (reflink/dedup/snapshot) blocks are
-	 * dropped by one reference and survive for their other owners; only the
-	 * last reference actually frees the bitmap. */
+	/*
+	 * #7 (atomicity extent-map + bitmap): journal the inode with the shrunk
+	 * extent map BEFORE freeing the bitmap.  The old order freed the bitmap
+	 * first (each ocsfs_free_blocks_rc commits its own txn) and only flushed
+	 * the inode later (mark_inode_dirty → deferred writeback, or a peer flush
+	 * in setattr), so a crash in between left the on-disk inode still pointing
+	 * at a now-free block — which the allocator can hand to another file,
+	 * cross-linking them and corrupting data.  Flushing first downgrades the
+	 * worst case to leaked blocks (allocated-but-unreferenced), which fsck
+	 * reclaims.  Mirrors ocsfs_punch_hole (ALTO-N1) and the btree-truncate
+	 * path; called under i_extent_lock exactly like the punch path.
+	 */
+	if (nfrees > 0) {
+		int fr = ocsfs_flush_inode_locked(inode, false);
+
+		if (fr)
+			pr_warn_ratelimited(
+				"ocsfs: truncate inode flush failed (%d)\n", fr);
+	}
+
+	/* Release the blocks refcount-aware, now that the on-disk inode no longer
+	 * references them.  Shared (reflink/dedup/snapshot) blocks are dropped by
+	 * one reference and survive for their other owners; only the last
+	 * reference actually frees the bitmap. */
 	for (i = 0; i < nfrees; i++)
 		ocsfs_free_blocks_rc(sb, frees[i].phys, frees[i].len);
 
