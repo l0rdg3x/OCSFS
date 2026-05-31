@@ -594,7 +594,7 @@ out_unlock_vfs:
 	return ret ? ret : remap_len;
 }
 
-static long ocsfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+long ocsfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct mnt_idmap *idmap = file_mnt_idmap(file);
 	struct inode *inode = file_inode(file);

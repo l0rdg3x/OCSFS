@@ -1176,6 +1176,7 @@ bool ocsfs_dir_btree_should_build(struct inode *dir);
 /* file.c */
 extern const struct file_operations ocsfs_file_fops;
 extern const struct address_space_operations ocsfs_aops;
+long ocsfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 int ocsfs_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
 		 u64 start, u64 len);
 int ocsfs_fileattr_get(struct dentry *dentry, struct file_kattr *fa);

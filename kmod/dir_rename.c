@@ -1093,4 +1093,15 @@ const struct file_operations ocsfs_dir_fops = {
 	.read           = generic_read_dir,
 	.iterate_shared = ocsfs_readdir,
 	.fsync          = generic_file_fsync,
+	/*
+	 * fscrypt key-management and policy ioctls (FS_IOC_ADD_ENCRYPTION_KEY,
+	 * FS_IOC_SET_ENCRYPTION_POLICY, …) are issued on *directory* fds — the
+	 * mountpoint for the key, the target dir for the policy.  Without an
+	 * ioctl handler on the directory fops they returned -ENOTTY, making
+	 * encryption unusable via the standard tools.  Share the same handler
+	 * as regular files (it dispatches the fscrypt ioctls, which are fd-type
+	 * agnostic) — the ext4/f2fs pattern.
+	 */
+	.unlocked_ioctl = ocsfs_ioctl,
+	.compat_ioctl   = compat_ptr_ioctl,
 };
