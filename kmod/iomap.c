@@ -151,6 +151,31 @@ static int ocsfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 			1);
 		try_blocks = max_t(u32, write_blocks, OCSFS_MIN_PREALLOC_BLOCKS);
 
+		/*
+		 * #13: clamp the speculative prealloc to the run of consecutive
+		 * holes starting at logical_block.  We only entered this branch
+		 * because logical_block itself is a hole, but the following blocks
+		 * may already be mapped; allocating over them would insert an
+		 * extent overlapping the existing one.  Overlapping extents make
+		 * ocsfs_extent_lookup ambiguous (it returns the first match), so a
+		 * read can hit a stale UNWRITTEN/old-phys extent and return zeros
+		 * or stale data instead of the just-written bytes.
+		 */
+		{
+			u32 k;
+
+			for (k = 1; k < try_blocks; k++) {
+				struct ocsfs_extent probe;
+
+				if (ocsfs_extent_lookup(inode, logical_block + k,
+							&probe) == 0 &&
+				    probe.physical_block != 0) {
+					try_blocks = k;
+					break;
+				}
+			}
+		}
+
 		ret = ocsfs_alloc_blocks(inode->i_sb, oi->i_ag,
 					 try_blocks, &phys);
 		if (ret && try_blocks > write_blocks) {
