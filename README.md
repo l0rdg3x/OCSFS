@@ -94,16 +94,24 @@ either node**:
   consistent on-disk `i_size`, both below and above the directory-B+tree
   threshold; survives remount with a clean `fsck`
 - ✅ 10-round **ping-pong overwrite** with a stable cross-node lock hand-off
+- ✅ Concurrent cross-node **rename** — within-dir, cross-dir and mixed
+  create+delete+rename churn from 3 nodes all converge correctly (clean `fsck`)
+- ✅ **Real node-crash recovery** — a node hard-crashed mid-write (`sysrq-b`) is
+  detected by a survivor, **SCSI-PR preempt-and-abort fenced**, its journal
+  replayed and its locks recovered; survivors stay online with data intact and a
+  clean `fsck`, and the crashed node reboots and rejoins reading correct data
+- ✅ **Heartbeat self-fencing** — a node that can't write its heartbeat for the
+  death threshold quiesces (refuses new exclusive locks) instead of being torn
+  out by a peer mid-mutation
 
 ### What's *not* validated yet
 
-- ❌ **Cluster recovery & fencing under real failures** — node-crash recovery,
-  SCSI-PR preempt-and-abort, and journal replay of a peer are implemented but
-  not yet exercised by killing a live node in a two-node cluster
 - ❌ **xfstests** `quick`/`auto` on a clustered LUN
-- ❌ Concurrent cross-node **rename** churn on the same directories (the
-  lost-update class is fixed and `rename` now refreshes every locked inode, but
-  it has not yet had its own dedicated 3-node stress run)
+- ❌ **Metadata throughput under heavy concurrent load** — the on-disk DLM does a
+  SCSI CAW per lock op; under sustained concurrent metadata churn from 3 nodes a
+  hot lock (e.g. a shared directory) can hit the 30 s acquire timeout as the
+  target's CAW path saturates. The per-block CAW storm on delete/truncate is
+  fixed; reducing the general per-op CAW (lock leasing) is the open scaling item
 - ❌ Long-haul soak / performance tuning
 
 ### Indicative scores
