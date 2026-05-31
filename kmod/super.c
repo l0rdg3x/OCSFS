@@ -217,7 +217,12 @@ static int ocsfs_load_ags(struct super_block *sb)
 	u32 i;
 	u64 ag_desc_block;
 
-	sbi->s_ags = kvmalloc_array(sbi->s_ag_count,
+	/* Over-allocate by OCSFS_AG_GROW_RESERVE so an online grow can append AGs
+	 * in place without moving the array (the embedded AG lock_res are on the
+	 * global DLM list and cannot be relocated). */
+	sbi->s_ag_capacity = sbi->s_ag_count + OCSFS_AG_GROW_RESERVE;
+	mutex_init(&sbi->s_grow_lock);
+	sbi->s_ags = kvmalloc_array(sbi->s_ag_capacity,
 				    sizeof(struct ocsfs_ag_info), GFP_KERNEL);
 	if (!sbi->s_ags)
 		return -ENOMEM;
@@ -658,6 +663,12 @@ int ocsfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	u64 free_inodes = 0;
 	u32 i;
 
+	/* Best-effort: pick up a peer's online grow so df reflects the new size
+	 * (no-op on the grower / single node; -ENXIO if we still need a LUN
+	 * rescan, which we simply ignore here). */
+	if (sbi->s_clustered)
+		ocsfs_grow_refresh(sb);
+
 	buf->f_type = OCSFS_MAGIC;
 	buf->f_bsize = sbi->s_block_size;
 	buf->f_blocks = sbi->s_total_blocks;
@@ -733,6 +744,329 @@ int ocsfs_sync_fs(struct super_block *sb, int wait)
 
 	up_write(&sbi->s_global_lock);
 	return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * ONLINE GROW — extend the filesystem into an expanded LUN while mounted.
+ *
+ * New AGs are described in an extension descriptor region placed in the new
+ * space (the primary region has no slack); each descriptor stores absolute
+ * geometry, so no existing AG moves.  The in-memory s_ags array was
+ * over-allocated at mount (s_ag_capacity), so new slots are appended in place
+ * and published by bumping s_ag_count last.  Peers pick the grow up via
+ * ocsfs_grow_refresh() from the heartbeat thread.
+ * ═══════════════════════════════════════════════════════════════ */
+
+/* Write a freshly-built metadata block synchronously.  These are brand-new
+ * blocks not referenced by anything until the SB update commits the grow, so a
+ * crash before that just leaves unused space — no journaling needed. */
+static int grow_sync_block(struct super_block *sb, u64 blkno,
+			   const void *data, u32 len)
+{
+	struct buffer_head *bh = sb_getblk(sb, blkno);
+	int ret;
+
+	if (!bh)
+		return -EIO;
+	lock_buffer(bh);
+	memset(bh->b_data, 0, sb->s_blocksize);
+	if (data)
+		memcpy(bh->b_data, data, len);
+	set_buffer_uptodate(bh);
+	mark_buffer_dirty(bh);
+	unlock_buffer(bh);
+	sync_dirty_buffer(bh);
+	ret = buffer_uptodate(bh) ? 0 : -EIO;
+	brelse(bh);
+	return ret;
+}
+
+/* Initialise one in-memory AG slot from a disk descriptor. */
+static void grow_init_ag_slot(struct ocsfs_sb_info *sbi, u32 i,
+			      const struct ocsfs_disk_ag *dag)
+{
+	struct ocsfs_ag_info *ag = &sbi->s_ags[i];
+	u64 abs_base;
+
+	ag->ag_no       = i;
+	ag->block_start = le64_to_cpu(dag->ag_block_start);
+	ag->block_count = le64_to_cpu(dag->ag_block_count);
+	ag->free_blocks = le64_to_cpu(dag->ag_free_blocks);
+	abs_base = ag->block_start * (u64)sbi->s_block_size;
+	ag->bitmap_off      = abs_base + le64_to_cpu(dag->ag_bitmap_off);
+	ag->inode_table_off = abs_base + le64_to_cpu(dag->ag_inode_table_off);
+	ag->bitmap_size = le64_to_cpu(dag->ag_bitmap_size);
+	ag->inode_count = le64_to_cpu(dag->ag_inode_count);
+	ag->free_inodes = le64_to_cpu(dag->ag_free_inodes);
+	ag->rc_btree_root = le64_to_cpu(dag->ag_rc_btree_root);
+	mutex_init(&ag->ag_lock);
+	ocsfs_lock_init(&ag->ag_lock_res, ocsfs_lock_hash_ag(i), OCSFS_LOCKRES_AG);
+	ocsfs_lock_init(&ag->ag_rc_lock_res, ocsfs_lock_hash_rc(i),
+			OCSFS_LOCKRES_REFCOUNT);
+}
+
+/* Build + write one new AG's on-disk metadata; returns its descriptor + free. */
+static int grow_write_new_ag(struct super_block *sb, u32 agno,
+			     u64 ag_data_start_byte, u64 ag_blocks, u64 ext_desc_byte,
+			     u16 max_nodes, u64 *ag_free, struct ocsfs_disk_ag *dag_out)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	u32 bs = sbi->s_block_size;
+	u64 ag_data_blk = ag_data_start_byte / bs;
+	u64 bitmap_blocks = (ag_blocks + (u64)bs * 8 - 1) / ((u64)bs * 8);
+	u64 inodes_per_ag = ag_blocks / 64;
+	u64 inode_table_blocks, metadata_blocks, free, b;
+	struct ocsfs_disk_ag dag;
+	u8 *bitmap;
+	int ret;
+
+	if (inodes_per_ag < 64)
+		inodes_per_ag = 64;
+	inode_table_blocks = (inodes_per_ag * OCSFS_INODE_SIZE + bs - 1) / bs;
+	metadata_blocks = 1 + bitmap_blocks + inode_table_blocks;
+	free = ag_blocks - metadata_blocks;
+
+	memset(&dag, 0, sizeof(dag));
+	dag.ag_magic           = cpu_to_le32(OCSFS_AG_MAGIC);
+	dag.ag_number          = cpu_to_le32(agno);
+	dag.ag_block_start     = cpu_to_le64(ag_data_blk);
+	dag.ag_block_count     = cpu_to_le64(ag_blocks);
+	dag.ag_free_blocks     = cpu_to_le64(free);
+	dag.ag_free_extents    = cpu_to_le64(1);
+	dag.ag_bitmap_off      = cpu_to_le64(bs);
+	dag.ag_bitmap_size     = cpu_to_le64(bitmap_blocks * bs);
+	dag.ag_inode_table_off = cpu_to_le64((1 + bitmap_blocks) * bs);
+	dag.ag_inode_count     = cpu_to_le64(inodes_per_ag);
+	dag.ag_free_inodes     = cpu_to_le64(inodes_per_ag);
+	dag.ag_owner_node      = cpu_to_le16(agno % (max_nodes ? max_nodes : 1));
+	dag.ag_checksum        = cpu_to_le32(ocsfs_crc32c(~0U, &dag,
+				   offsetof(struct ocsfs_disk_ag, ag_checksum)));
+
+	for (b = 0; b < inode_table_blocks; b++) {
+		ret = grow_sync_block(sb, ag_data_blk + 1 + bitmap_blocks + b, NULL, 0);
+		if (ret)
+			return ret;
+	}
+	bitmap = kvzalloc(bitmap_blocks * bs, GFP_KERNEL);
+	if (!bitmap)
+		return -ENOMEM;
+	for (b = 0; b < metadata_blocks; b++)
+		bitmap[b / 8] |= (1u << (b % 8));
+	for (b = 0; b < bitmap_blocks; b++) {
+		ret = grow_sync_block(sb, ag_data_blk + 1 + b, bitmap + b * bs, bs);
+		if (ret) {
+			kvfree(bitmap);
+			return ret;
+		}
+	}
+	kvfree(bitmap);
+
+	ret = grow_sync_block(sb, ag_data_blk, &dag, sizeof(dag));
+	if (ret)
+		return ret;
+	ret = grow_sync_block(sb, ext_desc_byte / bs, &dag, sizeof(dag));
+	if (ret)
+		return ret;
+
+	*ag_free = free;
+	*dag_out = dag;
+	return 0;
+}
+
+int ocsfs_grow_online(struct super_block *sb)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	u32 bs = sbi->s_block_size;
+	u64 ag_blocks = sbi->s_ag_size;
+	u64 ag_bytes = ag_blocks * bs;
+	u32 old_ags, new_ags, max_add, j;
+	u64 dev_size, old_end, avail, per_ag, ext_off, new_data_start, added_free = 0;
+	int ret = 0;
+
+	mutex_lock(&sbi->s_grow_lock);
+
+	old_ags  = sbi->s_ag_count;
+	dev_size = bdev_nr_bytes(sb->s_bdev);
+	old_end  = sbi->s_data_off + (u64)old_ags * ag_bytes;
+	if (dev_size <= old_end) {
+		pr_warn("ocsfs: grow: no new space (device %llu, fs end %llu)\n",
+			dev_size, old_end);
+		ret = -ENOSPC;
+		goto out;
+	}
+
+	avail   = dev_size - old_end;
+	per_ag  = ag_bytes + sizeof(struct ocsfs_disk_ag);
+	new_ags = (u32)(avail / per_ag);
+	max_add = sbi->s_ag_capacity - old_ags;
+	if (new_ags > max_add) {
+		pr_warn("ocsfs: grow: new space fits %u AGs but reserve holds %u; "
+			"adding %u (remount to use the rest)\n",
+			new_ags, max_add, max_add);
+		new_ags = max_add;
+	}
+	if (new_ags == 0) {
+		ret = -ENOSPC;
+		goto out;
+	}
+
+	ext_off        = old_end;
+	new_data_start = ext_off + (u64)new_ags * sizeof(struct ocsfs_disk_ag);
+
+	for (j = 0; j < new_ags; j++) {
+		u32 agno = old_ags + j;
+		u64 ag_data_start = new_data_start + (u64)j * ag_bytes;
+		u64 ext_desc = ext_off + (u64)j * sizeof(struct ocsfs_disk_ag);
+		struct ocsfs_disk_ag dag;
+		u64 free;
+
+		ret = grow_write_new_ag(sb, agno, ag_data_start, ag_blocks, ext_desc,
+					sbi->s_max_nodes, &free, &dag);
+		if (ret)
+			goto out;            /* uncommitted: SB not yet updated */
+		grow_init_ag_slot(sbi, agno, &dag);  /* slot ready but not yet published */
+		added_free += free;
+	}
+
+	/* Commit point: persist the superblock (primary + mirror). */
+	sbi->s_ds->s_ag_count = cpu_to_le32(old_ags + new_ags);
+	sbi->s_ds->s_ag_desc_primary_count = cpu_to_le32(
+		sbi->s_ag_desc_primary_count ? sbi->s_ag_desc_primary_count : old_ags);
+	sbi->s_ds->s_ag_desc_ext_off = cpu_to_le64(
+		sbi->s_ag_desc_ext_off ? sbi->s_ag_desc_ext_off : ext_off);
+	sbi->s_ds->s_total_blocks = cpu_to_le64(sbi->s_total_blocks +
+						(u64)new_ags * ag_blocks);
+	sbi->s_ds->s_free_blocks  = cpu_to_le64(sbi->s_free_blocks + added_free);
+	sbi->s_ds->s_feature_incompat = cpu_to_le64(sbi->s_feature_incompat |
+						    OCSFS_FEATURE_INCOMPAT_AG_GROW);
+	sbi->s_ds->s_checksum = cpu_to_le32(
+		ocsfs_crc32c(~0U, sbi->s_ds, OCSFS_SUPERBLOCK_SIZE - 4));
+	mark_buffer_dirty(sbi->s_sbh);
+	sync_dirty_buffer(sbi->s_sbh);
+	ocsfs_update_super_mirror(sb);
+
+	/* Publish to this node's allocators. */
+	if (!sbi->s_ag_desc_primary_count)
+		sbi->s_ag_desc_primary_count = old_ags;
+	if (!sbi->s_ag_desc_ext_off)
+		sbi->s_ag_desc_ext_off = ext_off;
+	sbi->s_feature_incompat |= OCSFS_FEATURE_INCOMPAT_AG_GROW;
+	sbi->s_total_blocks += (u64)new_ags * ag_blocks;
+	spin_lock(&sbi->s_free_lock);
+	sbi->s_free_blocks += added_free;
+	spin_unlock(&sbi->s_free_lock);
+	smp_wmb();
+	WRITE_ONCE(sbi->s_ag_count, old_ags + new_ags);
+
+	pr_info("ocsfs: online grow complete: %u -> %u AGs, +%llu free blocks\n",
+		old_ags, old_ags + new_ags, added_free);
+out:
+	mutex_unlock(&sbi->s_grow_lock);
+	return ret;
+}
+
+int ocsfs_grow_refresh(struct super_block *sb)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	struct buffer_head *bh;
+	struct ocsfs_disk_super *ds;
+	u32 disk_ags, disk_prim, old_ags, j;
+	u64 disk_ext_off, disk_total, disk_free;
+	int ret = 0;
+
+	if (!sbi->s_clustered)
+		return 0;
+	if (le32_to_cpu(sbi->s_ds->s_ag_count) == READ_ONCE(sbi->s_ag_count) &&
+	    !sbi->s_ag_desc_ext_off) {
+		/* cheap pre-check using our cached SB copy; still confirm on disk
+		 * only when it might have changed (see fresh read below) */
+	}
+
+	/* Fresh on-disk read of the superblock (block 0). */
+	bh = sb_getblk(sb, OCSFS_SUPERBLOCK_OFFSET / sbi->s_block_size);
+	if (!bh)
+		return -EIO;
+	clear_buffer_uptodate(bh);
+	if (bh_read(bh, 0) < 0) {
+		brelse(bh);
+		return -EIO;
+	}
+	ds = (struct ocsfs_disk_super *)bh->b_data;
+	disk_ags     = le32_to_cpu(ds->s_ag_count);
+	disk_prim    = le32_to_cpu(ds->s_ag_desc_primary_count);
+	disk_ext_off = le64_to_cpu(ds->s_ag_desc_ext_off);
+	disk_total   = le64_to_cpu(ds->s_total_blocks);
+	disk_free    = le64_to_cpu(ds->s_free_blocks);
+	brelse(bh);
+
+	if (disk_ags <= READ_ONCE(sbi->s_ag_count))
+		return 0;
+
+	/* Safety: do not adopt AGs whose data lies past this node's view of the
+	 * device.  A peer that has not yet rescanned the expanded LUN must not load
+	 * AGs it cannot address — it will pick them up once its bdev catches up. */
+	if (disk_total * (u64)sbi->s_block_size >
+	    bdev_nr_bytes(sb->s_bdev)) {
+		pr_warn_ratelimited("ocsfs: volume grew to %llu blocks but this node's "
+				    "device is smaller — rescan the LUN (iscsiadm -m node -R)\n",
+				    disk_total);
+		return -ENXIO;
+	}
+
+	mutex_lock(&sbi->s_grow_lock);
+	old_ags = sbi->s_ag_count;
+	if (disk_ags <= old_ags)
+		goto out;
+	if (disk_ags > sbi->s_ag_capacity) {
+		pr_warn("ocsfs: peer grew to %u AGs; our reserve holds %u — remount to use all the new space\n",
+			disk_ags, sbi->s_ag_capacity);
+		disk_ags = sbi->s_ag_capacity;
+		if (disk_ags <= old_ags)
+			goto out;
+	}
+
+	/* Route descriptor reads to the extension region. */
+	sbi->s_ag_desc_primary_count = disk_prim ? disk_prim : old_ags;
+	sbi->s_ag_desc_ext_off       = disk_ext_off;
+
+	for (j = old_ags; j < disk_ags; j++) {
+		struct buffer_head *db;
+		struct ocsfs_disk_ag *dag;
+		u64 blk = ocsfs_byte_to_block(sbi, ocsfs_ag_desc_byte_off(sbi, j));
+
+		db = sb_getblk(sb, blk);
+		if (!db) {
+			ret = -EIO;
+			break;
+		}
+		clear_buffer_uptodate(db);
+		if (bh_read(db, 0) < 0) {
+			brelse(db);
+			ret = -EIO;
+			break;
+		}
+		dag = (struct ocsfs_disk_ag *)db->b_data;
+		if (le32_to_cpu(dag->ag_magic) != OCSFS_AG_MAGIC) {
+			brelse(db);
+			ret = -EUCLEAN;
+			break;
+		}
+		grow_init_ag_slot(sbi, j, dag);
+		brelse(db);
+	}
+	if (!ret) {
+		sbi->s_feature_incompat |= OCSFS_FEATURE_INCOMPAT_AG_GROW;
+		sbi->s_total_blocks = disk_total;
+		spin_lock(&sbi->s_free_lock);
+		sbi->s_free_blocks = disk_free;
+		spin_unlock(&sbi->s_free_lock);
+		smp_wmb();
+		WRITE_ONCE(sbi->s_ag_count, disk_ags);
+		pr_info("ocsfs: picked up peer grow: now %u AGs\n", disk_ags);
+	}
+out:
+	mutex_unlock(&sbi->s_grow_lock);
+	return ret;
 }
 
 static struct dquot **ocsfs_get_dquots(struct inode *inode)

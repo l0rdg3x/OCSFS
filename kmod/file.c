@@ -635,6 +635,11 @@ static long ocsfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	}
 
 	/* ARCH-V3-6: cluster-wide filesystem freeze / thaw */
+	if (cmd == OCSFS_IOC_GROW) {
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+		return ocsfs_grow_online(inode->i_sb);
+	}
 	if (cmd == OCSFS_IOC_FREEZE_FS) {
 		if (!capable(CAP_SYS_ADMIN))
 			return -EPERM;

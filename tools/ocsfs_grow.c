@@ -27,6 +27,40 @@
 
 #include "ocsfs.h"
 
+/* Online-grow ioctl (mirrors kmod/ocsfs.h OCSFS_IOC_GROW). */
+#define OCSFS_IOC_GROW   _IO('O', 40)
+
+/* Online grow: trigger OCSFS_IOC_GROW on the mounted filesystem.  The ioctl is
+ * served by regular-file fops, so create a throwaway file to issue it on. */
+static int grow_online(const char *mnt)
+{
+	char trig[4096];
+	int fd, r, e;
+
+	snprintf(trig, sizeof(trig), "%s/.ocsfs-grow-trigger", mnt);
+	fd = open(trig, O_RDWR | O_CREAT, 0600);
+	if (fd < 0) {
+		fprintf(stderr, "ocsfs_grow: cannot create trigger in %s: %s\n",
+			mnt, strerror(errno));
+		return 1;
+	}
+	r = ioctl(fd, OCSFS_IOC_GROW);
+	e = errno;
+	close(fd);
+	unlink(trig);
+	if (r < 0) {
+		if (e == ENOSPC)
+			fprintf(stderr, "ocsfs_grow: no new space — expand the LUN and "
+					"rescan (iscsiadm -m node -R) on this node first\n");
+		else
+			fprintf(stderr, "ocsfs_grow: online grow failed: %s\n", strerror(e));
+		return 1;
+	}
+	printf("ocsfs_grow: online grow done (see dmesg / df). Peers pick up the new "
+	       "space on their next allocation.\n");
+	return 0;
+}
+
 static uint64_t get_device_size(int fd)
 {
 	uint64_t size = 0;
@@ -76,6 +110,21 @@ int main(int argc, char **argv)
 	if (argi >= argc) {
 		fprintf(stderr, "usage: ocsfs_grow [-n] <device>\n");
 		return 2;
+	}
+
+	/* A directory argument is a mountpoint -> ONLINE grow via ioctl (volume
+	 * stays mounted).  A block device -> offline grow (must be unmounted). */
+	{
+		struct stat pst;
+
+		if (stat(argv[argi], &pst) == 0 && S_ISDIR(pst.st_mode)) {
+			if (dry) {
+				printf("ocsfs_grow: online mode does not support -n; "
+				       "run without -n to grow the mounted volume\n");
+				return 0;
+			}
+			return grow_online(argv[argi]);
+		}
 	}
 
 	int fd = open(argv[argi], dry ? O_RDONLY : O_RDWR);

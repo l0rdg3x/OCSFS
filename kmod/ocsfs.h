@@ -227,6 +227,10 @@ enum ocsfs_cas_backend {
 #define OCSFS_FEATURE_INCOMPAT_KEY_STORE        (1ULL << 4)  /* ARCH-V3-1: shared encrypted key store */
 #define OCSFS_FEATURE_INCOMPAT_AG_GROW          (1ULL << 5)  /* extension AG-descriptor region (grow) */
 
+/* Spare s_ags slots reserved at mount for in-place online grow (append without
+ * moving the array).  Growing past s_ag_count + this needs a remount. */
+#define OCSFS_AG_GROW_RESERVE                   512u
+
 /* RO_COMPAT bits — read-write-semantic features */
 #define OCSFS_FEATURE_RO_COMPAT_SELECTIVE_INV   (1ULL << 0)  /* ARCH-7 */
 #define OCSFS_FEATURE_RO_COMPAT_HB_SUMMARY      (1ULL << 1)  /* ARCH-3 */
@@ -812,8 +816,15 @@ struct ocsfs_sb_info {
 	/* ARCH-V3-4: true when OCSFS_FEATURE_INCOMPAT_EXT_FLAGS4 is set */
 	bool            s_ext_flags4;
 
-	/* Allocation groups */
-	struct ocsfs_ag_info    *s_ags;         /* array [s_ag_count] */
+	/* Allocation groups.  s_ags is allocated with OCSFS_AG_GROW_RESERVE spare
+	 * slots past s_ag_count so an online grow can append AGs in place (the
+	 * embedded per-AG DLM lock_res are on the global DLM list and must not be
+	 * moved).  s_ag_capacity is the number of allocated slots; growth beyond it
+	 * needs a remount.  s_ag_count may be bumped live (after the new slots are
+	 * fully initialised) so it is read with READ_ONCE on the allocator paths. */
+	struct ocsfs_ag_info    *s_ags;         /* array [0..s_ag_capacity) */
+	u32                     s_ag_capacity;  /* allocated s_ags slots */
+	struct mutex            s_grow_lock;    /* serialises online grow on this node */
 
 	/* Journal */
 	struct ocsfs_journal    s_journal;
@@ -1076,6 +1087,11 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc);
 void ocsfs_put_super(struct super_block *sb);
 int ocsfs_statfs(struct dentry *dentry, struct kstatfs *buf);
 int ocsfs_sync_fs(struct super_block *sb, int wait);
+/* grow.c — online grow into an expanded LUN (volume mounted). */
+int ocsfs_grow_online(struct super_block *sb);
+/* Re-read the on-disk superblock; if a peer grew the volume, load the new AGs
+ * into this node's reserved s_ags slots.  Called from the heartbeat thread. */
+int ocsfs_grow_refresh(struct super_block *sb);
 
 /* inode.c */
 extern const struct inode_operations ocsfs_file_inode_ops;
@@ -1450,6 +1466,8 @@ struct ocsfs_vaai_xcopy_arg {
 #define OCSFS_IOC_WRITE_SAME  _IOW('O', 10, struct ocsfs_vaai_arg)
 #define OCSFS_IOC_UNMAP       _IOW('O', 11, struct ocsfs_vaai_arg)
 #define OCSFS_IOC_XCOPY       _IOW('O', 12, struct ocsfs_vaai_xcopy_arg)
+/* Online grow into an expanded LUN (CAP_SYS_ADMIN); volume stays mounted. */
+#define OCSFS_IOC_GROW        _IO ('O', 40)
 /* ARCH-V3-6: cluster-wide filesystem freeze/thaw (CAP_SYS_ADMIN required) */
 #define OCSFS_IOC_FREEZE_FS   _IO ('O', 20)
 #define OCSFS_IOC_THAW_FS     _IO ('O', 21)

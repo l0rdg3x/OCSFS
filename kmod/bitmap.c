@@ -298,8 +298,10 @@ int ocsfs_alloc_blocks(struct super_block *sb, u32 ag_hint, u32 count,
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	struct ocsfs_txn *txn;
 	u32 i, chosen;
+	bool grow_tried = false;
 	int ret;
 
+retry:
 	/*
 	 * Phase 1 (lockless): read free_blocks counters to pick a candidate AG.
 	 * The read may be slightly stale — phase 2 confirms under DLM-EX.
@@ -367,6 +369,20 @@ int ocsfs_alloc_blocks(struct super_block *sb, u32 ag_hint, u32 count,
 		ocsfs_txn_abort(txn);
 		if (ret != -ENOSPC)
 			return ret;
+	}
+
+	/*
+	 * Genuinely out of room in every AG we know about.  A peer may have grown
+	 * the volume into expanded LUN space; pick that up (loads the new AGs into
+	 * our reserved slots) and retry once before reporting ENOSPC.
+	 */
+	if (!grow_tried) {
+		u32 before = READ_ONCE(sbi->s_ag_count);
+
+		grow_tried = true;
+		if (ocsfs_grow_refresh(sb) == 0 &&
+		    READ_ONCE(sbi->s_ag_count) > before)
+			goto retry;
 	}
 
 	return -ENOSPC;
