@@ -37,6 +37,70 @@ static int ocsfs_initxattrs(struct inode *inode,
 }
 
 /* ═══════════════════════════════════════════════════════════════
+ * fscrypt filename helpers
+ *
+ * The VFS hands us plaintext dirent names, but an encrypted directory stores
+ * the *ciphertext* name in its dirents (and ocsfs_lookup already searches by
+ * it).  Resolve a VFS name to its on-disk form before add/del/rename so the
+ * stored name matches what lookup will search for — otherwise encrypted files
+ * become unreachable by name once their dentry is evicted.
+ *
+ * The encrypted name is copied into a caller-owned stack buffer and the fscrypt
+ * allocation freed immediately, so callers need no cleanup.  "." and ".." are
+ * never encrypted.
+ * ═══════════════════════════════════════════════════════════════ */
+
+static int ocsfs_disk_name(struct inode *dir, const struct qstr *vfs,
+			   u8 *buf, struct qstr *out)
+{
+#ifdef CONFIG_FS_ENCRYPTION
+	if (IS_ENCRYPTED(dir) &&
+	    !(vfs->len <= 2 && vfs->name[0] == '.' &&
+	      (vfs->len == 1 || vfs->name[1] == '.'))) {
+		struct fscrypt_name fn;
+		int r = fscrypt_setup_filename(dir, vfs, 0, &fn);
+
+		if (r)
+			return r;
+		if (fn.disk_name.len > OCSFS_MAX_NAME_LEN) {
+			fscrypt_free_filename(&fn);
+			return -ENAMETOOLONG;
+		}
+		memcpy(buf, fn.disk_name.name, fn.disk_name.len);
+		out->name = buf;
+		out->len  = fn.disk_name.len;
+		fscrypt_free_filename(&fn);
+		return 0;
+	}
+#endif
+	*out = *vfs;
+	return 0;
+}
+
+static int ocsfs_add_dirent_v(struct inode *dir, struct dentry *dentry,
+			      u64 ino, u8 file_type)
+{
+	u8 buf[OCSFS_MAX_NAME_LEN];
+	struct qstr disk;
+	int ret = ocsfs_disk_name(dir, &dentry->d_name, buf, &disk);
+
+	if (ret)
+		return ret;
+	return ocsfs_add_dirent(dir, &disk, ino, file_type);
+}
+
+static int ocsfs_del_dirent_v(struct inode *dir, struct dentry *dentry)
+{
+	u8 buf[OCSFS_MAX_NAME_LEN];
+	struct qstr disk;
+	int ret = ocsfs_disk_name(dir, &dentry->d_name, buf, &disk);
+
+	if (ret)
+		return ret;
+	return __ocsfs_del_dirent(dir, &disk);
+}
+
+/* ═══════════════════════════════════════════════════════════════
  * VFS UNLINK
  * ═══════════════════════════════════════════════════════════════ */
 
@@ -83,7 +147,7 @@ static int ocsfs_unlink(struct inode *dir, struct dentry *dentry)
 		ocsfs_inode_refresh_forced(inode);
 	}
 
-	ret = __ocsfs_del_dirent(dir, &dentry->d_name);
+	ret = ocsfs_del_dirent_v(dir, dentry);
 	if (ret)
 		goto out_unlock;
 
@@ -174,7 +238,7 @@ static int ocsfs_rmdir(struct inode *dir, struct dentry *dentry)
 		goto out_unlock;
 	}
 
-	ret = __ocsfs_del_dirent(dir, &dentry->d_name);
+	ret = ocsfs_del_dirent_v(dir, dentry);
 	if (ret)
 		goto out_unlock;
 
@@ -361,12 +425,25 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 	int n_locks = 0;
 	int ret;
 	int i;
+	u8 old_buf[OCSFS_MAX_NAME_LEN];
+	u8 new_buf[OCSFS_MAX_NAME_LEN];
+	struct qstr old_disk, new_disk;
 
 	if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE))
 		return -EINVAL;
 
 	ret = fscrypt_prepare_rename(old_dir, old_dentry, new_dir, new_dentry,
 				     flags);
+	if (ret)
+		return ret;
+
+	/* fscrypt: resolve both names to their on-disk (ciphertext) form, each
+	 * under its own directory's policy, so the dirent ops below match the
+	 * stored names (and lookup). */
+	ret = ocsfs_disk_name(old_dir, &old_dentry->d_name, old_buf, &old_disk);
+	if (ret)
+		return ret;
+	ret = ocsfs_disk_name(new_dir, &new_dentry->d_name, new_buf, &new_disk);
 	if (ret)
 		return ret;
 
@@ -436,18 +513,18 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 		bool old_is_dir = S_ISDIR(old_inode->i_mode);
 		bool new_is_dir = S_ISDIR(new_inode->i_mode);
 
-		ret = __ocsfs_update_dirent_ino(old_dir, &old_dentry->d_name,
+		ret = __ocsfs_update_dirent_ino(old_dir, &old_disk,
 						OCSFS_I(new_inode)->i_disk_ino,
 						ocsfs_mode_to_ft(new_inode->i_mode));
 		if (ret)
 			goto out_unlock;
 
-		ret = __ocsfs_update_dirent_ino(new_dir, &new_dentry->d_name,
+		ret = __ocsfs_update_dirent_ino(new_dir, &new_disk,
 						OCSFS_I(old_inode)->i_disk_ino,
 						ocsfs_mode_to_ft(old_inode->i_mode));
 		if (ret) {
 			int comp = __ocsfs_update_dirent_ino(
-					old_dir, &old_dentry->d_name,
+					old_dir, &old_disk,
 					OCSFS_I(old_inode)->i_disk_ino,
 					ocsfs_mode_to_ft(old_inode->i_mode));
 			if (comp)
@@ -503,8 +580,8 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 		 * Eliminates the del+add window where the target is transiently
 		 * absent and the add+del window where the inode appears in both dirs.
 		 */
-		ret = rename_replace_atomic(old_dir, &old_dentry->d_name,
-					    new_dir, &new_dentry->d_name,
+		ret = rename_replace_atomic(old_dir, &old_disk,
+					    new_dir, &new_disk,
 					    OCSFS_I(old_inode)->i_disk_ino,
 					    ocsfs_mode_to_ft(old_inode->i_mode));
 		if (ret == 0) {
@@ -522,7 +599,7 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 			goto out_unlock;
 
 		/* Slow path: no btree index — fall through to del+add+del */
-		ret = __ocsfs_del_dirent(new_dir, &new_dentry->d_name);
+		ret = __ocsfs_del_dirent(new_dir, &new_disk);
 		if (ret)
 			goto out_unlock;
 		if (dir_target) {
@@ -535,19 +612,19 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 	}
 
 	/* Add-before-remove: on crash, file in both dirs (fsck fixes nlink). */
-	ret = __ocsfs_add_dirent(new_dir, &new_dentry->d_name,
+	ret = __ocsfs_add_dirent(new_dir, &new_disk,
 				 OCSFS_I(old_inode)->i_disk_ino,
 				 ocsfs_mode_to_ft(old_inode->i_mode));
 	if (ret)
 		goto out_unlock;
 
-	ret = __ocsfs_del_dirent(old_dir, &old_dentry->d_name);
+	ret = __ocsfs_del_dirent(old_dir, &old_disk);
 	if (ret) {
 		/* Compensate: undo new entry to avoid ghost in new_dir.
 		 * ALTO-N6: after __ocsfs_add_dirent may have triggered
 		 * btree_migrate, the entry is indexed and should be findable
 		 * via the btree fast path in __ocsfs_del_dirent. */
-		int comp = __ocsfs_del_dirent(new_dir, &new_dentry->d_name);
+		int comp = __ocsfs_del_dirent(new_dir, &new_disk);
 
 		if (comp) {
 			pr_err("ocsfs: rename rollback failed (%d) — "
@@ -747,7 +824,7 @@ int ocsfs_create(struct mnt_idmap *idmap, struct inode *dir,
 		}
 	}
 
-	ret = ocsfs_add_dirent(dir, &dentry->d_name,
+	ret = ocsfs_add_dirent_v(dir, dentry,
 			       OCSFS_I(inode)->i_disk_ino,
 			       ocsfs_mode_to_ft(mode));
 	if (ret)
@@ -828,7 +905,7 @@ struct dentry *ocsfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 		}
 	}
 
-	ret = ocsfs_add_dirent(dir, &dentry->d_name,
+	ret = ocsfs_add_dirent_v(dir, dentry,
 			       OCSFS_I(inode)->i_disk_ino, OCSFS_FT_DIR);
 	if (ret)
 		goto fail;
@@ -890,7 +967,7 @@ static int ocsfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	if (ret && ret != -EOPNOTSUPP)
 		goto symlink_fail;
 
-	ret = ocsfs_add_dirent(dir, &dentry->d_name,
+	ret = ocsfs_add_dirent_v(dir, dentry,
 			       oi->i_disk_ino,
 			       ocsfs_mode_to_ft(inode->i_mode));
 	if (ret) {
@@ -954,7 +1031,7 @@ static int ocsfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	if (ret)
 		goto fail;
 
-	ret = ocsfs_add_dirent(dir, &dentry->d_name,
+	ret = ocsfs_add_dirent_v(dir, dentry,
 			       OCSFS_I(inode)->i_disk_ino,
 			       ocsfs_mode_to_ft(mode));
 	if (ret)
@@ -1009,7 +1086,7 @@ static int ocsfs_link(struct dentry *old_dentry, struct inode *dir,
 	inode_inc_link_count(inode);
 	ihold(inode);
 
-	ret = ocsfs_add_dirent(dir, &dentry->d_name,
+	ret = ocsfs_add_dirent_v(dir, dentry,
 			       oi->i_disk_ino,
 			       ocsfs_mode_to_ft(inode->i_mode));
 	if (ret) {
