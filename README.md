@@ -40,7 +40,7 @@ locking and SCSI-3 Persistent Reservations for fencing.
 | 📓 **Crash-safe journaling** | WAL with redo; replay on mount reconstructs committed transactions |
 | 🌳 **Modern data path** | iomap, extent B+ trees, O_DIRECT, sparse files, `FIEMAP`, `SEEK_HOLE/DATA` |
 | 🪞 **Space efficiency** | Reflink (`FICLONE`), CoW snapshots, inline LZ4/ZSTD compression, **cross-file dedup** |
-| 🔐 **Encryption** | fscrypt per-directory encryption with cluster-wide key distribution |
+| 🔐 **Encryption** | fscrypt scaffolding + cluster key distribution — ⚠️ **currently stores plaintext** (context-inheritance bug, see limitations); not yet usable for confidentiality |
 | ⚡ **VAAI offload** | `WRITE SAME`, `UNMAP`, `EXTENDED COPY` for array-accelerated VM ops |
 | 🏎️ **Near-raw VM-disk I/O** | Random 4K O_DIRECT read/write on a clustered LUN runs at ~device speed — the per-op clustering overhead is eliminated for a single active node |
 | 📈 **Online grow** | Expand the filesystem into a grown LUN while it stays mounted — `ocsfs-grow /mnt/point` |
@@ -494,7 +494,8 @@ sudo ./tools/ocsfs-fsck --repair /dev/sdb
 | **Crash atomicity (allocation)** | The block bitmap is committed *before* the extent map references the new blocks, so a crash between the two transactions can only **leak** space (blocks marked used with no owner) — never double-allocate. `fsck` reclaims the leak; collapsing the two updates into a single transaction (no transient leak) is a future cleanup, not a correctness fix |
 | **Filesystem grow** | ✅ Online (mounted) and offline grow implemented via `ocsfs-grow` (`INCOMPAT_AG_GROW`); validated 3-node. *Open:* a single grow per volume (re-growing an already-grown volume is rejected); rescan the LUN on every node before peers use the new space |
 | **Integration tests** | No xfstests run yet; no long-haul soak |
-| **Encryption — I/O** | No readahead, no O_DIRECT on encrypted files; reflink/snapshot/symlink inside encrypted dirs return `-EOPNOTSUPP` |
+| **Encryption — ⚠️ NOT confidential (stores plaintext)** | **Do not rely on encryption for confidentiality.** The fscrypt key/policy ioctls now work on directory fds (fixed), but a file created in an encrypted directory is **not** marked encrypted (`IS_ENCRYPTED` is false at writeback), so its data is written to disk in **plaintext** — confirmed by reading the raw data block via O_DIRECT. Root cause is in the directory→child encryption-context inheritance (the new inode does not pick up the parent's fscrypt policy). The read path "decrypts" only because there is nothing to decrypt. Tracked as a critical fix |
+| **Encryption — I/O** | No readahead, no O_DIRECT on encrypted files; reflink/snapshot/symlink inside encrypted dirs return `-EOPNOTSUPP`. (Moot until the inheritance bug above is fixed.) |
 | **Encryption — keys** | fscrypt keys live in a shared encrypted key store on the LUN (ChaCha20-Poly1305 / cluster secret); enable with `mkfs.ocsfs -K`, requires `cluster_secret=` at mount; peers fetch via `ocsfs-tool keys restore` |
 | **Compression** | Write path runs on fsync for buffered files only; O_DIRECT writes are never compressed; a file with >16 compressed extents is decompressed on B+tree migration |
 | **Quota** | Quota *hooks* are present — block/inode charges fire on the data path and on reflink (logical accounting, like XFS) — but quota *enforcement* is not wired: there are no on-disk quota inodes and no `quotaon` path, so limits cannot be set yet (the charges are effectively dormant). Directory/extent-btree/xattr **metadata** blocks are also not charged. Wiring quota-file enablement (cluster-coherent) is the remaining work |
