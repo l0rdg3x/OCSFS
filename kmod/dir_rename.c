@@ -8,7 +8,6 @@
 #include <linux/xattr.h>
 #include <linux/posix_acl.h>
 #include <linux/quotaops.h>
-#include <linux/fscrypt.h>
 #include "ocsfs.h"
 
 /* ═══════════════════════════════════════════════════════════════
@@ -34,70 +33,6 @@ static int ocsfs_initxattrs(struct inode *inode,
 			break;
 	}
 	return ret;
-}
-
-/* ═══════════════════════════════════════════════════════════════
- * fscrypt filename helpers
- *
- * The VFS hands us plaintext dirent names, but an encrypted directory stores
- * the *ciphertext* name in its dirents (and ocsfs_lookup already searches by
- * it).  Resolve a VFS name to its on-disk form before add/del/rename so the
- * stored name matches what lookup will search for — otherwise encrypted files
- * become unreachable by name once their dentry is evicted.
- *
- * The encrypted name is copied into a caller-owned stack buffer and the fscrypt
- * allocation freed immediately, so callers need no cleanup.  "." and ".." are
- * never encrypted.
- * ═══════════════════════════════════════════════════════════════ */
-
-static int ocsfs_disk_name(struct inode *dir, const struct qstr *vfs,
-			   u8 *buf, struct qstr *out)
-{
-#ifdef CONFIG_FS_ENCRYPTION
-	if (IS_ENCRYPTED(dir) &&
-	    !(vfs->len <= 2 && vfs->name[0] == '.' &&
-	      (vfs->len == 1 || vfs->name[1] == '.'))) {
-		struct fscrypt_name fn;
-		int r = fscrypt_setup_filename(dir, vfs, 0, &fn);
-
-		if (r)
-			return r;
-		if (fn.disk_name.len > OCSFS_MAX_NAME_LEN) {
-			fscrypt_free_filename(&fn);
-			return -ENAMETOOLONG;
-		}
-		memcpy(buf, fn.disk_name.name, fn.disk_name.len);
-		out->name = buf;
-		out->len  = fn.disk_name.len;
-		fscrypt_free_filename(&fn);
-		return 0;
-	}
-#endif
-	*out = *vfs;
-	return 0;
-}
-
-static int ocsfs_add_dirent_v(struct inode *dir, struct dentry *dentry,
-			      u64 ino, u8 file_type)
-{
-	u8 buf[OCSFS_MAX_NAME_LEN];
-	struct qstr disk;
-	int ret = ocsfs_disk_name(dir, &dentry->d_name, buf, &disk);
-
-	if (ret)
-		return ret;
-	return ocsfs_add_dirent(dir, &disk, ino, file_type);
-}
-
-static int ocsfs_del_dirent_v(struct inode *dir, struct dentry *dentry)
-{
-	u8 buf[OCSFS_MAX_NAME_LEN];
-	struct qstr disk;
-	int ret = ocsfs_disk_name(dir, &dentry->d_name, buf, &disk);
-
-	if (ret)
-		return ret;
-	return __ocsfs_del_dirent(dir, &disk);
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -147,7 +82,7 @@ static int ocsfs_unlink(struct inode *dir, struct dentry *dentry)
 		ocsfs_inode_refresh_forced(inode);
 	}
 
-	ret = ocsfs_del_dirent_v(dir, dentry);
+	ret = __ocsfs_del_dirent(dir, &dentry->d_name);
 	if (ret)
 		goto out_unlock;
 
@@ -238,7 +173,7 @@ static int ocsfs_rmdir(struct inode *dir, struct dentry *dentry)
 		goto out_unlock;
 	}
 
-	ret = ocsfs_del_dirent_v(dir, dentry);
+	ret = __ocsfs_del_dirent(dir, &dentry->d_name);
 	if (ret)
 		goto out_unlock;
 
@@ -425,27 +360,9 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 	int n_locks = 0;
 	int ret;
 	int i;
-	u8 old_buf[OCSFS_MAX_NAME_LEN];
-	u8 new_buf[OCSFS_MAX_NAME_LEN];
-	struct qstr old_disk, new_disk;
 
 	if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE))
 		return -EINVAL;
-
-	ret = fscrypt_prepare_rename(old_dir, old_dentry, new_dir, new_dentry,
-				     flags);
-	if (ret)
-		return ret;
-
-	/* fscrypt: resolve both names to their on-disk (ciphertext) form, each
-	 * under its own directory's policy, so the dirent ops below match the
-	 * stored names (and lookup). */
-	ret = ocsfs_disk_name(old_dir, &old_dentry->d_name, old_buf, &old_disk);
-	if (ret)
-		return ret;
-	ret = ocsfs_disk_name(new_dir, &new_dentry->d_name, new_buf, &new_disk);
-	if (ret)
-		return ret;
 
 	/* RENAME_NOREPLACE: fail if target already exists */
 	if ((flags & RENAME_NOREPLACE) && new_inode)
@@ -513,18 +430,18 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 		bool old_is_dir = S_ISDIR(old_inode->i_mode);
 		bool new_is_dir = S_ISDIR(new_inode->i_mode);
 
-		ret = __ocsfs_update_dirent_ino(old_dir, &old_disk,
+		ret = __ocsfs_update_dirent_ino(old_dir, &old_dentry->d_name,
 						OCSFS_I(new_inode)->i_disk_ino,
 						ocsfs_mode_to_ft(new_inode->i_mode));
 		if (ret)
 			goto out_unlock;
 
-		ret = __ocsfs_update_dirent_ino(new_dir, &new_disk,
+		ret = __ocsfs_update_dirent_ino(new_dir, &new_dentry->d_name,
 						OCSFS_I(old_inode)->i_disk_ino,
 						ocsfs_mode_to_ft(old_inode->i_mode));
 		if (ret) {
 			int comp = __ocsfs_update_dirent_ino(
-					old_dir, &old_disk,
+					old_dir, &old_dentry->d_name,
 					OCSFS_I(old_inode)->i_disk_ino,
 					ocsfs_mode_to_ft(old_inode->i_mode));
 			if (comp)
@@ -580,8 +497,8 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 		 * Eliminates the del+add window where the target is transiently
 		 * absent and the add+del window where the inode appears in both dirs.
 		 */
-		ret = rename_replace_atomic(old_dir, &old_disk,
-					    new_dir, &new_disk,
+		ret = rename_replace_atomic(old_dir, &old_dentry->d_name,
+					    new_dir, &new_dentry->d_name,
 					    OCSFS_I(old_inode)->i_disk_ino,
 					    ocsfs_mode_to_ft(old_inode->i_mode));
 		if (ret == 0) {
@@ -599,7 +516,7 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 			goto out_unlock;
 
 		/* Slow path: no btree index — fall through to del+add+del */
-		ret = __ocsfs_del_dirent(new_dir, &new_disk);
+		ret = __ocsfs_del_dirent(new_dir, &new_dentry->d_name);
 		if (ret)
 			goto out_unlock;
 		if (dir_target) {
@@ -612,19 +529,19 @@ static int ocsfs_rename(struct mnt_idmap *idmap,
 	}
 
 	/* Add-before-remove: on crash, file in both dirs (fsck fixes nlink). */
-	ret = __ocsfs_add_dirent(new_dir, &new_disk,
+	ret = __ocsfs_add_dirent(new_dir, &new_dentry->d_name,
 				 OCSFS_I(old_inode)->i_disk_ino,
 				 ocsfs_mode_to_ft(old_inode->i_mode));
 	if (ret)
 		goto out_unlock;
 
-	ret = __ocsfs_del_dirent(old_dir, &old_disk);
+	ret = __ocsfs_del_dirent(old_dir, &old_dentry->d_name);
 	if (ret) {
 		/* Compensate: undo new entry to avoid ghost in new_dir.
 		 * ALTO-N6: after __ocsfs_add_dirent may have triggered
 		 * btree_migrate, the entry is indexed and should be findable
 		 * via the btree fast path in __ocsfs_del_dirent. */
-		int comp = __ocsfs_del_dirent(new_dir, &new_disk);
+		int comp = __ocsfs_del_dirent(new_dir, &new_dentry->d_name);
 
 		if (comp) {
 			pr_err("ocsfs: rename rollback failed (%d) — "
@@ -770,7 +687,6 @@ int ocsfs_create(struct mnt_idmap *idmap, struct inode *dir,
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(dir->i_sb);
 	struct inode *inode;
-	bool encrypt = false;
 	int ret;
 
 	dquot_initialize(dir);
@@ -778,10 +694,6 @@ int ocsfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	inode = ocsfs_new_inode(dir, mode);
 	if (IS_ERR(inode))
 		return PTR_ERR(inode);
-
-	ret = fscrypt_prepare_new_inode(dir, inode, &encrypt);
-	if (ret)
-		goto fail;
 
 	ret = security_inode_init_security(inode, dir, &dentry->d_name,
 					   ocsfs_initxattrs, NULL);
@@ -802,16 +714,7 @@ int ocsfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	if (ret)
 		goto fail;
 
-	/* Persist encryption context and flush inode to disk BEFORE adding the
-	 * dirent to the parent directory.  If set_context runs after add_dirent,
-	 * a peer node can see the new dirent and open the inode while it still
-	 * lacks a crypto context, causing it to write plaintext. */
 	OCSFS_I(inode)->i_flags &= ~OCSFS_IFLAG_ORPHAN;
-	if (encrypt) {
-		ret = fscrypt_set_context(inode, NULL);
-		if (ret)
-			goto fail;
-	}
 	mark_inode_dirty(inode);
 	if (OCSFS_SB(inode->i_sb)->s_clustered) {
 		struct ocsfs_inode_info *oi = OCSFS_I(inode);
@@ -824,7 +727,7 @@ int ocsfs_create(struct mnt_idmap *idmap, struct inode *dir,
 		}
 	}
 
-	ret = ocsfs_add_dirent_v(dir, dentry,
+	ret = ocsfs_add_dirent(dir, &dentry->d_name,
 			       OCSFS_I(inode)->i_disk_ino,
 			       ocsfs_mode_to_ft(mode));
 	if (ret)
@@ -844,7 +747,6 @@ struct dentry *ocsfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(dir->i_sb);
 	struct inode *inode;
-	bool encrypt = false;
 	int ret;
 
 	dquot_initialize(dir);
@@ -852,10 +754,6 @@ struct dentry *ocsfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	inode = ocsfs_new_inode(dir, S_IFDIR | mode);
 	if (IS_ERR(inode))
 		return ERR_CAST(inode);
-
-	ret = fscrypt_prepare_new_inode(dir, inode, &encrypt);
-	if (ret)
-		goto fail;
 
 	ret = security_inode_init_security(inode, dir, &dentry->d_name,
 					   ocsfs_initxattrs, NULL);
@@ -884,14 +782,7 @@ struct dentry *ocsfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	if (ret)
 		goto fail;
 
-	/* Same ordering requirement as ocsfs_create: persist encryption context
-	 * before the parent dirent becomes visible to peer nodes. */
 	OCSFS_I(inode)->i_flags &= ~OCSFS_IFLAG_ORPHAN;
-	if (encrypt) {
-		ret = fscrypt_set_context(inode, NULL);
-		if (ret)
-			goto fail;
-	}
 	mark_inode_dirty(inode);
 	if (OCSFS_SB(inode->i_sb)->s_clustered) {
 		struct ocsfs_inode_info *oi = OCSFS_I(inode);
@@ -905,7 +796,7 @@ struct dentry *ocsfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 		}
 	}
 
-	ret = ocsfs_add_dirent_v(dir, dentry,
+	ret = ocsfs_add_dirent(dir, &dentry->d_name,
 			       OCSFS_I(inode)->i_disk_ino, OCSFS_FT_DIR);
 	if (ret)
 		goto fail;
@@ -936,12 +827,6 @@ static int ocsfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	if (slen > OCSFS_MAX_INLINE_SYMLINK)
 		return -ENAMETOOLONG;
 
-	/* fscrypt symlink support requires fscrypt_get_symlink() plumbing which
-	 * OCSFS does not implement; without it the ciphertext is exposed as the
-	 * link target.  Refuse until proper support is added. */
-	if (IS_ENCRYPTED(dir))
-		return -EOPNOTSUPP;
-
 	dquot_initialize(dir);
 
 	inode = ocsfs_new_inode(dir, S_IFLNK | S_IRWXUGO);
@@ -967,7 +852,7 @@ static int ocsfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	if (ret && ret != -EOPNOTSUPP)
 		goto symlink_fail;
 
-	ret = ocsfs_add_dirent_v(dir, dentry,
+	ret = ocsfs_add_dirent(dir, &dentry->d_name,
 			       oi->i_disk_ino,
 			       ocsfs_mode_to_ft(inode->i_mode));
 	if (ret) {
@@ -1031,7 +916,7 @@ static int ocsfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	if (ret)
 		goto fail;
 
-	ret = ocsfs_add_dirent_v(dir, dentry,
+	ret = ocsfs_add_dirent(dir, &dentry->d_name,
 			       OCSFS_I(inode)->i_disk_ino,
 			       ocsfs_mode_to_ft(mode));
 	if (ret)
@@ -1071,10 +956,6 @@ static int ocsfs_link(struct dentry *old_dentry, struct inode *dir,
 	if (S_ISDIR(inode->i_mode))
 		return -EPERM;
 
-	ret = fscrypt_prepare_link(old_dentry, dir, dentry);
-	if (ret)
-		return ret;
-
 	if (sbi->s_clustered) {
 		ret = ocsfs_lock_acquire(dir->i_sb, &oi->i_lock_res,
 					 OCSFS_LOCK_EX);
@@ -1086,7 +967,7 @@ static int ocsfs_link(struct dentry *old_dentry, struct inode *dir,
 	inode_inc_link_count(inode);
 	ihold(inode);
 
-	ret = ocsfs_add_dirent_v(dir, dentry,
+	ret = ocsfs_add_dirent(dir, &dentry->d_name,
 			       oi->i_disk_ino,
 			       ocsfs_mode_to_ft(inode->i_mode));
 	if (ret) {
@@ -1170,15 +1051,4 @@ const struct file_operations ocsfs_dir_fops = {
 	.read           = generic_read_dir,
 	.iterate_shared = ocsfs_readdir,
 	.fsync          = generic_file_fsync,
-	/*
-	 * fscrypt key-management and policy ioctls (FS_IOC_ADD_ENCRYPTION_KEY,
-	 * FS_IOC_SET_ENCRYPTION_POLICY, …) are issued on *directory* fds — the
-	 * mountpoint for the key, the target dir for the policy.  Without an
-	 * ioctl handler on the directory fops they returned -ENOTTY, making
-	 * encryption unusable via the standard tools.  Share the same handler
-	 * as regular files (it dispatches the fscrypt ioctls, which are fd-type
-	 * agnostic) — the ext4/f2fs pattern.
-	 */
-	.unlocked_ioctl = ocsfs_ioctl,
-	.compat_ioctl   = compat_ptr_ioctl,
 };

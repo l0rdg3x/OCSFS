@@ -418,7 +418,6 @@ static void format_device(int fd, uint64_t dev_size)
     printf("  Features:  ");
     if (cfg.features & OCSFS_FEAT_THIN_PROV) printf(" thin");
     if (cfg.features & OCSFS_FEAT_COMPRESSION) printf(" compress");
-    if (cfg.features & OCSFS_FEAT_ENCRYPTION) printf(" encrypt");
     if (cfg.features & OCSFS_FEAT_SNAPSHOTS) printf(" snapshots");
     if (cfg.features & OCSFS_FEAT_AUTH) printf(" auth");
     printf("\n");

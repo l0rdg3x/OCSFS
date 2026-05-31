@@ -142,7 +142,7 @@ later — size it deliberately.
 | `-E` | `<size>` | `1M` | Default extent (allocation-unit) hint, e.g. `1M`, `4M`. Larger = less metadata for big sequential files (VM images); smaller = better for many small files. |
 | `-A` | `<size>` | `1G` | Allocation Group size. Each AG has its own bitmap/inode-table/locks, so independent AGs avoid cross-node contention. |
 | `-J` | `<size>` | `32M` | **Per-node** journal size, e.g. `16M`, `64M`. Total journal = `J × N`. 16–32M suits VM workloads. |
-| `-K` | — | off | Enable cluster authentication (HMAC + encrypted key store). A `-K` volume will **not** mount without `-o cluster_secret=`; required for fscrypt encryption. |
+| `-K` | — | off | Enable **cluster authentication** (HMAC on journal/lock records keyed by the cluster secret). A `-K` volume will **not** mount without `-o cluster_secret=`. Integrity auth only — **not** file encryption (per-file encryption was removed; encrypt at the SAN/LUN or guest layer instead). |
 | `-T` | — | on | Enable thin provisioning (default on; flag kept for explicitness). |
 | `-f` | — | off | Force — skip the erase-confirmation prompt (needed for scripted runs). |
 | `-v` | — | off | Verbose — print computed geometry (AG count, journal offsets, inode-table layout). |
@@ -498,7 +498,7 @@ Use only FC SAN or LIO/TrueNAS SCALE iSCSI for multi-node deployments.
 |---|---|---|
 | Metadata-op throughput under cross-node contention | A *hot, contended* lock (e.g. one shared directory hammered by 3 nodes) does a SCSI CAW per hand-off and can hit the 30 s acquire timeout | **Data path is unaffected** — random VM-disk I/O on a single active node runs at near-raw speed (lock held lazily, no per-op CAW). Reducing per-op CAW on contended metadata locks is the open scaling item |
 | No xfstests coverage yet | Unknown edge cases in the VFS layer | Requires a 2-node testbed; KVM + LIO is sufficient |
-| Encryption I/O restrictions | fscrypt per-directory encryption **is** implemented (format with `-K`, mount with `cluster_secret=`) | No readahead and no O_DIRECT on encrypted files; reflink/snapshot/symlink **inside** encrypted dirs return `-EOPNOTSUPP` |
+| Encryption — out of scope (removed) | Per-file (fscrypt) encryption was **removed and is not planned** — it disables O_DIRECT and blocks reflink/snapshot, which are central to VM disks | Encrypt at the **SAN/LUN** layer (TrueNAS zvol) or **inside the guest** (LUKS / qcow2). `-K` provides cluster-auth HMAC only. |
 | Quota (stub) | dquot *hooks* are wired (data-path and reflink block charges, `dq_op`/`get_dquots`) but quota *enforcement* is not enableable yet | No on-disk quota inodes and no `quotaon` path, so limits cannot be set; metadata blocks (dir/extent-btree/xattr) are also not charged. CoW correctly does not double-charge (it swaps physical blocks, the logical count is unchanged) |
 | Snapshot for large files | Supported on V2 volumes (requires `INCOMPAT_RC_BTREE_PER_AG`; format with `mkfs.ocsfs` or upgrade with `ocsfs-tool tune --upgrade`) | Returns `-EOPNOTSUPP` on V1 volumes only |
 | Shared mmap unsupported in cluster mode | `MAP_SHARED\|PROT_WRITE` returns `-EOPNOTSUPP` in cluster mode | Private and read-only mappings work; single-node works |

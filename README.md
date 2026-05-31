@@ -40,7 +40,6 @@ locking and SCSI-3 Persistent Reservations for fencing.
 | 📓 **Crash-safe journaling** | WAL with redo; replay on mount reconstructs committed transactions |
 | 🌳 **Modern data path** | iomap, extent B+ trees, O_DIRECT, sparse files, `FIEMAP`, `SEEK_HOLE/DATA` |
 | 🪞 **Space efficiency** | Reflink (`FICLONE`), CoW snapshots, inline LZ4/ZSTD compression, **cross-file dedup** |
-| 🔐 **Encryption** | fscrypt scaffolding + cluster key distribution — ⚠️ **currently stores plaintext** (context-inheritance bug, see limitations); not yet usable for confidentiality |
 | ⚡ **VAAI offload** | `WRITE SAME`, `UNMAP`, `EXTENDED COPY` for array-accelerated VM ops |
 | 🏎️ **Near-raw VM-disk I/O** | Random 4K O_DIRECT read/write on a clustered LUN runs at ~device speed — the per-op clustering overhead is eliminated for a single active node |
 | 📈 **Online grow** | Expand the filesystem into a grown LUN while it stays mounted — `ocsfs-grow /mnt/point` |
@@ -143,7 +142,6 @@ warnings**:
 | Multi-node — coherence (create/delete/rename, 2–3 nodes) | ~92% | validated on hardware |
 | Multi-node — crash recovery + PR fencing | ~88% | validated on hardware (one induced crash) |
 | Multi-node — metadata-op throughput under cross-node contention | ~70% | CAW-bound on hot contended locks; data path is not affected |
-| Multi-node — with encryption | ~85% † | not yet exercised under node failure |
 | VMFS feature parity | ~72% | feature comparison |
 
 † See [`docs/developer-guide.md`](docs/developer-guide.md) for the full changelog
@@ -251,7 +249,6 @@ two-node buffered read/write ping-pong). Integrity is verified end-to-end with
 | `compress.c` · `compress_file.c` | Inline LZ4/ZSTD compression (read path); compress-on-fsync |
 | `dedup.c` · `dedup_index.c` | Content dedup ioctl + global cross-file index (DDT) with GC |
 | `xattr.c` · `acl.c` | Extended attributes (DLM-protected) and POSIX ACLs |
-| `crypto.c` | fscrypt: per-directory encryption, bounce-page I/O, cluster key safety |
 | `btree.c` · `btree_mod.c` | Generic B+ tree (search/insert/delete/range) + structural ops |
 | `flock.c` | Distributed POSIX locks: `fcntl(F_SETLK)` → DLM SH/EX |
 | `vaai.c` | VAAI offload: `WRITE SAME` (0x93), `UNMAP` (0x42), `EXTENDED COPY` (0x83) |
@@ -332,8 +329,8 @@ sudo insmod kmod/ocsfs.ko
 sudo mount -t ocsfs /dev/sdb /mnt/ocsfs
 ```
 
-A volume that requires the cluster secret (encryption / journal HMAC) additionally
-needs `-o cluster_secret=<64 hex chars>` at mount.
+A volume formatted with `-K` (cluster-auth HMAC) additionally needs
+`-o cluster_secret=<64 hex chars>` at mount.
 
 ---
 
@@ -360,7 +357,7 @@ the volume** — it cannot be changed later, so size it deliberately.
 | `-E` | `<size>` | `1M` | Default extent (allocation unit) hint, e.g. `1M`, `4M`. Larger extents reduce metadata for big sequential files (VM images, ISOs); smaller suit many small files. |
 | `-A` | `<size>` | `1G` | Allocation Group size. The volume is divided into AGs, each with its own bitmap, inode table and locks, so independent AGs are written without cross-node contention. |
 | `-J` | `<size>` | `32M` | **Per-node** journal (write-ahead log) size, e.g. `16M`, `64M`. Total journal space = `J × N`. Bigger journals absorb larger metadata bursts; 16–32M is plenty for VM workloads. |
-| `-K` | — | off | Enable **cluster authentication** (HMAC on journal/lock records + the encrypted key store). A `-K` volume **will not mount without** `-o cluster_secret=<64 hex>`. Required if you use fscrypt encryption. |
+| `-K` | — | off | Enable **cluster authentication** — an HMAC on journal/lock records keyed by the cluster secret, so a node without the secret cannot tamper with shared metadata. A `-K` volume **will not mount without** `-o cluster_secret=<64 hex>`. (This is integrity auth only; it is **not** file encryption — see Known limitations.) |
 | `-T` | — | on | Enable thin provisioning (blocks allocated on first write). On by default; the flag is kept for explicitness. |
 | `-f` | — | off | Force — skip the "this will erase the device" confirmation prompt. Required for scripted/unattended formatting. |
 | `-v` | — | off | Verbose — print the computed geometry (AG count, journal offsets, inode-table layout). |
@@ -374,7 +371,7 @@ the volume** — it cannot be changed later, so size it deliberately.
 | Small (2–4 nodes) | `8` | `16M` | `1M` | `mkfs.ocsfs -L vmstore -N 8 -J 16M -f /dev/sdb` |
 | Medium (5–16 nodes) | `32` | `32M` | `4M` | `mkfs.ocsfs -L vmstore -N 32 -J 32M -E 4M -f /dev/sdb` |
 | Large (17–64 nodes) | `64` | `64M` | `8M` | `mkfs.ocsfs -L vmstore -N 64 -J 64M -E 8M -f /dev/sdb` |
-| Encrypted cluster | `8` | `16M` | `1M` | `mkfs.ocsfs -L secure -N 8 -J 16M -K -f /dev/sdb` |
+| Authenticated cluster | `8` | `16M` | `1M` | `mkfs.ocsfs -L authn -N 8 -J 16M -K -f /dev/sdb` |
 
 > Tip: `mkfs.ocsfs -N <n>` over-allocates spare AG-descriptor slots so the volume
 > can later be **grown online** (see §3) without relocating existing data.
@@ -389,7 +386,7 @@ mount -t ocsfs [-o <options>] <device> <mountpoint>
 |---|---|
 | *(none)* | **Full cluster mode.** The node claims a slot, registers an SCSI-3 PR key and uses hardware Compare-And-Write for locking. This is the correct mode for a shared LUN with PR + CAW. |
 | `degraded` | **Single-node only.** Skips PR registration and the "no PR support" safety refusal. Use for loopback images or PR-less iSCSI. **Never mount the same device from two nodes with `degraded`** — there is no fencing and you *will* corrupt the volume. |
-| `cluster_secret=<64 hex>` | **Required** for a volume formatted with `-K` (and for fscrypt). 64 hexadecimal characters = the 32-byte cluster secret. Generate once with `openssl rand -hex 32`; it must be identical on every node. |
+| `cluster_secret=<64 hex>` | **Required** for a volume formatted with `-K` (cluster-auth HMAC). 64 hexadecimal characters = the 32-byte cluster secret. Generate once with `openssl rand -hex 32`; it must be identical on every node. |
 | `heartbeat_timeout=<ms>` | Override the heartbeat death threshold (diagnostics / slow targets). |
 
 ```bash
@@ -399,7 +396,7 @@ mount -t ocsfs /dev/sdb /mnt/ocsfs
 # Single-node loopback (no PR)
 mount -t ocsfs -o degraded /dev/loop0 /mnt/ocsfs
 
-# Authenticated / encrypted volume
+# Authenticated volume (-K)
 mount -t ocsfs -o cluster_secret=$(cat /etc/ocsfs.secret) /dev/sdb /mnt/ocsfs
 
 # /etc/fstab (network-attached device → _netdev)
@@ -494,9 +491,7 @@ sudo ./tools/ocsfs-fsck --repair /dev/sdb
 | **Crash atomicity (allocation)** | The block bitmap is committed *before* the extent map references the new blocks, so a crash between the two transactions can only **leak** space (blocks marked used with no owner) — never double-allocate. `fsck` reclaims the leak; collapsing the two updates into a single transaction (no transient leak) is a future cleanup, not a correctness fix |
 | **Filesystem grow** | ✅ Online (mounted) and offline grow implemented via `ocsfs-grow` (`INCOMPAT_AG_GROW`); validated 3-node. *Open:* a single grow per volume (re-growing an already-grown volume is rejected); rescan the LUN on every node before peers use the new space |
 | **Integration tests** | No xfstests run yet; no long-haul soak |
-| **Encryption — ⚠️ NOT confidential (stores plaintext)** | **Do not rely on encryption for confidentiality.** The fscrypt key/policy ioctls now work on directory fds (fixed), but a file created in an encrypted directory is **not** marked encrypted (`IS_ENCRYPTED` is false at writeback), so its data is written to disk in **plaintext** — confirmed by reading the raw data block via O_DIRECT. Root cause is in the directory→child encryption-context inheritance (the new inode does not pick up the parent's fscrypt policy). The read path "decrypts" only because there is nothing to decrypt. Tracked as a critical fix |
-| **Encryption — I/O** | No readahead, no O_DIRECT on encrypted files; reflink/snapshot/symlink inside encrypted dirs return `-EOPNOTSUPP`. (Moot until the inheritance bug above is fixed.) |
-| **Encryption — keys** | fscrypt keys live in a shared encrypted key store on the LUN (ChaCha20-Poly1305 / cluster secret); enable with `mkfs.ocsfs -K`, requires `cluster_secret=` at mount; peers fetch via `ocsfs-tool keys restore` |
+| **Encryption — out of scope (removed)** | Per-file (fscrypt) encryption has been **removed and is not planned**. For a shared-SAN VM/container filesystem it is the wrong layer: it disables O_DIRECT and blocks reflink/snapshot — both central to VM disk images. **Encrypt at the SAN/LUN layer** (e.g. the TrueNAS zvol) **or inside the guest** (LUKS / qcow2 encryption) instead; both are transparent to OCSFS and do not penalise the data path. The `-K` flag still enables **cluster authentication** (HMAC on journal/lock records), which is unrelated to file encryption |
 | **Compression** | Write path runs on fsync for buffered files only; O_DIRECT writes are never compressed; a file with >16 compressed extents is decompressed on B+tree migration |
 | **Quota** | Quota *hooks* are present — block/inode charges fire on the data path and on reflink (logical accounting, like XFS) — but quota *enforcement* is not wired: there are no on-disk quota inodes and no `quotaon` path, so limits cannot be set yet (the charges are effectively dormant). Directory/extent-btree/xattr **metadata** blocks are also not charged. Wiring quota-file enablement (cluster-coherent) is the remaining work |
 | **Shared writable mmap** | `MAP_SHARED\|PROT_WRITE` returns `-EOPNOTSUPP` in *cluster* mode (works single-node); read-only and private-COW mappings always work |

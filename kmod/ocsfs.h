@@ -200,7 +200,7 @@ enum ocsfs_cas_backend {
 #define OCSFS_COMPRESS_NONE	0
 #define OCSFS_COMPRESS_LZ4	1
 #define OCSFS_COMPRESS_ZSTD	2
-#define OCSFS_FEAT_ENCRYPTION   (1ULL << 2)
+#define OCSFS_FEAT_ENCRYPTION   (1ULL << 2)  /* RETIRED — per-file fscrypt removed; never set on any volume. Bit reserved, do not reuse. */
 #define OCSFS_FEAT_SNAPSHOTS    (1ULL << 3)
 #define OCSFS_FEAT_DEDUP        (1ULL << 4)
 #define OCSFS_FEAT_MULTI_LUN    (1ULL << 5)
@@ -1489,55 +1489,12 @@ int ocsfs_vaai_xcopy(struct super_block *sb,
 /* flock.c — POSIX distributed file locking via on-disk DLM */
 int ocsfs_file_lock(struct file *file, int cmd, struct file_lock *fl);
 
-/* crypto.c — fscrypt integration (optional per-directory encryption) */
-#ifdef CONFIG_FS_ENCRYPTION
-extern const struct fscrypt_operations ocsfs_fscrypt_ops;
-
-/* ARCH-V3-1: cluster key store ioctls — require CAP_SYS_ADMIN */
-
-/* Entry returned by OCSFS_IOC_KEY_LIST: identifies a stored key without exposing
- * raw key material.  Caller uses kle_id + kle_spec_type to call
- * OCSFS_IOC_KEY_FETCH, which returns the decrypted raw key so the caller can then
- * invoke FS_IOC_ADD_ENCRYPTION_KEY locally on this node. */
-struct ocsfs_key_list_entry {
-	__u8  kle_id[16];        /* fscrypt key identifier (16 bytes) */
-	__u16 kle_spec_type;     /* FSCRYPT_KEY_SPEC_TYPE_DESCRIPTOR or _IDENTIFIER */
-	__u16 kle_key_size;      /* original key size in bytes */
-	__u32 kle_pad;
-};
-
-struct ocsfs_key_list_arg {
-	__u32 kla_count;                         /* in: capacity; out: actual count */
-	__u32 kla_pad;
-	struct ocsfs_key_list_entry kla_keys[OCSFS_KEY_STORE_MAX_ENTRIES];
-};
-
-/* Fetch the decrypted raw key for a given identifier.
- * On success kfa_key[0..kfa_key_size-1] holds the raw key material. */
-struct ocsfs_key_fetch_arg {
-	__u8  kfa_id[16];        /* in: key identifier to look up */
-	__u16 kfa_spec_type;     /* in: FSCRYPT_KEY_SPEC_TYPE_* */
-	__u16 kfa_key_size;      /* out: decrypted key size */
-	__u32 kfa_pad;
-	__u8  kfa_key[64];       /* out: raw key material (zeroed on error) */
-};
-
-#define OCSFS_IOC_KEY_LIST   _IOWR('O', 30, struct ocsfs_key_list_arg)
-#define OCSFS_IOC_KEY_FETCH  _IOWR('O', 31, struct ocsfs_key_fetch_arg)
-
-/* Kernel-internal key store API */
-struct fscrypt_key_specifier;  /* forward decl — full type in <linux/fscrypt.h> */
-int  ocsfs_key_store_add(struct super_block *sb,
-			  const struct fscrypt_key_specifier *spec,
-			  const u8 *raw_key, u16 key_size);
-int  ocsfs_key_store_list(struct super_block *sb,
-			   struct ocsfs_key_list_entry *out,
-			   u32 max_entries, u32 *out_count);
-int  ocsfs_key_store_fetch(struct super_block *sb,
-			    const u8 *key_id, u8 *out_key, u16 *out_size);
-void ocsfs_key_store_notify_mount(struct super_block *sb);
-#else /* !CONFIG_FS_ENCRYPTION */
-static inline void ocsfs_key_store_notify_mount(struct super_block *sb) {}
-#endif /* CONFIG_FS_ENCRYPTION */
+/*
+ * fscrypt per-directory encryption was removed: for a shared-SAN VM/container
+ * filesystem, encryption belongs at the SAN/LUN or guest layer (it conflicts
+ * with O_DIRECT and reflink/snapshot, which are central to VM disks).  The
+ * INCOMPAT_KEY_STORE feature bit stays in INCOMPAT_SUPP so volumes formatted
+ * with the old `-K` (cluster auth + key store) still mount.
+ */
 
 #endif /* _OCSFS_KMOD_H */

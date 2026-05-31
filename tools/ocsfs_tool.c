@@ -180,7 +180,6 @@ static void cmd_info(int fd)
     printf("  Features:        ");
     if (sb.s_feature_flags & OCSFS_FEAT_THIN_PROV)   printf(" thin-provisioning");
     if (sb.s_feature_flags & OCSFS_FEAT_COMPRESSION)  printf(" compression");
-    if (sb.s_feature_flags & OCSFS_FEAT_ENCRYPTION)   printf(" encryption");
     if (sb.s_feature_flags & OCSFS_FEAT_SNAPSHOTS)    printf(" snapshots");
     if (sb.s_feature_flags & OCSFS_FEAT_DEDUP)        printf(" dedup");
     if (sb.s_feature_flags & OCSFS_FEAT_MULTI_LUN)    printf(" multi-lun");

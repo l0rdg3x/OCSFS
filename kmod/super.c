@@ -485,9 +485,6 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_qcop    = &dquot_quotactl_sysfile_ops;
 	sb->dq_op     = &dquot_operations;
 	sb->s_quota_types = QTYPE_MASK_USR | QTYPE_MASK_GRP | QTYPE_MASK_PRJ;
-#ifdef CONFIG_FS_ENCRYPTION
-	sb->s_cop = &ocsfs_fscrypt_ops;
-#endif
 
 	/* Load allocation group descriptors */
 	ret = ocsfs_load_ags(sb);
@@ -577,10 +574,6 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		sync_dirty_buffer(bh);
 		ocsfs_update_super_mirror(sb);
 	}
-
-	/* ARCH-V3-1: log keys present in shared store so admins know which
-	 * FS_IOC_ADD_ENCRYPTION_KEY calls are needed on this node. */
-	ocsfs_key_store_notify_mount(sb);
 
 	pr_info("ocsfs: mounted \"%.64s\" AGs=%u free=%llu slot=%u%s%s\n",
 		ds->s_label, sbi->s_ag_count, sbi->s_free_blocks, sbi->s_node_slot,
