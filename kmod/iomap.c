@@ -300,37 +300,64 @@ ssize_t ocsfs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	struct inode *inode = file_inode(iocb->ki_filp);
 	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
+	bool fresh = false;
 	ssize_t ret;
 
 	if (sbi->s_clustered) {
-		ret = ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
-					 OCSFS_LOCK_SH);
+		ret = ocsfs_lock_acquire_fresh(inode->i_sb, &oi->i_lock_res,
+					       OCSFS_LOCK_SH, &fresh);
 		if (ret)
 			return ret;
-		ret = ocsfs_inode_refresh(inode);
-		if (ret) {
-			ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
-			return ret;
-		}
 		/*
-		 * ARCH-7: selective page cache invalidation.
-		 *
-		 * - Same writer (local fast-path): our cache is coherent,
-		 *   no invalidation needed.
-		 * - Known range (lo < hi): invalidate only the pages the last
-		 *   EX holder dirtied — avoids thrashing clean read-only pages.
-		 * - No range info (lo == hi == 0): fall back to full invalidation
-		 *   to guarantee correctness (epoch jumped >1 or first access).
+		 * PERF (random-read hot path): only re-read the inode and
+		 * invalidate the page cache on a *fresh* cross-node acquire.  A
+		 * cache-hit re-acquire (we were lazily holding SH — or EX from a
+		 * preceding write — since our last access) proves no peer took EX
+		 * in between, so nothing on disk changed and our cache is coherent.
+		 * Skipping the per-read forced inode read here is what lets random
+		 * O_DIRECT reads run at device speed instead of one SAN round-trip
+		 * per 4 KiB.  The lock is released lazily below so a sustained read
+		 * stream re-takes it as a cache hit.
 		 */
-		if (oi->i_last_writer_slot == sbi->s_node_slot) {
-			/* we were the last EX holder: cache is still valid */
-		} else if (oi->i_lock_res.lr_inv_lo < oi->i_lock_res.lr_inv_hi) {
-			pgoff_t lo_pg = oi->i_lock_res.lr_inv_lo >> PAGE_SHIFT;
-			pgoff_t hi_pg = (oi->i_lock_res.lr_inv_hi - 1) >> PAGE_SHIFT;
+		if (fresh) {
+			ret = ocsfs_inode_refresh(inode);
+			if (ret) {
+				ocsfs_lock_release_lazy(inode->i_sb,
+							&oi->i_lock_res);
+				return ret;
+			}
+			/*
+			 * ARCH-7: page cache invalidation on a *fresh* acquire.
+			 *
+			 * A fresh acquire means we did NOT hold the lock
+			 * continuously since our last access — a peer took EX in
+			 * between and may have written.  So our cached pages may be
+			 * stale and MUST be dropped before the read below repopulates
+			 * from disk.  Use the dirty range the previous EX holder
+			 * published (lr_inv_lo/hi) when available, else invalidate the
+			 * whole mapping.
+			 *
+			 * We deliberately do NOT short-circuit on
+			 * i_last_writer_slot == s_node_slot here: that field is a
+			 * node-local hint that a peer's write does not clear, so
+			 * "we wrote last" can be false after a peer EX and would
+			 * wrongly skip invalidation, serving stale data on buffered
+			 * reads (cross-node coherence bug).  The cache-hit case (we
+			 * really did hold the lock throughout) is already handled by
+			 * the !fresh path, which skips invalidation entirely.
+			 */
+			if (oi->i_lock_res.lr_inv_lo <
+			    oi->i_lock_res.lr_inv_hi) {
+				pgoff_t lo_pg =
+					oi->i_lock_res.lr_inv_lo >> PAGE_SHIFT;
+				pgoff_t hi_pg =
+					(oi->i_lock_res.lr_inv_hi - 1) >> PAGE_SHIFT;
 
-			invalidate_mapping_pages(inode->i_mapping, lo_pg, hi_pg);
-		} else {
-			invalidate_inode_pages2(inode->i_mapping);
+				invalidate_mapping_pages(inode->i_mapping,
+							 lo_pg, hi_pg);
+			} else {
+				invalidate_inode_pages2(inode->i_mapping);
+			}
 		}
 	}
 
@@ -341,7 +368,7 @@ ssize_t ocsfs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		ret = filemap_read(iocb, to, 0);
 
 	if (sbi->s_clustered)
-		ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
+		ocsfs_lock_release_lazy(inode->i_sb, &oi->i_lock_res);
 
 	return ret;
 }
@@ -355,6 +382,7 @@ ssize_t ocsfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	loff_t start_pos = 0; /* ARCH-7: write start for dirty range tracking */
 	loff_t i_size_before = 0;
 	bool   meta_changed = false;
+	bool   fresh = false;
 
 	/*
 	 * Lock ordering: inode_lock → DLM EX.
@@ -367,22 +395,37 @@ ssize_t ocsfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	inode_lock(inode);
 
 	if (sbi->s_clustered) {
-		ret = ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
-					 OCSFS_LOCK_EX);
+		ret = ocsfs_lock_acquire_fresh(inode->i_sb, &oi->i_lock_res,
+					       OCSFS_LOCK_EX, &fresh);
 		if (ret)
 			goto out_unlock;
 		/*
-		 * ARCH-7 write-path selective invalidation.
+		 * ARCH-7 write-path page cache invalidation, on a *fresh* acquire
+		 * only.  A fresh EX acquire means a peer held EX in between and may
+		 * have written, so any cached pages may be stale and must be
+		 * dropped before a buffered read-modify-write reads them.  Use the
+		 * previous EX holder's published dirty range (lr_inv_lo/hi) when
+		 * available, else invalidate the whole mapping.  On a cache hit we
+		 * held EX throughout, so the cache is coherent — skip.
 		 *
-		 * lock_acquire(EX) captured the previous EX holder's dirty range
-		 * in lr_inv_lo/lr_inv_hi.  If we were the last writer our cache
-		 * is coherent — skip.  Otherwise invalidate only the range that
-		 * the previous EX holder actually dirtied; pages outside that
-		 * range are still valid.  If no range was recorded, fall back to
-		 * full invalidation.  After invalidation, zero lr_inv_lo/hi so
-		 * iomap_end starts tracking only this write's range.
+		 * We must NOT gate on i_last_writer_slot == s_node_slot: it is a
+		 * node-local hint that a peer's write does not clear, so it would
+		 * wrongly skip invalidation after a peer EX (cross-node coherence
+		 * bug).  After invalidation, zero lr_inv_lo/hi so iomap_end starts
+		 * tracking only this write's range.
 		 */
-		if (oi->i_last_writer_slot != sbi->s_node_slot) {
+		if (fresh) {
+			/*
+			 * A peer held EX since our last access: pull in its
+			 * flushed i_size / extent map before we map and write, so
+			 * we don't allocate over or past the peer's changes.
+			 */
+			ret = ocsfs_inode_refresh(inode);
+			if (ret) {
+				ocsfs_lock_release_lazy(inode->i_sb,
+							&oi->i_lock_res);
+				goto out_unlock;
+			}
 			if (oi->i_lock_res.lr_inv_lo < oi->i_lock_res.lr_inv_hi) {
 				pgoff_t lo_pg = oi->i_lock_res.lr_inv_lo >> PAGE_SHIFT;
 				pgoff_t hi_pg =

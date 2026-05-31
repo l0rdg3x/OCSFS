@@ -54,6 +54,9 @@ static int lr_write_entry(struct super_block *sb, struct ocsfs_lock_res *lr,
  * table (a peer may have changed it) WITHOUT clobbering a concurrent same-node
  * allocation's uncommitted marks (those come through as cache hits).
  */
+static int lock_release_ondisk_locked(struct super_block *sb,
+				      struct ocsfs_lock_res *lr);
+
 static int lock_acquire_impl(struct super_block *sb, struct ocsfs_lock_res *lr,
 			     u16 mode, bool *was_fresh)
 {
@@ -114,6 +117,23 @@ static int lock_acquire_impl(struct super_block *sb, struct ocsfs_lock_res *lr,
 					   msecs_to_jiffies(1000));
 			mutex_lock(&lr->lr_mutex);
 		}
+	}
+
+	/*
+	 * Self SH->stronger upgrade.  The read path (ocsfs_file_read_iter) now
+	 * releases the inode SH *lazily*, so this node can still own its on-disk
+	 * SH holder bit when a following write on the same inode asks for EX.  A
+	 * normal acquire would then read the disk lock, see an SH holder (us),
+	 * find SH incompatible with EX, and block on our own grant until the
+	 * acquire deadline.  Drop our lazy SH first — a real on-disk release of
+	 * just our holder bit — so the EX acquire below starts from NL with no
+	 * self-conflict.  Only when nothing actively holds it locally
+	 * (lr_hold == 0); an active same-node SH holder means a concurrent read
+	 * is in flight and the EX request must wait for it the normal way.
+	 */
+	if (mode > OCSFS_LOCK_SH && lr->lr_lazy && lr->lr_hold == 0 &&
+	    lr->lr_mode == OCSFS_LOCK_SH) {
+		lock_release_ondisk_locked(sb, lr);  /* lr_mode -> NL */
 	}
 
 	/*

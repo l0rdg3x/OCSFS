@@ -215,6 +215,24 @@ int ocsfs_refcount_get(struct super_block *sb, u64 phys_block,
 	rctx.ag_no = ag->ag_no;
 	rctx.txn   = NULL;   /* read-only path: rc_bt_alloc must not see a stale txn */
 
+	/*
+	 * PERF fast path (random-write hot path): an AG with no refcount btree
+	 * has no shared blocks, so every allocated block is implicitly refcount
+	 * 1.  Read rc_btree_root locklessly and skip the DLM round-trip.
+	 *
+	 * This is *behaviourally identical* to taking the SH lock below and then
+	 * finding root == 0: the lock never refreshes rc_btree_root (it only
+	 * serialises a tree *walk* against a concurrent rc_apply_delta), and the
+	 * root read here is the same in-memory field the locked path reads.  But
+	 * it removes two forced lock-block reads from every call — and needs_cow()
+	 * calls us once per write, so on a plain (un-shared) VM disk image this
+	 * was ~2 synchronous SAN round-trips per 4 KiB random write.
+	 */
+	if (!READ_ONCE(ag->rc_btree_root)) {
+		*refcount_out = 1;
+		return 0;
+	}
+
 	ret = ocsfs_lock_acquire(sb, &ag->ag_rc_lock_res, OCSFS_LOCK_SH);
 	if (ret)
 		return ret;
