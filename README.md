@@ -49,10 +49,11 @@ locking and SCSI-3 Persistent Reservations for fencing.
 ## 🚦 Status & validation
 
 > [!WARNING]
-> **Alpha / Research.** Both the single-node data path and **basic two-node
-> cross-node coherence are now validated on real hardware.** Cluster recovery,
-> fencing under real failures, and xfstests are still pending. Not
-> production-ready.
+> **Alpha / Research.** The single-node data path, **2- and 3-node cross-node
+> coherence**, and **real node-crash recovery with SCSI-PR fencing** are validated
+> on real hardware. Still open: metadata throughput under heavy concurrent load
+> (CAW-bound), xfstests, and long-haul soak. **Not production-ready — do not use
+> with data that matters.**
 
 ### What's validated on real hardware
 
@@ -77,9 +78,9 @@ clean `fsck` and **zero kernel warnings**:
 - ✅ **writer-priority fairness**: an exclusive writer is never starved by a
   continuous reader stream (worst lock-acquire ≤ 8 ms vs. a former 30 s timeout)
 
-**Two nodes**, both mounting the same LUN read-write concurrently (slot 0 +
-slot 1, distinct PR keys, hardware CAW), clean `fsck`, **zero warnings on
-either node**:
+**Two and three nodes**, all mounting the same LUN read-write concurrently
+(distinct slots and PR keys, hardware CAW), clean `fsck`, **zero kernel
+warnings**:
 
 - ✅ **cross-node write → read coherence** (both directions): a file written on
   one node reads back identically on the other
@@ -119,14 +120,14 @@ either node**:
 | Scenario | Score | Basis |
 |---|--:|---|
 | Single-node read/write (real SAN, full cluster) | ~94% | validated on hardware |
-| Multi-node — coherence, stable workload | ~90% | basic 2-node validated on hardware |
-| Multi-node — crash + recovery | ~85% † | structural estimate |
-| Multi-node — with encryption | ~85% † | structural estimate |
+| Multi-node — coherence (create/delete/rename, 2–3 nodes) | ~92% | validated on hardware |
+| Multi-node — crash recovery + PR fencing | ~88% | validated on hardware (one induced crash) |
+| Multi-node — metadata throughput under heavy load | ~70% | CAW-bound; lock-leasing in progress |
+| Multi-node — with encryption | ~85% † | not yet exercised under node failure |
 | VMFS feature parity | ~72% | feature comparison |
 
-† Not yet validated under real node failures. See
-[`docs/developer-guide.md`](docs/developer-guide.md) for the full changelog and
-the per-sprint correctness history.
+† See [`docs/developer-guide.md`](docs/developer-guide.md) for the full changelog
+and the per-sprint correctness history.
 
 ---
 
@@ -353,11 +354,12 @@ ocsfs/
 
 ## 🗺️ Roadmap
 
-1. ✅ ~~Real two-node cross-node coherence~~ — **done, validated on hardware**
-2. **Cluster recovery & fencing under real node failure** — kill a live node, verify peer recovery + SCSI-PR fencing
-3. Cross-node **block-bitmap coherence** (DLM-acquire-time invalidation) and inode-block write serialisation
-4. **xfstests** `quick`+`auto` on a clustered testbed
-5. Out-of-band STONITH integration; online `fsck` / scrub hardening
+1. ✅ ~~2- and 3-node cross-node coherence (read/write, directory, rename)~~ — validated on hardware
+2. ✅ ~~Cluster recovery & SCSI-PR fencing under a real node crash~~ — validated on hardware
+3. **Metadata throughput under heavy load** — reduce the per-op SCSI CAW (lock leasing) so a hot lock can't saturate the target's CAW path
+4. **Online filesystem grow** when the backing LUN is expanded
+5. **xfstests** `quick`+`auto` on a clustered testbed
+6. Recovery hardening (parallel multi-node recovery, self-recovery of own stale locks) and out-of-band STONITH
 
 ---
 
