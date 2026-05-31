@@ -746,6 +746,36 @@ static void ocsfs_lazy_revoke_fn(struct work_struct *work)
 		iput(batch[i]);
 	}
 
+	/*
+	 * Also sweep the AG locks (block/inode allocator), which are released
+	 * lazily by ocsfs_txn_release_locks().  They live in s_ags[] for the whole
+	 * sb lifetime, so no igrab is needed.  Same policy: if a lazily-held AG
+	 * lock has no active local holder and a peer is waiting on disk, perform
+	 * the real release so the peer can allocate.
+	 */
+	{
+		u32 a;
+
+		for (a = 0; a < sbi->s_ag_count; a++) {
+			struct ocsfs_lock_res *lr = &sbi->s_ags[a].ag_lock_res;
+			struct ocsfs_disk_lock dl;
+			struct buffer_head *bh;
+
+			if (!lr->lr_lazy)        /* racy peek; re-checked under mutex */
+				continue;
+			mutex_lock(&lr->lr_mutex);
+			if (lr->lr_lazy && lr->lr_hold == 0 &&
+			    lr_read_entry(sb, lr, &dl, &bh) == 0) {
+				bool waited = has_waiters(&dl);
+
+				brelse(bh);
+				if (waited)
+					lock_release_ondisk_locked(sb, lr);
+			}
+			mutex_unlock(&lr->lr_mutex);
+		}
+	}
+
 reschedule:
 	if (sbi->s_clustered)
 		queue_delayed_work(system_wq, &sbi->s_lazy_revoke_work,

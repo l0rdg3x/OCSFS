@@ -387,14 +387,25 @@ void ocsfs_txn_defer_unlock(struct ocsfs_txn *txn, struct ocsfs_lock_res *lr)
 	list_add_tail(&tl->list, &txn->t_locks);
 }
 
-/* Release all locks deferred via ocsfs_txn_defer_unlock(). */
+/* Release all locks deferred via ocsfs_txn_defer_unlock().
+ *
+ * These are AG locks (block/inode allocator).  We release them *lazily*: the
+ * on-disk lock stays held so this node's next allocation in the same AG is a
+ * cache hit with no SCSI-CAW round-trip.  Holding it past commit keeps the
+ * cross-node invariant (the allocation is durable on disk before any peer can
+ * acquire the AG and read the bitmap) — in fact strengthens it.  A peer that
+ * needs the AG sets a waiter bit on disk and the lazy-revoke sweep performs the
+ * real release within one interval; unmount and crash-recovery really-release.
+ * Under the common VM-disk workload each node allocates from its own AG (via
+ * ag_hint), so this turns O(allocs) CAWs into ~one per AG handoff.
+ */
 static void ocsfs_txn_release_locks(struct ocsfs_txn *txn)
 {
 	struct ocsfs_txn_lock *tl, *tmp;
 	struct super_block *sb = txn->t_journal->j_sb;
 
 	list_for_each_entry_safe(tl, tmp, &txn->t_locks, list) {
-		ocsfs_lock_release(sb, tl->lr);
+		ocsfs_lock_release_lazy(sb, tl->lr);
 		list_del(&tl->list);
 		kfree(tl);
 	}

@@ -603,6 +603,21 @@ void ocsfs_put_super(struct super_block *sb)
 	ocsfs_debugfs_exit(sb);
 	ocsfs_dedup_scrub_stop(sb);
 	ocsfs_lazy_revoke_stop(sb);
+	/*
+	 * Really-release any AG locks the allocator left held lazily, so we don't
+	 * strand them on disk (held EX by a now-departing slot) for the next mount
+	 * or a peer to have to recover.  The sweep is already stopped, so no race.
+	 */
+	if (sbi->s_clustered && sbi->s_ags) {
+		u32 a;
+
+		for (a = 0; a < sbi->s_ag_count; a++) {
+			struct ocsfs_lock_res *lr = &sbi->s_ags[a].ag_lock_res;
+
+			if (lr->lr_lazy || lr->lr_mode != OCSFS_LOCK_NL)
+				ocsfs_lock_release(sb, lr);
+		}
+	}
 	ocsfs_journal_exit(sb);   /* flush journal before releasing cluster slot */
 	ocsfs_cluster_exit(sb);
 	ocsfs_comp_pool_destroy(sbi);
