@@ -314,15 +314,21 @@ sudo ./tools/ocsfs-fsck --repair /dev/sdb
 
 | Area | Status |
 |---|---|
-| **Multi-node coherence** | 2- and 3-node read/write/overwrite plus **concurrent same-directory create/delete/churn coherence validated on real hardware** (the directory lost-update class — stale `i_size`/extent rollback and stale dirent/B+tree reads — is fixed). Cross-node **rename** churn lacks a dedicated 3-node stress run |
-| **Cluster recovery & fencing** | Implemented; not yet exercised by killing a live node in a 2-node cluster |
-| **Integration tests** | No xfstests run yet |
-| **Encryption — I/O** | No readahead, no O_DIRECT; reflink/snapshot/symlink inside encrypted dirs return `-EOPNOTSUPP` |
-| **Encryption — keys** | fscrypt keys live in a shared encrypted key store on the LUN (ChaCha20-Poly1305 / cluster secret); peers fetch via `ocsfs-tool keys restore`. Enable with `mkfs.ocsfs -K`; requires `cluster_secret=` at mount |
-| **Compression write path** | Applied on fsync for buffered files only; O_DIRECT writes are never compressed |
-| **Shared writable mmap** | `MAP_SHARED\|PROT_WRITE` returns `-EOPNOTSUPP` in *cluster* mode (works single-node); read-only and private COW mappings always work |
-| **STONITH** | Fencing uses SCSI PR; out-of-band STONITH (PDU/iDRAC) is not wired |
+| **Metadata scaling under heavy load** | The on-disk DLM does a SCSI CAW per lock acquire/release. Under sustained concurrent metadata churn on a *hot* lock (e.g. a shared directory) acquires can hit the 30 s timeout as the target's CAW path saturates (the op fails, the node stays up). The per-block CAW storm on delete/truncate is fixed; reducing the general per-op CAW (lock leasing) is the open scaling item |
+| **Multi-node coherence** | ✅ Validated on real hardware (2- and 3-node): read/write/overwrite, concurrent same-directory create/delete/churn, and concurrent rename (within-dir, cross-dir, mixed) all converge correctly with a clean `fsck` |
+| **Cluster recovery & fencing** | ✅ Real node-crash recovery validated: a survivor detects the death, **SCSI-PR preempt-and-abort** fences the dead node, replays its journal and recovers its locks; survivors stay online with data intact, and the crashed node reboots and rejoins. **Self-fencing** quiesces a node that can't write its heartbeat. *Open:* a falsely-recovered-then-rejoining node can be left with stale previous-generation locks under extreme load |
+| **Fencing method** | SCSI-3 Persistent Reservations only; out-of-band STONITH (PDU / iDRAC / IPMI) is not wired |
 | **Recovery concurrency** | One dead node recovered at a time; a second simultaneous failure is queued |
+| **Slot-claim / refcount TOCTOU** | Node-table slot claim and cross-node refcount updates are CAW-serialised but retain a small TOCTOU window (architectural) |
+| **Crash atomicity** | Extent-map and bitmap updates commit as two separate journal transactions (tiny crash window between them); `fsck` reconciles |
+| **Online grow** | No online/offline filesystem grow yet when the backing LUN is expanded (planned) |
+| **Integration tests** | No xfstests run yet; no long-haul soak / perf tuning |
+| **Encryption — I/O** | No readahead, no O_DIRECT on encrypted files; reflink/snapshot/symlink inside encrypted dirs return `-EOPNOTSUPP` |
+| **Encryption — keys** | fscrypt keys live in a shared encrypted key store on the LUN (ChaCha20-Poly1305 / cluster secret); enable with `mkfs.ocsfs -K`, requires `cluster_secret=` at mount; peers fetch via `ocsfs-tool keys restore` |
+| **Compression** | Write path runs on fsync for buffered files only; O_DIRECT writes are never compressed; a file with >16 compressed extents is decompressed on B+tree migration |
+| **Quota** | Block quota does not account for CoW/snapshot sharing or directory/metadata blocks |
+| **Shared writable mmap** | `MAP_SHARED\|PROT_WRITE` returns `-EOPNOTSUPP` in *cluster* mode (works single-node); read-only and private-COW mappings always work |
+| **Maturity** | Alpha / research — not production-ready |
 
 ---
 
