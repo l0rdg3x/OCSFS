@@ -117,6 +117,7 @@
 #define OCSFS_FEATURE_INCOMPAT_EXT_FLAGS4       (1ULL << 2)  /* ARCH-V3-4: 4-bit extent flags */
 #define OCSFS_FEATURE_INCOMPAT_JOURNAL_HMAC     (1ULL << 3)  /* ALTO-V3-10: HMAC on COMMIT */
 #define OCSFS_FEATURE_INCOMPAT_KEY_STORE        (1ULL << 4)  /* ARCH-V3-1: shared key store */
+#define OCSFS_FEATURE_INCOMPAT_AG_GROW          (1ULL << 5)  /* grow: extension AG-descriptor region */
 #define OCSFS_FEATURE_RO_COMPAT_SELECTIVE_INV   (1ULL << 0)  /* ARCH-7 */
 #define OCSFS_FEATURE_RO_COMPAT_HB_SUMMARY      (1ULL << 1)  /* ARCH-3: HB O(1) summary block */
 #define OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB     (1ULL << 2)  /* ARCH-6 */
@@ -229,7 +230,13 @@ struct ocsfs_superblock {
     uint64_t    s_feature_ro_compat;
     uint32_t    s_lock_primary_count; /* 0 = use legacy 4096 */
     uint64_t    s_dedup_index_root;  /* cross-file dedup DDT root, 0 = empty */
-    uint8_t     s_reserved[3850];    /* was 3858; 8 carved for s_dedup_index_root */
+    /* AG grow (INCOMPAT_AG_GROW): descriptors for AGs added by an online/offline
+     * grow live in an extension region (the primary region has no slack).
+     * s_ag_desc_primary_count = AGs in the primary region [s_ag_desc_off];
+     * s_ag_desc_ext_off = byte offset of the extension region (0 = none). */
+    uint32_t    s_ag_desc_primary_count; /* 0 = legacy: all AGs in primary */
+    uint64_t    s_ag_desc_ext_off;       /* extension AG-descriptor region, 0 = none */
+    uint8_t     s_reserved[3838];    /* 3850 - 12 carved for AG-grow fields */
     uint32_t    s_checksum;         /* CRC32C of bytes 0..4091 */
 } __attribute__((packed));
 

@@ -194,6 +194,21 @@ static int ocsfs_validate_super(struct ocsfs_disk_super *ds,
 	return 0;
 }
 
+/* Byte offset of AG @i's on-disk descriptor.  AGs below the primary count live
+ * in the primary region at s_ag_desc_off; the rest (added by a grow) live in the
+ * extension region at s_ag_desc_ext_off.  primary_count == 0 is legacy/no-grow:
+ * every descriptor is in the primary region (unchanged behaviour). */
+static u64 ocsfs_ag_desc_byte_off(struct ocsfs_sb_info *sbi, u32 i)
+{
+	u32 primary = sbi->s_ag_desc_primary_count;
+
+	if (primary == 0 || i < primary)
+		return sbi->s_ag_desc_off +
+		       (u64)i * sizeof(struct ocsfs_disk_ag);
+	return sbi->s_ag_desc_ext_off +
+	       (u64)(i - primary) * sizeof(struct ocsfs_disk_ag);
+}
+
 /* load allocation groups */
 static int ocsfs_load_ags(struct super_block *sb)
 {
@@ -212,7 +227,7 @@ static int ocsfs_load_ags(struct super_block *sb)
 		struct ocsfs_ag_info *ag = &sbi->s_ags[i];
 
 		ag_desc_block = ocsfs_byte_to_block(sbi,
-				sbi->s_ag_desc_off + (u64)i * sizeof(*dag));
+				ocsfs_ag_desc_byte_off(sbi, i));
 		bh = sb_bread(sb, ag_desc_block);
 		if (!bh) {
 			pr_err("ocsfs: failed to read AG %u descriptor\n", i);
@@ -427,6 +442,10 @@ int ocsfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sbi->s_dedup_index_root      = le64_to_cpu(ds->s_dedup_index_root);
 	sbi->s_data_off = le64_to_cpu(ds->s_data_off);
 	sbi->s_ag_desc_off = le64_to_cpu(ds->s_ag_desc_off);
+	/* AG grow: descriptors for AGs >= s_ag_desc_primary_count live in the
+	 * extension region.  0 = legacy / no grow → all AGs in the primary region. */
+	sbi->s_ag_desc_primary_count = le32_to_cpu(ds->s_ag_desc_primary_count);
+	sbi->s_ag_desc_ext_off       = le64_to_cpu(ds->s_ag_desc_ext_off);
 	sbi->s_ext_flags4 = !!(sbi->s_feature_incompat &
 			       OCSFS_FEATURE_INCOMPAT_EXT_FLAGS4);
 
@@ -682,7 +701,7 @@ int ocsfs_sync_fs(struct super_block *sb, int wait)
 	/* Persist per-AG free counts to AG descriptor blocks */
 	for (i = 0; i < sbi->s_ag_count; i++) {
 		struct ocsfs_ag_info *ag = &sbi->s_ags[i];
-		u64 off  = sbi->s_ag_desc_off + (u64)i * sizeof(struct ocsfs_disk_ag);
+		u64 off  = ocsfs_ag_desc_byte_off(sbi, i);
 		u64 blk  = ocsfs_byte_to_block(sbi, off);
 		/*
 		 * Read-modify-write: we only update the mutable counters but

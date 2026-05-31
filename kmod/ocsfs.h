@@ -225,6 +225,7 @@ enum ocsfs_cas_backend {
 #define OCSFS_FEATURE_INCOMPAT_EXT_FLAGS4       (1ULL << 2)  /* ARCH-V3-4: 4-bit extent flags */
 #define OCSFS_FEATURE_INCOMPAT_JOURNAL_HMAC     (1ULL << 3)  /* ALTO-V3-10: HMAC on COMMIT records */
 #define OCSFS_FEATURE_INCOMPAT_KEY_STORE        (1ULL << 4)  /* ARCH-V3-1: shared encrypted key store */
+#define OCSFS_FEATURE_INCOMPAT_AG_GROW          (1ULL << 5)  /* extension AG-descriptor region (grow) */
 
 /* RO_COMPAT bits — read-write-semantic features */
 #define OCSFS_FEATURE_RO_COMPAT_SELECTIVE_INV   (1ULL << 0)  /* ARCH-7 */
@@ -237,7 +238,8 @@ enum ocsfs_cas_backend {
 					 OCSFS_FEATURE_INCOMPAT_RC_BTREE_PER_AG | \
 					 OCSFS_FEATURE_INCOMPAT_EXT_FLAGS4       | \
 					 OCSFS_FEATURE_INCOMPAT_JOURNAL_HMAC     | \
-					 OCSFS_FEATURE_INCOMPAT_KEY_STORE)
+					 OCSFS_FEATURE_INCOMPAT_KEY_STORE        | \
+					 OCSFS_FEATURE_INCOMPAT_AG_GROW)
 #define OCSFS_FEATURE_RO_COMPAT_SUPP    (OCSFS_FEATURE_RO_COMPAT_SELECTIVE_INV | \
 					 OCSFS_FEATURE_RO_COMPAT_HB_SUMMARY | \
 					 OCSFS_FEATURE_RO_COMPAT_DEDUP_SCRUB | \
@@ -422,7 +424,14 @@ struct ocsfs_disk_super {
 	 * (OCSFS_FEATURE_RO_COMPAT_DEDUP_INDEX). 0 = empty/not yet created.
 	 * Carved from s_reserved (8 bytes). */
 	__le64  s_dedup_index_root;
-	__u8    s_reserved[3850];   /* was 3858; reduced 8 for s_dedup_index_root */
+	/* AG grow (INCOMPAT_AG_GROW) — carved from s_reserved (12 bytes).
+	 * s_ag_desc_primary_count = AGs whose descriptors are in the primary region
+	 * at s_ag_desc_off; descriptors for AGs grown beyond that live in the
+	 * extension region at s_ag_desc_ext_off (each holds an absolute geometry so
+	 * existing AGs never move).  0 = legacy (all AGs in the primary region). */
+	__le32  s_ag_desc_primary_count;
+	__le64  s_ag_desc_ext_off;
+	__u8    s_reserved[3838];   /* 3850 - 12 for AG-grow fields */
 	__le32  s_checksum;
 } __packed;
 
@@ -798,6 +807,8 @@ struct ocsfs_sb_info {
 	u32             s_lock_primary_count;    /* 0 = legacy (OCSFS_LOCK_ENTRY_COUNT) */
 	u64             s_data_off;             /* first data byte */
 	u64             s_ag_desc_off;
+	u32             s_ag_desc_primary_count; /* AGs in the primary desc region; 0 = legacy (all) */
+	u64             s_ag_desc_ext_off;       /* extension AG-desc region byte offset, 0 = none */
 	/* ARCH-V3-4: true when OCSFS_FEATURE_INCOMPAT_EXT_FLAGS4 is set */
 	bool            s_ext_flags4;
 

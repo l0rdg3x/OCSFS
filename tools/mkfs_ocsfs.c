@@ -258,6 +258,10 @@ static void format_device(int fd, uint64_t dev_size)
     sb.s_lock_table_off = OCSFS_LOCK_TABLE_OFF;
     sb.s_journal_off = ocsfs_journal_offset();
     sb.s_ag_desc_off = ag_desc_off;
+    /* All AGs are in the primary descriptor region at creation; a later grow adds
+     * an extension region (s_ag_desc_ext_off) and sets INCOMPAT_AG_GROW. */
+    sb.s_ag_desc_primary_count = ag_count;
+    sb.s_ag_desc_ext_off = 0;
     sb.s_data_off = data_start;
     sb.s_mkfs_time = now_ns();
     sb.s_mount_count = 0;
