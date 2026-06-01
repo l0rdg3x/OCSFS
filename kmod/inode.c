@@ -11,6 +11,7 @@
 #include <linux/fileattr.h>
 #include <linux/quotaops.h>
 #include <linux/bio.h>
+#include <linux/iomap.h>
 #include "ocsfs.h"
 
 /* ═══════════════════════════════════════════════════════════════
@@ -845,7 +846,39 @@ int ocsfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 					 sbi->s_block_size;
 
 			/*
-			 * truncate_setsize first: shrinks i_size and invalidates
+			 * Zero the partial tail of the last data block ON DISK
+			 * before shrinking i_size.  truncate_setsize() only zeroes
+			 * the page-cache tail of that block; the folio is then above
+			 * the new EOF, so iomap writeback never persists it and the
+			 * stale bytes survive on disk.  A later extend (ftruncate up
+			 * / fallocate / reflink) re-exposes that block and a
+			 * cache-cold read returns the pre-truncate data (caught by
+			 * fsx: truncate to a sub-block size then extend → stale tail
+			 * read from disk).  iomap_truncate_page() zeroes
+			 * [ia_size, end-of-block) through the write path while the
+			 * block is still within i_size; flush it so the zeroed tail
+			 * reaches disk before truncate_setsize() drops EOF below it.
+			 * Block-aligned truncations and UNWRITTEN/hole tails (which
+			 * already read zero) are skipped.
+			 */
+			if (attr->ia_size & (sbi->s_block_size - 1)) {
+				ret = iomap_truncate_page(inode, attr->ia_size,
+							  NULL, &ocsfs_iomap_ops,
+							  NULL, NULL);
+				if (ret) {
+					if (sbi->s_clustered)
+						ocsfs_lock_release(inode->i_sb,
+							&oi->i_lock_res);
+					return ret;
+				}
+				filemap_write_and_wait_range(inode->i_mapping,
+					attr->ia_size,
+					round_up(attr->ia_size,
+						 sbi->s_block_size) - 1);
+			}
+
+			/*
+			 * truncate_setsize: shrinks i_size and invalidates
 			 * page cache + mmap mappings before we free blocks.
 			 * This prevents mmap faults on freed blocks in the window
 			 * between extent_truncate and truncate_setsize.
