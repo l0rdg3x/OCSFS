@@ -837,6 +837,10 @@ int ocsfs_extent_btree_punch_hole(struct inode *inode,
 	u64 search_from;
 	u64 saved_blocks;
 	int safety = 65536;
+	/* Punched physical ranges, freed REFCOUNT-AWARE after the btree txn
+	 * commits (see the free site and the matching truncate path). */
+	struct { u64 phys; u32 len; } *fb = NULL;
+	u32 fb_n = 0, fb_cap = 0;
 	u32 i;
 	int ret;
 
@@ -939,10 +943,31 @@ int ocsfs_extent_btree_punch_hole(struct inode *inode,
 					u32 free_len   = (u32)(free_end - free_start);
 
 					if (free_len && !(flags & OCSFS_EXT_UNWRITTEN)) {
-						ret = ocsfs_free_blocks_txn(txn,
-								phys, free_len);
-						if (ret)
-							goto abort;
+						/* Defer to AFTER the txn commits and free
+						 * REFCOUNT-AWARE: a punched block may be shared
+						 * (reflink/clone/dedup) and ocsfs_free_blocks_txn()
+						 * would clear its bitmap bit while other owners
+						 * still reference it (refcount stays > 1) — the
+						 * allocator then hands the still-referenced block
+						 * back out and a later CoW self-deadlocks /
+						 * cross-links.  ocsfs_free_blocks_rc() must also run
+						 * with NO open txn (it takes the AG refcount lock
+						 * then its own txn).  Mirrors the truncate path. */
+						if (fb_n == fb_cap) {
+							u32 nc = fb_cap ? fb_cap * 2 : 64;
+							void *nf = krealloc_array(fb, nc,
+									sizeof(*fb), GFP_NOFS);
+
+							if (!nf) {
+								ret = -ENOMEM;
+								goto abort;
+							}
+							fb = nf;
+							fb_cap = nc;
+						}
+						fb[fb_n].phys = phys;
+						fb[fb_n].len  = free_len;
+						fb_n++;
 						inode->i_blocks -= (u64)free_len *
 								   (sbi->s_block_size / 512);
 					}
@@ -961,13 +986,20 @@ int ocsfs_extent_btree_punch_hole(struct inode *inode,
 	} while (tc.count > 0);
 
 	ret = ocsfs_txn_commit(txn);
-	if (!ret)
+	if (!ret) {
+		/* btree removals are durable — release the punched blocks
+		 * refcount-aware (no txn held). */
+		for (i = 0; i < fb_n; i++)
+			ocsfs_free_blocks_rc(sb, fb[i].phys, fb[i].len);
 		mark_inode_dirty(inode);
+	}
+	kfree(fb);
 	return ret;
 
 abort:
 	ocsfs_txn_abort(txn);
 	inode->i_blocks = saved_blocks;
+	kfree(fb);
 	return ret;
 }
 

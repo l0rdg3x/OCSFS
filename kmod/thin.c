@@ -43,6 +43,7 @@ static int ocsfs_zero_within_block(struct inode *inode, loff_t byte_off,
 	struct ocsfs_extent ext;
 	struct buffer_head *bh;
 	u64 phys;
+	bool did_cow = false;
 	int ret;
 
 	if (byte_len <= 0)
@@ -79,26 +80,43 @@ static int ocsfs_zero_within_block(struct inode *inode, loff_t byte_off,
 		if (ret || ext.physical_block == 0)
 			return ret;
 		phys = ext.physical_block + (lblk - ext.logical_block);
+		did_cow = true;
 	}
 
-	/* FORCE a fresh disk read.  OCSFS data lives in the iomap page cache
-	 * (folios), so a cached buffer_head for this block may be stale (zero) —
-	 * sb_bread() would then read zeros, and after the memset+sync below the
-	 * PRESERVED bytes of the block would be lost (caught by fsx: a punch
-	 * ending mid-block zeroed the block's tail).  The caller (ocsfs_fallocate)
-	 * has already flushed this block's folio to disk (round_down..round_up of
-	 * the range), so the on-disk copy is current; re-read it. */
 	bh = sb_getblk(inode->i_sb, phys);
 	if (!bh)
 		return -EIO;
-	lock_buffer(bh);
-	clear_buffer_uptodate(bh);
-	unlock_buffer(bh);
-	if (bh_read(bh, 0) < 0) {
-		brelse(bh);
-		return -EIO;
+	if (did_cow) {
+		/* ocsfs_cow_extent() just copied the source data into this
+		 * (now dirty + uptodate) buffer for the freshly-allocated block.
+		 * The new block is NOT on disk yet (cow_extent cannot sync under
+		 * i_extent_lock without deadlocking the writeback path), so a force
+		 * re-read would discard the dirty buffer and read the new block's
+		 * stale on-disk contents.  Use the buffer as the CoW left it.  The
+		 * memset + sync_dirty_buffer below then persists the final result. */
+		if (!buffer_uptodate(bh) && bh_read(bh, 0) < 0) {
+			brelse(bh);
+			return -EIO;
+		}
+		lock_buffer(bh);
+	} else {
+		/* No CoW: OCSFS data lives in the iomap page cache (folios), so a
+		 * cached buffer_head for this block may be stale (zero) — sb_bread()
+		 * would then read zeros, and after the memset+sync below the
+		 * PRESERVED bytes of the block would be lost (caught by fsx: a punch
+		 * ending mid-block zeroed the block's tail).  The caller
+		 * (ocsfs_fallocate) has already flushed this block's folio to disk
+		 * (round_down..round_up of the range), so the on-disk copy is
+		 * current; FORCE a fresh disk read. */
+		lock_buffer(bh);
+		clear_buffer_uptodate(bh);
+		unlock_buffer(bh);
+		if (bh_read(bh, 0) < 0) {
+			brelse(bh);
+			return -EIO;
+		}
+		lock_buffer(bh);
 	}
-	lock_buffer(bh);
 	memset(bh->b_data + boff, 0, byte_len);
 	mark_buffer_dirty(bh);
 	unlock_buffer(bh);
@@ -279,14 +297,21 @@ int ocsfs_punch_hole(struct inode *inode, loff_t offset, loff_t len)
 	mark_inode_dirty(inode);
 	mutex_unlock(&oi->i_extent_lock);
 
-	/* Free blocks only after inode is safely on disk */
+	/* Free blocks only after inode is safely on disk.  Use the REFCOUNT-AWARE
+	 * free: a punched block may be shared (reflink / clone / dedup), and a plain
+	 * ocsfs_free_blocks() would clear its bitmap bit out from under the other
+	 * owners while their refcount stays > 1 — a bitmap/refcount inconsistency
+	 * that later makes the allocator hand the still-referenced block back out
+	 * (observed as a CoW that allocates its own source block and self-deadlocks
+	 * in ocsfs_cow_extent, and as latent cross-link corruption).  The extent-
+	 * btree punch path already frees refcount-aware; the inline path must match. */
 	{
 		int k;
 
 		for (k = 0; k < nfrees; k++)
-			ocsfs_free_blocks(inode->i_sb,
-					  deferred_frees[k].phys,
-					  deferred_frees[k].count);
+			ocsfs_free_blocks_rc(inode->i_sb,
+					     deferred_frees[k].phys,
+					     deferred_frees[k].count);
 	}
 	return ret;
 }

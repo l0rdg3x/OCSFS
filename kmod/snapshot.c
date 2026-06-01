@@ -443,6 +443,22 @@ int ocsfs_cow_extent(struct inode *inode, u64 logical, u32 len)
 	if (ret)
 		return ret;
 
+	/* Defence in depth: the allocator must never return a block that overlaps
+	 * the CoW source.  That can only happen if a shared block (refcount > 1) is
+	 * marked FREE in the bitmap — a refcount/bitmap inconsistency (e.g. a punch
+	 * that freed a shared block non-refcount-aware).  Proceeding would
+	 * self-deadlock — sb_getblk(new_phys) and sb_getblk(old_phys) return the
+	 * SAME buffer_head, and the copy loop would lock_buffer() it twice — and
+	 * mis-account the block.  Refuse cleanly instead of hanging the FS. */
+	if (new_phys < old_phys + len && old_phys < new_phys + len) {
+		pr_warn_ratelimited(
+			"ocsfs: cow_extent allocation overlaps source (logical=%llu old_phys=%llu new_phys=%llu len=%u) — refcount/bitmap inconsistency, refusing\n",
+			(unsigned long long)logical, (unsigned long long)old_phys,
+			(unsigned long long)new_phys, len);
+		ocsfs_free_blocks(sb, new_phys, len);
+		return -EUCLEAN;
+	}
+
 	/* Copy data block by block.
 	 *
 	 * OCSFS data lives in the iomap PAGE CACHE (folios), NOT in buffer_heads.
@@ -512,18 +528,16 @@ int ocsfs_cow_extent(struct inode *inode, u64 logical, u32 len)
 		set_buffer_uptodate(new_bh);
 		mark_buffer_dirty(new_bh);
 		unlock_buffer(new_bh);
-		/* Persist the CoW'd block to disk NOW.  We write the new block
-		 * through a buffer_head, but OCSFS reads it back through the iomap
-		 * data path (bios straight to disk), and the post-CoW
-		 * ocsfs_zero_within_block() force-re-reads it from disk — neither
-		 * observes a merely dirty buffer.  mark_buffer_dirty() plus the
-		 * blkdev_issue_flush() below is NOT enough: the flush only barriers
-		 * already-submitted I/O, it never writes a dirty buffer back.
-		 * Without this sync the new block keeps its stale on-disk contents,
-		 * so a punch/zero of a just-CoW'd shared block reads garbage
-		 * (fsx: a byte preserved past a punch came back as another block's
-		 * data). */
-		sync_dirty_buffer(new_bh);
+		/* Leave new_bh dirty (uptodate) in the buffer cache; do NOT
+		 * sync_dirty_buffer() it here.  cow_extent runs under
+		 * i_extent_lock, and a synchronous writeback of a dirty buffer
+		 * under that lock deadlocks against the iomap folio writeback path
+		 * (ocsfs_writepages -> ocsfs_writeback_range -> ocsfs_iomap_begin),
+		 * which takes i_extent_lock while holding a folio lock — observed
+		 * as a hard hang in cow_extent's __lock_buffer under concurrent
+		 * copy_file_range + writeback.  The post-CoW reader that needs this
+		 * data (ocsfs_zero_within_block) consumes the dirty buffer directly
+		 * instead of re-reading the (not-yet-persisted) on-disk block. */
 		brelse(new_bh);
 	}
 
