@@ -335,6 +335,7 @@ class Fsck:
 
         # ── 5+. Extended checks ───────────────────────────────────────────────
         self._check_inodes(f, ags, bs)
+        self._check_namespace(f, ags, bs)
         self._check_dedup_index(f, fields, ags, bs)
         self._check_heartbeat(f, bs, fields["s_max_nodes"])
         self._check_lock_table(f, bs)
@@ -538,6 +539,107 @@ class Fsck:
 
         print(f"  Inodes: {total_valid} OK, {total_bad} bad CRC, "
               f"{total_orphan} orphaned")
+
+    def _check_namespace(self, f, ags, bs):
+        """Drop directory entries that point at a now-free/invalid inode.
+
+        After a crash an uncommitted create can leave a dirent in the parent
+        while its inode was never durably written (and _check_inodes above has
+        since freed the empty slot) — a "dangling" entry that surfaces as a
+        broken file.  We re-scan the (post-repair) inode tables for the set of
+        live inode numbers, then walk every directory's data blocks and clear
+        any entry whose target is not live.
+
+        Scope: directories whose data is in inline extents AND whose entries are
+        a flat list (no dirent B+ tree) are repaired in place; directories with
+        an extent B+ tree or a dirent B+ tree are reported but NOT auto-repaired
+        here (editing a block without updating the dirent index would desync it
+        — a dedicated index-aware pass is the follow-up).
+        """
+        print("Checking directory namespace...")
+        DIRENT = 282          # sizeof(struct ocsfs_disk_dirent)
+        DE_MAGIC = 0x44495245 # 'DIRE'
+        S_IFMT, S_IFDIR = 0xF000, 0x4000
+        INLINE_OFF, INLINE_N, EXT_SZ = 92, 16, 24  # i_inline_extents @92, 16×24
+
+        # Pass 1: live inode numbers + directories (fresh, post-repair).
+        live = set()
+        dirs = []   # (ino, i_size, ext_tree_root, dir_btree_root, inline bytes)
+        for ag in ags:
+            itab = ag.get("inode_table_off", 0)
+            icount = ag.get("inode_count", 0)
+            if not itab or not icount:
+                continue
+            for idx in range(icount):
+                try:
+                    raw = read_at(f, itab + idx * OCSFS_INODE_SIZE, OCSFS_INODE_SIZE)
+                except OSError:
+                    break
+                if struct.unpack_from("<I", raw, 0)[0] != OCSFS_INODE_MAGIC:
+                    continue
+                ino, = struct.unpack_from("<Q", raw, 4)
+                live.add(ino)
+                mode, = struct.unpack_from("<H", raw, 12)
+                if (mode & S_IFMT) == S_IFDIR:
+                    isize, = struct.unpack_from("<Q", raw, 24)   # i_size @24
+                    etr,   = struct.unpack_from("<Q", raw, 72)   # i_extent_tree_root @72
+                    dbr,   = struct.unpack_from("<Q", raw, 476)  # i_dir_btree_root @476
+                    inline = raw[INLINE_OFF:INLINE_OFF + INLINE_N * EXT_SZ]
+                    dirs.append((ino, isize, etr, dbr, inline))
+
+        # Pass 2: walk directory data blocks.
+        checked = dangling = repaired = skipped = 0
+        for ino, isize, etr, dbr, inline in dirs:
+            if etr != 0 or dbr != 0:
+                skipped += 1
+                walkable = False
+            else:
+                walkable = True
+            # Build logical→physical map from the inline extents.
+            emap = {}
+            for k in range(INLINE_N):
+                lb, pb, ln = struct.unpack_from("<QQI", inline, k * EXT_SZ)
+                if pb == 0 or ln == 0:
+                    continue
+                for j in range(ln):
+                    emap[lb + j] = pb + j
+            nblocks = (isize + bs - 1) // bs
+            for lb in range(nblocks):
+                phys = emap.get(lb)
+                if phys is None:
+                    continue
+                try:
+                    blk = bytearray(read_at(f, phys * bs, bs))
+                except OSError:
+                    continue
+                dirty = False
+                for off in range(0, bs - DIRENT + 1, DIRENT):
+                    if struct.unpack_from("<I", blk, off)[0] != DE_MAGIC:
+                        continue
+                    if blk[off + 21] == 0:   # de_name_len @21
+                        continue
+                    de_ino, = struct.unpack_from("<Q", blk, off + 4)
+                    checked += 1
+                    if de_ino in live:
+                        continue
+                    nl = blk[off + 21]
+                    name = bytes(blk[off + 22:off + 22 + min(nl, 255)]).decode(
+                        "utf-8", "replace")
+                    self.error(f"dir ino={ino}: entry '{name}' -> free/invalid "
+                               f"inode {de_ino} (dangling)")
+                    dangling += 1
+                    if self.repair and walkable:
+                        struct.pack_into("<I", blk, off, 0)  # clear de_magic = free slot
+                        dirty = True
+                if dirty:
+                    f.seek(phys * bs)
+                    f.write(bytes(blk))
+                    repaired += 1
+                    self.fix(f"dir ino={ino}: removed dangling entr(y/ies) in block {lb}")
+        note = (f", {skipped} indexed/large dir(s) reported only (not auto-repaired)"
+                if skipped else "")
+        print(f"  Namespace: {checked} entries checked, {dangling} dangling"
+              f"{(' (' + str(repaired) + ' blocks repaired)') if repaired else ''}{note}")
 
     def _check_heartbeat(self, f, bs, max_nodes):
         """Check heartbeat entries for all node slots."""
