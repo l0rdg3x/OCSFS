@@ -15,6 +15,7 @@
 
 #include <linux/types.h>
 #include <linux/falloc.h>
+#include <linux/pagemap.h>
 #include "ocsfs.h"
 
 /* ═══════════════════════════════════════════════════════════════
@@ -378,6 +379,17 @@ long ocsfs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 			goto out_inode_unlock;
 	}
 
+	/* Punch and zero_range change the data visible through the extent map
+	 * (data -> hole/zeros).  Flush any dirty pages in the range first so the
+	 * on-disk extent work is consistent, then (after the op succeeds, in
+	 * out:) drop the now-stale clean pages so a buffered read reflects the
+	 * new state instead of returning pre-punch/zero cached data.  The
+	 * clustered lr_inv_lo/hi mechanism only covers *peer* nodes; the local
+	 * page cache must be invalidated here too (caught by fsx). */
+	if (mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE))
+		filemap_write_and_wait_range(inode->i_mapping, offset,
+					     offset + len - 1);
+
 	if (mode & FALLOC_FL_PUNCH_HOLE) {
 		ret = ocsfs_punch_hole(inode, offset, len);
 		goto out;
@@ -408,6 +420,17 @@ long ocsfs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 	mark_inode_dirty(inode);
 
 out:
+	/* Drop stale clean pages over the punched/zeroed range on the local
+	 * mapping; subsequent buffered reads repopulate from the updated extent
+	 * map (hole -> zeros, or the zeroed blocks). */
+	if (ret == 0 && (mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE))) {
+		filemap_invalidate_lock(inode->i_mapping);
+		invalidate_inode_pages2_range(inode->i_mapping,
+			offset >> PAGE_SHIFT,
+			(offset + len - 1) >> PAGE_SHIFT);
+		filemap_invalidate_unlock(inode->i_mapping);
+	}
+
 	if (sbi->s_clustered) {
 		if (ret == 0) {
 			int fr;
