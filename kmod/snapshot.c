@@ -526,18 +526,39 @@ int ocsfs_cow_extent(struct inode *inode, u64 logical, u32 len)
 		}
 
 		set_buffer_uptodate(new_bh);
-		mark_buffer_dirty(new_bh);
-		unlock_buffer(new_bh);
-		/* Leave new_bh dirty (uptodate) in the buffer cache; do NOT
-		 * sync_dirty_buffer() it here.  cow_extent runs under
-		 * i_extent_lock, and a synchronous writeback of a dirty buffer
-		 * under that lock deadlocks against the iomap folio writeback path
-		 * (ocsfs_writepages -> ocsfs_writeback_range -> ocsfs_iomap_begin),
-		 * which takes i_extent_lock while holding a folio lock — observed
-		 * as a hard hang in cow_extent's __lock_buffer under concurrent
-		 * copy_file_range + writeback.  The post-CoW reader that needs this
-		 * data (ocsfs_zero_within_block) consumes the dirty buffer directly
-		 * instead of re-reading the (not-yet-persisted) on-disk block. */
+		/*
+		 * Write new_phys to disk SYNCHRONOUSLY here, do NOT just
+		 * mark_buffer_dirty() and defer.  The iomap buffered-write path
+		 * does its read-modify-write by reading new_phys FROM DISK (a bio
+		 * issued by iomap, which never consults this bdev buffer cache);
+		 * if the CoW'd bytes sit only in a dirty buffer_head, that disk
+		 * read returns the stale (zero) on-disk block, iomap fills the
+		 * folio with zeros and then persists the zero folio over new_phys —
+		 * the just-CoW'd data is lost (fsx cl_13: a written block read back
+		 * zero ON DISK after a reflink + sub-block write).  The bdev buffer
+		 * cache and the iomap folio cache are two separate caches for the
+		 * same block; only by landing the data on the actual device do both
+		 * paths agree.
+		 *
+		 * submit_bh() on our own already-locked new_bh issues the write bio
+		 * directly (it consumes the buffer lock and releases it in the
+		 * completion handler) — it does NOT lock_buffer() a buffer another
+		 * thread might hold, so it cannot reproduce the old sync_dirty_buffer
+		 * hang (that was the alloc-overlap self-deadlock, sb_getblk(new) ==
+		 * sb_getblk(old) locking the same bh twice, now refused by the
+		 * overlap guard above).  The post-loop blkdev_issue_flush() then
+		 * makes the data durable before the extent map is remapped, keeping
+		 * the copy-before-remap crash-safety invariant.
+		 */
+		get_bh(new_bh);
+		new_bh->b_end_io = end_buffer_write_sync;
+		submit_bh(REQ_OP_WRITE | REQ_SYNC, new_bh);
+		wait_on_buffer(new_bh);
+		if (!buffer_uptodate(new_bh)) {
+			brelse(new_bh);
+			ocsfs_free_blocks(sb, new_phys, len);
+			return -EIO;
+		}
 		brelse(new_bh);
 	}
 

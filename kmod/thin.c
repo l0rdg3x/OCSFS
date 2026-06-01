@@ -88,13 +88,12 @@ static int ocsfs_zero_within_block(struct inode *inode, loff_t byte_off,
 	if (!bh)
 		return -EIO;
 	if (did_cow) {
-		/* ocsfs_cow_extent() just copied the source data into this
-		 * (now dirty + uptodate) buffer for the freshly-allocated block.
-		 * The new block is NOT on disk yet (cow_extent cannot sync under
-		 * i_extent_lock without deadlocking the writeback path), so a force
-		 * re-read would discard the dirty buffer and read the new block's
-		 * stale on-disk contents.  Use the buffer as the CoW left it.  The
-		 * memset + sync_dirty_buffer below then persists the final result. */
+		/* ocsfs_cow_extent() just copied the source data into this block
+		 * and wrote it to disk synchronously (submit_bh), leaving the buffer
+		 * uptodate.  Use it as the CoW left it — do NOT force a re-read that
+		 * could race the just-issued write; the on-disk copy is already
+		 * current.  The memset + sync_dirty_buffer below then persists the
+		 * zeroed-edge result on top of it. */
 		if (!buffer_uptodate(bh) && bh_read(bh, 0) < 0) {
 			brelse(bh);
 			return -EIO;
