@@ -538,9 +538,10 @@ If fencing fails and the device is PR-capable, `recovery.c` forces `SB_RDONLY`
 and aborts rather than proceeding with potentially split-brain state. On
 non-PR devices (degraded mode), a warning is logged and recovery continues.
 
-**Current limitation:** Only one recovery target at a time (`s_recovery_target`
-is a single `u16`). If two nodes fail simultaneously, the second is not
-recovered until the first recovery completes.
+**Multi-node recovery:** Recovery targets are tracked as a bitmask
+(`s_recovery_pending`), so simultaneous failures of multiple nodes are all
+queued and drained serially (each fenced and replayed in turn) — not limited to
+a single target.
 
 **Sprint C (2026-05-28) — recovery robustness:**
 
@@ -796,7 +797,9 @@ Fix: `inode.c:ocsfs_setattr` sets `lr_inv_lo = from_block; lr_inv_hi =
 U64_MAX` (full tail) before the lock is released. `thin.c:ocsfs_fallocate`
 sets the exact byte-range of the fallocate operation converted to blocks.
 
-**ALTO-V3-9 — Encrypted folio invalidation race (`iomap.c`):**
+**ALTO-V3-9 — Encrypted folio invalidation race (`iomap.c`): _[REMOVED — per-file
+fscrypt was retired (commit d021c72); this wrapper and the bounce-page path no
+longer exist. Kept for history.]_**
 When fscrypt is enabled, `ocsfs_iomap_aops.invalidate_folio` is wired to
 `ocsfs_enc_invalidate_folio` instead of the plain `iomap_invalidate_folio`.
 The wrapper calls `folio_wait_writeback(folio)` first, ensuring any
@@ -832,7 +835,8 @@ that block and find uninitialized data. Fix: on commit failure in the
 `need_alloc` branch, `oi->i_xattr_block` is reset to 0 so the next call
 re-allocates cleanly.
 
-**MEDIO-V3-9 — `ocsfs_fscrypt_empty_dir` real disk scan (`crypto.c`):**
+**MEDIO-V3-9 — `ocsfs_fscrypt_empty_dir` real disk scan (`crypto.c`): _[REMOVED —
+`crypto.c` and all fscrypt code were retired (commit d021c72). Kept for history.]_**
 The previous implementation checked `oi->i_dirent_count == 0`, a cached
 in-memory counter that can lag behind the on-disk state in cluster mode (a
 peer could have added entries since the last inode refresh). The fix
@@ -1210,6 +1214,14 @@ holder, allowing long-running write operations to extend the lease without full
 release-and-reacquire.
 
 ### Sprint P — ARCH-V3-1: Cluster-wide fscrypt key distribution (2026-05-29)
+
+> **⚠️ SUPERSEDED — per-file fscrypt was retired (commit d021c72).** This entire
+> mechanism (the `KEY_STORE` distribution, `ocsfs_key_store_add`, ChaCha20-Poly1305
+> wrapping) was removed: encryption is the wrong layer for a shared-SAN VM
+> filesystem (disables O_DIRECT, blocks reflink/snapshot). Encrypt at the SAN/LUN
+> (TrueNAS zvol) or guest (LUKS/qcow2). The on-disk `KEY_STORE` layout is only
+> preserved so existing `-K` (cluster-auth HMAC) volumes still mount. Kept below
+> for history.
 
 **Problem**: fscrypt keys are node-local. In cluster mode, node A adds a key and encrypts files;
 node B has no mechanism to obtain the key. Without it, node B cannot open those files (receives
@@ -2021,17 +2033,21 @@ sending raw CDBs. It uses a two-path design:
 (opcode 0x89, SBC-4 §5.3): `expected || new_data` in a mempool-backed buffer.
 `lock_write_entry()` uses CAW when `s_caw_supported` is set.
 
-**No integration test suite**
+**Integration test suite — bring-up done, hardening ongoing**
 
-No xfstests run has been performed. The minimum testbed (2 nodes + LIO
-iSCSI) is sufficient to run `xfstests quick` and `xfstests auto`. This
-is now the top priority.
+A 3-node xfstests harness is in place (TrueNAS iSCSI LUNs, glue `FSTYP=ocsfs`):
+`generic` runs with 11 passing and the `fsx`-based cases (009/075/091/112/127/263)
+used as the primary data-path fuzzer. `fsx` (with `--replay-ops` bisection against
+an XFS reflink ground-truth) has driven a long series of data-path fixes
+(reflink/punch/zero/copy/mmap/CoW coherence, refcount-aware frees on the punch
+paths, a CoW self-deadlock). Remaining work: clear the residual `fsx` data
+mismatch frontier, then a clean full `generic` sweep across the 3 nodes.
 
 ### Architectural limitations
 
 | Gap | Impact | Path to fix |
 |---|---|---|
-| Single recovery target | Second node death during recovery is not handled | Change `s_recovery_target` to a bitmask and process the queue serially |
+| Multi-node recovery | Handled: recovery is tracked as a bitmask (`s_recovery_pending`), not a single target, so a second node death during recovery is queued and drained serially | — implemented |
 | Snapshot / refcount table fill-up | Resolved on V2 volumes via per-AG refcount B+ tree (ARCH-5, `INCOMPAT_RC_BTREE_PER_AG`). Tree grows by allocating blocks from the AG itself — no fixed-size limit. Returns `-EOPNOTSUPP` on V1 only. | Upgrade V1 volumes with `ocsfs-tool tune --upgrade` |
 | Compression write path (O_DIRECT) | O_DIRECT writes are never compressed | Architectural: O_DIRECT bypasses the page cache where compression hooks live |
 | Shared mmap in cluster mode | `MAP_SHARED|PROT_WRITE` returns `-EOPNOTSUPP` | Would require distributed cache coherence — out of scope for v0.1 |
