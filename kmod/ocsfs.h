@@ -337,6 +337,7 @@ static inline u16 ocsfs_ext_set_comp_algo(u16 flags, u8 algo)
 /* Total dead-node detection window: suspected + confirmation period */
 #define OCSFS_HB_DEAD_MS            (OCSFS_HB_TIMEOUT_MS + OCSFS_HB_CONFIRM_MS)
 #define OCSFS_HB_CHECK_MS           2000   /* check peers every 2s */
+#define OCSFS_HB_GROW_MS            30000  /* LUN-rescan + grow autonomy every 30s */
 #define OCSFS_HB_IO_TIMEOUT_MS      3000   /* heartbeat write I/O deadline */
 /* SUSPECTED nodes are still considered alive for this many × HB_TIMEOUT_MS */
 #define OCSFS_HB_SUSPECTED_MULT     2
@@ -1098,6 +1099,9 @@ int ocsfs_grow_online(struct super_block *sb);
 /* Re-read the on-disk superblock; if a peer grew the volume, load the new AGs
  * into this node's reserved s_ags slots.  Called from the heartbeat thread. */
 int ocsfs_grow_refresh(struct super_block *sb);
+/* Heartbeat-driven autonomy: rescan the LUN, pick up peer grows, and grow into a
+ * newly-expanded LUN — serialised cluster-wide, no per-node manual steps. */
+void ocsfs_grow_auto(struct super_block *sb);
 
 /* inode.c */
 extern const struct inode_operations ocsfs_file_inode_ops;

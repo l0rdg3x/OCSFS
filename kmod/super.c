@@ -8,6 +8,8 @@
 
 #include <linux/fs_context.h>
 #include <linux/fs_parser.h>
+#include <scsi/scsi_device.h>
+#include <scsi/scsi_host.h>
 #include "ocsfs.h"
 
 static struct kmem_cache *ocsfs_inode_cachep;
@@ -1081,6 +1083,78 @@ int ocsfs_grow_refresh(struct super_block *sb)
 out:
 	mutex_unlock(&sbi->s_grow_lock);
 	return ret;
+}
+
+/*
+ * Re-read the backing LUN's capacity so an online expansion of the device
+ * (a SAN admin growing the iSCSI/FC LUN) becomes visible to this node WITHOUT a
+ * manual `iscsiadm -R` / sysfs rescan.  Only SCSI-backed devices are rescanned;
+ * anything else is left untouched.
+ */
+static void ocsfs_rescan_bdev(struct super_block *sb)
+{
+	struct device *dev;
+
+	if (!sb->s_bdev || !sb->s_bdev->bd_disk)
+		return;
+	dev = disk_to_dev(sb->s_bdev->bd_disk)->parent;
+	if (dev && scsi_is_sdev_device(dev))
+		scsi_rescan_device(to_scsi_device(dev));
+}
+
+/* Current end-of-data byte offset, accounting for the reserved AG-descriptor
+ * extension region once the volume has been grown at least once. */
+static u64 ocsfs_fs_data_end(struct ocsfs_sb_info *sbi)
+{
+	u64 ag_bytes = (u64)sbi->s_ag_size * sbi->s_block_size;
+
+	if (sbi->s_ag_desc_ext_off == 0)
+		return sbi->s_data_off + (u64)sbi->s_ag_count * ag_bytes;
+	return sbi->s_ag_desc_ext_off +
+	       (u64)OCSFS_AG_GROW_RESERVE * sizeof(struct ocsfs_disk_ag) +
+	       (u64)(sbi->s_ag_count - sbi->s_ag_desc_primary_count) * ag_bytes;
+}
+
+/*
+ * Heartbeat-driven grow autonomy.  Run periodically on every node so that a LUN
+ * expansion is picked up cluster-wide with no per-node manual steps:
+ *   1. rescan the device so its new (larger) size becomes visible;
+ *   2. pull in a peer's online grow (df/allocator already do this, but do it
+ *      here too so a peer converges without waiting for local I/O);
+ *   3. if the LUN is now larger than the filesystem, grow into it.
+ * The grow is serialised cluster-wide by AG 0's DLM EX lock and is idempotent —
+ * ocsfs_grow_online re-checks the device size under the lock and returns ENOSPC
+ * when there is nothing to add.  So when several nodes notice the same expansion
+ * at once, only the first to take the lock actually grows; the others find no
+ * new space and converge via ocsfs_grow_refresh.  No leader election needed.
+ */
+void ocsfs_grow_auto(struct super_block *sb)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
+	u64 dev_size, fs_end, ag_bytes;
+	int ret;
+
+	if (!sbi->s_clustered)
+		return;
+	/* Do not mutate shared state while fencing ourselves out. */
+	if (atomic_read(&sbi->s_hb.hb_zombie) ||
+	    atomic_read(&sbi->s_hb.hb_self_fenced))
+		return;
+
+	ocsfs_rescan_bdev(sb);
+	ocsfs_grow_refresh(sb);
+
+	ag_bytes = (u64)sbi->s_ag_size * sbi->s_block_size;
+	dev_size = bdev_nr_bytes(sb->s_bdev);
+	fs_end   = ocsfs_fs_data_end(sbi);
+	if (dev_size < fs_end + ag_bytes)
+		return;   /* no room for even one more AG */
+
+	ret = ocsfs_lock_acquire(sb, &sbi->s_ags[0].ag_lock_res, OCSFS_LOCK_EX);
+	if (ret)
+		return;
+	ocsfs_grow_online(sb);   /* idempotent under the lock */
+	ocsfs_lock_release(sb, &sbi->s_ags[0].ag_lock_res);
 }
 
 static struct dquot **ocsfs_get_dquots(struct inode *inode)

@@ -578,8 +578,10 @@ static int ocsfs_heartbeat_thread(void *data)
 	struct ocsfs_sb_info *sbi = OCSFS_SB(sb);
 	unsigned long write_jiffies = msecs_to_jiffies(OCSFS_HB_INTERVAL_MS);
 	unsigned long check_jiffies = msecs_to_jiffies(OCSFS_HB_CHECK_MS);
+	unsigned long grow_jiffies  = msecs_to_jiffies(OCSFS_HB_GROW_MS);
 	unsigned long next_write = jiffies;
 	unsigned long next_check = jiffies + check_jiffies;
+	unsigned long next_grow  = jiffies + grow_jiffies;
 
 	pr_info("ocsfs: heartbeat thread started (slot %u, interval %ums)\n",
 		sbi->s_node_slot, OCSFS_HB_INTERVAL_MS);
@@ -635,9 +637,19 @@ static int ocsfs_heartbeat_thread(void *data)
 				break;
 		}
 
+		/* Grow autonomy: rescan the LUN, pick up peer grows, and grow
+		 * into a newly-expanded LUN — no per-node manual steps. */
+		if (time_after_eq(now, next_grow)) {
+			ocsfs_grow_auto(sb);
+			next_grow = jiffies + grow_jiffies;
+			if (kthread_should_stop())
+				break;
+		}
+
 		/* Sleep until next event, but not longer than needed */
 		sleep_jiffies = min_t(long,
-				      (long)(next_write - jiffies),
+				      min_t(long, (long)(next_write - jiffies),
+					    (long)(next_grow - jiffies)),
 				      (long)(next_check - jiffies));
 		if (sleep_jiffies > 0)
 			wait_event_interruptible_timeout(sbi->s_hb.hb_waitq,
