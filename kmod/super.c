@@ -872,44 +872,65 @@ int ocsfs_grow_online(struct super_block *sb)
 	u32 bs = sbi->s_block_size;
 	u64 ag_blocks = sbi->s_ag_size;
 	u64 ag_bytes = ag_blocks * bs;
-	u32 old_ags, new_ags, max_add, j;
-	u64 dev_size, old_end, avail, per_ag, ext_off, new_data_start, added_free = 0;
+	u32 old_ags, new_ags, max_add, j, primary, grown_count, ext_free;
+	u64 dev_size, avail, ext_off, new_data_start, added_free = 0;
+	u64 reserve_bytes = (u64)OCSFS_AG_GROW_RESERVE *
+			    sizeof(struct ocsfs_disk_ag);
+	bool first_grow;
 	int ret = 0;
 
 	mutex_lock(&sbi->s_grow_lock);
 
 	old_ags  = sbi->s_ag_count;
 	dev_size = bdev_nr_bytes(sb->s_bdev);
-	old_end  = sbi->s_data_off + (u64)old_ags * ag_bytes;
-	if (dev_size <= old_end) {
-		pr_warn("ocsfs: grow: no new space (device %llu, fs end %llu)\n",
-			dev_size, old_end);
+
+	/*
+	 * Multi-grow layout.  The extension region — the contiguous on-disk array
+	 * of descriptors for grown AGs that ocsfs_ag_desc_byte_off() reads — is
+	 * reserved at its full OCSFS_AG_GROW_RESERVE size on the FIRST grow, right
+	 * after the original AG data.  Every grow (first or subsequent) writes its
+	 * descriptors into that fixed region and appends its AG *data* after the
+	 * previous grown data, so a volume can be grown again and again as the LUN
+	 * is re-expanded (up to OCSFS_AG_GROW_RESERVE grown AGs in total) without
+	 * ever moving the descriptor array.
+	 */
+	first_grow  = (sbi->s_ag_desc_ext_off == 0);
+	primary     = first_grow ? old_ags : sbi->s_ag_desc_primary_count;
+	grown_count = old_ags - primary;           /* AGs added by prior grows */
+	ext_free    = OCSFS_AG_GROW_RESERVE - grown_count;
+	ext_off     = first_grow ? (sbi->s_data_off + (u64)old_ags * ag_bytes)
+				 : sbi->s_ag_desc_ext_off;
+	/* Grown AG data always lives after the (fixed) reserved ext region. */
+	new_data_start = ext_off + reserve_bytes + (u64)grown_count * ag_bytes;
+
+	if (dev_size <= new_data_start) {
+		pr_warn("ocsfs: grow: no new space (device %llu, next AG data at %llu)\n",
+			dev_size, new_data_start);
 		ret = -ENOSPC;
 		goto out;
 	}
 
-	avail   = dev_size - old_end;
-	per_ag  = ag_bytes + sizeof(struct ocsfs_disk_ag);
-	new_ags = (u32)(avail / per_ag);
+	avail   = dev_size - new_data_start;
+	new_ags = (u32)(avail / ag_bytes);
 	max_add = sbi->s_ag_capacity - old_ags;
-	if (new_ags > max_add) {
-		pr_warn("ocsfs: grow: new space fits %u AGs but reserve holds %u; "
-			"adding %u (remount to use the rest)\n",
-			new_ags, max_add, max_add);
+	if (new_ags > max_add)
 		new_ags = max_add;
+	if (new_ags > ext_free) {
+		pr_warn("ocsfs: grow: extension region has room for %u more AG(s) "
+			"(cap %u total); capping this grow\n",
+			ext_free, OCSFS_AG_GROW_RESERVE);
+		new_ags = ext_free;
 	}
 	if (new_ags == 0) {
 		ret = -ENOSPC;
 		goto out;
 	}
 
-	ext_off        = old_end;
-	new_data_start = ext_off + (u64)new_ags * sizeof(struct ocsfs_disk_ag);
-
 	for (j = 0; j < new_ags; j++) {
 		u32 agno = old_ags + j;
 		u64 ag_data_start = new_data_start + (u64)j * ag_bytes;
-		u64 ext_desc = ext_off + (u64)j * sizeof(struct ocsfs_disk_ag);
+		u64 ext_desc = ext_off +
+			       (u64)(grown_count + j) * sizeof(struct ocsfs_disk_ag);
 		struct ocsfs_disk_ag dag;
 		u64 free;
 
