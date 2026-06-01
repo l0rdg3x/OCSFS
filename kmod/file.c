@@ -756,6 +756,25 @@ long ocsfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	iput(dir);
 	return ret;
 }
+/*
+ * mmap write fault: go through iomap so that a write to a mapped page
+ * allocates the backing blocks (iomap_begin with IOMAP_WRITE) and sets the
+ * iomap per-block folio state, keeping mmap coherent with the iomap
+ * read_iter/write_iter/fallocate paths.  Using the generic
+ * filemap_page_mkwrite instead leaves an mmap write to a hole with no backing
+ * blocks — the dirty data is then lost on writeback (caught by fsx mmap ops).
+ */
+static vm_fault_t ocsfs_page_mkwrite(struct vm_fault *vmf)
+{
+	return iomap_page_mkwrite(vmf, &ocsfs_iomap_ops, NULL);
+}
+
+static const struct vm_operations_struct ocsfs_file_vm_ops = {
+	.fault        = filemap_fault,
+	.map_pages    = filemap_map_pages,
+	.page_mkwrite = ocsfs_page_mkwrite,
+};
+
 static int ocsfs_file_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	/*
@@ -768,7 +787,10 @@ static int ocsfs_file_mmap(struct file *file, struct vm_area_struct *vma)
 	if (OCSFS_SB(file_inode(file)->i_sb)->s_clustered &&
 	    (vma->vm_flags & VM_SHARED) && (vma->vm_flags & VM_WRITE))
 		return -EOPNOTSUPP;
-	return generic_file_mmap(file, vma);
+
+	file_accessed(file);
+	vma->vm_ops = &ocsfs_file_vm_ops;
+	return 0;
 }
 
 const struct file_operations ocsfs_file_fops = {
