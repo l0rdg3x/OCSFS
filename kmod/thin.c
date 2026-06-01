@@ -543,15 +543,27 @@ long ocsfs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 	}
 
 	/* Punch and zero_range change the data visible through the extent map
-	 * (data -> hole/zeros).  Flush any dirty pages in the range first so the
-	 * on-disk extent work is consistent, then (after the op succeeds, in
-	 * out:) drop the now-stale clean pages so a buffered read reflects the
-	 * new state instead of returning pre-punch/zero cached data.  The
-	 * clustered lr_inv_lo/hi mechanism only covers *peer* nodes; the local
-	 * page cache must be invalidated here too (caught by fsx). */
-	if (mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE))
-		filemap_write_and_wait_range(inode->i_mapping, offset,
-					     offset + len - 1);
+	 * (data -> hole/zeros).  Flush dirty pages first, then (after the op, in
+	 * out:) drop the now-stale clean pages so a buffered read reflects the new
+	 * state instead of returning pre-punch/zero cached data.  The clustered
+	 * lr_inv_lo/hi mechanism only covers *peer* nodes; the local page cache
+	 * must be invalidated here too (caught by fsx).
+	 *
+	 * Flush the FULL edge blocks, not just [offset, offset+len): the partial
+	 * sub-block zeroing (ocsfs_zero_within_block) reads/rewrites the whole
+	 * edge block via the buffer_head, but the live data is in the iomap page
+	 * cache.  The PRESERVED bytes of a partial edge block fall OUTSIDE
+	 * [offset, offset+len); unless those whole blocks are flushed first, the
+	 * buffer_head read sees stale on-disk data and the preserved bytes are
+	 * lost (caught by fsx: a punch ending mid-block zeroed the bytes just past
+	 * its end, because that block's tail had only-in-page-cache data). */
+	if (mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE)) {
+		u64 bs = sbi->s_block_size;
+
+		filemap_write_and_wait_range(inode->i_mapping,
+					     round_down(offset, bs),
+					     round_up(offset + len, bs) - 1);
+	}
 
 	if (mode & FALLOC_FL_PUNCH_HOLE) {
 		ret = ocsfs_punch_hole(inode, offset, len);
