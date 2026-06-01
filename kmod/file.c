@@ -468,22 +468,28 @@ static loff_t ocsfs_remap_file_range(struct file *src_file, loff_t pos_in,
 		}
 	}
 
+	/* Reflink shares whole blocks: it cannot serve a sub-block-aligned
+	 * source/dest offset.  Reject BEFORE generic_remap_file_range_prep()
+	 * (which would itself return -EINVAL) using -EOPNOTSUPP, so that
+	 * vfs_copy_file_range() — which tries ->remap_file_range first for
+	 * same-superblock copies — falls back to a normal (splice) copy instead
+	 * of propagating the error.  Otherwise an unaligned copy_file_range()
+	 * fails with EINVAL (caught by fsx).  A direct unaligned FICLONE gets
+	 * -EOPNOTSUPP, which callers treat as "clone unsupported, fall back". */
+	if (!IS_ALIGNED(pos_in, sbi->s_block_size) ||
+	    !IS_ALIGNED(pos_out, sbi->s_block_size)) {
+		ret = -EOPNOTSUPP;
+		goto out_unlock_dlm;
+	}
+
 	ret = generic_remap_file_range_prep(src_file, pos_in, dst_file, pos_out,
 					    &remap_len, remap_flags);
 	if (ret || remap_len == 0)
 		goto out_unlock_dlm;
 
-	if (!IS_ALIGNED(pos_in,    sbi->s_block_size) ||
-	    !IS_ALIGNED(pos_out,   sbi->s_block_size) ||
-	    !IS_ALIGNED(remap_len, sbi->s_block_size)) {
-		/* Reflink shares whole blocks, so it cannot serve a sub-block
-		 * aligned request.  Return -EOPNOTSUPP (not -EINVAL) so that
-		 * vfs_copy_file_range(), which tries ->remap_file_range first for
-		 * same-superblock copies, falls back to a normal (splice) copy
-		 * instead of propagating the error — otherwise an unaligned
-		 * copy_file_range() fails with EINVAL (caught by fsx). A direct
-		 * unaligned FICLONE likewise gets EOPNOTSUPP, which callers treat
-		 * as "clone unsupported, fall back to copy". */
+	/* len may still be sub-block after prep (e.g. shortened to EOF); a
+	 * whole-block clone cannot represent the tail, so fall back to copy. */
+	if (!IS_ALIGNED(remap_len, sbi->s_block_size)) {
 		ret = -EOPNOTSUPP;
 		goto out_unlock_dlm;
 	}
@@ -774,6 +780,9 @@ const struct file_operations ocsfs_file_fops = {
 	.fsync            = ocsfs_fsync,
 	.fallocate        = ocsfs_fallocate,         /* thin.c */
 	.splice_read      = filemap_splice_read,
+	.splice_write     = iter_file_splice_write,  /* needed for copy_file_range
+						      * splice fallback: do_splice_from
+						      * returns -EINVAL without it */
 	.remap_file_range = ocsfs_remap_file_range,
 	.unlocked_ioctl   = ocsfs_ioctl,
 	.lock             = ocsfs_file_lock,         /* POSIX distributed locking (flock.c) */
