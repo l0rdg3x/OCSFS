@@ -81,9 +81,23 @@ static int ocsfs_zero_within_block(struct inode *inode, loff_t byte_off,
 		phys = ext.physical_block + (lblk - ext.logical_block);
 	}
 
-	bh = sb_bread(inode->i_sb, phys);
+	/* FORCE a fresh disk read.  OCSFS data lives in the iomap page cache
+	 * (folios), so a cached buffer_head for this block may be stale (zero) —
+	 * sb_bread() would then read zeros, and after the memset+sync below the
+	 * PRESERVED bytes of the block would be lost (caught by fsx: a punch
+	 * ending mid-block zeroed the block's tail).  The caller (ocsfs_fallocate)
+	 * has already flushed this block's folio to disk (round_down..round_up of
+	 * the range), so the on-disk copy is current; re-read it. */
+	bh = sb_getblk(inode->i_sb, phys);
 	if (!bh)
 		return -EIO;
+	lock_buffer(bh);
+	clear_buffer_uptodate(bh);
+	unlock_buffer(bh);
+	if (bh_read(bh, 0) < 0) {
+		brelse(bh);
+		return -EIO;
+	}
 	lock_buffer(bh);
 	memset(bh->b_data + boff, 0, byte_len);
 	mark_buffer_dirty(bh);

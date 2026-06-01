@@ -25,6 +25,8 @@
  */
 
 #include "ocsfs.h"
+#include <linux/pagemap.h>
+#include <linux/highmem.h>
 
 /* ═══════════════════════════════════════════════════════════════
  * SNAPSHOT METADATA
@@ -441,39 +443,53 @@ int ocsfs_cow_extent(struct inode *inode, u64 logical, u32 len)
 	if (ret)
 		return ret;
 
-	/* Copy data block by block */
+	/* Copy data block by block.
+	 *
+	 * OCSFS data lives in the iomap PAGE CACHE (folios), NOT in buffer_heads.
+	 * A raw sb_bread() of the source block reads a separate buffer_head cache
+	 * that iomap never populates, so it can return stale / zero-filled data
+	 * and the CoW would silently copy ZEROS — corrupting every reader of the
+	 * new block (caught by fsx: a punch on a shared block CoW-copied zeros).
+	 * So copy from the uptodate folio when present; fall back to a disk read
+	 * only when the block is not cached.  filemap_get_folio() is a pure cache
+	 * lookup (no iomap_begin), so it does not deadlock on i_extent_lock. */
 	for (i = 0; i < len; i++) {
-		/*
-		 * In cluster mode force a fresh disk read: the page cache may
-		 * hold a stale copy of the source blocks if another node wrote
-		 * to this extent before triggering our CoW.  Copying stale data
-		 * to the new blocks would silently lose the other node's writes.
-		 */
-		if (1) {
-			/* Cached read: the page cache is the authoritative latest copy
-			 * (a forced disk re-read would copy STALER on-disk data and lose
-			 * our own un-flushed writes); see ocsfs_inode_invalidate_cache. */
-			old_bh = sb_bread(sb, old_phys + i);
-			if (!old_bh) {
-				ocsfs_free_blocks(sb, new_phys, len);
-				return -EIO;
-			}
-		}
+		loff_t spos = (loff_t)(logical + i) * sbi->s_block_size;
+		struct folio *sfolio;
+		bool copied = false;
 
 		new_bh = sb_getblk(sb, new_phys + i);
 		if (!new_bh) {
-			brelse(old_bh);
 			ocsfs_free_blocks(sb, new_phys, len);
 			return -ENOMEM;
 		}
-
 		lock_buffer(new_bh);
-		memcpy(new_bh->b_data, old_bh->b_data, sbi->s_block_size);
+
+		sfolio = filemap_get_folio(inode->i_mapping, spos >> PAGE_SHIFT);
+		if (!IS_ERR_OR_NULL(sfolio)) {
+			if (folio_test_uptodate(sfolio)) {
+				memcpy_from_folio(new_bh->b_data, sfolio,
+						  offset_in_folio(sfolio, spos),
+						  sbi->s_block_size);
+				copied = true;
+			}
+			folio_put(sfolio);
+		}
+		if (!copied) {
+			old_bh = sb_bread(sb, old_phys + i);
+			if (!old_bh) {
+				unlock_buffer(new_bh);
+				brelse(new_bh);
+				ocsfs_free_blocks(sb, new_phys, len);
+				return -EIO;
+			}
+			memcpy(new_bh->b_data, old_bh->b_data, sbi->s_block_size);
+			brelse(old_bh);
+		}
+
 		set_buffer_uptodate(new_bh);
 		mark_buffer_dirty(new_bh);
 		unlock_buffer(new_bh);
-
-		brelse(old_bh);
 		brelse(new_bh);
 	}
 
