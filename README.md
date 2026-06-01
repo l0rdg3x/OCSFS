@@ -42,7 +42,7 @@ locking and SCSI-3 Persistent Reservations for fencing.
 | 🪞 **Space efficiency** | Reflink (`FICLONE`), CoW snapshots, inline LZ4/ZSTD compression, **cross-file dedup** |
 | ⚡ **VAAI offload** | `WRITE SAME`, `UNMAP`, `EXTENDED COPY` for array-accelerated VM ops |
 | 🏎️ **Near-raw VM-disk I/O** | Random 4K O_DIRECT read/write on a clustered LUN runs at ~device speed — the per-op clustering overhead is eliminated for a single active node |
-| 📈 **Online grow** | Expand the filesystem into a grown LUN while it stays mounted — `ocsfs-grow /mnt/point` |
+| 📈 **Autonomous online grow** | Expand the backing LUN any number of times — every node rescans the device and grows into the new space on its own, no per-node steps |
 | 🧱 **Proxmox-native** | Storage plugin, mount helper, DKMS, Debian packaging |
 
 ---
@@ -88,8 +88,10 @@ clean `fsck` and **zero kernel warnings**:
   read/write to a pre-allocated VM-disk image reaches device speed (see
   [Performance](#-performance)) — the per-operation DLM/refresh overhead that
   previously capped it at the SAN's single-op rate is gone
-- ✅ **online filesystem grow**: the volume is expanded into a grown LUN while it
-  stays mounted, and peers pick up the new space on their next allocation
+- ✅ **autonomous online grow**: the backing LUN is expanded (repeatedly) while
+  the volume stays mounted; each node rescans the device and grows into the new
+  space on its own from the heartbeat thread — validated on a real iSCSI LUN,
+  expanded only on the SAN side, with no per-node rescan or grow command
 
 **Two and three nodes**, all mounting the same LUN read-write concurrently
 (distinct slots and PR keys, hardware CAW), clean `fsck`, **zero kernel
@@ -412,32 +414,36 @@ mount -t ocsfs -o cluster_secret=$(cat /etc/ocsfs.secret) /dev/sdb /mnt/ocsfs
 # /dev/sdb  /mnt/ocsfs  ocsfs  defaults,_netdev  0 0
 ```
 
-### 3. `ocsfs-grow` — expand into a larger LUN
+### 3. Growing into an expanded LUN
 
-After you enlarge the backing LUN (e.g. grow the TrueNAS zvol and
-`iscsiadm -m node -R` to rescan), give the new space to the filesystem. The same
-binary does **online** (mounted) or **offline** (unmounted) grow depending on
-whether you pass a **mountpoint** or a **block device**:
+OCSFS grows into a bigger backing LUN **autonomously** and **repeatedly** — every
+time you enlarge the LUN, the cluster picks up the new space on its own.
+
+**Autonomous (default).** Just expand the LUN on the SAN. On a mounted volume,
+each node's heartbeat thread (every ~30 s) re-reads the device capacity, and the
+first node to see free space grows into it under a cluster-wide lock; the others
+converge automatically. No `iscsiadm`/rescan and no grow command per node.
 
 ```bash
-# ONLINE — volume stays mounted; pass the MOUNTPOINT.
-#   Issues OCSFS_IOC_GROW; the node writes the new AG descriptors live and
-#   bumps the AG count. Peers pick up the new space on their next allocation
-#   (or immediately via statfs). Run on ONE node.
-ocsfs-grow /mnt/ocsfs
-
-# OFFLINE — volume unmounted on EVERY node; pass the BLOCK DEVICE.
-ocsfs-grow /dev/sdb
-
-# Dry run (offline only) — report what would be added, change nothing.
-ocsfs-grow -n /dev/sdb
+# On the SAN only — e.g. TrueNAS: enlarge the zvol, then tell the iSCSI target
+# to re-read its size so every initiator sees the change without re-login:
+zfs set volsize=<new-size> <pool>/<zvol>      # or via the API / UI
+scstadmin -resync_dev <extent-name>           # sends the capacity-change UA
+# …each OCSFS node rescans and grows on its own within ~30 s.
 ```
 
-Existing AGs are never moved (each descriptor stores absolute geometry); new AGs
-are described in an extension region carved from the added space
-(`INCOMPAT_AG_GROW`). **Important:** rescan the LUN on **all** nodes
-(`iscsiadm -m node -R`) before they try to use the new space, or a peer will
-refuse it as "beyond device size".
+This repeats for every expansion (up to `OCSFS_AG_GROW_RESERVE` added AGs over the
+volume's life). Existing AGs are never moved — each descriptor stores absolute
+geometry; new-AG descriptors live in a fixed extension region reserved on the
+first grow (`INCOMPAT_AG_GROW`).
+
+**Manual `ocsfs-grow`** (optional — to grow immediately, or offline):
+
+```bash
+ocsfs-grow /mnt/ocsfs    # ONLINE — pass the MOUNTPOINT; grows now on this node
+ocsfs-grow /dev/sdb      # OFFLINE — volume unmounted on EVERY node; pass the device
+ocsfs-grow -n /dev/sdb   # Dry run (offline only) — report only, change nothing
+```
 
 ### 4. `ocsfs-fsck` — offline check & repair
 
@@ -492,13 +498,10 @@ sudo ./tools/ocsfs-fsck --repair /dev/sdb
 | Area | Status |
 |---|---|
 | **Metadata-op scaling under cross-node contention** | The on-disk DLM does a SCSI CAW per *cross-node* lock acquire/release. Under sustained concurrent metadata churn on a *hot, contended* lock (e.g. a shared directory) acquires can hit the 30 s timeout as the target's CAW path saturates (the op fails, the node stays up). **The data path is not affected** — an uncontended lock is held lazily and re-taken from cache with no CAW, so single-node random VM-disk I/O runs at near-raw speed (see [Performance](#-performance)). The per-block CAW storm on delete/truncate is fixed; reducing per-op CAW on genuinely contended metadata locks is the open scaling item |
-| **Multi-node coherence** | ✅ Validated on real hardware (2- and 3-node): read/write/overwrite, concurrent same-directory create/delete/churn, and concurrent rename (within-dir, cross-dir, mixed) all converge correctly with a clean `fsck` |
-| **Cluster recovery & fencing** | ✅ Real node-crash recovery validated: a survivor detects the death, **SCSI-PR preempt-and-abort** fences the dead node, replays its journal and recovers its locks; survivors stay online with data intact, and the crashed node reboots and rejoins. **Self-fencing** quiesces a node that can't write its heartbeat; **zombie self-fence** catches the inverse — a node *falsely* recovered while still alive reads its own slot, sees it was recovered (DEAD / generation changed), invalidates its cached locks and forces itself read-only (remount to rejoin), preventing split-brain |
 | **Fencing method** | SCSI-3 Persistent Reservations only; out-of-band STONITH (PDU / iDRAC / IPMI) is not wired |
 | **Recovery concurrency** | Multiple dead nodes are tracked in a pending bitmask and recovered one at a time (sequential drain, none dropped); concurrent multi-node recovery is not parallelised |
 | **Slot-claim / refcount TOCTOU** | Node-table slot claim and cross-node refcount updates are CAW-serialised but retain a small TOCTOU window (architectural) |
 | **Crash atomicity (allocation)** | The block bitmap is committed *before* the extent map references the new blocks, so a crash between the two transactions can only **leak** space (blocks marked used with no owner) — never double-allocate. `fsck` reclaims the leak; collapsing the two updates into a single transaction (no transient leak) is a future cleanup, not a correctness fix |
-| **Filesystem grow** | ✅ Online (mounted) and offline grow implemented via `ocsfs-grow` (`INCOMPAT_AG_GROW`); validated 3-node. *Open:* a single grow per volume (re-growing an already-grown volume is rejected); rescan the LUN on every node before peers use the new space |
 | **Integration tests** | No xfstests run yet; no long-haul soak |
 | **Encryption — out of scope (removed)** | Per-file (fscrypt) encryption has been **removed and is not planned**. For a shared-SAN VM/container filesystem it is the wrong layer: it disables O_DIRECT and blocks reflink/snapshot — both central to VM disk images. **Encrypt at the SAN/LUN layer** (e.g. the TrueNAS zvol) **or inside the guest** (LUKS / qcow2 encryption) instead; both are transparent to OCSFS and do not penalise the data path. The `-K` flag still enables **cluster authentication** (HMAC on journal/lock records), which is unrelated to file encryption |
 | **Compression** | Write path runs on fsync for buffered files only; O_DIRECT writes are never compressed; a file with >16 compressed extents is decompressed on B+tree migration |

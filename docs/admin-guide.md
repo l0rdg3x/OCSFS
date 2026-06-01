@@ -361,12 +361,18 @@ ocsfs-grow /dev/mapper/mpath0
 ocsfs-grow -n /dev/mapper/mpath0
 ```
 
-Existing AGs are never moved (descriptors store absolute geometry); new AGs are
-described in an extension region in the added space (`INCOMPAT_AG_GROW`).
+Existing AGs are never moved (descriptors store absolute geometry); new-AG
+descriptors live in a fixed extension region reserved on the first grow
+(`INCOMPAT_AG_GROW`). The volume can be grown **repeatedly** as the LUN is
+expanded again and again (up to `OCSFS_AG_GROW_RESERVE` added AGs over its life).
 
-> **Rescan first, on every node.** If a peer has not rescanned the larger LUN it
-> will reject the new AGs as "beyond device size" until it does. One grow per
-> volume is supported (re-growing an already-grown volume is rejected).
+> **Autonomous by default.** You normally don't run `ocsfs-grow` at all: after you
+> enlarge the LUN on the SAN (and resync the iSCSI target — e.g.
+> `scstadmin -resync_dev <extent>` on TrueNAS, which sends the capacity-change
+> Unit Attention), each node's heartbeat thread re-reads the device and grows
+> into the new space on its own within ~30 s, serialised cluster-wide. Run
+> `ocsfs-grow <mountpoint>` only if you want to grow immediately instead of
+> waiting for the next heartbeat cycle.
 
 ### Offline filesystem check
 
@@ -502,7 +508,6 @@ Use only FC SAN or LIO/TrueNAS SCALE iSCSI for multi-node deployments.
 | Quota (stub) | dquot *hooks* are wired (data-path and reflink block charges, `dq_op`/`get_dquots`) but quota *enforcement* is not enableable yet | No on-disk quota inodes and no `quotaon` path, so limits cannot be set; metadata blocks (dir/extent-btree/xattr) are also not charged. CoW correctly does not double-charge (it swaps physical blocks, the logical count is unchanged) |
 | Snapshot for large files | Supported on V2 volumes (requires `INCOMPAT_RC_BTREE_PER_AG`; format with `mkfs.ocsfs` or upgrade with `ocsfs-tool tune --upgrade`) | Returns `-EOPNOTSUPP` on V1 volumes only |
 | Shared mmap unsupported in cluster mode | `MAP_SHARED\|PROT_WRITE` returns `-EOPNOTSUPP` in cluster mode | Private and read-only mappings work; single-node works |
-| Single grow per volume | `ocsfs-grow` adds space once (online or offline) | Re-growing an already-grown volume is rejected; rescan the LUN on every node first |
 | Sequential multi-node recovery | Multiple dead nodes are recovered one at a time | Pending failures are tracked in a bitmask (`s_recovery_pending`) and drained in sequence — none are dropped; concurrent recovery is just not parallelised |
 | No out-of-band STONITH | SCSI PR fencing works; hardware PDU/iDRAC not wired | Proxmox API can serve as soft STONITH in lab environments |
 

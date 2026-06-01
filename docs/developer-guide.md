@@ -22,7 +22,6 @@
 13. [Debugfs Instrumentation](#13-debugfs-instrumentation)
 14. [VAAI Storage Offload](#14-vaai-storage-offload)
 15. [Open Issues and Limitations](#15-open-issues-and-limitations)
-16. [Encryption (fscrypt)](#16-encryption-fscrypt)
 
 ---
 
@@ -1674,6 +1673,44 @@ Fix: call `ocsfs_flush_inode_locked(inode, false)` before the free loop, under
 (setattr shrink, evict/delete, rename-over). Validated on a real iSCSI LUN with a
 truncate/delete stress plus `repro13` FULL and a clean `fsck`.
 
+### Repeated + autonomous online grow (2026-06-01)
+
+**Repeated grow.** `ocsfs_grow_online` previously supported one grow per volume:
+the AG-descriptor *extension region* (the contiguous on-disk array that
+`ocsfs_ag_desc_byte_off` reads for AGs ≥ `s_ag_desc_primary_count`) was sized for
+just the first grow's AGs and placed at the then-current data end. A second grow
+wrote its descriptors at the *new* data end — non-contiguous with the first
+region — while the reader still indexed one contiguous array, so the second
+grow's AGs were read from inside the first grown AG's data (corruption); the
+offline tool therefore rejected re-grow. Fix: reserve the extension region at its
+full `OCSFS_AG_GROW_RESERVE` size on the **first** grow, right after the original
+AG data; every grow writes its descriptors into that fixed region and appends its
+AG *data* after the previous grown data. Data end and free space are computed
+accounting for the reserved region, and `new_ags` is capped by both the in-memory
+slot capacity and the remaining room in the extension region. The superblock
+commit point and crash-safe ordering, and `ocsfs_ag_desc_byte_off` /
+mount-time read path, are unchanged. A volume can now be grown up to
+`OCSFS_AG_GROW_RESERVE` AGs over its life.
+
+**Autonomy.** `ocsfs_grow_auto`, called from the heartbeat thread every
+`OCSFS_HB_GROW_MS` (30 s) on every clustered node, makes a LUN expansion
+self-applying with no per-node steps: (1) `ocsfs_rescan_bdev` re-reads the SCSI
+device capacity (`scsi_rescan_device`, guarded by `scsi_is_sdev_device`; no-op on
+non-SCSI), so the larger LUN is visible without a manual `iscsiadm -R`;
+(2) `ocsfs_grow_refresh` pulls in a peer's grow; (3) if the device is now larger
+than the filesystem, it grows into it. The grow is serialised cluster-wide by AG
+0's DLM EX lock and is idempotent (`ocsfs_grow_online` re-checks the device size
+under the lock), so concurrent notice from several nodes yields exactly one grow
+and the rest converge via `grow_refresh` — no leader election. Skipped while the
+node is self-fencing (`hb_zombie` / `hb_self_fenced`).
+
+Validated on a real iSCSI LUN (TrueNAS): the LUN was enlarged **only on the SAN
+side** — `zfs volsize` + `scstadmin -resync_dev` (which sends the SCSI
+capacity-change Unit Attention) — and within 30 s the node rescanned (164→172 GiB)
+and grew (40→42 AGs) on its own, data intact, `fsck` clean. This also documents
+the LUN-resize-without-disconnect mechanism: resize the zvol, resync the SCST
+extent, and the initiator picks up the new size on its next device rescan.
+
 ---
 
 ## 9. I/O Path
@@ -1990,118 +2027,15 @@ is now the top priority.
 | Compression write path (O_DIRECT) | O_DIRECT writes are never compressed | Architectural: O_DIRECT bypasses the page cache where compression hooks live |
 | Shared mmap in cluster mode | `MAP_SHARED|PROT_WRITE` returns `-EOPNOTSUPP` | Would require distributed cache coherence — out of scope for v0.1 |
 | POSIX distributed file locking | Implemented at inode granularity (`flock.c`): `F_RDLCK`→DLM SH, `F_WRLCK`→DLM EX. Same-node byte-range semantics via `posix_lock_file`; cross-node coherence via on-disk DLM. Multiple SH holders on the same inode will serialize if any node holds EX (DLM release/re-acquire path). | — implemented |
-| Encryption | Implemented via fscrypt (`crypto.c`). Per-directory policy; bounce-page I/O. Cluster-safe write path (Sprint A). Reflink/snapshot/symlinks in encrypted dirs return `-EOPNOTSUPP`. Node-local keys (ARCH-V3-1 open). | See §16 |
+| Encryption | **Removed** — per-file fscrypt was the wrong layer for a shared-SAN VM filesystem (disables O_DIRECT, blocks reflink/snapshot). Encrypt at the SAN/LUN (TrueNAS zvol) or guest (LUKS/qcow2). `-K` cluster-auth HMAC is unrelated and stays. | n/a |
 | Quota | Implemented: `i_dquot[MAXQUOTAS]` in `ocsfs_inode_info`; inode quota via `dquot_alloc/free_inode`; block quota via `dquot_alloc/free_space_nodirty` in `ocsfs_iomap_begin` and `ocsfs_alloc_extent`. Block quota is not charged for CoW, snapshot creation, or directory/metadata blocks. | Commits `8bc4c38` (inode) + `58933a7` (block) |
 | No out-of-band STONITH | Fencing relies solely on SCSI PR | Wire Proxmox API or iDRAC as a fallback fencing agent |
 | Node table TOCTOU | Mitigated by SCSI CAW (BSG-direct, now implemented) | Full fix requires per-device PR-scoped reservation on slot claim |
 
----
 
-## 16. Encryption (fscrypt)
-
-OCSFS supports optional per-directory encryption via the Linux fscrypt
-framework (`CONFIG_FS_ENCRYPTION=y`). Encryption is entirely opt-in: an
-unencrypted filesystem behaves identically to previous versions.
-
-### Design
-
-| Component | Implementation |
-|---|---|
-| Context storage | xattr `security.c` on the directory inode (`ocsfs_fscrypt_ops.get/set_context`) |
-| Key management | Standard fscrypt key ring: `FS_IOC_ADD_ENCRYPTION_KEY` / `FS_IOC_REMOVE_ENCRYPTION_KEY` |
-| Policy | Per-directory: `FS_IOC_SET_ENCRYPTION_POLICY` on an empty directory |
-| Data path | Bounce pages (`needs_bounce_pages=1`): encrypted read/write handled in `ocsfs_enc_read_folio()` / `ocsfs_enc_writepages()` |
-| inode_info_offs | `ptrdiff_t` offset of `i_crypt_info` relative to `vfs_inode` inside `ocsfs_inode_info` — required by the fscrypt ABI |
-
-### Enabling encryption on a directory
-
-```bash
-# Add a key to the filesystem keyring
-fscryptctl add_key /mnt/ocsfs
-
-# Set an encryption policy on an empty directory
-fscryptctl set_policy <key_identifier> /mnt/ocsfs/private
-
-# All files created inside will be encrypted automatically
-echo "hello" > /mnt/ocsfs/private/secret.txt
-```
-
-Alternatively, use `ioctl` directly:
-
-```c
-struct fscrypt_policy_v2 policy = {
-    .version            = FSCRYPT_POLICY_V2,
-    .contents_encryption_mode  = FSCRYPT_MODE_AES_256_XTS,
-    .filenames_encryption_mode = FSCRYPT_MODE_AES_256_CTS,
-    .flags              = 0,
-};
-memcpy(policy.master_key_identifier, key_id, FSCRYPT_KEY_IDENTIFIER_SIZE);
-ioctl(dirfd, FS_IOC_SET_ENCRYPTION_POLICY, &policy);
-```
-
-### Supported ioctls
-
-| ioctl | Description |
-|---|---|
-| `FS_IOC_SET_ENCRYPTION_POLICY` | Set per-directory encryption policy |
-| `FS_IOC_GET_ENCRYPTION_POLICY_EX` | Read current policy |
-| `FS_IOC_ADD_ENCRYPTION_KEY` | Add a master key to the filesystem |
-| `FS_IOC_REMOVE_ENCRYPTION_KEY` | Remove a master key (current user) |
-| `FS_IOC_REMOVE_ENCRYPTION_KEY_ALL_USERS` | Remove a master key (all users, requires `CAP_SYS_ADMIN`) |
-| `FS_IOC_GET_ENCRYPTION_KEY_STATUS` | Query key presence |
-| `FS_IOC_GET_ENCRYPTION_NONCE` | Retrieve per-inode nonce |
-
-### Data path
-
-**Read:** `ocsfs_enc_read_folio()` reads each filesystem block synchronously
-via `sb_bread()`, copies the data into the folio, zero-fills holes, then
-calls `fscrypt_decrypt_pagecache_blocks()` to decrypt the folio in-place
-before marking it uptodate.
-
-**Write:** `ocsfs_enc_writepages()` (called from `ocsfs_writepages()`)
-iterates dirty folios with `writeback_iter()`. For each folio it calls
-`fscrypt_encrypt_pagecache_blocks()` to obtain an encrypted bounce `struct page *`,
-then submits a synchronous bio via `bio_add_page()` + `submit_bio_wait()`.
-The bounce page is freed with `fscrypt_free_bounce_page()` after I/O.
-
-### Cluster safety (Sprint A — 2026-05-28)
-
-The following correctness issues identified in the Opus v3 review have been fixed:
-
-| Issue | Fix |
-|---|---|
-| Async writeback without DLM EX (CRIT-V3-1) | `ocsfs_enc_writepages()` skips early if `lr_mode != OCSFS_LOCK_EX`. Background writeback (kswapd, bdi_writeback) is a no-op; `ocsfs_file_write_iter()` flushes dirty pages under DLM EX via `filemap_write_and_wait()` before releasing. |
-| Reflink of encrypted file (CRIT-V3-5) | `ocsfs_remap_file_range()` returns `-EOPNOTSUPP` if either source or destination is encrypted. Sharing physical blocks with different fscrypt IVs produces unreadable ciphertext. |
-| Snapshot of encrypted file (CRIT-V3-6) | `ocsfs_snapshot_create()` returns `-EOPNOTSUPP` for encrypted inodes. The snapshot inode has a different `i_ino`, so fscrypt derives a different IV and reads produce garbage. |
-| Symlinks in encrypted directories (CRIT-V3-7) | `ocsfs_symlink()` returns `-EOPNOTSUPP` if the parent directory is encrypted (`fscrypt_get_symlink` plumbing not yet implemented). `ocsfs_iget()` no longer loads inline ciphertext as a plaintext symlink target for encrypted inodes. |
-| `fscrypt_set_context` after `add_dirent` (ALTO-V3-7) | In `ocsfs_create()` and `ocsfs_mkdir()`, the encryption context is now persisted and flushed to disk **before** the directory entry is added to the parent. This closes the window where a peer node could see the new inode without a crypto context and write plaintext. |
-| `i_crypt_info` not reset on slab reuse (ALTO-V3-1) | `ocsfs_alloc_inode()` now initialises `oi->i_crypt_info = NULL`. |
-| `enc_read_folio` without DLM SH (ALTO-V3-6) | Added `WARN_ONCE` in `ocsfs_enc_read_folio()` to surface call sites (splice_read, userfaultfd) that arrive without DLM SH in cluster mode. |
-
-**ARCH-V3-1 — Cluster key distribution (Sprint P, 2026-05-29):** Implemented via the shared
-encrypted key store. See §Sprint P above for the full protocol. When
-`OCSFS_FEATURE_INCOMPAT_KEY_STORE` is active, `FS_IOC_ADD_ENCRYPTION_KEY` automatically
-persists the key to the shared store. Other nodes retrieve it with:
-
-```bash
-# On each cluster node that needs the key
-ocsfs-tool keys restore /dev/sdb   # lists + fetches + adds all stored keys
-# Internally: OCSFS_IOC_KEY_LIST → OCSFS_IOC_KEY_FETCH → FS_IOC_ADD_ENCRYPTION_KEY
-```
-
-Two new ioctls are available for scripting:
-| ioctl | Description |
-|---|---|
-| `OCSFS_IOC_KEY_LIST` | List key identifiers in the shared store (no raw material exposed) |
-| `OCSFS_IOC_KEY_FETCH` | Decrypt and return raw key for a given identifier (`CAP_SYS_ADMIN`) |
-
-### Limitations
-
-| Limitation | Notes |
-|---|---|
-| No readahead | Encrypted inodes return early from `ocsfs_iomap_readahead()` — the iomap-based readahead path cannot decrypt asynchronously |
-| No O_DIRECT | O_DIRECT bypasses the page cache; bounce-page decryption requires the page cache |
-| Buffered writes only | `ocsfs_enc_writepages()` submits one synchronous bio per folio — acceptable for VM disk images, suboptimal for bulk streaming |
-| No reflink / snapshot | Both operations return `-EOPNOTSUPP` on encrypted inodes (see cluster safety above) |
-| No symlinks in encrypted dirs | Returns `-EOPNOTSUPP` until `fscrypt_get_symlink` is wired up |
-| Key store not cluster-atomic | Concurrent `FS_IOC_ADD_ENCRYPTION_KEY` from two nodes is idempotent but not serialised; race on the key store block is benign (same-key writes produce the same result) |
+<!-- Section 16 (Encryption / fscrypt) removed: per-file fscrypt was retired
+     (commit d021c72). It was the wrong layer for a shared-SAN VM filesystem —
+     it disables O_DIRECT and blocks reflink/snapshot, both central to VM disk
+     images. Encrypt at the SAN/LUN layer (e.g. the TrueNAS zvol) or inside the
+     guest (LUKS / qcow2). The `-K` flag still provides cluster-auth HMAC on
+     journal/lock records, which is unrelated to file encryption. -->
