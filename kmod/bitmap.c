@@ -587,6 +587,20 @@ int ocsfs_alloc_inode_num(struct super_block *sb, u32 ag_hint, u64 *ino_out)
 					di->i_magic = cpu_to_le32(OCSFS_INODE_MAGIC);
 					di->i_ino = cpu_to_le64(
 						ag_no * sbi->s_ag_size + i);
+					/*
+					 * Stamp a VALID checksum on the just-reserved slot.
+					 * The inode body is still empty (nlink=0) and is
+					 * filled in by the first ocsfs_flush_inode_locked, but
+					 * if a crash hits in that alloc→flush window the
+					 * on-disk inode must not look corrupt: without this the
+					 * checksum stayed 0 (from the memset) while magic was
+					 * valid, so fsck flagged "bad CRC (stored=00000000)"
+					 * and could not reclaim it.  With a valid CRC it is a
+					 * well-formed nlink=0 orphan that fsck/orphan-scan
+					 * reclaims cleanly.
+					 */
+					di->i_checksum = cpu_to_le32(ocsfs_crc32c(
+						~0U, di, OCSFS_INODE_SIZE - 4));
 					brelse(bh);
 
 					ag->free_inodes--;

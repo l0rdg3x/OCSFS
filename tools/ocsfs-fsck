@@ -253,6 +253,7 @@ class Fsck:
             ag["bitmap_off"]       = abs_base + ag["ag_bitmap_off"]
             ag["bitmap_size"]      = ag["ag_bitmap_size"]
             ag["inode_table_off"]  = abs_base + ag["ag_inode_table_off"]
+            ag["desc_byte_off"]    = ag_block * bs   # for in-place repair
 
             stored_ag_crc  = ag["ag_checksum"]
             computed_ag    = crc32c(ag_raw[:bs - 4])
@@ -429,7 +430,7 @@ class Fsck:
                 self.log(f"AG {ag_no}: inode table not initialised, skipping")
                 continue
 
-            valid = bad = orphan = 0
+            valid = bad = orphan = reclaimed = 0
             for idx in range(inode_count):
                 byte_off = itable_off + idx * OCSFS_INODE_SIZE
                 try:
@@ -446,8 +447,31 @@ class Fsck:
                 stored_crc, = struct.unpack_from("<I", raw, OCSFS_INODE_SIZE - 4)
                 computed    = crc32c(raw[:OCSFS_INODE_SIZE - 4])
                 if stored_crc != computed:
-                    self.error(f"AG {ag_no} inode {idx}: CRC mismatch "
-                               f"(stored={stored_crc:08X} computed={computed:08X})")
+                    # A "reserved-but-unflushed" slot: ocsfs_alloc_inode_num
+                    # stamps magic+ino and journals the slot, then the inode body
+                    # is filled in by the first flush.  A crash in that window
+                    # used to leave magic valid but checksum 0 and an empty body
+                    # (mode=0, nlink=0).  Such a slot is safely reclaimable; a
+                    # bad-CRC inode WITH a populated body is genuine corruption
+                    # and is only reported.  (The kernel now stamps a valid CRC
+                    # at allocation, so this is for older volumes + safety.)
+                    e_mode,  = struct.unpack_from("<H", raw, 12)
+                    e_nlink, = struct.unpack_from("<H", raw, 14)
+                    e_size,  = struct.unpack_from("<Q", raw, 24)
+                    empty = (e_mode == 0 and e_nlink == 0 and e_size == 0)
+                    if empty:
+                        self.error(f"AG {ag_no} inode {idx}: reserved-but-unflushed "
+                                   f"slot (bad CRC, empty body)")
+                        if self.repair:
+                            f.seek(byte_off)
+                            f.write(b"\x00" * OCSFS_INODE_SIZE)  # free the slot
+                            reclaimed += 1
+                            self.fix(f"AG {ag_no} inode {idx}: freed "
+                                     f"reserved-but-unflushed slot")
+                    else:
+                        self.error(f"AG {ag_no} inode {idx}: CRC mismatch "
+                                   f"(stored={stored_crc:08X} computed={computed:08X}) "
+                                   f"— populated body, not auto-cleared")
                     bad += 1
                     continue
 
@@ -457,13 +481,24 @@ class Fsck:
                 I_NLINK_OFF = 14
                 I_FLAGS_OFF = 64
                 i_flags, = struct.unpack_from("<I", raw, I_FLAGS_OFF)
+                e_size, = struct.unpack_from("<Q", raw, 24)   # i_size @24
                 is_orphan = bool(i_flags & OCSFS_IFLAG_ORPHAN) or (nlink == 0 and ino != 0)
                 if is_orphan:
                     self.warn(f"AG {ag_no} inode {idx}: ino={ino} mode=0o{mode:06o} "
                               f"nlink={nlink} flags=0x{i_flags:04x} — orphan")
                     orphan += 1
-                    if self.repair:
-                        # Clear the ORPHAN flag and zero nlink; recompute CRC.
+                    if self.repair and mode == 0 and e_size == 0:
+                        # Empty orphan (no body, no blocks) — e.g. an inode that
+                        # was allocated but crashed before its first flush.  Free
+                        # the slot outright and return it to the AG counter.
+                        f.seek(byte_off)
+                        f.write(b"\x00" * OCSFS_INODE_SIZE)
+                        reclaimed += 1
+                        self.fix(f"AG {ag_no} inode {idx}: freed empty orphan slot")
+                    elif self.repair:
+                        # Populated orphan (a deleted-but-was-open file): just
+                        # normalise the flags/nlink; block reclaim is left to the
+                        # kernel's evict path on the next mount.
                         patched = bytearray(raw)
                         struct.pack_into("<H", patched, I_NLINK_OFF, 0)
                         i_flags_new = i_flags & ~OCSFS_IFLAG_ORPHAN
@@ -478,6 +513,23 @@ class Fsck:
                     valid += 1
                     self.log(f"AG {ag_no} inode {idx}: ino={ino} mode=0o{mode:06o} "
                              f"nlink={nlink} OK")
+
+            # Return any freed reserved-but-unflushed slots to the AG's
+            # free-inode counter and re-stamp the descriptor CRC, so the
+            # allocator (which skips an AG whose free_inodes == 0) can hand
+            # them out again.  ag_free_inodes is at offset 72 in the 4096-byte
+            # descriptor block; ag_checksum is the last 4 bytes.
+            if self.repair and reclaimed > 0 and ag.get("desc_byte_off"):
+                AG_FREE_INODES_OFF = 72
+                dblk = read_at(f, ag["desc_byte_off"], bs)
+                dbuf = bytearray(dblk)
+                cur, = struct.unpack_from("<Q", dbuf, AG_FREE_INODES_OFF)
+                struct.pack_into("<Q", dbuf, AG_FREE_INODES_OFF, cur + reclaimed)
+                struct.pack_into("<I", dbuf, bs - 4, crc32c(bytes(dbuf[:bs - 4])))
+                f.seek(ag["desc_byte_off"])
+                f.write(bytes(dbuf))
+                self.fix(f"AG {ag_no}: free_inodes {cur} -> {cur + reclaimed} "
+                         f"after reclaiming {reclaimed} slot(s)")
 
             total_valid  += valid
             total_bad    += bad
