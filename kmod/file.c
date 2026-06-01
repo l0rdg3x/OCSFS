@@ -476,7 +476,15 @@ static loff_t ocsfs_remap_file_range(struct file *src_file, loff_t pos_in,
 	if (!IS_ALIGNED(pos_in,    sbi->s_block_size) ||
 	    !IS_ALIGNED(pos_out,   sbi->s_block_size) ||
 	    !IS_ALIGNED(remap_len, sbi->s_block_size)) {
-		ret = -EINVAL;
+		/* Reflink shares whole blocks, so it cannot serve a sub-block
+		 * aligned request.  Return -EOPNOTSUPP (not -EINVAL) so that
+		 * vfs_copy_file_range(), which tries ->remap_file_range first for
+		 * same-superblock copies, falls back to a normal (splice) copy
+		 * instead of propagating the error — otherwise an unaligned
+		 * copy_file_range() fails with EINVAL (caught by fsx). A direct
+		 * unaligned FICLONE likewise gets EOPNOTSUPP, which callers treat
+		 * as "clone unsupported, fall back to copy". */
+		ret = -EOPNOTSUPP;
 		goto out_unlock_dlm;
 	}
 
