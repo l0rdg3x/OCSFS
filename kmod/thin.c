@@ -272,37 +272,69 @@ int ocsfs_zero_range(struct inode *inode, loff_t offset, loff_t len)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
 	struct ocsfs_inode_info *oi = OCSFS_I(inode);
-	u64 start_block = offset / sbi->s_block_size;
-	u64 end_block = (offset + len + sbi->s_block_size - 1) /
-			sbi->s_block_size;
+	u64 bs = sbi->s_block_size;
+	loff_t pend = offset + len;
+	/* Whole blocks FULLY inside [offset, pend): [full_start, full_end).
+	 * The partial edge blocks keep their data outside the range; only their
+	 * in-range bytes are zeroed in place.  The previous code used
+	 * floor(offset/bs) for start_block and zeroed/UNWROTE whole edge blocks,
+	 * destroying the preserved prefix/suffix bytes when offset or pend fell
+	 * mid-block (caught by fsx: a zero_range starting mid-block wiped the
+	 * block's leading bytes). */
+	u64 full_start = (u64)(offset + bs - 1) / bs;
+	u64 full_end   = (u64)pend / bs;
+	loff_t head_end   = (loff_t)full_start * bs;
+	loff_t tail_start = (loff_t)full_end * bs;
 	u16 i;
 
+	if (len <= 0)
+		return 0;
+
+	/* Invalidate page cache for the zeroed region */
+	truncate_pagecache_range(inode, offset, pend - 1);
+
+	/* Zero the partial (sub-block) bytes at the head and tail in place,
+	 * preserving the surrounding bytes (same helper the punch path uses). */
+	mutex_lock(&oi->i_extent_lock);
+	if (offset < head_end)
+		ocsfs_zero_within_block(inode, offset,
+					min_t(loff_t, pend, head_end) - offset);
+	if (pend > tail_start && tail_start >= head_end)
+		ocsfs_zero_within_block(inode, max_t(loff_t, offset, tail_start),
+					pend - max_t(loff_t, offset, tail_start));
+	mutex_unlock(&oi->i_extent_lock);
+
 	if (oi->i_extent_tree_root) {
-		truncate_pagecache_range(inode, offset, offset + len - 1);
-		return ocsfs_extent_btree_zero_range(inode, start_block, end_block);
+		if (full_start < full_end)
+			return ocsfs_extent_btree_zero_range(inode, full_start,
+							     full_end);
+		return 0;
 	}
 
-	/* Invalidate page cache for zeroed region */
-	truncate_pagecache_range(inode, offset, offset + len - 1);
+	if (full_start >= full_end)
+		return 0;   /* only partial edges — no whole blocks to zero */
 
 	mutex_lock(&oi->i_extent_lock);
 
-	/* Mark overlapping extents as UNWRITTEN */
+	/* Whole-block interior only: mark UNWRITTEN (reads return zeros) or
+	 * physically zero the full blocks that intersect [full_start, full_end). */
 	for (i = 0; i < oi->i_extent_count; i++) {
 		struct ocsfs_extent *e = &oi->i_extents[i];
 		u64 ext_end = e->logical_block + e->length;
 
-		if (ext_end <= start_block || e->logical_block >= end_block)
+		if (ext_end <= full_start || e->logical_block >= full_end)
 			continue;
+		if (!e->physical_block || (e->flags & OCSFS_EXT_UNWRITTEN))
+			continue;   /* hole / unwritten already reads as zero */
 
-		if (e->logical_block >= start_block && ext_end <= end_block) {
-			/* Fully contained: mark UNWRITTEN (reads return zeros). */
+		if (e->logical_block >= full_start && ext_end <= full_end) {
+			/* Fully inside the interior: reads return zeros. */
 			e->flags = OCSFS_EXT_UNWRITTEN;
-		} else if (ext_end > start_block && e->logical_block < end_block) {
-			/* MEDIO-N2: partial overlap — physically zero the blocks
-			 * that intersect the range so callers see zero data. */
-			u64 zs   = max(e->logical_block, start_block);
-			u64 ze   = min(ext_end, end_block);
+		} else if (!(e->flags & OCSFS_EXT_COMPRESSED)) {
+			/* Spans the interior boundary — physically zero the full
+			 * blocks that intersect [full_start, full_end). */
+			u64 zs   = max(e->logical_block, full_start);
+			u64 ze   = min(ext_end, full_end);
 			u64 phys = e->physical_block + (zs - e->logical_block);
 			u64 k;
 
