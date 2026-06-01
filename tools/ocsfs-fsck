@@ -550,11 +550,14 @@ class Fsck:
         live inode numbers, then walk every directory's data blocks and clear
         any entry whose target is not live.
 
-        Scope: directories whose data is in inline extents AND whose entries are
-        a flat list (no dirent B+ tree) are repaired in place; directories with
-        an extent B+ tree or a dirent B+ tree are reported but NOT auto-repaired
-        here (editing a block without updating the dirent index would desync it
-        — a dedicated index-aware pass is the follow-up).
+        Scope: directories whose data is in inline extents are repaired in place,
+        whether or not they carry a dirent B+ tree index — clearing a block entry
+        is enough because the kernel re-validates de_magic/de_name on every
+        btree lookup (ocsfs_dir_btree_lookup) and readdir scans the blocks, so a
+        zeroed entry disappears from both and the stale index pointer is harmless.
+        Only directories whose DATA lives in an extent B+ tree (>16 extents, i.e.
+        very large dirs) are reported but not walked here, since their blocks are
+        not reachable through the inline extent map.
         """
         print("Checking directory namespace...")
         DIRENT = 282          # sizeof(struct ocsfs_disk_dirent)
@@ -590,10 +593,16 @@ class Fsck:
         # Pass 2: walk directory data blocks.
         checked = dangling = repaired = skipped = 0
         for ino, isize, etr, dbr, inline in dirs:
-            if etr != 0 or dbr != 0:
+            if etr != 0:
+                # extent-btree dir (>16 extents): blocks not reachable via the
+                # inline extent map — report only (rare; very large directories).
                 skipped += 1
                 walkable = False
             else:
+                # inline-extent dir: walk it.  A dirent B+ tree index (dbr), if
+                # present, is left as-is — the kernel re-validates de_magic on
+                # lookup and readdir scans the blocks, so a zeroed entry is gone
+                # from both and the stale index pointer is harmless.
                 walkable = True
             # Build logical→physical map from the inline extents.
             emap = {}

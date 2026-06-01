@@ -700,7 +700,14 @@ static void ocsfs_flush_new_inode(struct inode *inode)
 		lk = ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
 					OCSFS_LOCK_EX);
 	if (!lk) {
-		int fr = ocsfs_flush_inode_locked(inode, true);
+		/*
+		 * Crash-safety needs only the journal commit (the inode txn lands
+		 * before the dirent txn, so replay restores the inode-first order);
+		 * the extra sync_dirty_buffer is required only in CLUSTERED mode so
+		 * a peer that follows the just-published dirent reads the inode from
+		 * its final on-disk location, not a stale one.  Single-node skips it.
+		 */
+		int fr = ocsfs_flush_inode_locked(inode, sbi->s_clustered);
 
 		if (sbi->s_clustered)
 			ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
