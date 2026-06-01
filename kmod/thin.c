@@ -559,6 +559,52 @@ int ocsfs_zero_range(struct inode *inode, loff_t offset, loff_t len)
 	if (head_end < tail_start)
 		truncate_pagecache_range(inode, head_end, tail_start - 1);
 
+	/*
+	 * CoW any SHARED whole block in [full_start, full_end) before the
+	 * conversion below.  A block shared via reflink/snapshot/dedup must never
+	 * be modified in place: the inline path memset()s it (corrupting every
+	 * other owner immediately), and both paths would otherwise mark it
+	 * UNWRITTEN while it still points at the shared physical block — a later
+	 * write to that UNWRITTEN block skips CoW (UNWRITTEN is assumed private)
+	 * and overwrites the shared block, corrupting the other owners.  Break the
+	 * sharing here so the conversion only ever touches PRIVATE blocks.  The
+	 * partial edges are already CoW'd in ocsfs_punch_zero_edge().  Caught by
+	 * fsx (clone + zero_range): the other clone read zeros / stale bytes.
+	 */
+	if (full_start < full_end) {
+		u64 b = full_start;
+		int cret = 0;
+
+		mutex_lock(&oi->i_extent_lock);
+		while (b < full_end) {
+			struct ocsfs_extent ext;
+			u64 ext_end, cow_end, phys;
+
+			if (ocsfs_extent_lookup(inode, b, &ext) != 0 ||
+			    ext.physical_block == 0) {
+				b++;                    /* hole — nothing shared */
+				continue;
+			}
+			ext_end = ext.logical_block + ext.length;
+			if (ext.flags & OCSFS_EXT_UNWRITTEN) {
+				b = ext_end;            /* already reads zero */
+				continue;
+			}
+			cow_end = min(ext_end, full_end);
+			phys = ext.physical_block + (b - ext.logical_block);
+			if (ocsfs_needs_cow(inode->i_sb, phys)) {
+				cret = ocsfs_cow_extent(inode, b,
+							(u32)(cow_end - b));
+				if (cret)
+					break;
+			}
+			b = cow_end;
+		}
+		mutex_unlock(&oi->i_extent_lock);
+		if (cret)
+			return cret;
+	}
+
 	if (oi->i_extent_tree_root) {
 		if (full_start < full_end)
 			return ocsfs_extent_btree_zero_range(inode, full_start,
