@@ -999,11 +999,11 @@ not be attempted without code changes to support them:
 |---|---|
 | **Multi-LUN spanning** | A single OCSFS volume cannot span multiple block devices. Do not attempt RAID-0 or dm-linear across two LUNs. |
 | **More than 4 nodes simultaneously** | The test format uses `--max-nodes 4`. Mounting a fifth node will fail. Re-format with `--max-nodes N` (max 256) to increase the limit. |
-| **Simultaneous dual-node failure** | Only one recovery target is tracked at a time (`s_recovery_target` is a single `u16`). If two nodes fail simultaneously, the second is not recovered until the first completes. |
+| **Simultaneous dual-node failure (sequential recovery only)** | Multiple dead nodes *are* all recovered — pending failures are tracked in a bitmask (`s_recovery_pending`) and drained one at a time, none dropped. Recovery is just not parallelised: the second node is recovered only after the first completes. |
 | **Non-PR devices (degraded mode)** | Mounting on a target that does not support SCSI-3 PR (e.g., a basic iSCSI target without PR) is allowed in degraded mode, but fencing is skipped. Do not use degraded mode for split-brain correctness testing. |
 | **Snapshot + cluster** | Snapshot creation (`OCSFS_IOC_SNAPSHOT`) is implemented but not tested in multi-node mode. Use snapshots only in single-node mode during this alpha. |
 | **Dedup in cluster mode** | `OCSFS_IOC_DEDUP` ioctl acquires a per-inode EX lock but does not yet coordinate AG-level refcount updates across nodes. Avoid running dedup while other nodes are writing. |
-| **Online resize** | `ocsfs_tool --resize` is not implemented. Resizing requires unmounting all nodes, using `ocsfs_tool` offline, then remounting. |
+| **Online resize (grow only)** | Online **grow** is implemented: when the backing LUN is expanded, every node auto-detects and grows the volume autonomously (heartbeat-driven, serialised under the AG0 DLM lock); repeated grows are supported as the LUN keeps expanding. **Shrink is not possible online** (the kernel cannot shrink a live block device). There is no online *shrink* path at all. |
 | **Kernel ≥ 7.1** | The module is written and tested against 7.0.x. The iomap API changes in 7.1 may break compilation. Pin to 7.0.x for now. |
 | **32-bit architectures** | Not tested. All `__le64` fields assume the host can perform 64-bit atomic reads. |
 | **FC SAN passthrough** | The guide covers iSCSI only. FC SAN passthrough to Proxmox VMs requires additional configuration (vHBA or SR-IOV) not documented here. |
