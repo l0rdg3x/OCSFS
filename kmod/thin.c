@@ -529,24 +529,36 @@ int ocsfs_zero_range(struct inode *inode, loff_t offset, loff_t len)
 	u64 full_end   = (u64)pend / bs;
 	loff_t head_end   = (loff_t)full_start * bs;
 	loff_t tail_start = (loff_t)full_end * bs;
+	int eret;
 	u16 i;
 
 	if (len <= 0)
 		return 0;
 
-	/* Invalidate page cache for the zeroed region */
-	truncate_pagecache_range(inode, offset, pend - 1);
+	/* Zero the partial (sub-block) edge bytes via the page cache, preserving
+	 * the surrounding bytes.  Uses the same folio-coherent helper as the punch
+	 * path (ocsfs_punch_zero_edge): the old raw buffer_head zeroing was a
+	 * second cache for the block and raced with the async folio writeback,
+	 * corrupting it non-deterministically.  Runs WITHOUT i_extent_lock. */
+	if (offset < head_end) {
+		eret = ocsfs_punch_zero_edge(inode, offset,
+					     min_t(loff_t, pend, head_end) - offset);
+		if (eret)
+			return eret;
+	}
+	if (pend > tail_start && tail_start >= head_end) {
+		eret = ocsfs_punch_zero_edge(inode,
+					     max_t(loff_t, offset, tail_start),
+					     pend - max_t(loff_t, offset, tail_start));
+		if (eret)
+			return eret;
+	}
 
-	/* Zero the partial (sub-block) bytes at the head and tail in place,
-	 * preserving the surrounding bytes (same helper the punch path uses). */
-	mutex_lock(&oi->i_extent_lock);
-	if (offset < head_end)
-		ocsfs_zero_within_block(inode, offset,
-					min_t(loff_t, pend, head_end) - offset);
-	if (pend > tail_start && tail_start >= head_end)
-		ocsfs_zero_within_block(inode, max_t(loff_t, offset, tail_start),
-					pend - max_t(loff_t, offset, tail_start));
-	mutex_unlock(&oi->i_extent_lock);
+	/* Drop the page cache for the WHOLE (middle) blocks that become UNWRITTEN
+	 * — NOT the edge blocks just dirtied above (truncate would discard that
+	 * zeroing); those middle blocks read back as zeros. */
+	if (head_end < tail_start)
+		truncate_pagecache_range(inode, head_end, tail_start - 1);
 
 	if (oi->i_extent_tree_root) {
 		if (full_start < full_end)
