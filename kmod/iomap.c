@@ -804,6 +804,27 @@ static ssize_t ocsfs_writeback_range(struct iomap_writepage_ctx *wpc,
 	if (ret < 0)
 		return ret;
 
+	/* #14: a DIRTY folio mapped to a HOLE means a write to this block had not
+	 * yet been persisted when the block was freed (punch/truncate) and the
+	 * extent removed.  But every free DISCARDS dirty folios over its range
+	 * (truncate_pagecache_range), so a folio that is STILL dirty here is NEWER
+	 * than any free — its data must NOT be lost (the plain iomap writeback
+	 * skips holes, silently dropping the write; caught by fsx as on-disk
+	 * corruption: a write survived in cache but the block read back stale).
+	 * Re-allocate the block now (delalloc-at-writeback) and let the UNWRITTEN
+	 * conversion below persist it.  A legitimately punched block has no dirty
+	 * folio to reach here, so this never resurrects discarded data. */
+	if (wpc->iomap.type == IOMAP_HOLE) {
+		unsigned int nofs = memalloc_nofs_save();
+
+		ret = ocsfs_iomap_begin(wpc->inode, pos,
+					wpc->inode->i_sb->s_blocksize,
+					IOMAP_WRITE, &wpc->iomap, NULL);
+		memalloc_nofs_restore(nofs);
+		if (ret < 0)
+			return ret;
+	}
+
 	/* ALTO-N2: writeback path does not call iomap_end, so UNWRITTEN extents
 	 * would remain UNWRITTEN after data reaches disk — subsequent reads
 	 * return zeroes instead of the written data.  Convert here instead. */
