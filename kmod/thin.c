@@ -63,7 +63,24 @@ static int ocsfs_zero_within_block(struct inode *inode, loff_t byte_off,
 		if (ret || ext.physical_block == 0)
 			return ret;
 	}
+
+	/* COW a shared (reflinked/snapshot/dedup) block before zeroing it in
+	 * place: the block is mutated with a raw memset, so without CoW the other
+	 * sharers would also see the zeroed bytes (a partial punch/zero_range of
+	 * one file would corrupt the data of every file sharing that block).
+	 * Caller holds i_extent_lock (and DLM EX in cluster mode), satisfying
+	 * ocsfs_cow_extent's contract; re-lookup since the extent map changes. */
 	phys = ext.physical_block + (lblk - ext.logical_block);
+	if (ocsfs_needs_cow(inode->i_sb, phys)) {
+		ret = ocsfs_cow_extent(inode, lblk, 1);
+		if (ret)
+			return ret;
+		ret = ocsfs_extent_lookup(inode, lblk, &ext);
+		if (ret || ext.physical_block == 0)
+			return ret;
+		phys = ext.physical_block + (lblk - ext.logical_block);
+	}
+
 	bh = sb_bread(inode->i_sb, phys);
 	if (!bh)
 		return -EIO;
