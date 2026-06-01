@@ -678,6 +678,38 @@ out:
 	return 0;
 }
 
+/*
+ * #17: persist a just-created inode (ORPHAN cleared, mode/nlink set) to disk
+ * BEFORE its directory entry becomes durable.  ocsfs_add_dirent journals the
+ * dirent, so if the inode were still unflushed a crash would leave a dirent
+ * pointing at an empty/zero inode — a dangling entry that surfaces as a broken
+ * file.  Flushing the inode first makes the worst case a dirent-less inode (an
+ * unreferenced leak fsck reclaims), never a dangling entry.  Every create-style
+ * handler MUST call this immediately before ocsfs_add_dirent().  Single-node
+ * previously skipped this flush (only clustered did it under EX).
+ */
+static void ocsfs_flush_new_inode(struct inode *inode)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
+	struct ocsfs_inode_info *oi = OCSFS_I(inode);
+	int lk = 0;
+
+	oi->i_flags &= ~OCSFS_IFLAG_ORPHAN;
+	mark_inode_dirty(inode);
+	if (sbi->s_clustered)
+		lk = ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
+					OCSFS_LOCK_EX);
+	if (!lk) {
+		int fr = ocsfs_flush_inode_locked(inode, true);
+
+		if (sbi->s_clustered)
+			ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
+		if (fr)
+			pr_warn_ratelimited("ocsfs: new-inode flush failed (%d)\n",
+					    fr);
+	}
+}
+
 /* ═══════════════════════════════════════════════════════════════
  * VFS CREATE AND MKDIR
  * ═══════════════════════════════════════════════════════════════ */
@@ -714,18 +746,8 @@ int ocsfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	if (ret)
 		goto fail;
 
-	OCSFS_I(inode)->i_flags &= ~OCSFS_IFLAG_ORPHAN;
-	mark_inode_dirty(inode);
-	if (OCSFS_SB(inode->i_sb)->s_clustered) {
-		struct ocsfs_inode_info *oi = OCSFS_I(inode);
-
-		ret = ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
-					 OCSFS_LOCK_EX);
-		if (!ret) {
-			ocsfs_flush_inode_locked(inode, true);
-			ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
-		}
-	}
+	/* #17: persist the inode before its dirent becomes durable (no dangling). */
+	ocsfs_flush_new_inode(inode);
 
 	ret = ocsfs_add_dirent(dir, &dentry->d_name,
 			       OCSFS_I(inode)->i_disk_ino,
@@ -782,19 +804,8 @@ struct dentry *ocsfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	if (ret)
 		goto fail;
 
-	OCSFS_I(inode)->i_flags &= ~OCSFS_IFLAG_ORPHAN;
-	mark_inode_dirty(inode);
-	if (OCSFS_SB(inode->i_sb)->s_clustered) {
-		struct ocsfs_inode_info *oi = OCSFS_I(inode);
-		int fr;
-
-		fr = ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
-					OCSFS_LOCK_EX);
-		if (!fr) {
-			ocsfs_flush_inode_locked(inode, true);
-			ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
-		}
-	}
+	/* #17: persist the new dir (., .., nlink=2) before its parent dirent. */
+	ocsfs_flush_new_inode(inode);
 
 	ret = ocsfs_add_dirent(dir, &dentry->d_name,
 			       OCSFS_I(inode)->i_disk_ino, OCSFS_FT_DIR);
@@ -852,6 +863,10 @@ static int ocsfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	if (ret && ret != -EOPNOTSUPP)
 		goto symlink_fail;
 
+	/* #17: persist the symlink inode (inline target) before its dirent so a
+	 * crash never leaves a dirent pointing at an unflushed inode. */
+	ocsfs_flush_new_inode(inode);
+
 	ret = ocsfs_add_dirent(dir, &dentry->d_name,
 			       oi->i_disk_ino,
 			       ocsfs_mode_to_ft(inode->i_mode));
@@ -866,16 +881,6 @@ symlink_fail:
 		return ret;
 	}
 
-	oi->i_flags &= ~OCSFS_IFLAG_ORPHAN;
-	mark_inode_dirty(inode);
-	if (OCSFS_SB(inode->i_sb)->s_clustered) {
-		int fr = ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
-					    OCSFS_LOCK_EX);
-		if (!fr) {
-			ocsfs_flush_inode_locked(inode, true);
-			ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
-		}
-	}
 	d_instantiate(dentry, inode);
 	return 0;
 }
@@ -916,23 +921,15 @@ static int ocsfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	if (ret)
 		goto fail;
 
+	/* #17: persist the special inode before its dirent. */
+	ocsfs_flush_new_inode(inode);
+
 	ret = ocsfs_add_dirent(dir, &dentry->d_name,
 			       OCSFS_I(inode)->i_disk_ino,
 			       ocsfs_mode_to_ft(mode));
 	if (ret)
 		goto fail;
 
-	OCSFS_I(inode)->i_flags &= ~OCSFS_IFLAG_ORPHAN;
-	mark_inode_dirty(inode);
-	if (OCSFS_SB(inode->i_sb)->s_clustered) {
-		struct ocsfs_inode_info *oi = OCSFS_I(inode);
-		int fr = ocsfs_lock_acquire(inode->i_sb, &oi->i_lock_res,
-					    OCSFS_LOCK_EX);
-		if (!fr) {
-			ocsfs_flush_inode_locked(inode, true);
-			ocsfs_lock_release(inode->i_sb, &oi->i_lock_res);
-		}
-	}
 	d_instantiate(dentry, inode);
 	return 0;
 fail:
