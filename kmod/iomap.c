@@ -53,7 +53,7 @@ static int ocsfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 		 * data on disk, corrupting subsequent reads.  Decompress in
 		 * place so the caller sees a plain WRITTEN extent.
 		 */
-		if ((flags & IOMAP_WRITE) &&
+		if ((flags & (IOMAP_WRITE | IOMAP_ZERO)) &&
 		    (ext.flags & OCSFS_EXT_COMPRESSED)) {
 			ret = ocsfs_extent_decompress_for_write(inode,
 								logical_block);
@@ -77,7 +77,7 @@ static int ocsfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 		 * i_extent_lock — satisfies ocsfs_cow_extent's contract.
 		 * Re-lookup after CoW since the extent map changed.
 		 */
-		if ((flags & IOMAP_WRITE) &&
+		if ((flags & (IOMAP_WRITE | IOMAP_ZERO)) &&
 		    !(ext.flags & OCSFS_EXT_UNWRITTEN) &&
 		    ocsfs_needs_cow(inode->i_sb, ext.physical_block)) {
 			u32 cow_blocks = min_t(u32, (u32)remaining_blocks,

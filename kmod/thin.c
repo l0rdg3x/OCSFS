@@ -16,6 +16,7 @@
 #include <linux/types.h>
 #include <linux/falloc.h>
 #include <linux/pagemap.h>
+#include <linux/iomap.h>
 #include "ocsfs.h"
 
 /* ═══════════════════════════════════════════════════════════════
@@ -125,6 +126,59 @@ static int ocsfs_zero_within_block(struct inode *inode, loff_t byte_off,
 	return 0;
 }
 
+/*
+ * Zero a sub-block edge range [byte_off, byte_off+byte_len) of a punch/zero,
+ * choosing a page-cache-coherent path.
+ *
+ * NON-shared block: use iomap_zero_range() — it reads, zeroes and dirties the
+ * iomap FOLIO (proper RMW), so the zeroing reaches disk through the one data
+ * path.  The old buffer_head path (ocsfs_zero_within_block) was a SECOND cache
+ * for the block; the inode's folio could be written back by the async flusher
+ * and race/overwrite it, corrupting the block non-deterministically (fsx: pure
+ * punch + write/read, no reflink/CoW).
+ *
+ * SHARED (reflink/snapshot/dedup) block: must be CoW'd first, and the CoW'd
+ * block lives only in cow_extent's dirty buffer (cow_extent cannot sync under
+ * i_extent_lock without deadlocking writeback).  iomap_zero_range would RMW
+ * from the not-yet-persisted on-disk block and lose the preserved tail, so a
+ * shared edge keeps the CoW-aware buffer_head path (ocsfs_zero_within_block),
+ * which copies from that dirty buffer.
+ */
+static int ocsfs_punch_zero_edge(struct inode *inode, loff_t byte_off,
+				 loff_t byte_len)
+{
+	struct ocsfs_inode_info *oi = OCSFS_I(inode);
+	u64 bs = OCSFS_SB(inode->i_sb)->s_block_size;
+	u64 lblk = (u64)byte_off / bs;
+	struct ocsfs_extent ext;
+	bool shared = false;
+	int ret;
+
+	if (byte_len <= 0)
+		return 0;
+
+	mutex_lock(&oi->i_extent_lock);
+	if (ocsfs_extent_lookup(inode, lblk, &ext) == 0 && ext.physical_block &&
+	    !(ext.flags & OCSFS_EXT_UNWRITTEN)) {
+		u64 phys = ext.physical_block + (lblk - ext.logical_block);
+
+		shared = ocsfs_needs_cow(inode->i_sb, phys);
+	}
+	if (shared) {
+		/* CoW-aware buffer_head path, run under i_extent_lock as it
+		 * requires (it calls ocsfs_cow_extent). */
+		ret = ocsfs_zero_within_block(inode, byte_off, byte_len);
+		mutex_unlock(&oi->i_extent_lock);
+		return ret;
+	}
+	mutex_unlock(&oi->i_extent_lock);
+
+	/* iomap_zero_range re-enters ocsfs_iomap_begin (takes i_extent_lock), so
+	 * it must run WITHOUT the lock held. */
+	return iomap_zero_range(inode, byte_off, byte_len, NULL,
+				&ocsfs_iomap_ops, NULL, NULL);
+}
+
 int ocsfs_punch_hole(struct inode *inode, loff_t offset, loff_t len)
 {
 	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
@@ -149,18 +203,38 @@ int ocsfs_punch_hole(struct inode *inode, loff_t offset, loff_t len)
 	if (len <= 0)
 		return 0;
 
-	/* Invalidate page cache for the punched region */
-	truncate_pagecache_range(inode, offset, pend - 1);
+	/* Zero the partial (sub-block) edge bytes via the iomap PAGE CACHE, so the
+	 * zeroing is coherent with the data path.  The old code zeroed the edges
+	 * through a raw buffer_head (sb_getblk + memset + sync_dirty_buffer) — a
+	 * SECOND cache for the same block.  The inode's iomap folio for that edge
+	 * block could then be written back by the async flusher and race with /
+	 * overwrite the buffer_head write, corrupting the block NON-deterministically
+	 * (caught by fsx: pure punch + write/read, no reflink/CoW; the on-disk
+	 * result varied run-to-run).  iomap_zero_range() reads, zeroes and dirties
+	 * the folio itself (proper RMW); a shared edge block is CoW'd inside
+	 * ocsfs_iomap_begin (IOMAP_ZERO is now handled like IOMAP_WRITE there).
+	 * It MUST run WITHOUT i_extent_lock: it re-enters ocsfs_iomap_begin, which
+	 * takes that lock (holding it here would self-deadlock). */
+	if (offset < head_end) {
+		ret = ocsfs_punch_zero_edge(inode, offset,
+					    min_t(loff_t, pend, head_end) - offset);
+		if (ret)
+			return ret;
+	}
+	if (pend > tail_start && tail_start >= head_end) {
+		ret = ocsfs_punch_zero_edge(inode,
+					    max_t(loff_t, offset, tail_start),
+					    pend - max_t(loff_t, offset, tail_start));
+		if (ret)
+			return ret;
+	}
 
-	/* Zero the partial (sub-block) bytes at the head and tail. */
-	mutex_lock(&oi->i_extent_lock);
-	if (offset < head_end)
-		ocsfs_zero_within_block(inode, offset,
-					min_t(loff_t, pend, head_end) - offset);
-	if (pend > tail_start && tail_start >= head_end)
-		ocsfs_zero_within_block(inode, max_t(loff_t, offset, tail_start),
-					pend - max_t(loff_t, offset, tail_start));
-	mutex_unlock(&oi->i_extent_lock);
+	/* Drop the page cache for the WHOLE (middle) blocks that are about to be
+	 * freed — but NOT the partial edge blocks, whose folios we just dirtied
+	 * above (truncate_pagecache_range would discard that zeroing).  After the
+	 * free those middle blocks read back as a hole (zeros). */
+	if (head_end < tail_start)
+		truncate_pagecache_range(inode, head_end, tail_start - 1);
 
 	if (oi->i_extent_tree_root)
 		return ocsfs_extent_btree_punch_hole(inode, full_start, full_end);
