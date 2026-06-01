@@ -476,8 +476,30 @@ int ocsfs_cow_extent(struct inode *inode, u64 logical, u32 len)
 			folio_put(sfolio);
 		}
 		if (!copied) {
-			old_bh = sb_bread(sb, old_phys + i);
+			/* No usable cached folio (e.g. the dst page was invalidated
+			 * by a preceding reflink, which shares whole blocks then evicts
+			 * the dst page cache).  The shared block's correct contents are
+			 * on disk — generic_remap_file_range_prep() wrote the source's
+			 * dirty pages back before sharing — but iomap writeback submits
+			 * bios directly and never updates the buffer_head cache, so a
+			 * plain sb_bread() of this physical block can return a stale
+			 * (zero) buffer and the CoW would copy zeros over the preserved
+			 * bytes.  FORCE a fresh disk read to stay coherent with the
+			 * iomap data path, exactly like ocsfs_zero_within_block()
+			 * (fsx: a punch ending mid-block on a reflink-shared block
+			 * CoW-copied stale zeros over the tail it had to preserve). */
+			old_bh = sb_getblk(sb, old_phys + i);
 			if (!old_bh) {
+				unlock_buffer(new_bh);
+				brelse(new_bh);
+				ocsfs_free_blocks(sb, new_phys, len);
+				return -EIO;
+			}
+			lock_buffer(old_bh);
+			clear_buffer_uptodate(old_bh);
+			unlock_buffer(old_bh);
+			if (bh_read(old_bh, 0) < 0) {
+				brelse(old_bh);
 				unlock_buffer(new_bh);
 				brelse(new_bh);
 				ocsfs_free_blocks(sb, new_phys, len);
@@ -490,6 +512,18 @@ int ocsfs_cow_extent(struct inode *inode, u64 logical, u32 len)
 		set_buffer_uptodate(new_bh);
 		mark_buffer_dirty(new_bh);
 		unlock_buffer(new_bh);
+		/* Persist the CoW'd block to disk NOW.  We write the new block
+		 * through a buffer_head, but OCSFS reads it back through the iomap
+		 * data path (bios straight to disk), and the post-CoW
+		 * ocsfs_zero_within_block() force-re-reads it from disk — neither
+		 * observes a merely dirty buffer.  mark_buffer_dirty() plus the
+		 * blkdev_issue_flush() below is NOT enough: the flush only barriers
+		 * already-submitted I/O, it never writes a dirty buffer back.
+		 * Without this sync the new block keeps its stale on-disk contents,
+		 * so a punch/zero of a just-CoW'd shared block reads garbage
+		 * (fsx: a byte preserved past a punch came back as another block's
+		 * data). */
+		sync_dirty_buffer(new_bh);
 		brelse(new_bh);
 	}
 
