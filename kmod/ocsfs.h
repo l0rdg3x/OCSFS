@@ -1385,6 +1385,7 @@ int ocsfs_prealloc_blocks(struct inode *inode, u64 offset, u64 len);
 long ocsfs_fallocate(struct file *file, int mode, loff_t offset, loff_t len);
 int ocsfs_punch_hole(struct inode *inode, loff_t offset, loff_t len);
 int ocsfs_zero_range(struct inode *inode, loff_t offset, loff_t len);
+int ocsfs_clear_block_range(struct inode *inode, u64 start_block, u64 end_block);
 int ocsfs_discard_blocks(struct super_block *sb, u64 block, u32 count);
 void ocsfs_thin_stats(struct inode *inode, u64 *written, u64 *unwritten);
 
