@@ -74,6 +74,36 @@ int ocsfs_extent_insert(struct inode *inode, u64 logical, u64 physical,
 		return ocsfs_extent_btree_insert(inode, logical, physical,
 						 len, flags);
 
+	/*
+	 * INVARIANT: the extent map must never contain overlapping logical
+	 * ranges.  ocsfs_extent_lookup() returns the FIRST match, so an overlap
+	 * makes a logical block resolve to two different physical blocks —
+	 * reads/writeback then race between them and one persists stale zeros
+	 * (data corruption).  Every caller that adds a mapping must first clear
+	 * the range (write/prealloc clamp to consecutive holes; reflink clears
+	 * the dst range).  This tripwire catches any path that violates the
+	 * invariant before it corrupts data — a firing here is always a bug in
+	 * the caller, not a tolerable condition.
+	 */
+	{
+		u16 j;
+
+		for (j = 0; j < oi->i_extent_count; j++) {
+			struct ocsfs_extent *e = &oi->i_extents[j];
+
+			if (logical < e->logical_block + e->length &&
+			    e->logical_block < logical + len) {
+				WARN_ONCE(1,
+					"ocsfs: extent_insert OVERLAP ino=%llu new[log=%llu len=%u] vs existing[log=%llu len=%u] — caller bug\n",
+					(unsigned long long)oi->i_disk_ino,
+					(unsigned long long)logical, len,
+					(unsigned long long)e->logical_block,
+					e->length);
+				break;
+			}
+		}
+	}
+
 	/* Try to merge with an existing extent */
 	for (i = 0; i < oi->i_extent_count; i++) {
 		struct ocsfs_extent *e = &oi->i_extents[i];

@@ -216,6 +216,35 @@ int ocsfs_extent_btree_insert(struct inode *inode, u64 logical, u64 physical,
 
 	if (ret)
 		return ret;
+
+	/*
+	 * INVARIANT: no overlapping logical ranges (see ocsfs_extent_insert).
+	 * Check the extent straddling/at the new start (search_le) and any extent
+	 * starting inside the new range (search_le of the last block).  A firing
+	 * here means a caller added a mapping without clearing the range first —
+	 * always a bug, because ocsfs_extent_lookup() would then resolve a block
+	 * to two physical locations and a read could return stale zeros.
+	 */
+	{
+		u64 ok, ov;
+
+		if (ocsfs_btree_search_le(&bt, logical, &ok, &ov) == 0 &&
+		    ok != logical && ok + ext_len(f4, ov) > logical)
+			WARN_ONCE(1,
+				"ocsfs: btree_insert OVERLAP ino=%llu new[log=%llu len=%u] vs prev[key=%llu len=%u] — caller bug\n",
+				(unsigned long long)oi->i_disk_ino,
+				(unsigned long long)logical, len,
+				(unsigned long long)ok, ext_len(f4, ov));
+		else if (len > 1 &&
+			 ocsfs_btree_search_le(&bt, logical + len - 1, &ok, &ov) == 0 &&
+			 ok > logical && ok < logical + len)
+			WARN_ONCE(1,
+				"ocsfs: btree_insert OVERLAP ino=%llu new[log=%llu len=%u] vs next[key=%llu len=%u] — caller bug\n",
+				(unsigned long long)oi->i_disk_ino,
+				(unsigned long long)logical, len,
+				(unsigned long long)ok, ext_len(f4, ov));
+	}
+
 	txn = ocsfs_txn_begin(inode->i_sb);
 	if (IS_ERR(txn))
 		return PTR_ERR(txn);

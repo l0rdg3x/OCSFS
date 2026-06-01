@@ -272,6 +272,36 @@ int ocsfs_prealloc_blocks(struct inode *inode, u64 offset, u64 len)
 		alloc_len = (u32)min_t(u64, end_block - cur,
 				       OCSFS_PREALLOC_MAX_BLOCKS);
 
+		/*
+		 * CRITICAL: clamp the run to the first already-mapped block.
+		 * cur itself is a hole (lookup above returned no mapping), but a
+		 * block within [cur, cur+alloc_len) may already be mapped — the
+		 * lookup only probed cur.  ocsfs_alloc_extent() inserts the extent
+		 * [cur, cur+alloc_len) verbatim (UNWRITTEN allocates exactly the
+		 * requested length), so without this clamp it OVERLAPS the existing
+		 * extent.  Overlapping extents make ocsfs_extent_lookup() ambiguous
+		 * (it returns the first match), so a later read/writeback can resolve
+		 * the same logical block to two different physical blocks and return
+		 * stale zeros — and a subsequent reflink propagates the overlap into
+		 * the clone's destination (its dst-range clear's search_le lands on
+		 * the spurious exact-key extent and misses the straddling one).
+		 * Caught by fsx clone/fallocate replay (READ BAD DATA, zeros).  Same
+		 * consecutive-hole clamp the iomap_begin allocating-write path does.
+		 */
+		{
+			u64 k;
+
+			for (k = 1; k < alloc_len; k++) {
+				struct ocsfs_extent probe;
+
+				if (ocsfs_extent_lookup(inode, cur + k, &probe) == 0 &&
+				    probe.physical_block != 0) {
+					alloc_len = (u32)k;
+					break;
+				}
+			}
+		}
+
 		ret = ocsfs_alloc_extent(inode, cur, alloc_len,
 					 &allocated, &phys,
 					 OCSFS_EXT_UNWRITTEN);
