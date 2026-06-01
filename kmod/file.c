@@ -498,18 +498,6 @@ static loff_t ocsfs_remap_file_range(struct file *src_file, loff_t pos_in,
 	dst_blk  = (u64)pos_out / sbi->s_block_size;
 	len_blks = (u64)remap_len / sbi->s_block_size;
 
-	/* Turn the destination range into a clean hole first (freeing its old
-	 * blocks refcount-aware), so that holes in the source become holes in
-	 * the destination.  Without this the dest keeps its pre-clone data where
-	 * the source has a hole (caught by fsx).  Done before taking
-	 * i_extent_lock — the helper takes it itself / the btree punch manages
-	 * its own access.  src and dst ranges never overlap when src == dst
-	 * (generic_remap_file_range_prep rejects that), so the source data is
-	 * untouched. */
-	ret = ocsfs_clear_block_range(dst, dst_blk, dst_blk + len_blks);
-	if (ret)
-		goto out_unlock_dlm;
-
 	if (src_oi->i_disk_ino < dst_oi->i_disk_ino || src == dst) {
 		mutex_lock(&src_oi->i_extent_lock);
 		if (src != dst)
