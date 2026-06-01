@@ -425,6 +425,11 @@ static loff_t ocsfs_remap_file_range(struct file *src_file, loff_t pos_in,
 	loff_t ret;
 	u16 i;
 
+	/* Dedup (FIDEDUPERANGE / REMAP_FILE_DEDUP) is not supported: report
+	 * -EOPNOTSUPP (not -EINVAL) so callers treat it as "unsupported, skip"
+	 * rather than a hard error. */
+	if (remap_flags & REMAP_FILE_DEDUP)
+		return -EOPNOTSUPP;
 	if (remap_flags & ~REMAP_FILE_CAN_SHORTEN)
 		return -EINVAL;
 
