@@ -260,6 +260,120 @@ int ocsfs_punch_hole(struct inode *inode, loff_t offset, loff_t len)
 	return ret;
 }
 
+/*
+ * Clear [start_block, end_block) of an inode's extent map, freeing the
+ * physical blocks REFCOUNT-AWARE (ocsfs_free_blocks_rc, so shared/reflinked
+ * blocks are only released when their last reference goes away).
+ *
+ * Used by reflink to turn the destination range into a clean hole BEFORE
+ * sharing the source's blocks, so the destination mirrors the source exactly
+ * (including the source's holes).  Block-aligned range only.  Caller holds
+ * i_rwsem EX (and DLM EX in cluster mode); this takes i_extent_lock itself.
+ */
+int ocsfs_clear_block_range(struct inode *inode, u64 start_block, u64 end_block)
+{
+	struct ocsfs_sb_info *sbi = OCSFS_SB(inode->i_sb);
+	struct ocsfs_inode_info *oi = OCSFS_I(inode);
+	struct { u64 phys; u32 count; } frees[OCSFS_INLINE_EXTENTS + 1];
+	int nfrees = 0;
+	int i;
+	int ret = 0;
+
+	if (start_block >= end_block)
+		return 0;
+
+	/* Btree-backed: the btree punch already frees refcount-aware. */
+	if (oi->i_extent_tree_root)
+		return ocsfs_extent_btree_punch_hole(inode, start_block, end_block);
+
+	mutex_lock(&oi->i_extent_lock);
+
+	for (i = oi->i_extent_count - 1; i >= 0; i--) {
+		struct ocsfs_extent *e = &oi->i_extents[i];
+		u64 ext_start = e->logical_block;
+		u64 ext_end = e->logical_block + e->length;
+
+		if (ext_end <= start_block || ext_start >= end_block)
+			continue;
+
+		if (e->flags & OCSFS_EXT_COMPRESSED) {
+			ret = ocsfs_extent_decompress_for_write(inode, ext_start);
+			if (ret)
+				goto out;
+			i++;            /* re-visit this (now uncompressed) index */
+			continue;
+		}
+
+		if (ext_start >= start_block && ext_end <= end_block) {
+			/* Fully inside: remove and free. */
+			frees[nfrees].phys  = e->physical_block;
+			frees[nfrees].count = ocsfs_ext_phys_blocks(e);
+			nfrees++;
+			inode->i_blocks -= (u64)e->length * (sbi->s_block_size / 512);
+			if (i + 1 < oi->i_extent_count)
+				memmove(&oi->i_extents[i], &oi->i_extents[i + 1],
+					(oi->i_extent_count - i - 1) *
+					sizeof(struct ocsfs_extent));
+			oi->i_extent_count--;
+		} else if (ext_start >= start_block) {
+			/* Head overlap: shrink from front. */
+			u32 removed = (u32)(end_block - ext_start);
+
+			frees[nfrees].phys  = e->physical_block;
+			frees[nfrees].count = removed;
+			nfrees++;
+			inode->i_blocks -= (u64)removed * (sbi->s_block_size / 512);
+			e->logical_block  += removed;
+			e->physical_block += removed;
+			e->length         -= removed;
+		} else if (ext_end <= end_block) {
+			/* Tail overlap: shrink from back. */
+			u32 removed = (u32)(ext_end - start_block);
+
+			frees[nfrees].phys  = e->physical_block +
+					      (e->length - removed);
+			frees[nfrees].count = removed;
+			nfrees++;
+			inode->i_blocks -= (u64)removed * (sbi->s_block_size / 512);
+			e->length -= removed;
+		} else {
+			/* Middle: split into head + tail, free the middle. */
+			u32 head_len = (u32)(start_block - ext_start);
+			u32 tail_len = (u32)(ext_end - end_block);
+			u64 tail_phys = e->physical_block + (end_block - ext_start);
+			u32 removed = (u32)(end_block - start_block);
+
+			frees[nfrees].phys  = e->physical_block + head_len;
+			frees[nfrees].count = removed;
+			nfrees++;
+			inode->i_blocks -= (u64)removed * (sbi->s_block_size / 512);
+			e->length = head_len;
+			ret = ocsfs_extent_insert(inode, end_block, tail_phys,
+						  tail_len, e->flags);
+			if (ret)
+				pr_warn("ocsfs: reflink dst-clear split failed: "
+					"inode %llu\n", oi->i_disk_ino);
+			break;          /* only one split possible per range */
+		}
+	}
+
+	if (nfrees > 0) {
+		int fr = ocsfs_flush_inode_locked(inode, false);
+
+		if (fr)
+			pr_warn_ratelimited(
+				"ocsfs: reflink dst-clear flush failed (%d)\n", fr);
+	}
+	mark_inode_dirty(inode);
+out:
+	mutex_unlock(&oi->i_extent_lock);
+
+	for (i = 0; i < nfrees; i++)
+		ocsfs_free_blocks_rc(inode->i_sb, frees[i].phys, frees[i].count);
+
+	return ret;
+}
+
 /* ═══════════════════════════════════════════════════════════════
  * ZERO RANGE
  *

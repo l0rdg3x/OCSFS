@@ -363,55 +363,63 @@ after_compress:;
 	return blkdev_issue_flush(inode->i_sb->s_bdev);
 }
 /* REMAP FILE RANGE — extent sharing for cp --reflink / FICLONE (DEDUP not supported) */
-struct ocsfs_remap_ctx {
-	struct inode         *dst;
-	u64                   src_blk, dst_blk, end_blk;
-	struct ocsfs_sb_info *sbi;
-	int                   ret;
+/* Collect-first reflink: the source's extents are gathered into a local array
+ * (read-only) BEFORE the destination is cleared and the shared extents are
+ * inserted.  This is required when src == dst (fsx clones within one file):
+ * iterating the source extent tree while inserting into the same tree would
+ * corrupt the walk.  Source holes / UNWRITTEN ranges are simply not collected,
+ * so after the dst is cleared they remain holes in the destination (the dest
+ * mirrors the source exactly). */
+struct ocsfs_remap_ent {
+	u64 phys;
+	u64 log_dst;
+	u32 clip;
 };
 
-static int remap_extent_cb(u64 logical, u64 physical, u32 length,
-			    u16 flags, void *priv)
-{
-	struct ocsfs_remap_ctx *rc = priv;
-	u64 ov_s = max(logical, rc->src_blk);
-	u64 ov_e = min(logical + (u64)length, rc->end_blk);
-	u64 phys, log_dst;
-	u32 clip;
+struct ocsfs_remap_collect {
+	struct ocsfs_remap_ent *ents;
+	u32 n;
+	u32 cap;
+	u64 src_blk, dst_blk, end_blk;
 	int ret;
+};
 
-	if (ov_s >= ov_e || !physical || (flags & OCSFS_EXT_UNWRITTEN))
-		return 0;
+/* First pass: count shareable source extents overlapping the range. */
+static int remap_count_cb(u64 logical, u64 physical, u32 length,
+			  u16 flags, void *priv)
+{
+	struct ocsfs_remap_collect *c = priv;
+	u64 ov_s = max(logical, c->src_blk);
+	u64 ov_e = min(logical + (u64)length, c->end_blk);
 
-	phys    = physical + (ov_s - logical);
-	log_dst = rc->dst_blk + (ov_s - rc->src_blk);
-	clip    = (u32)(ov_e - ov_s);
-
-	/* Charge the clone's block quota (logical accounting) before sharing. */
-	ret = dquot_alloc_space_nodirty(rc->dst,
-				(u64)clip * rc->sbi->s_block_size);
-	if (ret) { rc->ret = ret; return ret; }
-
-	ret = ocsfs_refcount_inc(rc->dst->i_sb, phys, clip);
-	if (ret) {
-		dquot_free_space_nodirty(rc->dst,
-				(u64)clip * rc->sbi->s_block_size);
-		rc->ret = ret;
-		return ret;
-	}
-
-	ret = ocsfs_extent_insert(rc->dst, log_dst, phys, clip,
-				  OCSFS_EXT_WRITTEN);
-	if (ret) {
-		ocsfs_refcount_dec(rc->dst->i_sb, phys, clip, NULL);
-		dquot_free_space_nodirty(rc->dst,
-				(u64)clip * rc->sbi->s_block_size);
-		rc->ret = ret;
-		return ret;
-	}
-	rc->dst->i_blocks += (u64)clip * (rc->sbi->s_block_size / 512);
+	if (ov_s < ov_e && physical &&
+	    !(flags & (OCSFS_EXT_UNWRITTEN | OCSFS_EXT_COMPRESSED)))
+		c->cap++;
 	return 0;
 }
+
+/* Second pass: record them (no map mutation, no refcount/quota yet). */
+static int remap_collect_cb(u64 logical, u64 physical, u32 length,
+			    u16 flags, void *priv)
+{
+	struct ocsfs_remap_collect *c = priv;
+	u64 ov_s = max(logical, c->src_blk);
+	u64 ov_e = min(logical + (u64)length, c->end_blk);
+
+	if (ov_s >= ov_e || !physical ||
+	    (flags & (OCSFS_EXT_UNWRITTEN | OCSFS_EXT_COMPRESSED)))
+		return 0;
+	if (c->n >= c->cap) {            /* sized from the count pass; be safe */
+		c->ret = -ENOSPC;
+		return -ENOSPC;
+	}
+	c->ents[c->n].phys    = physical + (ov_s - logical);
+	c->ents[c->n].log_dst = c->dst_blk + (ov_s - c->src_blk);
+	c->ents[c->n].clip    = (u32)(ov_e - ov_s);
+	c->n++;
+	return 0;
+}
+
 static loff_t ocsfs_remap_file_range(struct file *src_file, loff_t pos_in,
 				     struct file *dst_file, loff_t pos_out,
 				     loff_t remap_len, unsigned int remap_flags)
@@ -503,81 +511,102 @@ static loff_t ocsfs_remap_file_range(struct file *src_file, loff_t pos_in,
 	dst_blk  = (u64)pos_out / sbi->s_block_size;
 	len_blks = (u64)remap_len / sbi->s_block_size;
 
-	if (src_oi->i_disk_ino < dst_oi->i_disk_ino || src == dst) {
-		mutex_lock(&src_oi->i_extent_lock);
-		if (src != dst)
-			mutex_lock_nested(&dst_oi->i_extent_lock,
-					  SINGLE_DEPTH_NESTING);
-	} else {
-		mutex_lock(&dst_oi->i_extent_lock);
-		mutex_lock_nested(&src_oi->i_extent_lock, SINGLE_DEPTH_NESTING);
-	}
-
-	if (src_oi->i_extent_tree_root) {
-		struct ocsfs_remap_ctx rc = {
-			dst, src_blk, dst_blk, src_blk + len_blks, sbi, 0
+	/* Phase 1: collect the source's shareable extents into a local array,
+	 * READ-ONLY.  Required when src == dst: we must not iterate the source
+	 * extent tree while inserting clones into the same tree.  Source holes /
+	 * UNWRITTEN ranges are not collected, so after the dst is cleared (phase
+	 * 2) they remain holes in the destination. */
+	{
+		struct ocsfs_remap_collect c = {
+			.src_blk = src_blk,
+			.dst_blk = dst_blk,
+			.end_blk = src_blk + len_blks,
 		};
-		ocsfs_extent_btree_iterate(src, remap_extent_cb, &rc);
-		ret = rc.ret;
-	} else {
-		ret = 0;
-		for (i = 0; i < src_oi->i_extent_count && !ret; i++) {
-			struct ocsfs_extent *e = &src_oi->i_extents[i];
-			u64 ov_s = max(e->logical_block, src_blk);
-			u64 ov_e = min(e->logical_block + (u64)e->length,
-				       src_blk + len_blks);
-			u64 phys, log_dst;
-			u32 clip;
+		u32 k;
 
-			if (ov_s >= ov_e || !e->physical_block ||
-			    (e->flags & (OCSFS_EXT_UNWRITTEN |
-					 OCSFS_EXT_COMPRESSED)))
-				continue;
+		mutex_lock(&src_oi->i_extent_lock);
+		if (src_oi->i_extent_tree_root) {
+			ocsfs_extent_btree_iterate(src, remap_count_cb, &c);
+		} else {
+			for (i = 0; i < src_oi->i_extent_count; i++)
+				remap_count_cb(src_oi->i_extents[i].logical_block,
+					src_oi->i_extents[i].physical_block,
+					src_oi->i_extents[i].length,
+					src_oi->i_extents[i].flags, &c);
+		}
+		if (c.cap) {
+			c.ents = kvmalloc_array(c.cap, sizeof(*c.ents), GFP_NOFS);
+			if (!c.ents) {
+				mutex_unlock(&src_oi->i_extent_lock);
+				ret = -ENOMEM;
+				goto out_unlock_dlm;
+			}
+			if (src_oi->i_extent_tree_root) {
+				ocsfs_extent_btree_iterate(src, remap_collect_cb,
+							   &c);
+			} else {
+				for (i = 0; i < src_oi->i_extent_count; i++)
+					remap_collect_cb(
+						src_oi->i_extents[i].logical_block,
+						src_oi->i_extents[i].physical_block,
+						src_oi->i_extents[i].length,
+						src_oi->i_extents[i].flags, &c);
+			}
+		}
+		mutex_unlock(&src_oi->i_extent_lock);
+		ret = c.ret;
+		if (ret) {
+			kvfree(c.ents);
+			goto out_unlock_dlm;
+		}
 
-			phys    = e->physical_block + (ov_s - e->logical_block);
-			log_dst = dst_blk + (ov_s - src_blk);
-			clip    = (u32)(ov_e - ov_s);
+		/* Phase 2: turn the dst range into a clean hole (refcount-aware),
+		 * so the source's holes are reflected in the destination. */
+		ret = ocsfs_clear_block_range(dst, dst_blk, dst_blk + len_blks);
+		if (ret) {
+			kvfree(c.ents);
+			goto out_unlock_dlm;
+		}
+
+		/* Phase 3: insert the collected shared extents into the dst. */
+		mutex_lock(&dst_oi->i_extent_lock);
+		for (k = 0; k < c.n && !ret; k++) {
+			struct ocsfs_remap_ent *e = &c.ents[k];
 
 			ret = dquot_alloc_space_nodirty(dst,
-					(u64)clip * sbi->s_block_size);
-			if (ret) break;
-			ret = ocsfs_refcount_inc(src->i_sb, phys, clip);
+					(u64)e->clip * sbi->s_block_size);
+			if (ret)
+				break;
+			ret = ocsfs_refcount_inc(dst->i_sb, e->phys, e->clip);
 			if (ret) {
 				dquot_free_space_nodirty(dst,
-					(u64)clip * sbi->s_block_size);
+					(u64)e->clip * sbi->s_block_size);
 				break;
 			}
-			ret = ocsfs_extent_insert(dst, log_dst, phys, clip,
-						  OCSFS_EXT_WRITTEN);
+			ret = ocsfs_extent_insert(dst, e->log_dst, e->phys,
+						  e->clip, OCSFS_EXT_WRITTEN);
 			if (ret) {
-				ocsfs_refcount_dec(src->i_sb, phys, clip, NULL);
+				ocsfs_refcount_dec(dst->i_sb, e->phys, e->clip,
+						   NULL);
 				dquot_free_space_nodirty(dst,
-					(u64)clip * sbi->s_block_size);
+					(u64)e->clip * sbi->s_block_size);
 				break;
 			}
-			dst->i_blocks += (u64)clip * (sbi->s_block_size / 512);
+			dst->i_blocks += (u64)e->clip * (sbi->s_block_size / 512);
 		}
-	}
 
-	if (!ret) {
-		if (pos_out + remap_len > i_size_read(dst))
-			i_size_write(dst, pos_out + remap_len);
-		mark_inode_dirty(dst);
-		if (sbi->s_clustered) {
-			ocsfs_flush_inode_locked(dst, true);
-			if (src != dst)
-				ocsfs_flush_inode_locked(src, true);
+		if (!ret) {
+			if (pos_out + remap_len > i_size_read(dst))
+				i_size_write(dst, pos_out + remap_len);
+			mark_inode_dirty(dst);
+			if (sbi->s_clustered) {
+				ocsfs_flush_inode_locked(dst, true);
+				if (src != dst)
+					ocsfs_flush_inode_locked(src, true);
+			}
 		}
-	}
-
-	if (src == dst) {
-		mutex_unlock(&src_oi->i_extent_lock);
-	} else if (src_oi->i_disk_ino < dst_oi->i_disk_ino) {
 		mutex_unlock(&dst_oi->i_extent_lock);
-		mutex_unlock(&src_oi->i_extent_lock);
-	} else {
-		mutex_unlock(&src_oi->i_extent_lock);
-		mutex_unlock(&dst_oi->i_extent_lock);
+		kvfree(c.ents);
 	}
 
 	/* Evict stale clean pages over the destination range.  The extent map
