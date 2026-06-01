@@ -93,6 +93,15 @@ management network.
 
 ## 2. On-Disk Layout
 
+**Capacity limits** (all size fields are 64-bit; default 4 KiB block):
+max **file** size **8 EiB** (`s_maxbytes = MAX_LFS_FILESIZE`, `i_size` is `__le64`;
+single extent ≤ 16 TiB via `e_length __le32`, chained 16-inline + B+ tree);
+max **filesystem** size **~4 EiB** (`s_ag_count __le32` × 1 GiB default AG, raised
+by larger `mkfs -A` AGs toward the `__le64` physical-block limit ~64 ZiB);
+**256** nodes (`OCSFS_MAX_NODES`); block size 512 B–64 KiB. Online/autonomous grow
+adds ≤ `OCSFS_AG_GROW_RESERVE` = 512 AGs over a volume's life (≈ +512 GiB at the
+default AG size).
+
 The volume occupies an entire block device. Regions are sequential from offset 0.
 
 ```

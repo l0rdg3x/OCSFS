@@ -287,6 +287,29 @@ two-node buffered read/write ping-pong). Integrity is verified end-to-end with
 
 ---
 
+## 📏 Limits
+
+Architectural maxima from the on-disk format (all size fields are 64-bit;
+default 4 KiB block, range 512 B – 64 KiB):
+
+| Limit | Value (4 KiB block) | Bound by |
+|---|--:|---|
+| **Max file size** | **8 EiB** | `s_maxbytes = MAX_LFS_FILESIZE` (VFS cap); `i_size` is `__le64` |
+| Single extent | 16 TiB | `e_length` `__le32` (blocks); a file chains many extents (16 inline + B+ tree) |
+| **Max filesystem size** | **~4 EiB** | `s_ag_count` `__le32` × 1 GiB default AG; larger `mkfs -A` AGs raise it toward the 64-bit block-layer limit |
+| Block addressing | ~64 ZiB | physical block number is `__le64` |
+| Allocation groups | 2³² | `s_ag_count` `__le32` |
+| Nodes per volume | 256 | `OCSFS_MAX_NODES` |
+| Block size | 512 B – 64 KiB | power of two (`mkfs -b`) |
+
+> **Online-grow increment.** The autonomous/online grow can add up to
+> `OCSFS_AG_GROW_RESERVE` = **512 AGs over a volume's lifetime** (≈ **+512 GiB**
+> with default 1 GiB AGs). To grow beyond that, format larger up front or use
+> bigger AGs (`mkfs -A`) so each grow adds more space per AG. The *format* maxima
+> above are far larger than any real LUN; tested here at the 100–172 GiB scale.
+
+---
+
 ## 🔨 Building
 
 ```bash
