@@ -16,6 +16,7 @@
 #include "ocsfs.h"
 #include <linux/iomap.h>
 #include <linux/fiemap.h>
+#include <linux/pagemap.h>
 
 /* ═══════════════════════════════════════════════════════════════
  * GET_BLOCK — maps logical file block → physical disk block
@@ -558,6 +559,24 @@ static loff_t ocsfs_remap_file_range(struct file *src_file, loff_t pos_in,
 	} else {
 		mutex_unlock(&src_oi->i_extent_lock);
 		mutex_unlock(&dst_oi->i_extent_lock);
+	}
+
+	/* Evict stale clean pages over the destination range.  The extent map
+	 * now points at the (shared) source blocks, but clean cached pages from
+	 * before the clone still hold the destination's old contents, so a
+	 * subsequent buffered read would return stale data.
+	 * generic_remap_file_range_prep() only writes back *dirty* pages before
+	 * the remap; it never evicts clean pages afterwards — that is the
+	 * filesystem's job (cf. ext4/xfs).  Done outside i_extent_lock to avoid
+	 * an ABBA with writeback (which takes i_extent_lock under a page lock),
+	 * while i_rwsem EX (held via lock_two_nondirectories) keeps writers out.
+	 * Caught by fsx / xfstests generic/075,091,112,127,263. */
+	if (remap_len > 0) {
+		filemap_invalidate_lock(dst->i_mapping);
+		invalidate_inode_pages2_range(dst->i_mapping,
+			pos_out >> PAGE_SHIFT,
+			(pos_out + remap_len - 1) >> PAGE_SHIFT);
+		filemap_invalidate_unlock(dst->i_mapping);
 	}
 
 out_unlock_dlm:
