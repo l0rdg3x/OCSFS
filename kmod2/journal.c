@@ -16,6 +16,16 @@
  */
 #include "ocsfs.h"
 #include <linux/blkdev.h>
+#include <linux/moduleparam.h>
+
+/* DEBUG/TEST: when set, txn_commit publishes the journal then returns WITHOUT
+ * checkpointing (journal left dirty). A hard crash here is then recovered by
+ * replay on the next mount — the deterministic way to exercise J2. Never set
+ * in production. */
+static bool ocsfs2_crash_after_commit;
+module_param_named(crash_after_commit, ocsfs2_crash_after_commit, bool, 0644);
+MODULE_PARM_DESC(crash_after_commit,
+		 "TEST: skip checkpoint after commit to exercise replay");
 
 static inline u64 jblk_phys(struct ocsfs2_journal *j, u64 rec)
 {
@@ -268,6 +278,15 @@ int ocsfs2_txn_commit(struct ocsfs2_txn *txn)
 	ret = persist_header(j);
 	if (ret)
 		goto out_unlock;
+
+	if (unlikely(ocsfs2_crash_after_commit)) {
+		/* leave the journal dirty on purpose; a crash now is replayed */
+		mutex_unlock(&j->j_lock);
+		kfree(desc);
+		kfree(commit);
+		txn_free(txn, false);
+		return 0;
+	}
 
 	/* checkpoint: copy the after-images to their home locations */
 	list_for_each_entry(tb, &txn->t_bufs, link) {

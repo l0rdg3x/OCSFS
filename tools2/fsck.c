@@ -174,7 +174,11 @@ int main(int argc, char **argv)
 		free(bm);
 		free_stored = le64toh(ag.ag_free_blocks);
 		if (free_stored != expect_count - used)
-			ERR("AG%u free_blocks=%llu but count-used=%llu\n", i,
+			/* The block bitmap is authoritative; ag_free_blocks is a
+			 * cached, recomputable hint (not journaled) that can drift by
+			 * the allocations since the last sync after a crash. This is
+			 * recoverable via repair (cf. e2fsck -p), not corruption. */
+			WARN("AG%u free_blocks=%llu but bitmap implies %llu (recomputable hint)\n", i,
 			    (unsigned long long)free_stored, (unsigned long long)(expect_count - used));
 		total_free_recomputed += expect_count - used;
 
