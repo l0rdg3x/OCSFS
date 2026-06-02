@@ -389,21 +389,15 @@ static int ocsfs2_file_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-/* mmap write fault goes through iomap so a store to a mapped page allocates its
- * backing blocks (iomap_begin WRITE) and sets per-block folio state — keeping
- * mmap coherent with the read/write_iter + fallocate paths. (filemap's generic
- * page_mkwrite would leave an mmap write to a hole unbacked and lose it on
- * writeback — caught by fsx's MAPWRITE/MAPREAD.) */
-static vm_fault_t ocsfs2_page_mkwrite(struct vm_fault *vmf)
-{
-	return iomap_page_mkwrite(vmf, &ocsfs2_iomap_ops, NULL);
-}
-
-static const struct vm_operations_struct ocsfs2_file_vm_ops = {
-	.fault        = filemap_fault,
-	.map_pages    = filemap_map_pages,
-	.page_mkwrite = ocsfs2_page_mkwrite,
-};
+/* mmap is intentionally NOT supported. OCSFS v2 targets Proxmox image storage:
+ * QEMU VM disks (raw/qcow2) are accessed via pread/pwrite/aio, and LXC containers
+ * are stored as raw images on a loop device (the plugin advertises subvol=0, so
+ * Proxmox never unpacks a container rootfs directly onto OCSFS). The loop driver
+ * uses read_iter/write_iter on its backing file — never mmap. No path in the
+ * Proxmox workload mmaps an OCSFS file, so omitting .mmap (mmap() -> -ENODEV)
+ * costs nothing and removes the mmap+CoW stale-MAPREAD hazard class entirely
+ * (a mapped page could otherwise survive a reflink/CoW that rewrote its backing
+ * block, serving stale data). */
 
 /* copy_file_range: byte-granular server-side copy. We go through the generic
  * splice helper (read + buffered write) so unaligned ranges work; block-aligned
@@ -415,26 +409,13 @@ static ssize_t ocsfs2_copy_file_range(struct file *in, loff_t pos_in,
 	return splice_copy_file_range(in, pos_in, out, pos_out, len);
 }
 
-static int ocsfs2_file_mmap(struct file *file, struct vm_area_struct *vma)
-{
-	/* Cluster: a shared-writable mmap would need an EX lease re-check on every
-	 * page fault to stay coherent — not wired yet, so refuse it (the file is
-	 * single-writer-owned anyway). Read-only / private-COW mappings are safe. */
-	if (OCSFS2_SB(file_inode(file)->i_sb)->s_cluster &&
-	    (vma->vm_flags & VM_SHARED) && (vma->vm_flags & VM_WRITE))
-		return -EOPNOTSUPP;
-	file_accessed(file);
-	vma->vm_ops = &ocsfs2_file_vm_ops;
-	return 0;
-}
-
 const struct file_operations ocsfs2_file_fops = {
 	.open             = ocsfs2_file_open,
 	.release          = ocsfs2_file_release,     /* drop the ownership lease */
 	.llseek           = ocsfs2_llseek,           /* + SEEK_HOLE / SEEK_DATA */
 	.read_iter        = ocsfs2_file_read_iter,
 	.write_iter       = ocsfs2_file_write_iter,
-	.mmap             = ocsfs2_file_mmap,        /* iomap page_mkwrite */
+	/* no .mmap: unused by the Proxmox workload; see comment above */
 	.fsync            = ocsfs2_fsync,
 	.fallocate        = ocsfs2_fallocate,        /* prealloc / punch / zero */
 	.splice_read      = filemap_splice_read,
