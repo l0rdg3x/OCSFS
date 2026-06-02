@@ -24,8 +24,24 @@ ROOT="$(dirname "$HERE")"
 KREL="$(uname -r)"
 KBUILD="/lib/modules/$KREL/build"
 
+# 0. prerequisites (build toolchain + matching kernel headers). The out-of-tree
+#    module must be built against THIS node's exact kernel. Auto-install on a
+#    Debian/PVE node; otherwise tell the admin exactly what to install.
+need_prereq=0
+command -v cc >/dev/null   || need_prereq=1
+[ -d "$KBUILD" ]           || need_prereq=1
+if [ "$need_prereq" -eq 1 ]; then
+    if command -v apt-get >/dev/null; then
+        say "installing prerequisites (build-essential, pve-headers-$KREL)"
+        apt-get update -qq 2>/dev/null || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential "pve-headers-$KREL" 2>/dev/null || \
+            DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential "linux-headers-$KREL" 2>/dev/null || true
+    fi
+fi
 [ -d "$KBUILD" ] || die "kernel headers for $KREL not found ($KBUILD). Install: apt install pve-headers-$KREL"
-command -v cc >/dev/null || die "no C compiler (apt install build-essential)"
+command -v cc >/dev/null || die "no C compiler. Install: apt install build-essential"
 
 # 1. kernel module
 say "building ocsfs2 kernel module for $KREL"

@@ -8,7 +8,20 @@
 #   ocsfs2-maint scrub     # verify metadata checksums on each ocsfs2 mount
 #   ocsfs2-maint defrag    # defragment fragmented files under each ocsfs2 mount
 #
-# Tunables (env): OCSFS2_DEFRAG_MINEXT (min extents to defrag a file, default 16)
+# CLUSTER COORDINATION: the timer is enabled on every node (so maintenance still
+# happens if any node is down), but the work runs ONCE PER CYCLE for the whole
+# cluster, on whichever node gets there first — not once per node. Two on-disk
+# markers on the shared filesystem make this safe:
+#   * a completion STAMP (.ocsfs2-maint.<mode>.stamp) — if maintenance completed
+#     less than OCSFS2_MAINT_INTERVAL seconds ago, every node skips this cycle;
+#   * an exclusive LOCK  (.ocsfs2-maint.<mode>.lock)  — an atomic O_EXCL file so
+#     two nodes firing at the same instant cannot both start. OCSFS serialises
+#     cross-node namespace ops, so exactly one node wins. A lock left by a
+#     crashed node is stolen once it is older than OCSFS2_MAINT_STALE seconds.
+#
+# Tunables (env): OCSFS2_DEFRAG_MINEXT   min extents to defrag a file (def 16)
+#                 OCSFS2_MAINT_INTERVAL  skip if done within N s   (def 518400 = 6d)
+#                 OCSFS2_MAINT_STALE     stale-lock steal age      (def 86400  = 24h)
 set -u
 
 mode="${1:-}"
@@ -18,12 +31,56 @@ case "$mode" in
 esac
 
 minext="${OCSFS2_DEFRAG_MINEXT:-16}"
+interval="${OCSFS2_MAINT_INTERVAL:-518400}"
+stale="${OCSFS2_MAINT_STALE:-86400}"
+me="$(hostname)/$$"
 rc=0
 found=0
+
+now() { date +%s; }
+epoch_of() {                 # last field of a marker file, 0 if absent/garbage
+	local v; v="$(cat "$1" 2>/dev/null)"; v="${v##* }"
+	case "$v" in (''|*[!0-9]*) echo 0 ;; (*) echo "$v" ;; esac
+}
+recent() {                   # 0 if <interval> since the stamp in $1
+	[ "$(( $(now) - $(epoch_of "$1") ))" -lt "$interval" ]
+}
+
+# claim_lock <lockpath> : 0 = we own it, 1 = a live node owns it
+claim_lock() {
+	local lock="$1" age
+	if ( set -C; printf '%s %s\n' "$me" "$(now)" > "$lock" ) 2>/dev/null; then
+		return 0
+	fi
+	age=$(( $(now) - $(epoch_of "$lock") ))
+	if [ "$age" -ge "$stale" ]; then          # crashed owner: steal it
+		rm -f "$lock" 2>/dev/null || true
+		( set -C; printf '%s %s\n' "$me" "$(now)" > "$lock" ) 2>/dev/null && return 0
+	fi
+	return 1
+}
 
 while read -r mp; do
 	[ -n "$mp" ] || continue
 	found=1
+	stamp="$mp/.ocsfs2-maint.$mode.stamp"
+	lock="$mp/.ocsfs2-maint.$mode.lock"
+
+	if recent "$stamp"; then
+		echo "ocsfs2-maint: $mode on $mp already done this cycle — skip"
+		continue
+	fi
+	if ! claim_lock "$lock"; then
+		echo "ocsfs2-maint: $mode on $mp running on another node — skip"
+		continue
+	fi
+	trap 'rm -f "$lock" 2>/dev/null' EXIT
+	if recent "$stamp"; then            # a peer finished while we waited
+		echo "ocsfs2-maint: $mode on $mp just completed elsewhere — skip"
+		rm -f "$lock" 2>/dev/null; trap - EXIT
+		continue
+	fi
+
 	case "$mode" in
 	scrub)
 		echo "ocsfs2-maint: scrubbing $mp"
@@ -31,9 +88,15 @@ while read -r mp; do
 		;;
 	defrag)
 		echo "ocsfs2-maint: defragmenting $mp (min $minext extents)"
+		# files actively owned by another node return -EBUSY and are skipped
+		# (a running VM's disk is never relocated from elsewhere)
 		/usr/sbin/ocsfs2-defrag -r -t "$minext" "$mp" || rc=1
 		;;
 	esac
+
+	printf '%s %s\n' "$me" "$(now)" > "$stamp" 2>/dev/null || true  # mark cycle done
+	rm -f "$lock" 2>/dev/null || true
+	trap - EXIT
 done < <(findmnt -rn -t ocsfs2 -o TARGET 2>/dev/null)
 
 [ "$found" -eq 1 ] || echo "ocsfs2-maint: no ocsfs2 filesystems mounted"

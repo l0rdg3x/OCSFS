@@ -80,6 +80,14 @@ int ocsfs2_defrag_file(struct inode *inode, struct ocsfs2_defrag_result *res)
 	ret = filemap_write_and_wait(inode->i_mapping);
 	if (ret)
 		goto out;
+	/* Persist our own metadata, then coherently re-read the inode from disk so
+	 * we operate on the CURRENT extent map even if a peer last owned the file
+	 * (the open lease may be held lazily and skip its refresh). This makes
+	 * defrag idempotent across nodes — a peer that already defragged this file
+	 * leaves us seeing the compacted map, so we no-op instead of relocating a
+	 * stale view (which would leak blocks). */
+	write_inode_now(inode, 1);
+	ocsfs2_inode_refresh_coherent(inode);
 	isize_blk = (i_size_read(inode) + bs - 1) / bs;
 	if (isize_blk == 0)
 		goto out;

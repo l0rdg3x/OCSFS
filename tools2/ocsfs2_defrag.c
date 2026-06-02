@@ -53,9 +53,18 @@ static void defrag_one(const char *path)
 {
 	struct ocsfs2_defrag_result r;
 	long before;
-	int fd = open(path, O_RDONLY);
+	/* O_RDWR so the open takes the EXCLUSIVE ownership lease: in a cluster the
+	 * file's writing node owns it, so a defrag attempt from another node gets
+	 * -EBUSY and skips (you never relocate a file in use elsewhere, and two
+	 * nodes can't defrag the same file at once). */
+	int fd = open(path, O_RDWR);
 
 	if (fd < 0) {
+		if (errno == EBUSY) {       /* owned by another node — expected, skip */
+			if (g_dry)
+				printf("%s: in use on another node (skip)\n", path);
+			return;
+		}
 		fprintf(stderr, "ocsfs2-defrag: %s: %s\n", path, strerror(errno));
 		g_rc = 1;
 		return;
