@@ -340,6 +340,7 @@ destination node.
 | **Maturity of cluster paths** | The single-node data path is differentially validated (`fsx_diff.sh` vs XFS, 24/24 clean incl. clone/reflink) and `fsck`-clean. The multi-node coherence/recovery paths are validated on 2–3 nodes but have had less soak time than a production FS. |
 | **Metadata-op throughput under cross-node contention** | Namespace ops on a *shared* directory serialise on one metadata lease; fine for the VM-disk workload (rare namespace churn), not tuned for many nodes hammering one directory. The **data path is unaffected** (single-writer, no per-I/O CAW). |
 | **Concurrent evict-time free under cluster** | Concurrent delete+alloc across nodes is not yet fully coordinated at evict time (known follow-up). |
+| **`df` free-count in cluster mode** | The on-disk **block bitmap is authoritative and always correct** (`fsck` recomputes it; allocation never returns a false ENOSPC), but the superblock's *cached* free-block counter drifts in cluster mode (each node updates its bitmap via CAW; the shared counter is not kept in sync), so `df` can over-report free space until a remount. Cosmetic — not a data/integrity issue; recomputing the cached counter is a known follow-up. |
 | **Encryption** | Out of scope by design — encrypt at the SAN/LUN (LUKS on the zvol) or in the guest (qcow2/LUKS); per-file fscrypt would disable O_DIRECT and block reflink/snapshot. |
 | **Fencing** | SCSI-3 Persistent Reservations only; out-of-band STONITH not wired. |
 

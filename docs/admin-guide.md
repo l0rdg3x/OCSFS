@@ -1,526 +1,408 @@
-# OCSFS — Administrator Guide
+# OCSFS v2 — Administrator Guide
 
-**Version:** 0.1 — May 2026
-**Platform:** Proxmox VE 8.x / 9.x, Linux kernel 6.6+ LTS (validated on 7.0.x-pve)
-**Status:** Alpha — do not use with production data
+**Filesystem:** OCSFS v2 (`ocsfs2`) — a shared-disk clustered filesystem with
+**single-writer ownership**, built for Proxmox VE VM/CT image storage on a SAN
+LUN (iSCSI/FC) that supports SCSI Persistent Reservations + Compare-and-Write.
 
-> **Performance note.** Random 4 KiB O_DIRECT I/O to a VM-disk image on a
-> clustered LUN runs at **near-raw device speed** for a single active node (the
-> per-operation DLM/CAW overhead is held off the hot path). The bound that
-> remains is *metadata-operation* throughput when a lock is genuinely contended
-> across nodes. See the **Performance** section of the project `README.md`.
+> Status: alpha / research. Validated on real iSCSI LUNs, single-node and 2–3
+> nodes. Not production-hardened. Always keep backups.
 
 ---
 
-## Table of Contents
+## 1. What it is (and is not)
 
-1. [Prerequisites](#1-prerequisites)
-2. [Installation](#2-installation)
-3. [Formatting the LUN](#3-formatting-the-lun)
-4. [Proxmox VE Configuration](#4-proxmox-ve-configuration)
-5. [Mount and Basic Operations](#5-mount-and-basic-operations)
-6. [Monitoring](#6-monitoring)
-7. [Maintenance Operations](#7-maintenance-operations)
-8. [Troubleshooting](#8-troubleshooting)
-9. [Known Limitations](#9-known-limitations)
+OCSFS v2 lets several Proxmox nodes mount the **same block device** and use it as
+one POSIX filesystem. Unlike a per-I/O distributed-lock filesystem, OCSFS gives
+each open file to **one node at a time** (a coarse, long-held *ownership lease*).
+That node does all I/O to the file at near-raw speed with no per-operation
+network/SCSI round-trip; on close (or live-migration handoff) ownership passes to
+another node. This matches the VM-disk workload: one running VM writes its disk
+from one host.
 
----
+| In scope | Out of scope |
+|---|---|
+| VM/CT disk images (raw, qcow2) | General multi-writer POSIX on one file |
+| reflink clones, CoW snapshots, cross-file dedup | Inline compression (breaks O_DIRECT) |
+| thin provisioning + discard/TRIM | Per-file encryption (use LUKS on the LUN/guest) |
+| online metadata scrub, defrag | mmap (`-ENODEV`; unused by the workload) |
+| autonomous, repeatable online grow | Quotas (hooks only, not enforceable) |
 
-## 1. Prerequisites
-
-### Storage Infrastructure
-
-- **Shared block device:** FC SAN LUN or iSCSI target with SCSI-3 Persistent
-  Reservations support, accessible from all cluster nodes simultaneously.
-- **Multipath (recommended):** `multipathd` configured so that
-  `/dev/mapper/mpath*` devices are visible on all nodes. Not strictly required
-  for single-node or lab setups.
-- **SCSI-3 PR:** The storage target must support SCSI-3 Persistent
-  Reservations. All enterprise FC arrays do. For iSCSI, LIO (Linux) and
-  TrueNAS SCALE support PR natively; check your target's documentation.
-
-### Kernel and OS
-
-- Linux kernel 6.6 LTS or newer
-- Proxmox VE 8.0 or newer (for PVE integration)
-
-### Verify SCSI PR support
-
-```bash
-# Run on the node that will connect to the shared device
-sg_persist -i -k /dev/mapper/mpathX
-# Expected: "PR generation=0x0" (empty is fine; any response means PR works)
-
-# If sg_persist is not installed:
-apt install sg3-utils
-```
-
-### Required packages on each node
-
-```bash
-apt install build-essential dkms linux-headers-$(uname -r) \
-            multipath-tools sg3-utils uuid-runtime open-iscsi
-```
+> **Designed for high availability — never stop the filesystem.** Every
+> maintenance task is **online**: check (`fsck`/scrub), defragment, grow and
+> discard all run on a mounted, in-use volume with no downtime. A node crash is
+> survived: the remaining nodes keep serving their own files, fence the dead node
+> and recover its files automatically (journal replay + lease reclaim) within
+> seconds, with no data loss. There is no offline-maintenance window in normal
+> operation — unmounting is only needed for the optional full off-disk `fsck`
+> repair pass.
 
 ---
 
-## 2. Installation
+## 2. Requirements
 
-### Option A — Debian packages (recommended)
+- A **shared block LUN** reachable as the same device from every node
+  (`/dev/disk/by-id/...`). For clustered mode the target must support **SCSI-3
+  Persistent Reservations** and **Compare-and-Write (CAW / opcode 0x89)**
+  (TrueNAS SCST, most enterprise arrays). Single-node mode needs neither.
+- **Identical kernel across all nodes** — the module is out-of-tree and must
+  match `uname -r` on each node.
 
-```bash
-git clone https://github.com/l0rdg3x/OCSFS /opt/ocsfs
-cd /opt/ocsfs
+### Prerequisites (install on every node)
 
-# Build packages
-dpkg-buildpackage -us -uc -b
-
-# Install on every Proxmox node
-dpkg -i ../ocsfs-tools_0.1.0-1_amd64.deb \
-        ../ocsfs-dkms_0.1.0-1_all.deb \
-        ../ocsfs-proxmox_0.1.0-1_all.deb
-```
-
-### Option B — Manual installation
+The module is built per node against its running kernel, so each node needs the
+build toolchain and matching headers:
 
 ```bash
-cd /opt/ocsfs
-
-# Userspace tools
-make all
-sudo make install        # installs to /usr/local/bin
-
-# Kernel module via DKMS
-sudo dkms add kmod/
-sudo dkms build ocsfs/0.1.0
-sudo dkms install ocsfs/0.1.0
-
-# Proxmox VE plugin
-sudo proxmox/install.sh
+apt-get install -y build-essential pve-headers-$(uname -r)
 ```
 
-### Verify installation
-
-```bash
-sudo modprobe ocsfs
-dmesg | grep ocsfs
-# Expected: "ocsfs: Open Cluster Shared FileSystem v0.1 loaded"
-
-mkfs.ocsfs --version
-ocsfs-tool --help
-```
+That is the entire end-user prerequisite set — no debug or test tooling is
+needed in production. `proxmox2/install.sh` **installs these automatically** if they are missing (it
+calls `apt-get` for `build-essential` + `pve-headers-$(uname -r)`), so on a
+standard Debian/PVE node you can run the installer directly. After a kernel
+upgrade, re-run the installer to rebuild the module against the new kernel.
 
 ---
 
-## 3. Formatting the LUN
+## 3. Install
 
-> **Warning:** `mkfs.ocsfs` destroys all existing data on the device.
-> Run this only on a dedicated LUN, on **one node**.
+The one-step installer builds and installs the module, the user tools and (on
+Proxmox) the storage plugin:
 
 ```bash
-# Identify the multipath device
-multipath -ll
-
-# Format — run on ONE node only
-mkfs.ocsfs -L my-datastore -N 16 -J 32M -E 4M -f -v /dev/mapper/mpath0
-
-# Verify
-ocsfs-tool info /dev/mapper/mpath0
+cd OCSFS/proxmox2
+./install.sh
 ```
 
-### Full option reference
+It performs:
 
-Syntax: `mkfs.ocsfs [options] <device>`. **Geometry chosen here (block size, AG
-size, max nodes) is fixed for the life of the volume** and cannot be changed
-later — size it deliberately.
+1. `make -C kmod2` against the running kernel → installs `ocsfs2.ko` to
+   `/lib/modules/$(uname -r)/extra/` and runs `depmod`.
+2. Builds `mkfs.ocsfs2`, `fsck.ocsfs2`, `ocsfs2-scrub`, `ocsfs2-defrag` → `/usr/sbin`.
+3. Installs the PVE storage plugin `OCSFS2Plugin.pm` and `mount.ocsfs2`.
+4. Installs and enables the periodic `ocsfs2-scrub.timer` and `ocsfs2-defrag.timer`.
 
-| Flag | Argument | Default | Meaning |
-|---|---|---|---|
-| `-L` | `<label>` | (none) | Volume label, ≤ 63 chars. Shown by `ocsfs-tool info`; usable as `mount LABEL=…`. |
-| `-N` | `<max_nodes>` | `64` | Maximum cluster nodes that may ever mount the volume (1–256). Sizes the node-slot table, per-node journals, lock table and heartbeat area. **`-N 1` = single-node volume** (no DLM/CAW); `-N ≥ 2` = full cluster mode. Fixed at format. |
-| `-b` | `<bytes>` | `4096` | Block size (plain number or `K`/`M` suffix). Leave at 4096 to match page size and SAN logical block. |
-| `-E` | `<size>` | `1M` | Default extent (allocation-unit) hint, e.g. `1M`, `4M`. Larger = less metadata for big sequential files (VM images); smaller = better for many small files. |
-| `-A` | `<size>` | `1G` | Allocation Group size. Each AG has its own bitmap/inode-table/locks, so independent AGs avoid cross-node contention. |
-| `-J` | `<size>` | `32M` | **Per-node** journal size, e.g. `16M`, `64M`. Total journal = `J × N`. 16–32M suits VM workloads. |
-| `-K` | — | off | Enable **cluster authentication** (HMAC on journal/lock records keyed by the cluster secret). A `-K` volume will **not** mount without `-o cluster_secret=`. Integrity auth only — **not** file encryption (per-file encryption was removed; encrypt at the SAN/LUN or guest layer instead). |
-| `-T` | — | on | Enable thin provisioning (default on; flag kept for explicitness). |
-| `-f` | — | off | Force — skip the erase-confirmation prompt (needed for scripted runs). |
-| `-v` | — | off | Verbose — print computed geometry (AG count, journal offsets, inode-table layout). |
-| `-h` | — | — | Show help. |
-
-### Recommended profiles for Proxmox clusters
-
-| Cluster size | `-N` | `-J` | `-E` | Example |
-|---|---|---|---|---|
-| Single node (lab) | `1` | `16M` | `1M` | `mkfs.ocsfs -L local -N 1 -J 16M -f /dev/sdb` |
-| Small (2–4 nodes) | `8` | `16M` | `1M` | `mkfs.ocsfs -L vmstore -N 8 -J 16M -f /dev/mapper/mpath0` |
-| Medium (5–16 nodes) | `32` | `32M` | `4M` | `mkfs.ocsfs -L vmstore -N 32 -J 32M -E 4M -f /dev/mapper/mpath0` |
-| Large (17–64 nodes) | `64` | `64M` | `8M` | `mkfs.ocsfs -L vmstore -N 64 -J 64M -E 8M -f /dev/mapper/mpath0` |
-| Encrypted cluster | `8` | `16M` | `1M` | `mkfs.ocsfs -L secure -N 8 -J 16M -K -f /dev/mapper/mpath0` |
-
-> `max_nodes` is fixed at format time. Oversize slightly for future growth — and
-> note `mkfs.ocsfs` over-allocates spare AG-descriptor slots so the volume can
-> later be **grown online** (see §7) without relocating data.
+Run it on **every** node. Build on a node with the exact target kernel.
 
 ---
 
-## 4. Proxmox VE Configuration
-
-### Add storage via CLI (runs on one node, replicates automatically)
+## 4. Create a filesystem
 
 ```bash
-pvesm add ocsfs fc-shared \
-  --path /mnt/pve/fc-shared \
-  --device /dev/mapper/mpath0 \
-  --content images,iso,vztmpl,backup,rootdir,snippets \
-  --maxnodes 16 \
-  --thin 1 \
-  --shared 1
+# single node (no cluster services), whole device:
+mkfs.ocsfs2 -f -N 1 /dev/disk/by-id/scsi-XXXX
+
+# clustered, up to 3 nodes:
+mkfs.ocsfs2 -f -N 3 /dev/disk/by-id/scsi-XXXX
 ```
 
-### Manual configuration in `/etc/pve/storage.cfg`
+| Flag | Meaning |
+|---|---|
+| `-N <n>` | maximum number of cluster nodes (slots). `1` = single-node. |
+| `-f` | force (overwrite an existing filesystem) |
+| `-s <MiB>` | format only the first *N* MiB and let autogrow extend later |
+
+`mkfs` lays out uniform allocation groups (AG), each self-contained
+(header + block bitmap + inode table + per-AG refcount B+tree), a per-node
+journal area, the lease/membership tables and a superblock + mirror. The
+`AUTOGROW` compat feature is set so the volume can grow online later.
+
+---
+
+## 5. Mount
+
+```bash
+# single node:
+mount -t ocsfs2 /dev/disk/by-id/scsi-XXXX /mnt/vmstore
+
+# clustered (every node, same LUN):
+mount -t ocsfs2 -o cluster /dev/disk/by-id/scsi-XXXX /mnt/vmstore
+```
+
+`-o cluster` enables membership (heartbeat slot), SCSI-PR fencing, the ownership
+/ metadata leases and crash recovery. Without it the volume is single-node only.
+
+On mount each node claims a heartbeat slot and starts its liveness epoch; a node
+that stops heartbeating is fenced (its PR key is preempted) and its files are
+recovered by a survivor (journal replay + lease reclaim).
+
+---
+
+## 6. Proxmox integration
+
+Add a storage of type `ocsfs2` in `/etc/pve/storage.cfg`:
 
 ```
-ocsfs: fc-shared
-    path /mnt/pve/fc-shared
-    device /dev/mapper/mpath0
+ocsfs2: vmstore
+    path /mnt/pve/vmstore
+    device /dev/disk/by-id/scsi-3600...   # the shared LUN (stable path)
     content images,iso,vztmpl,backup,rootdir,snippets
-    maxnodes 16
-    thin 1
+    cluster 1
     shared 1
 ```
 
-### Storage options reference
+The plugin owns mount/unmount of the LUN and presents it like a directory
+datastore, so VM and CT image management, ISOs and backups all work. It prefers
+**reflink** for clones (`cp --reflink=always`), so a linked clone or a template
+deploy is near-instant and space-efficient. Live migration works because the
+file's write-ownership lease is handed from source to destination on open/close —
+no data copy.
 
-| Option | Description | Default |
+- **VM disks**: store as `raw` (reflink/snapshot/discard all work) or `qcow2`.
+- **CT (LXC)**: stored as `raw` images on a loop device (`subvol=0`), so the
+  container's own filesystem lives inside the image — OCSFS sees only
+  pread/pwrite, never mmap.
+
+### Proxmox disk cache modes
+
+All QEMU cache modes work, because OCSFS keeps the buffered and O_DIRECT paths
+coherent and CoW-correct:
+
+| `cache=` | Guest I/O to OCSFS | Notes |
 |---|---|---|
-| `path` | Local mount point | (required) |
-| `device` | Block device (use multipath path) | (required) |
-| `content` | Supported content types | images |
-| `maxnodes` | Max concurrent nodes | 64 |
-| `thin` | Enable thin provisioning for VM disks | 0 |
-| `shared` | Mark storage as shared between nodes | 0 |
-| `cluster_secret` | 64 hex-char (32-byte) cluster secret. Required for volumes formatted with `mkfs.ocsfs -K` and for the encrypted key store. Stored in `storage.cfg` — prefer `secret_file`. | (none) |
-| `secret_file` | Path to a `0600` file whose first line is the cluster secret. Takes precedence over `cluster_secret`. | (none) |
-| `degraded` | Allow clustered mount without SCSI-3 PR fencing (zombie-node risk; lab only). | 0 |
-
-> **Auth/encrypted clusters:** a volume created with `mkfs.ocsfs -K` will *not* mount
-> without a cluster secret. Set `secret_file` on every node (same secret), e.g.:
->
-> ```
-> ocsfs: fc-shared
->     path /mnt/pve/fc-shared
->     device /dev/mapper/mpath0
->     content images
->     maxnodes 16
->     thin 1
->     shared 1
->     secret_file /etc/pve/priv/ocsfs-fc-shared.secret
-> ```
->
-> Create the secret once with `openssl rand -hex 32 > /etc/pve/priv/ocsfs-fc-shared.secret`
-> (it lands under `/etc/pve/priv`, replicated and root-only across the PVE cluster).
-
-### Enable on all nodes
-
-The Proxmox plugin mounts the storage automatically via `ocsfs-mount@.service`:
-
-```bash
-# Verify the service is active on each node
-systemctl status ocsfs-mount@fc-shared.service
-
-# Manual mount if needed
-mount -t ocsfs /dev/mapper/mpath0 /mnt/pve/fc-shared
-```
+| `none` (default) / `directsync` | O_DIRECT | hot path; validated clean vs XFS |
+| `writeback` / `writethrough` / `unsafe` | buffered | validated clean vs XFS |
 
 ---
 
-## 5. Mount and Basic Operations
+## 7. Day-2 operations
 
-### Manual mount
-
-```bash
-sudo modprobe ocsfs
-
-# Standard mount
-sudo mount -t ocsfs /dev/mapper/mpath0 /mnt/ocsfs
-
-# With cluster authentication (if the volume has FEAT_AUTH)
-sudo mount -t ocsfs -o cluster_secret=<64-hex-chars> \
-  /dev/mapper/mpath0 /mnt/ocsfs
-```
-
-### Unmount
+### Snapshots & clones
 
 ```bash
-# Check that no process is using the filesystem
-lsof /mnt/ocsfs
-
-sudo umount /mnt/ocsfs
+cp --reflink=always disk.raw disk-clone.raw     # FICLONE
+ocsfs2-tool snapshot disk.raw disk.snap         # OCSFS_IOC_SNAP_CREATE
 ```
 
-### Persistent mount via `/etc/fstab`
+A snapshot/clone shares blocks; the first write to either side copies just the
+touched blocks (block-granular CoW), so sharers stay isolated.
 
+### Online grow (repeatable)
+
+Extend the LUN on the SAN, rescan it on each node, then either let the autogrow
+watcher pick it up (it polls every ~30 s) or force it:
+
+```bash
+ocsfs2-tool growfs /mnt/vmstore        # OCSFS_IOC_GROWFS — force a grow check now
 ```
-/dev/mapper/mpath0  /mnt/ocsfs  ocsfs  defaults,_netdev  0 0
+
+Grow appends new AGs onto the freshly-available space and publishes the new size
+to peers. It can be run **any number of times** (unlike v1's one-shot grow).
+
+### Discard / thin reclaim
+
+```bash
+fstrim /mnt/vmstore                    # FITRIM → SCSI UNMAP on free blocks
 ```
+
+### Scrub (periodic + on-demand)
+
+Verifies every metadata checksum (superblock, AG headers, inode table, extent
+and refcount B+trees, xattrs) online while mounted:
+
+```bash
+ocsfs2-scrub /mnt/vmstore              # OCSFS_IOC_SCRUB; prints a summary
+```
+
+The installer enables `ocsfs2-scrub.timer` (weekly) to scrub every mounted
+`ocsfs2` volume and log findings to the journal. See §8.
+
+### Defragment (periodic + on-demand)
+
+Coalesces a file's extent map by relocating its **private** (non-shared) data
+into contiguous runs, reducing fragmentation that random VM-disk writes,
+snapshots and discard accumulate over time:
+
+```bash
+ocsfs2-defrag /mnt/vmstore/vm-100-disk-0.raw   # one file
+ocsfs2-defrag -r /mnt/vmstore                  # walk a tree, defrag fragmented files
+ocsfs2-defrag -n /mnt/vmstore/disk.raw         # dry-run: report fragmentation only
+```
+
+Shared (reflinked/snapshotted/deduped) extents are left intact so defrag never
+breaks sharing or inflates space. The installer enables `ocsfs2-defrag.timer`
+(weekly, after scrub). See §8.
+
+### Check (online **or** offline)
+
+```bash
+fsck.ocsfs2 /mnt/vmstore                         # ONLINE: mounted, in-use — via scrub ioctl
+# or, with the volume unmounted, a full off-disk pass:
+umount /mnt/vmstore && fsck.ocsfs2 /dev/disk/by-id/scsi-XXXX
+```
+
+Give `fsck.ocsfs2` a **mountpoint** to check a *running* filesystem (no downtime —
+it verifies every metadata checksum and per-AG structure via `OCSFS_IOC_SCRUB`),
+or a **device** for the full off-disk structural pass. Cross-referential *repair*
+still requires unmounting.
 
 ---
 
-## 6. Monitoring
+## 8. The periodic services
 
-### Cluster status
+Two systemd timers are installed and enabled by `install.sh`:
 
-```bash
-ocsfs-tool status /mnt/ocsfs
+| Unit | Default schedule | Action |
+|---|---|---|
+| `ocsfs2-scrub.timer` | weekly (Sun 03:00) | scrub every mounted `ocsfs2` mount |
+| `ocsfs2-defrag.timer` | weekly (Sun 04:00) | defrag fragmented files under every mount |
 
-# Example output:
-# Volume: shared-vm-store  UUID: a1b2c3...
-# Block size: 4096  Total: 4.8 TiB  Free: 2.7 TiB
-#
-# Node 0 [pve1]  ACTIVE  HB: 2s ago  Locks: 0
-# Node 1 [pve2]  ACTIVE  HB: 3s ago  Locks: 5
-# Node 2 [pve3]  ACTIVE  HB: 1s ago  Locks: 3
-```
-
-### Active nodes
+They both invoke `/usr/sbin/ocsfs2-maint <scrub|defrag>`, which discovers the
+mounted `ocsfs2` filesystems (`findmnt -t ocsfs2`) and runs the corresponding
+tool on each, logging to the systemd journal. Tune them with a drop-in:
 
 ```bash
-ocsfs-tool nodes /mnt/ocsfs
+systemctl edit ocsfs2-scrub.timer      # change OnCalendar=
+journalctl -u ocsfs2-scrub.service     # read findings
+systemctl disable --now ocsfs2-defrag.timer   # opt out
 ```
 
-### Lock table
+Both are **online** and safe to run on a mounted, in-use volume.
 
-```bash
-# Show all active locks (useful for diagnosing stalls or orphan locks)
-ocsfs-tool locks /mnt/ocsfs
-```
-
-### Space usage
-
-```bash
-ocsfs-tool df /mnt/ocsfs
-# Reports: total/used/free, thin-allocated vs. written, inodes per AG
-```
-
-### Kernel log
-
-```bash
-# Live OCSFS messages
-dmesg -w | grep ocsfs
-
-# Heartbeat and recovery events
-journalctl -k | grep ocsfs
-```
+**On a cluster the timer is enabled on every node, but only ONE node runs each
+job per cycle.** `ocsfs2-maint` elects a single node with an atomic lock file on
+the shared filesystem (`.ocsfs2-maint.<mode>.lock` at the mount root); the others
+log "skipped … running on another node". A lock left by a crashed node is stolen
+after `OCSFS2_MAINT_STALE` seconds (default 24 h). Keeping the timer on all nodes
+means maintenance still happens if the usual node is down — no single point of
+failure. Defrag additionally skips any file actively owned by another node
+(it returns `-EBUSY`), so a running VM's disk is never relocated from elsewhere.
 
 ---
 
-## 7. Maintenance Operations
+## 9. Command reference
 
-### Online defragmentation
+Every command below is shown as **synopsis → what it does → options → example**.
+All tools accept `-h`/`--help`.
 
-```bash
-# Start defrag in background, limited to 50 MB/s
-ocsfs-defrag /mnt/ocsfs -b 50
+### `mkfs.ocsfs2` — create a filesystem
 
-# Dry run — report only, no changes
-ocsfs-defrag /mnt/ocsfs -n
-
-# Verbose with custom fragmentation threshold
-ocsfs-defrag /mnt/ocsfs -v -t 4 -b 100
-
-# Pause / Resume via signals
-kill -USR1 <defrag-pid>   # pause
-kill -USR2 <defrag-pid>   # resume
 ```
-
-The defrag daemon uses the lock table to ensure only one instance runs
-cluster-wide at a time.
-
-### Growing the filesystem onto a larger LUN
-
-When you enlarge the backing LUN, hand the new space to OCSFS with `ocsfs-grow`.
-The same binary picks **online** vs **offline** from its argument: a **mountpoint**
-grows the live filesystem via `OCSFS_IOC_GROW`; a **block device** grows it offline.
-
-```bash
-# 1. Enlarge the LUN on the storage side (e.g. grow the TrueNAS zvol).
-
-# 2. Rescan the new size on EVERY node that has the LUN attached:
-iscsiadm -m node -R                 # iSCSI
-# (FC: echo 1 > /sys/class/scsi_device/<h:c:t:l>/device/rescan)
-
-# 3a. ONLINE grow — volume stays mounted. Run on ONE node, pass the MOUNTPOINT:
-ocsfs-grow /mnt/pve/fc-shared
-#    Peers see the extra space on their next allocation (or immediately via statfs/df).
-
-# 3b. OFFLINE grow — unmount on ALL nodes first, pass the DEVICE:
-ocsfs-grow /dev/mapper/mpath0
-
-# Dry run (offline only): report what would be added, change nothing.
-ocsfs-grow -n /dev/mapper/mpath0
+mkfs.ocsfs2 [-f] -N <max-nodes> [-s <MiB>] <device>
 ```
+Writes a fresh OCSFS v2 filesystem onto `<device>` (a whole disk/LUN or a
+partition). **Destroys existing data.**
 
-Existing AGs are never moved (descriptors store absolute geometry); new-AG
-descriptors live in a fixed extension region reserved on the first grow
-(`INCOMPAT_AG_GROW`). The volume can be grown **repeatedly** as the LUN is
-expanded again and again (up to `OCSFS_AG_GROW_RESERVE` added AGs over its life).
-
-> **Autonomous by default.** You normally don't run `ocsfs-grow` at all: after you
-> enlarge the LUN on the SAN (and resync the iSCSI target — e.g.
-> `scstadmin -resync_dev <extent>` on TrueNAS, which sends the capacity-change
-> Unit Attention), each node's heartbeat thread re-reads the device and grows
-> into the new space on its own within ~30 s, serialised cluster-wide. Run
-> `ocsfs-grow <mountpoint>` only if you want to grow immediately instead of
-> waiting for the next heartbeat cycle.
-
-### Offline filesystem check
-
-```bash
-# The device MUST NOT be mounted
-umount /mnt/ocsfs
-
-# Run all 9 checks (read-only)
-python3 /opt/ocsfs/tools/ocsfs-fsck /dev/mapper/mpath0
-
-# Run with repair mode (patches orphans, stale locks, node slots)
-python3 /opt/ocsfs/tools/ocsfs-fsck --repair /dev/mapper/mpath0
-```
-
-Checks performed:
-
-| # | Check |
+| Option | Meaning |
 |---|---|
-| 1 | Superblock magic and CRC32c |
-| 2 | AG descriptor consistency |
-| 3 | Journal header validity |
-| 3b | Free block cross-check: bitmap popcount vs. AG descriptors vs. superblock |
-| 4 | Inode table: orphan detection and repair |
-| 5 | Extent consistency within each inode |
-| 6 | Heartbeat region: stale entries |
-| 7 | Lock table: stale or orphaned locks |
-| 8 | Refcount table: unreferenced entries |
-| 9 | Node slot table: stale ACTIVE entries |
-
-### Thin provisioning — reclaiming space
-
-Space is reclaimed automatically when guest OSes issue TRIM/DISCARD. To force it:
+| `-N <n>` | maximum cluster nodes (lease/HB slots). `1` = single-node, no cluster services. **Required.** |
+| `-f` | force: overwrite an existing filesystem/signature |
+| `-s <MiB>` | format only the first *MiB* and rely on autogrow to extend later (thin initial layout) |
 
 ```bash
-# From inside the guest Linux VM
-fstrim -v /
-
-# Verify reclaimed space on the host
-ocsfs-tool df /mnt/ocsfs
+# 3-node clustered FS on the whole LUN:
+mkfs.ocsfs2 -f -N 3 /dev/disk/by-id/scsi-3600abcd
 ```
 
-### Manual recovery of a dead node
+### `mount` — attach the filesystem
 
-Recovery is automatic when heartbeat timeout expires. If it does not start:
+```
+mount -t ocsfs2 [-o cluster] <device> <mountpoint>
+```
+Mounts the volume. Add `-o cluster` on a LUN shared by more than one node to
+turn on membership, fencing, leases and recovery; omit it for single-host use.
 
 ```bash
-# Force recovery of a specific slot
-ocsfs-tool recover /mnt/ocsfs --node <slot-number>
+mount -t ocsfs2 -o cluster /dev/disk/by-id/scsi-3600abcd /mnt/vmstore
+```
 
-# Emergency fencing
-ocsfs-tool fence /mnt/ocsfs --node <slot-number>
+### `ocsfs2-tool` — snapshots, grow and tuning
+
+```
+ocsfs2-tool snapshot <src-file> <new-snap-file>   # point-in-time reflink copy
+ocsfs2-tool growfs   <mountpoint>                 # force an autogrow check now
+```
+`snapshot` creates a new file that shares all of `<src-file>`'s blocks and
+diverges on the next write to either side. `growfs` makes the FS notice that the
+underlying LUN got bigger and append new allocation groups (safe to repeat).
+
+```bash
+ocsfs2-tool snapshot /mnt/vmstore/vm-100-disk-0.raw /mnt/vmstore/vm-100-disk-0.snap
+ocsfs2-tool growfs /mnt/vmstore
+```
+
+### `ocsfs2-scrub` — verify metadata checksums (online)
+
+```
+ocsfs2-scrub [-q] <mountpoint>
+```
+Walks all metadata and verifies every CRC32c while the volume stays mounted and
+in use. Prints how many objects were checked and how many errors were found
+(exit `0` = clean, non-zero = findings). `-q` prints only the one-line summary.
+
+```bash
+ocsfs2-scrub /mnt/vmstore
+# ocsfs2-scrub: /mnt/vmstore — checked 29 AGs / 1284 inodes, 0 errors → CLEAN
+```
+
+### `ocsfs2-defrag` — reduce file fragmentation (online)
+
+```
+ocsfs2-defrag [-r] [-n] [-t <min-extents>] <path>
+```
+Relocates a file's **private** data into contiguous runs to shrink its extent
+count. Shared (reflink/snapshot/dedup) blocks are skipped, so it never breaks
+sharing.
+
+| Option | Meaning |
+|---|---|
+| `-r` | recurse into a directory and defrag every regular file under it |
+| `-n` | dry-run: only report each file's current extent count / fragmentation |
+| `-t <n>` | only defrag files with more than *n* extents (default 8) |
+
+```bash
+ocsfs2-defrag -n /mnt/vmstore/vm-100-disk-0.raw     # report only
+ocsfs2-defrag /mnt/vmstore/vm-100-disk-0.raw        # defrag one file
+ocsfs2-defrag -r -t 16 /mnt/vmstore                 # defrag the whole store
+```
+
+### `fstrim` — reclaim free space on the SAN (thin)
+
+```
+fstrim <mountpoint>
+```
+Standard util-linux command; OCSFS turns it into SCSI UNMAP on the volume's free
+blocks so the SAN can thin-reclaim them.
+
+### `fsck.ocsfs2` — check, online or offline
+
+```
+fsck.ocsfs2 <device>        # OFFLINE: full structural + checksum pass (unmounted)
+fsck.ocsfs2 <mountpoint>    # ONLINE: live check via OCSFS_IOC_SCRUB (no downtime)
+```
+Read-only verifier. Pass a **mountpoint** to check a *running* filesystem without
+stopping it (it runs the same engine as `ocsfs2-scrub`), or a **device** for the
+full off-disk pass with the volume unmounted. Repair is offline-only.
+
+```bash
+fsck.ocsfs2 /mnt/vmstore                                   # online, no downtime
+umount /mnt/vmstore && fsck.ocsfs2 /dev/disk/by-id/scsi-3600abcd   # offline
 ```
 
 ---
 
-## 8. Troubleshooting
+## 10. Troubleshooting
 
-### Module fails to load
+| Symptom | Cause / fix |
+|---|---|
+| `mount: unknown filesystem type 'ocsfs2'` | `modprobe ocsfs2`; check the module matches `uname -r` (rebuild on the right kernel) |
+| `mount ... -EBUSY` on a file open | another live node owns the write lease; it releases on close/migration |
+| node fenced / files briefly unavailable | a peer stopped heartbeating and was fenced; its files are recovered (journal replay) within a few seconds |
+| `fstrim` returns 0 bytes | nothing to reclaim, or the LUN does not advertise UNMAP |
+| `mmap(): No such device (ENODEV)` | by design — OCSFS has no mmap; the workload never needs it |
+| scrub reports a checksum error | a metadata block is damaged; unmount and run `fsck.ocsfs2`, restore from backup if needed |
 
-```bash
-dmesg | grep ocsfs
-modinfo ocsfs        # verify module is compiled for the running kernel
-dkms status          # verify DKMS state
-```
-
-**Common cause:** kernel was updated without rebuilding the module.
-
-```bash
-dkms autoinstall
-```
-
-### Mount fails with "bad magic"
-
-```bash
-ocsfs-tool info /dev/mapper/mpath0
-# Error → device is not formatted as OCSFS
-# Verify the correct multipath device: multipath -ll
-```
-
-### Mount fails with "superblock checksum mismatch"
-
-The primary superblock is corrupted. OCSFS automatically tries the mirror
-superblock at offset 4 KB. If both fail, run offline fsck:
-
-```bash
-python3 /opt/ocsfs/tools/ocsfs-fsck --repair /dev/mapper/mpath0
-```
-
-### Node fails to join the cluster (heartbeat timeout)
-
-```bash
-# Verify the multipath device is accessible for read/write
-dd if=/dev/mapper/mpath0 of=/dev/null bs=4096 count=100
-
-# Check if the storage path is saturated
-iostat -x 1 5 dm-3
-
-# Temporarily increase the timeout (requires remount)
-mount -t ocsfs -o heartbeat_timeout=30000 /dev/mapper/mpath0 /mnt/ocsfs
-```
-
-### Lock timeout on an operation
-
-```bash
-# Identify who holds the lock
-ocsfs-tool locks /mnt/ocsfs
-
-# If the holder node is DEAD but not recovered:
-ocsfs-tool recover /mnt/ocsfs --node <slot>
-```
-
-### SCSI PR not supported (basic iSCSI target without PR)
-
-OCSFS detects automatically when the device does not support PR and operates
-in **degraded single-node mode**. The kernel log shows:
-
-```
-ocsfs: device does not support SCSI PR; cluster safety depends on exclusive SAN zoning
-```
-
-In this mode, mounting on multiple nodes simultaneously is **unsafe**.
-Use only FC SAN or LIO/TrueNAS SCALE iSCSI for multi-node deployments.
+**Never** `fuser -km` a mountpoint on a Proxmox node (it can kill `init`). Use
+`umount` (non-lazy) and retry.
 
 ---
 
-## 9. Known Limitations
+## 11. Limits & caveats
 
-| Limitation | Impact | Notes |
-|---|---|---|
-| Metadata-op throughput under cross-node contention | A *hot, contended* lock (e.g. one shared directory hammered by 3 nodes) does a SCSI CAW per hand-off and can hit the 30 s acquire timeout | **Data path is unaffected** — random VM-disk I/O on a single active node runs at near-raw speed (lock held lazily, no per-op CAW). Reducing per-op CAW on contended metadata locks is the open scaling item |
-| xfstests coverage in progress | VFS edge cases still being shaken out | A 3-node harness (`FSTYP=ocsfs`, TrueNAS iSCSI) is running; `generic` is partly green and the `fsx` data-path fuzzer drives ongoing hardening. A clean full `generic` sweep is the remaining milestone |
-| Encryption — out of scope (removed) | Per-file (fscrypt) encryption was **removed and is not planned** — it disables O_DIRECT and blocks reflink/snapshot, which are central to VM disks | Encrypt at the **SAN/LUN** layer (TrueNAS zvol) or **inside the guest** (LUKS / qcow2). `-K` provides cluster-auth HMAC only. |
-| Quota (stub) | dquot *hooks* are wired (data-path and reflink block charges, `dq_op`/`get_dquots`) but quota *enforcement* is not enableable yet | No on-disk quota inodes and no `quotaon` path, so limits cannot be set; metadata blocks (dir/extent-btree/xattr) are also not charged. CoW correctly does not double-charge (it swaps physical blocks, the logical count is unchanged) |
-| Snapshot for large files | Supported on V2 volumes (requires `INCOMPAT_RC_BTREE_PER_AG`; format with `mkfs.ocsfs` or upgrade with `ocsfs-tool tune --upgrade`) | Returns `-EOPNOTSUPP` on V1 volumes only |
-| mmap unsupported (by design) | `mmap()` on an OCSFS file returns `-ENODEV` | Out of scope: QEMU VM disks use pread/pwrite/aio and Proxmox stores LXC as raw images on a loop device (`subvol=0`), so nothing in the workload mmaps an OCSFS file. Removing it also eliminates the mmap+CoW stale-read hazard |
-| Sequential multi-node recovery | Multiple dead nodes are recovered one at a time | Pending failures are tracked in a bitmask (`s_recovery_pending`) and drained in sequence — none are dropped; concurrent recovery is just not parallelised |
-| No out-of-band STONITH | SCSI PR fencing works; hardware PDU/iDRAC not wired | Proxmox API can serve as soft STONITH in lab environments |
-
-> **Zombie self-fence (gen-change self-recovery).** If a node's heartbeat is
-> merely *slow* and a peer recovers it while it is still alive, the node detects
-> this on its next heartbeat check (its own slot reads DEAD or its mount
-> generation changed), invalidates its cached locks and forces itself
-> **read-only** — writes then fail with `EROFS`. Recover by unmounting and
-> remounting that node (it rejoins with a fresh generation). Watch for
-> `ocsfs: ═══ ZOMBIE FENCE ═══` in `dmesg`.
-
-> **Alpha status:** OCSFS is under active development. Do not deploy with
-> critical data without a tested backup plan and thorough evaluation in your
-> own environment. Single-node I/O, **2- and 3-node cross-node coherence**, and
-> **real node-crash recovery with SCSI-PR fencing** are validated on a real
-> iSCSI testbed (TrueNAS SCALE); xfstests and long-haul soak are still open.
+- Encryption is **out of scope** — encrypt the LUN (LUKS on the zvol) or the
+  guest. `-K` provides cluster-auth HMAC only.
+- Quotas are stubbed (hooks present, not enforceable).
+- Compression is **out of scope** (incompatible with O_DIRECT and the iomap 1:1
+  mapping); space efficiency comes from dedup + thin + discard.
+- Multi-node recovery is sequential (one dead node at a time; none are dropped).
+- Out-of-band STONITH (PDU/iDRAC) is not wired; SCSI-PR fencing is.
