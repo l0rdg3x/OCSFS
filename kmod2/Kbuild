@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# OCSFS v2 out-of-tree kernel module build rules.
+#   make -C /lib/modules/$(uname -r)/build M=$PWD/kmod2 modules
+
+obj-m += ocsfs2.o
+
+# A1: skeleton only. A2 appends transport/scsi_pr.o; later tasks append more.
+ocsfs2-y := super.o
+
+ccflags-y := -I$(src) -Wall
