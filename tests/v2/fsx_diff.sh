@@ -20,8 +20,13 @@ FSX=/root/xfstests/ltp/fsx
 OM=/mnt/ocfsxdiff; XM=/mnt/xfsxdiff
 mkdir -p $OM $XM
 # fsx flag matrix mirroring xfstests generic/075,091,127,263 (aligned to avoid
-# the unaligned-O_DIRECT artifact); buffered+mmap and O_DIRECT.
-MATRIX=("-r 4096 -t 4096 -w 4096" "-r 4096 -t 4096 -w 4096 -Z")
+# the unaligned-O_DIRECT artifact). mmap is disabled (-R -W): OCSFS v2 does not
+# implement .mmap (unused by the Proxmox VM/LXC-raw-image workload), so a fsx
+# mapped op would be a spurious OPERR vs XFS. Rows: buffered, O_DIRECT (-Z needs
+# -R -W -r -w), and clone-isolated (clone on; dedupe -B / copy -E off).
+MATRIX=("-r 4096 -t 4096 -w 4096 -R -W" \
+        "-r 4096 -t 4096 -w 4096 -Z -R -W" \
+        "-r 4096 -t 4096 -w 4096 -R -W -B -E")
 
 verdict() { echo "$1" | grep -qi "BAD DATA" && { echo BADDATA; return; }
             echo "$1" | grep -qi "A-OK" && { echo OK; return; }; echo OPERR; }

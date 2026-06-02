@@ -282,10 +282,13 @@ to steady-state performance.
   for 2–3 nodes.
 
 ### v2 (after v1 is solid)
-- Cross-file dedup (DDT), inline LZ4/ZSTD compression.
+- Cross-file dedup (DDT). *(Done.)*
 
 ### Dropped/deferred
 - Per-file encryption, VAAI offload, quotas.
+- **Inline LZ4/ZSTD compression — out of scope (not planned):** it breaks the
+  iomap 1:1 logical↔physical mapping and O_DIRECT (`cache=none`, the Proxmox
+  default); space savings come from dedup + thin + discard instead.
 
 ---
 

@@ -122,10 +122,11 @@ fallback. **No loopback devices.**
   with node count; no metadata collapse under concurrent load
 - ✅ **differential data-path testing** (`tests/v2/fsx_diff.sh`) — identical
   `fsx` seeds/params on OCSFS vs **XFS** (a bug counts only when OCSFS diverges
-  from XFS, filtering fuzzer/golden-output artifacts): **O_DIRECT** (the Proxmox
-  `cache=none` path) matches XFS with **zero** divergence over 8 seeds. The
-  **buffered+mmap+reflink** mix still diverges on some seeds (real, open — see
-  Known limitations)
+  from XFS, filtering fuzzer/golden-output artifacts): **buffered**, **O_DIRECT**
+  (the Proxmox `cache=none` path) and **clone/reflink** all match XFS with **zero
+  divergence** over 8 seeds × 3 flag matrices (24/24 runs), `fsck` clean. mmap is
+  disabled in the matrix because OCSFS v2 does not implement it (unused by the
+  Proxmox workload)
 
 ### Testing method (lesson learned)
 
@@ -140,13 +141,16 @@ O_DIRECT artifact. This is how the real reflink data-loss bug above was confirme
 (minimal deterministic repro; XFS correct, OCSFS not) and how the O_DIRECT path
 was cleared.
 
-### What's deferred (see [Known limitations](#️-known-limitations) → *Fase F*)
+### What's deferred (see [Known limitations](#️-known-limitations))
 
-- ⏳ inline LZ4/ZSTD **compression** — architecturally at odds with the iomap
-  data path and O_DIRECT; deliberately not bolted on
 - ⏳ per-**data-block** checksums — needs a format-v3 region + write hooks on
   both the buffered and O_DIRECT paths; metadata is already fully checksummed and
   the scrub verifies it
+
+> **Inline compression is out of scope** (not a TODO): it breaks the iomap 1:1
+> logical↔physical mapping and O_DIRECT (`cache=none`, the Proxmox default), so it
+> cannot be added without sacrificing the hot-path integrity/performance OCSFS
+> targets. Space savings come from dedup + thin + discard instead.
 
 ---
 
@@ -331,9 +335,9 @@ destination node.
 | Area | Status |
 |---|---|
 | **Maturity** | Alpha / research — not production-ready, AI-generated, unreviewed |
-| **Inline compression (Fase F)** | Not implemented. Transparent compression breaks the iomap 1:1 logical↔physical mapping and O_DIRECT (`cache=none`, the Proxmox default), and would require a parallel non-iomap data path — explicitly avoided. Space savings come from dedup + thin + discard instead. |
+| **Inline compression** | **Out of scope — not planned.** Transparent compression breaks the iomap 1:1 logical↔physical mapping and O_DIRECT (`cache=none`, the Proxmox default), and would require a parallel non-iomap data path that sacrifices hot-path integrity/performance — explicitly avoided. Space savings come from dedup + thin + discard instead. |
 | **Per-data-block checksums (Fase F)** | Not implemented. All **metadata** is CRC32c-checksummed and the online scrub verifies it; per-data-block checksums need a format-v3 per-AG region plus write hooks on both the buffered and O_DIRECT paths (a half-correct version would false-positive on every VM write). |
-| **buffered + clone (reflink) data path** | Differential testing (`fsx_diff.sh` vs XFS) shows the **O_DIRECT path** (Proxmox `cache=none`/`directsync`) and **buffered without reflink** (`cache=writeback`, no clones) are both correct — zero divergence over 8 seeds. The **buffered + CLONE** mix still diverges on ~3/8 seeds (real, open; isolated to clone — dedupe/copy are clean). Four real bugs in this area were already fixed (reflink dirty-data discard, punch-edge discard, copy_file_range EINVAL, freed-metadata-block revoke); the residual is a btree-node/data block-reuse interaction under truncate+clone, localized via bpftrace and under continued differential hardening. The hot VM-disk path (O_DIRECT) is unaffected. |
+| **Maturity of cluster paths** | The single-node data path is differentially validated (`fsx_diff.sh` vs XFS, 24/24 clean incl. clone/reflink) and `fsck`-clean. The multi-node coherence/recovery paths are validated on 2–3 nodes but have had less soak time than a production FS. |
 | **Metadata-op throughput under cross-node contention** | Namespace ops on a *shared* directory serialise on one metadata lease; fine for the VM-disk workload (rare namespace churn), not tuned for many nodes hammering one directory. The **data path is unaffected** (single-writer, no per-I/O CAW). |
 | **Concurrent evict-time free under cluster** | Concurrent delete+alloc across nodes is not yet fully coordinated at evict time (known follow-up). |
 | **Encryption** | Out of scope by design — encrypt at the SAN/LUN (LUKS on the zvol) or in the guest (qcow2/LUKS); per-file fscrypt would disable O_DIRECT and block reflink/snapshot. |
@@ -365,7 +369,7 @@ ocsfs/
 4. ✅ ~~L5 recovery (peer journal replay + eager lease reclaim)~~
 5. ✅ ~~discard/TRIM, autonomous repeatable autogrow, online metadata scrub~~
 6. ✅ ~~multinode performance + curated xfstests~~
-7. **Fase F** — inline compression and per-data-block checksums (format-v3), if/when the trade-offs are worth it
+7. per-data-block checksums (format-v3), if/when the trade-offs are worth it — *(inline compression is **out of scope**: incompatible with O_DIRECT + the iomap 1:1 mapping)*
 8. Corosync membership provider (the L3 interface is already pluggable); parallel multi-node recovery; out-of-band STONITH
 
 ---
