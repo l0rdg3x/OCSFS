@@ -238,6 +238,7 @@ struct inode *ocsfs2_iget(struct super_block *sb, u64 ino)
 	if (S_ISREG(inode->i_mode)) {
 		inode->i_op = &ocsfs2_file_iops;
 		inode->i_fop = &ocsfs2_file_fops;
+		inode->i_mapping->a_ops = &ocsfs2_file_aops;
 	} else if (S_ISDIR(inode->i_mode)) {
 		inode->i_op = &ocsfs2_dir_iops;
 		inode->i_fop = &ocsfs2_dir_fops;
@@ -437,6 +438,7 @@ struct inode *ocsfs2_new_inode(struct mnt_idmap *idmap, struct inode *dir,
 	if (S_ISREG(mode)) {
 		inode->i_op = &ocsfs2_file_iops;
 		inode->i_fop = &ocsfs2_file_fops;
+		inode->i_mapping->a_ops = &ocsfs2_file_aops;
 	} else if (S_ISDIR(mode)) {
 		inode->i_op = &ocsfs2_dir_iops;
 		inode->i_fop = &ocsfs2_dir_fops;
@@ -450,27 +452,146 @@ struct inode *ocsfs2_new_inode(struct mnt_idmap *idmap, struct inode *dir,
 	return inode;
 }
 
-/* ── inline extent map ── */
+/* ── inline extent map ──
+ * i_extents[] is kept sorted ascending by logical block. All callers hold
+ * i_meta_lock (writers) or the VFS i_rwsem (dir readers). Plan 2: inline only;
+ * a >16-extent file returns -ENOSPC until the B+tree spill (Plan 2b).
+ */
 
-int ocsfs2_bmap(struct inode *inode, u64 logical_block, u64 *phys_out)
+/* Find the extent covering @lblk. On hit fills *cover and returns 0. On miss
+ * returns -ENOENT and sets *next_logical to the start of the next extent after
+ * @lblk (U64_MAX if none) so a hole can be clamped. */
+int ocsfs2_extent_find(struct inode *inode, u64 lblk,
+		       struct ocsfs2_extent *cover, u64 *next_logical)
 {
 	struct ocsfs2_inode_info *oi = OCSFS2_I(inode);
+	u64 next = U64_MAX;
 	u16 i;
 
 	for (i = 0; i < oi->i_extent_count; i++) {
 		struct ocsfs2_extent *e = &oi->i_extents[i];
 
-		if (logical_block >= e->logical &&
-		    logical_block < e->logical + e->length) {
-			*phys_out = e->physical + (logical_block - e->logical);
+		if (lblk >= e->logical && lblk < e->logical + e->length) {
+			if (cover)
+				*cover = *e;
 			return 0;
 		}
+		if (e->logical > lblk && e->logical < next)
+			next = e->logical;
 	}
+	if (next_logical)
+		*next_logical = next;
 	return -ENOENT;
 }
 
-/* Allocate one block and append it as the next logical block of @inode.
- * Extends the last extent if physically contiguous, else adds a new one.
+int ocsfs2_bmap(struct inode *inode, u64 logical_block, u64 *phys_out)
+{
+	struct ocsfs2_extent cover;
+	int ret = ocsfs2_extent_find(inode, logical_block, &cover, NULL);
+
+	if (ret)
+		return ret;
+	*phys_out = cover.physical + (logical_block - cover.logical);
+	return 0;
+}
+
+/* Insert [logical, logical+len) -> phys into the sorted extent map, merging
+ * with a physically+logically contiguous neighbour where possible. */
+int ocsfs2_extent_insert(struct inode *inode, u64 logical, u64 phys,
+			 u32 len, u16 flags)
+{
+	struct ocsfs2_inode_info *oi = OCSFS2_I(inode);
+	struct ocsfs2_extent *ex = oi->i_extents;
+	u16 pos;
+
+	/* find insertion position (first extent with logical > new logical) */
+	for (pos = 0; pos < oi->i_extent_count; pos++)
+		if (ex[pos].logical > logical)
+			break;
+
+	/* merge with previous */
+	if (pos > 0) {
+		struct ocsfs2_extent *p = &ex[pos - 1];
+
+		if (p->flags == flags &&
+		    p->logical + p->length == logical &&
+		    p->physical + p->length == phys) {
+			p->length += len;
+			/* now maybe merge p with the following extent */
+			if (pos < oi->i_extent_count &&
+			    ex[pos].flags == flags &&
+			    p->logical + p->length == ex[pos].logical &&
+			    p->physical + p->length == ex[pos].physical) {
+				p->length += ex[pos].length;
+				memmove(&ex[pos], &ex[pos + 1],
+					(oi->i_extent_count - pos - 1) * sizeof(*ex));
+				oi->i_extent_count--;
+			}
+			return 0;
+		}
+	}
+	/* merge with next (prepend) */
+	if (pos < oi->i_extent_count) {
+		struct ocsfs2_extent *n = &ex[pos];
+
+		if (n->flags == flags &&
+		    logical + len == n->logical &&
+		    phys + len == n->physical) {
+			n->logical = logical;
+			n->physical = phys;
+			n->length += len;
+			return 0;
+		}
+	}
+	/* insert a new extent at pos */
+	if (oi->i_extent_count >= OCSFS2_INLINE_EXTENTS) {
+		pr_warn_ratelimited("ocsfs2: inode %llu: >%u extents (B+tree spill is Plan 2b)\n",
+				    oi->i_disk_ino, OCSFS2_INLINE_EXTENTS);
+		return -ENOSPC;
+	}
+	memmove(&ex[pos + 1], &ex[pos],
+		(oi->i_extent_count - pos) * sizeof(*ex));
+	ex[pos].logical = logical;
+	ex[pos].physical = phys;
+	ex[pos].length = len;
+	ex[pos].flags = flags;
+	oi->i_extent_count++;
+	return 0;
+}
+
+/* Free every block with logical >= from_block, splitting a straddling extent. */
+void ocsfs2_extent_truncate_from(struct inode *inode, u64 from_block)
+{
+	struct ocsfs2_inode_info *oi = OCSFS2_I(inode);
+	struct super_block *sb = inode->i_sb;
+	struct ocsfs2_extent *ex = oi->i_extents;
+	u32 spb = sb->s_blocksize / 512;
+	u16 i = 0;
+
+	while (i < oi->i_extent_count) {
+		struct ocsfs2_extent *e = &ex[i];
+		u64 e_end = e->logical + e->length;
+
+		if (e->logical >= from_block) {
+			ocsfs2_free_blocks(sb, e->physical, e->length);
+			inode->i_blocks -= (u64)e->length * spb;
+			memmove(&ex[i], &ex[i + 1],
+				(oi->i_extent_count - i - 1) * sizeof(*ex));
+			oi->i_extent_count--;
+			continue;   /* don't advance: shifted next into i */
+		}
+		if (e_end > from_block) {
+			u32 keep = (u32)(from_block - e->logical);
+
+			ocsfs2_free_blocks(sb, e->physical + keep, e->length - keep);
+			inode->i_blocks -= (u64)(e->length - keep) * spb;
+			e->length = keep;
+		}
+		i++;
+	}
+}
+
+/* Allocate one block and append it as the next logical block of @inode (dirs).
  * Returns the physical block in *phys_out. Caller holds i_meta_lock. */
 int ocsfs2_inode_append_block(struct inode *inode, u64 *phys_out)
 {
@@ -483,27 +604,11 @@ int ocsfs2_inode_append_block(struct inode *inode, u64 *phys_out)
 	ret = ocsfs2_alloc_blocks(sb, oi->i_ag, 1, &phys);
 	if (ret)
 		return ret;
-
-	if (oi->i_extent_count > 0) {
-		struct ocsfs2_extent *last = &oi->i_extents[oi->i_extent_count - 1];
-
-		if (last->logical + last->length == next_logical &&
-		    last->physical + last->length == phys) {
-			last->length++;
-			goto done;
-		}
-	}
-	if (oi->i_extent_count >= OCSFS2_INLINE_EXTENTS) {
-		/* Plan 1: inline extents only. Extent B+tree spill is Plan 2. */
+	ret = ocsfs2_extent_insert(inode, next_logical, phys, 1, OCSFS2_EXT_WRITTEN);
+	if (ret) {
 		ocsfs2_free_blocks(sb, phys, 1);
-		return -ENOSPC;
+		return ret;
 	}
-	oi->i_extents[oi->i_extent_count].logical = next_logical;
-	oi->i_extents[oi->i_extent_count].physical = phys;
-	oi->i_extents[oi->i_extent_count].length = 1;
-	oi->i_extents[oi->i_extent_count].flags = OCSFS2_EXT_WRITTEN;
-	oi->i_extent_count++;
-done:
 	inode->i_blocks += sb->s_blocksize / 512;
 	*phys_out = phys;
 	return 0;
@@ -531,8 +636,17 @@ int ocsfs2_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		return ret;
 
 	if ((attr->ia_valid & ATTR_SIZE) && attr->ia_size != inode->i_size) {
-		/* Plan 1: no file data path yet; only metadata size tracking. */
-		truncate_setsize(inode, attr->ia_size);
+		loff_t oldsize = inode->i_size;
+
+		truncate_setsize(inode, attr->ia_size);   /* sets i_size, trims cache */
+		if (attr->ia_size < oldsize) {
+			u64 from = DIV_ROUND_UP_ULL(attr->ia_size,
+						   inode->i_sb->s_blocksize);
+
+			mutex_lock(&OCSFS2_I(inode)->i_meta_lock);
+			ocsfs2_extent_truncate_from(inode, from);
+			mutex_unlock(&OCSFS2_I(inode)->i_meta_lock);
+		}
 	}
 	setattr_copy(idmap, inode, attr);
 	mark_inode_dirty(inode);
@@ -549,10 +663,4 @@ const struct inode_operations ocsfs2_file_iops = {
 const struct inode_operations ocsfs2_special_iops = {
 	.setattr = ocsfs2_setattr,
 	.getattr = ocsfs2_getattr,
-};
-
-/* Plan 1: regular files have no data path. Allow open/seek; read/write of
- * content arrives in Plan 2. */
-const struct file_operations ocsfs2_file_fops = {
-	.llseek = generic_file_llseek,
 };

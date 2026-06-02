@@ -464,9 +464,19 @@ int  ocsfs2_getattr(struct mnt_idmap *idmap, const struct path *path,
 		    struct kstat *stat, u32 request_mask, unsigned int flags);
 int  ocsfs2_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		    struct iattr *attr);
-/* extent map (Plan 1: inline extents only) */
+/* extent map (Plan 1/2: inline extents only — caller holds i_meta_lock) */
 int  ocsfs2_bmap(struct inode *inode, u64 logical_block, u64 *phys_out);
 int  ocsfs2_inode_append_block(struct inode *inode, u64 *phys_out);
+int  ocsfs2_extent_find(struct inode *inode, u64 lblk,
+			struct ocsfs2_extent *cover, u64 *next_logical);
+int  ocsfs2_extent_insert(struct inode *inode, u64 logical, u64 phys,
+			  u32 len, u16 flags);
+void ocsfs2_extent_truncate_from(struct inode *inode, u64 from_block);
+
+/* iomap.c — file data path */
+extern const struct address_space_operations ocsfs2_file_aops;
+ssize_t ocsfs2_file_read_iter(struct kiocb *iocb, struct iov_iter *to);
+ssize_t ocsfs2_file_write_iter(struct kiocb *iocb, struct iov_iter *from);
 
 /* bitmap.c */
 int  ocsfs2_alloc_blocks(struct super_block *sb, u32 ag_hint, u32 count,
