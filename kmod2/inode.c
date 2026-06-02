@@ -30,6 +30,7 @@ struct inode *ocsfs2_alloc_inode(struct super_block *sb)
 	oi->i_extent_count = 0;
 	oi->i_extent_tree_root = 0;
 	oi->i_dir_btree_root = 0;
+	oi->i_xattr_block = 0;
 	oi->i_dirent_count = 0;
 	return &oi->vfs_inode;
 }
@@ -127,6 +128,7 @@ static void fill_disk_inode(struct inode *inode, struct ocsfs2_disk_inode *di)
 	di->i_rdev = cpu_to_le32(new_encode_dev(inode->i_rdev));
 	di->i_extent_tree_root = cpu_to_le64(oi->i_extent_tree_root);
 	di->i_dir_btree_root = cpu_to_le64(oi->i_dir_btree_root);
+	di->i_xattr_block = cpu_to_le64(oi->i_xattr_block);
 	di->i_dirent_count = cpu_to_le32(oi->i_dirent_count);
 
 	if (S_ISLNK(inode->i_mode)) {
@@ -263,6 +265,7 @@ struct inode *ocsfs2_iget(struct super_block *sb, u64 ino)
 	oi->i_ag = ocsfs2_ino_to_ag(sbi, ino);
 	oi->i_extent_tree_root = le64_to_cpu(di.i_extent_tree_root);
 	oi->i_dir_btree_root = le64_to_cpu(di.i_dir_btree_root);
+	oi->i_xattr_block = le64_to_cpu(di.i_xattr_block);
 	oi->i_dirent_count = le32_to_cpu(di.i_dirent_count);
 	parse_extents(oi, &di);
 
@@ -316,6 +319,7 @@ void ocsfs2_evict_inode(struct inode *inode)
 			ocsfs2_free_blocks_rc(inode->i_sb, oi->i_extents[i].physical,
 					      oi->i_extents[i].length);
 		oi->i_extent_count = 0;
+		ocsfs2_xattr_free(inode);   /* release the xattr/ACL block */
 	}
 
 	clear_inode(inode);
@@ -488,6 +492,7 @@ struct inode *ocsfs2_new_inode(struct mnt_idmap *idmap, struct inode *dir,
 	oi->i_extent_count = 0;
 	oi->i_extent_tree_root = 0;
 	oi->i_dir_btree_root = 0;
+	oi->i_xattr_block = 0;
 	oi->i_dirent_count = 0;
 
 	if (S_ISREG(mode)) {
@@ -861,14 +866,24 @@ int ocsfs2_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 /* ── operation tables ── */
 
 const struct inode_operations ocsfs2_file_iops = {
-	.setattr = ocsfs2_setattr,
-	.getattr = ocsfs2_getattr,
-	.fiemap  = ocsfs2_fiemap,
+	.setattr   = ocsfs2_setattr,
+	.getattr   = ocsfs2_getattr,
+	.fiemap    = ocsfs2_fiemap,
+	.listxattr = ocsfs2_listxattr,
+#ifdef CONFIG_FS_POSIX_ACL
+	.get_inode_acl = ocsfs2_get_acl,
+	.set_acl       = ocsfs2_set_acl,
+#endif
 };
 
 const struct inode_operations ocsfs2_special_iops = {
-	.setattr = ocsfs2_setattr,
-	.getattr = ocsfs2_getattr,
+	.setattr   = ocsfs2_setattr,
+	.getattr   = ocsfs2_getattr,
+	.listxattr = ocsfs2_listxattr,
+#ifdef CONFIG_FS_POSIX_ACL
+	.get_inode_acl = ocsfs2_get_acl,
+	.set_acl       = ocsfs2_set_acl,
+#endif
 };
 
 const struct inode_operations ocsfs2_symlink_iops = {

@@ -40,6 +40,7 @@
 #define OCSFS2_LEASE_MAGIC    0x4C455332u   /* 'LES2' */
 #define OCSFS2_NODE_MAGIC     0x4E4F4432u   /* 'NOD2' */
 #define OCSFS2_RC_NODE_MAGIC  0x52434E32u   /* 'RCN2' — refcount btree node */
+#define OCSFS2_XATTR_MAGIC    0x58415432u   /* 'XAT2' — extended attr block */
 
 #define OCSFS2_VERSION_MAJOR  2
 #define OCSFS2_VERSION_MINOR  0
@@ -309,6 +310,20 @@ struct ocsfs2_disk_rc_node {         /* one 4096-byte metadata block */
 } __packed;
 static_assert(sizeof(struct ocsfs2_disk_rc_node) == 4096, "rc_node 4096");
 
+/* ── extended attributes (Plan 5b) ──
+ * All of an inode's xattrs (including POSIX ACLs) live in a single 4 KiB block
+ * pointed at by i_xattr_block (0 = none). Entries are packed after the header:
+ * [le16 name_len][le16 value_len][name][value], 4-byte aligned. The full
+ * prefixed name ("user.foo", "system.posix_acl_access", ...) is stored. */
+struct ocsfs2_disk_xattr_header {
+	__le32  xh_magic;            /* OCSFS2_XATTR_MAGIC */
+	__le32  xh_count;            /* number of entries */
+	__le32  xh_used;             /* bytes of entries after this header */
+	__le32  xh_checksum;         /* crc32c(~0, whole block, this field 0) */
+} __packed;
+static_assert(sizeof(struct ocsfs2_disk_xattr_header) == 16, "xattr_header 16");
+#define OCSFS2_XATTR_SPACE  (OCSFS2_BLOCK_SIZE - sizeof(struct ocsfs2_disk_xattr_header))
+
 /* ── reflink/snapshot ioctl ──
  * OCSFS_IOC_SNAP_CREATE: called on a regular-file fd; arg points at a
  * NUL-terminated name (<= OCSFS2_MAX_NAME) for a point-in-time reflink copy
@@ -440,6 +455,7 @@ struct ocsfs2_inode_info {
 	struct ocsfs2_extent i_extents[OCSFS2_INLINE_EXTENTS];
 	u64   i_extent_tree_root;
 	u64   i_dir_btree_root;
+	u64   i_xattr_block;             /* xattr/ACL block, 0 = none */
 	u32   i_dirent_count;
 	struct mutex i_meta_lock;        /* protects extent map + dir metadata */
 	struct inode vfs_inode;          /* must be last */
@@ -668,6 +684,19 @@ static inline int ocsfs2_jbuf(struct buffer_head *bh)
 
 	return txn ? ocsfs2_txn_get(txn, bh) : 0;
 }
+
+/* xattr.c — extended attributes + POSIX ACL */
+extern const struct xattr_handler * const ocsfs2_xattr_handlers[];
+int  ocsfs2_xattr_get(struct inode *inode, const char *name, void *buf,
+		      size_t size);
+int  ocsfs2_xattr_set(struct inode *inode, const char *name, const void *value,
+		      size_t size, int flags);
+ssize_t ocsfs2_listxattr(struct dentry *dentry, char *buffer, size_t size);
+void ocsfs2_xattr_free(struct inode *inode);   /* free the xattr block on evict */
+struct posix_acl *ocsfs2_get_acl(struct inode *inode, int type, bool rcu);
+int  ocsfs2_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
+		    struct posix_acl *acl, int type);
+int  ocsfs2_init_acl(struct inode *inode, struct inode *dir);   /* inherit on create */
 
 /* rename.c */
 int  ocsfs2_rename(struct mnt_idmap *idmap, struct inode *old_dir,

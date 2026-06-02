@@ -267,6 +267,9 @@ static int ocsfs2_mknod_common(struct mnt_idmap *idmap, struct inode *dir,
 		ocsfs2_txn_abort(txn);
 		return PTR_ERR(inode);
 	}
+	ret = ocsfs2_init_acl(inode, dir);   /* inherit default ACL / apply umask */
+	if (ret)
+		goto fail;
 	ret = ocsfs2_write_inode_block(inode);
 	if (ret)
 		goto fail;
@@ -398,6 +401,9 @@ static struct dentry *ocsfs2_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 		ocsfs2_txn_abort(txn);
 		return ERR_CAST(inode);
 	}
+	ret = ocsfs2_init_acl(inode, dir);   /* inherit default ACL / apply umask */
+	if (ret)
+		goto fail;
 	ret = ocsfs2_init_empty_dir(inode, dir);
 	if (ret)
 		goto fail;
@@ -521,6 +527,11 @@ const struct inode_operations ocsfs2_dir_iops = {
 	.mknod   = ocsfs2_mknod,
 	.setattr = ocsfs2_setattr,
 	.getattr = ocsfs2_getattr,
+	.listxattr = ocsfs2_listxattr,
+#ifdef CONFIG_FS_POSIX_ACL
+	.get_inode_acl = ocsfs2_get_acl,
+	.set_acl       = ocsfs2_set_acl,
+#endif
 };
 
 const struct file_operations ocsfs2_dir_fops = {

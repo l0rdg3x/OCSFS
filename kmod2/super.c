@@ -338,6 +338,8 @@ static int ocsfs2_fill_super(struct super_block *sb, struct fs_context *fc)
 
 	sb->s_magic = OCSFS2_MAGIC;
 	sb->s_op = &ocsfs2_sops;
+	sb->s_xattr = ocsfs2_xattr_handlers;
+	sb->s_flags |= SB_POSIXACL;   /* FS applies umask/ACL via posix_acl_create */
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 	sb->s_time_gran = 1;
 
