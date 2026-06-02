@@ -149,6 +149,7 @@ int ocsfs2_write_inode_block(struct inode *inode)
 	u64 blk;
 	u32 off_in_blk;
 	struct buffer_head *bh;
+	int ret;
 
 	if (!byte_off)
 		return -EINVAL;
@@ -158,9 +159,15 @@ int ocsfs2_write_inode_block(struct inode *inode)
 	bh = sb_bread(sb, blk);
 	if (!bh)
 		return -EIO;
+	ret = ocsfs2_jbuf(bh);   /* enrol in current txn (snapshot) before modifying */
+	if (ret) {
+		brelse(bh);
+		return ret;
+	}
 	fill_disk_inode(inode, (struct ocsfs2_disk_inode *)(bh->b_data + off_in_blk));
 	mark_buffer_dirty(bh);
-	if (sb->s_flags & SB_SYNCHRONOUS || (inode_state_read(inode) & I_DIRTY_SYNC))
+	if (!ocsfs2_current_txn() &&
+	    (sb->s_flags & SB_SYNCHRONOUS || (inode_state_read(inode) & I_DIRTY_SYNC)))
 		sync_dirty_buffer(bh);
 	brelse(bh);
 	return 0;
@@ -293,6 +300,10 @@ static int reserve_inode_slot(struct super_block *sb, u32 ag, u64 local)
 	bh = sb_bread(sb, blk);
 	if (!bh)
 		return -EIO;
+	if (ocsfs2_jbuf(bh)) {
+		brelse(bh);
+		return -ENOMEM;
+	}
 	di = (struct ocsfs2_disk_inode *)(bh->b_data + off);
 	memset(di, 0, sizeof(*di));
 	di->i_magic = cpu_to_le32(OCSFS2_INODE_MAGIC);
@@ -387,8 +398,11 @@ void ocsfs2_free_inode_num(struct super_block *sb, u64 ino)
 	mutex_lock(&ai->ag_lock);
 	bh = sb_bread(sb, blk);
 	if (bh) {
+		ocsfs2_jbuf(bh);   /* enrol if within a txn (else writeback) */
 		memset(bh->b_data + off, 0, OCSFS2_INODE_SIZE);
 		mark_buffer_dirty(bh);
+		if (!ocsfs2_current_txn())
+			sync_dirty_buffer(bh);
 		brelse(bh);
 	}
 	ai->free_inodes++;

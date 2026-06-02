@@ -123,6 +123,8 @@ struct ocsfs2_txn *ocsfs2_txn_begin(struct super_block *sb)
 		return NULL;
 	txn->t_sb = sb;
 	INIT_LIST_HEAD(&txn->t_bufs);
+	/* jbd2-style: metadata write helpers find this via current->journal_info */
+	current->journal_info = txn;
 	return txn;
 }
 
@@ -175,6 +177,7 @@ static void txn_free(struct ocsfs2_txn *txn, bool restore)
 
 void ocsfs2_txn_abort(struct ocsfs2_txn *txn)
 {
+	current->journal_info = NULL;
 	txn_free(txn, true);   /* revert in-memory buffers to their before-image */
 }
 
@@ -188,6 +191,8 @@ int ocsfs2_txn_commit(struct ocsfs2_txn *txn)
 	u64 start, seq, len;
 	u32 nr, i;
 	int ret = 0;
+
+	current->journal_info = NULL;   /* this task is no longer building a txn */
 
 	if (txn->t_failed) {
 		ocsfs2_txn_abort(txn);

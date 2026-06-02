@@ -35,10 +35,12 @@ static int repoint_dotdot(struct inode *dir, u64 new_parent_ino)
 				continue;
 			if (de->de_name_len == 2 &&
 			    de->de_name[0] == '.' && de->de_name[1] == '.') {
+				ret = ocsfs2_jbuf(bh);
+				if (ret)
+					break;
 				de->de_ino = cpu_to_le64(new_parent_ino);
 				ocsfs2_dirent_set_csum(de);
 				mark_buffer_dirty(bh);
-				ret = 0;
 				break;
 			}
 		}
@@ -57,6 +59,7 @@ int ocsfs2_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 	struct inode *old_inode = d_inode(old_dentry);
 	struct inode *new_inode = d_inode(new_dentry);
 	bool is_dir = S_ISDIR(old_inode->i_mode);
+	struct ocsfs2_txn *txn;
 	struct timespec64 now;
 	int ret;
 
@@ -76,19 +79,21 @@ int ocsfs2_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 		}
 	}
 
+	txn = ocsfs2_txn_begin(old_dir->i_sb);
+	if (!txn)
+		return -ENOMEM;
+
 	/* 1. install the new name pointing at old_inode */
 	if (new_inode) {
-		/* replace existing target's dirent ino in place would be neater,
-		 * but for simplicity remove then add */
 		ret = ocsfs2_del_dirent(new_dir, &new_dentry->d_name);
 		if (ret && ret != -ENOENT)
-			return ret;
+			goto fail;
 	}
 	ret = ocsfs2_add_dirent(new_dir, &new_dentry->d_name,
 				OCSFS2_I(old_inode)->i_disk_ino,
 				ocsfs2_mode_to_ft(old_inode->i_mode));
 	if (ret)
-		return ret;
+		goto fail;
 
 	/* 2. drop the displaced target inode */
 	if (new_inode) {
@@ -99,34 +104,45 @@ int ocsfs2_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 			drop_nlink(new_inode);
 		}
 		inode_set_ctime_current(new_inode);
-		mark_inode_dirty(new_inode);
+		ret = ocsfs2_write_inode_block(new_inode);
+		if (ret)
+			goto fail;
 	}
 
 	/* 3. remove the old name */
 	ret = ocsfs2_del_dirent(old_dir, &old_dentry->d_name);
-	if (ret) {
-		/* best-effort rollback of the new name */
-		ocsfs2_del_dirent(new_dir, &new_dentry->d_name);
-		return ret;
-	}
+	if (ret)
+		goto fail;
 
 	/* 4. directory move across parents: fix ".." and nlinks */
 	if (is_dir && old_dir != new_dir) {
-		repoint_dotdot(old_inode, OCSFS2_I(new_dir)->i_disk_ino);
+		ret = repoint_dotdot(old_inode, OCSFS2_I(new_dir)->i_disk_ino);
+		if (ret)
+			goto fail;
 		drop_nlink(old_dir);   /* old parent loses child's ".." backlink */
 		inc_nlink(new_dir);    /* new parent gains it */
-		mark_inode_dirty(old_dir);
-		mark_inode_dirty(new_dir);
 	}
 
 	now = current_time(old_inode);
 	inode_set_ctime_to_ts(old_inode, now);
-	mark_inode_dirty(old_inode);
 	inode_set_mtime_to_ts(old_dir, now);
 	inode_set_ctime_to_ts(old_dir, now);
-	mark_inode_dirty(old_dir);
 	inode_set_mtime_to_ts(new_dir, now);
 	inode_set_ctime_to_ts(new_dir, now);
-	mark_inode_dirty(new_dir);
-	return 0;
+
+	ret = ocsfs2_write_inode_block(old_inode);
+	if (ret)
+		goto fail;
+	ret = ocsfs2_write_inode_block(old_dir);
+	if (ret)
+		goto fail;
+	if (new_dir != old_dir) {
+		ret = ocsfs2_write_inode_block(new_dir);
+		if (ret)
+			goto fail;
+	}
+	return ocsfs2_txn_commit(txn);
+fail:
+	ocsfs2_txn_abort(txn);
+	return ret;
 }

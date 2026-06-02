@@ -107,6 +107,8 @@ int ocsfs2_add_dirent(struct inode *dir, const struct qstr *name,
 
 			if (le32_to_cpu(de->de_magic) == OCSFS2_DIRENT_MAGIC)
 				continue;
+			ret = ocsfs2_jbuf(bh);
+			if (ret) { brelse(bh); goto out; }
 			write_dirent(de, name, ino, ft);
 			mark_buffer_dirty(bh);
 			brelse(bh);
@@ -122,6 +124,8 @@ int ocsfs2_add_dirent(struct inode *dir, const struct qstr *name,
 	dir->i_size += OCSFS2_BLOCK_SIZE;
 	bh = sb_bread(sb, phys);
 	if (!bh) { ret = -EIO; goto out; }
+	ret = ocsfs2_jbuf(bh);
+	if (ret) { brelse(bh); goto out; }
 	memset(bh->b_data, 0, OCSFS2_BLOCK_SIZE);
 	write_dirent(slot_ptr(bh, 0), name, ino, ft);
 	mark_buffer_dirty(bh);
@@ -162,6 +166,7 @@ int ocsfs2_del_dirent(struct inode *dir, const struct qstr *name)
 				continue;
 			if (!name_eq(de, name))
 				continue;
+			if (ocsfs2_jbuf(bh)) { brelse(bh); ret = -ENOMEM; goto out; }
 			memset(de, 0, OCSFS2_DIRENT_SIZE);
 			mark_buffer_dirty(bh);
 			brelse(bh);
@@ -248,13 +253,18 @@ static int ocsfs2_create(struct mnt_idmap *idmap, struct inode *dir,
 			 struct dentry *dentry, umode_t mode, bool excl)
 {
 	struct inode *inode;
+	struct ocsfs2_txn *txn;
 	int ret;
 
-	inode = ocsfs2_new_inode(idmap, dir, mode, 0);
-	if (IS_ERR(inode))
-		return PTR_ERR(inode);
+	txn = ocsfs2_txn_begin(dir->i_sb);
+	if (!txn)
+		return -ENOMEM;
 
-	/* persist the inode before its dirent becomes durable (no dangling ref) */
+	inode = ocsfs2_new_inode(idmap, dir, mode, 0);   /* reserve enrols the slot */
+	if (IS_ERR(inode)) {
+		ocsfs2_txn_abort(txn);
+		return PTR_ERR(inode);
+	}
 	ret = ocsfs2_write_inode_block(inode);
 	if (ret)
 		goto fail;
@@ -262,9 +272,17 @@ static int ocsfs2_create(struct mnt_idmap *idmap, struct inode *dir,
 				OCSFS2_I(inode)->i_disk_ino, ocsfs2_mode_to_ft(mode));
 	if (ret)
 		goto fail;
+	ret = ocsfs2_write_inode_block(dir);   /* dir size/mtime/dirent_count, atomically */
+	if (ret)
+		goto fail;
+	ret = ocsfs2_txn_commit(txn);          /* frees txn (success or fail) */
+	if (ret)
+		goto fail_committed;
 	d_instantiate(dentry, inode);
 	return 0;
 fail:
+	ocsfs2_txn_abort(txn);
+fail_committed:
 	inode_dec_link_count(inode);
 	discard_new_inode(inode);
 	return ret;
@@ -274,17 +292,22 @@ static struct dentry *ocsfs2_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 				   struct dentry *dentry, umode_t mode)
 {
 	struct inode *inode;
+	struct ocsfs2_txn *txn;
 	int ret;
 
-	inode = ocsfs2_new_inode(idmap, dir, S_IFDIR | mode, 0);
-	if (IS_ERR(inode))
-		return ERR_CAST(inode);
+	txn = ocsfs2_txn_begin(dir->i_sb);
+	if (!txn)
+		return ERR_PTR(-ENOMEM);
 
+	inode = ocsfs2_new_inode(idmap, dir, S_IFDIR | mode, 0);
+	if (IS_ERR(inode)) {
+		ocsfs2_txn_abort(txn);
+		return ERR_CAST(inode);
+	}
 	ret = ocsfs2_init_empty_dir(inode, dir);
 	if (ret)
 		goto fail;
 	set_nlink(inode, 2);   /* "." + the entry in the parent */
-
 	ret = ocsfs2_write_inode_block(inode);
 	if (ret)
 		goto fail;
@@ -293,10 +316,17 @@ static struct dentry *ocsfs2_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	if (ret)
 		goto fail;
 	inc_nlink(dir);        /* ".." in the new child points back at dir */
-	mark_inode_dirty(dir);
+	ret = ocsfs2_write_inode_block(dir);
+	if (ret)
+		goto fail;
+	ret = ocsfs2_txn_commit(txn);
+	if (ret)
+		goto fail_committed;
 	d_instantiate(dentry, inode);
 	return NULL;
 fail:
+	ocsfs2_txn_abort(txn);
+fail_committed:
 	clear_nlink(inode);
 	discard_new_inode(inode);
 	return ERR_PTR(ret);
@@ -305,32 +335,55 @@ fail:
 static int ocsfs2_unlink(struct inode *dir, struct dentry *dentry)
 {
 	struct inode *inode = d_inode(dentry);
+	struct ocsfs2_txn *txn;
 	int ret;
 
+	txn = ocsfs2_txn_begin(dir->i_sb);
+	if (!txn)
+		return -ENOMEM;
 	ret = ocsfs2_del_dirent(dir, &dentry->d_name);
 	if (ret)
-		return ret;
+		goto fail;
 	inode_set_ctime_to_ts(inode, inode_get_ctime(dir));
 	drop_nlink(inode);
-	mark_inode_dirty(inode);
-	return 0;
+	ret = ocsfs2_write_inode_block(inode);   /* nlink-- atomic with dirent removal */
+	if (ret)
+		goto fail;
+	ret = ocsfs2_write_inode_block(dir);
+	if (ret)
+		goto fail;
+	return ocsfs2_txn_commit(txn);
+fail:
+	ocsfs2_txn_abort(txn);
+	return ret;
 }
 
 static int ocsfs2_rmdir(struct inode *dir, struct dentry *dentry)
 {
 	struct inode *inode = d_inode(dentry);
+	struct ocsfs2_txn *txn;
 	int ret;
 
 	if (!ocsfs2_empty_dir(inode))
 		return -ENOTEMPTY;
+	txn = ocsfs2_txn_begin(dir->i_sb);
+	if (!txn)
+		return -ENOMEM;
 	ret = ocsfs2_del_dirent(dir, &dentry->d_name);
 	if (ret)
-		return ret;
+		goto fail;
 	clear_nlink(inode);       /* drops the dir's own "." link to 0 */
-	mark_inode_dirty(inode);
+	ret = ocsfs2_write_inode_block(inode);
+	if (ret)
+		goto fail;
 	drop_nlink(dir);          /* parent loses the child's ".." backlink */
-	mark_inode_dirty(dir);
-	return 0;
+	ret = ocsfs2_write_inode_block(dir);
+	if (ret)
+		goto fail;
+	return ocsfs2_txn_commit(txn);
+fail:
+	ocsfs2_txn_abort(txn);
+	return ret;
 }
 
 static int ocsfs2_readdir(struct file *file, struct dir_context *ctx)

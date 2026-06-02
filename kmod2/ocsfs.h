@@ -28,6 +28,7 @@
 #include <linux/uuid.h>
 #include <linux/time64.h>
 #include <linux/dma-direction.h>
+#include <linux/sched.h>
 
 /* ═══════════════════════ on-disk constants ═══════════════════════ */
 
@@ -567,6 +568,22 @@ struct ocsfs2_txn *ocsfs2_txn_begin(struct super_block *sb);
 int  ocsfs2_txn_get(struct ocsfs2_txn *txn, struct buffer_head *bh);
 int  ocsfs2_txn_commit(struct ocsfs2_txn *txn);
 void ocsfs2_txn_abort(struct ocsfs2_txn *txn);
+
+/* The transaction the current task is building (jbd2-style), or NULL. Metadata
+ * write helpers enrol their buffers here so the op commits atomically. */
+static inline struct ocsfs2_txn *ocsfs2_current_txn(void)
+{
+	return current->journal_info;
+}
+
+/* Enrol a metadata buffer in the current txn (snapshotting its before-image)
+ * BEFORE modifying it. No-op (returns 0) outside a transaction. */
+static inline int ocsfs2_jbuf(struct buffer_head *bh)
+{
+	struct ocsfs2_txn *txn = ocsfs2_current_txn();
+
+	return txn ? ocsfs2_txn_get(txn, bh) : 0;
+}
 
 /* rename.c */
 int  ocsfs2_rename(struct mnt_idmap *idmap, struct inode *old_dir,

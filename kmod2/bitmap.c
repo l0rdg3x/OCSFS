@@ -53,13 +53,18 @@ static void flush_bitmap_range(struct super_block *sb, struct ocsfs2_ag_info *ai
 			       struct buffer_head **bhs, const u8 *buf,
 			       u64 bit_lo, u64 bit_hi)
 {
+	struct ocsfs2_txn *txn = ocsfs2_current_txn();
 	u64 blo = (bit_lo / 8) / sb->s_blocksize;
 	u64 bhi = ((bit_hi - 1) / 8) / sb->s_blocksize;
 	u64 i;
 
 	for (i = blo; i <= bhi && i < ai->bitmap_blocks; i++) {
+		if (txn)
+			ocsfs2_txn_get(txn, bhs[i]);  /* snapshot before overwrite */
 		memcpy(bhs[i]->b_data, buf + i * sb->s_blocksize, sb->s_blocksize);
 		mark_buffer_dirty(bhs[i]);
+		if (!txn)
+			sync_dirty_buffer(bhs[i]);    /* data path: bitmap durable ahead of inode */
 	}
 }
 
