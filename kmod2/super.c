@@ -216,6 +216,7 @@ static void ocsfs2_put_super(struct super_block *sb)
 	if (!sbi)
 		return;
 	write_back_meta(sb);
+	ocsfs2_journal_exit(sb);
 	kvfree(sbi->s_ags);
 	if (sbi->s_sbh)
 		brelse(sbi->s_sbh);
@@ -313,9 +314,26 @@ static int ocsfs2_fill_super(struct super_block *sb, struct fs_context *fc)
 	sbi->s_data_off       = le64_to_cpu(ds->s_data_off);
 	sbi->s_clustered = false;   /* Plan 1: single-node only */
 
+	/* Bring up the journal and replay any committed-but-uncheckpointed txn
+	 * BEFORE reading AG headers / the root inode, so we read consistent
+	 * metadata. */
+	if (!sb_rdonly(sb)) {
+		ret = ocsfs2_journal_init(sb);
+		if (ret) {
+			pr_err("ocsfs2: journal init failed: %d\n", ret);
+			goto fail_sbh;
+		}
+		ret = ocsfs2_journal_replay(sb);
+		if (ret) {
+			pr_err("ocsfs2: journal replay failed: %d\n", ret);
+			ocsfs2_journal_exit(sb);
+			goto fail_sbh;
+		}
+	}
+
 	ret = read_ag_headers(sb);
 	if (ret)
-		goto fail_ags;
+		goto fail_journal;
 
 	sb->s_magic = OCSFS2_MAGIC;
 	sb->s_op = &ocsfs2_sops;
@@ -326,17 +344,17 @@ static int ocsfs2_fill_super(struct super_block *sb, struct fs_context *fc)
 	if (IS_ERR(root)) {
 		pr_err("ocsfs2: cannot read root inode\n");
 		ret = PTR_ERR(root);
-		goto fail_ags;
+		goto fail_journal;
 	}
 	if (!S_ISDIR(root->i_mode)) {
 		iput(root);
 		ret = -EINVAL;
-		goto fail_ags;
+		goto fail_journal;
 	}
 	sb->s_root = d_make_root(root);
 	if (!sb->s_root) {
 		ret = -ENOMEM;
-		goto fail_ags;
+		goto fail_journal;
 	}
 
 	pr_info("ocsfs2: mounted %s (%u AGs, %llu blocks)\n",
@@ -344,9 +362,11 @@ static int ocsfs2_fill_super(struct super_block *sb, struct fs_context *fc)
 		(unsigned long long)sbi->s_total_blocks);
 	return 0;
 
-fail_ags:
+fail_journal:
+	ocsfs2_journal_exit(sb);
 	kvfree(sbi->s_ags);
 	sbi->s_ags = NULL;
+fail_sbh:
 	if (sbi->s_sbh)
 		brelse(sbi->s_sbh);
 fail:

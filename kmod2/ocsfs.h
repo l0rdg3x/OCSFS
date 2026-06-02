@@ -246,6 +246,39 @@ struct ocsfs2_disk_journal_hdr {     /* one block */
 } __packed;
 static_assert(sizeof(struct ocsfs2_disk_journal_hdr) == 4096, "journal_hdr 4096");
 
+/* Journal record block types (one 4 KiB block each). */
+#define OCSFS2_JREC_DESC    1
+#define OCSFS2_JREC_COMMIT  2
+#define OCSFS2_JTXN_MAX_BLOCKS  254   /* fits in one descriptor block */
+
+struct ocsfs2_jent {
+	__le64  je_home;     /* home block number of this after-image */
+	__le32  je_crc;      /* crc32c of the after-image block content */
+	__le32  je_pad;
+} __packed;
+static_assert(sizeof(struct ocsfs2_jent) == 16, "jent 16");
+
+struct ocsfs2_disk_jdesc {           /* descriptor block */
+	__le32  jd_magic;
+	__le32  jd_type;     /* OCSFS2_JREC_DESC */
+	__le64  jd_seq;
+	__le32  jd_nr;       /* number of after-image blocks following */
+	__le32  jd_pad;
+	struct ocsfs2_jent jd_ent[OCSFS2_JTXN_MAX_BLOCKS];   /* 254 * 16 = 4064 */
+	__u8    jd_reserved[4];
+	__le32  jd_checksum; /* crc32c([0..4091]) */
+} __packed;
+static_assert(sizeof(struct ocsfs2_disk_jdesc) == 4096, "jdesc 4096");
+
+struct ocsfs2_disk_jcommit {         /* commit block */
+	__le32  jc_magic;
+	__le32  jc_type;     /* OCSFS2_JREC_COMMIT */
+	__le64  jc_seq;
+	__le32  jc_checksum; /* crc32c([0..15]) */
+	__u8    jc_pad[4076];
+} __packed;
+static_assert(sizeof(struct ocsfs2_disk_jcommit) == 4096, "jcommit 4096");
+
 /* reservation unit sizes used by mkfs to size the cluster regions */
 #define OCSFS2_NODE_SLOT_SIZE   256
 #define OCSFS2_HEARTBEAT_SIZE   256
@@ -284,6 +317,37 @@ struct ocsfs2_ag_info {
 	struct mutex ag_lock;    /* protects this AG's bitmap + inode table */
 };
 
+/* In-memory journal state (single-node: this node's slot-0 WAL). */
+struct ocsfs2_journal {
+	u64    j_off;        /* journal region byte offset */
+	u64    j_first_blk;  /* j_off / blocksize */
+	u64    j_blocks;     /* total blocks in the region */
+	u64    j_ring_len;   /* j_blocks - 1 (block 0 is the header) */
+	u64    j_head;       /* monotonic record index — next free slot */
+	u64    j_tail;       /* monotonic record index — oldest live record */
+	u64    j_seq;        /* next transaction sequence */
+	struct mutex j_lock;
+	struct buffer_head *j_hdr_bh;
+	struct super_block *j_sb;
+	bool   j_active;
+};
+
+/* A metadata buffer enrolled in a transaction (with its before-image). */
+struct ocsfs2_txn_buf {
+	struct list_head  link;
+	struct buffer_head *bh;
+	u64    home_block;
+	u8    *before;       /* snapshot taken at txn_get (for abort rollback) */
+};
+
+struct ocsfs2_txn {
+	struct super_block *t_sb;
+	u64    t_seq;
+	struct list_head t_bufs;
+	unsigned int t_nr;
+	bool   t_failed;
+};
+
 struct ocsfs2_sb_info {
 	struct super_block  *s_sb;
 	struct buffer_head  *s_sbh;      /* superblock buffer (block 0 or mirror) */
@@ -320,6 +384,8 @@ struct ocsfs2_sb_info {
 
 	spinlock_t  s_free_lock;         /* protects s_free_blocks/s_free_inodes */
 	struct mutex s_super_lock;       /* serialises superblock writeback */
+
+	struct ocsfs2_journal s_journal; /* WAL redo log (single-node slot 0) */
 
 	/* cluster identity — reserved, unused in Plan 1 */
 	struct ocsfs2_pr_info s_pr;
@@ -492,6 +558,15 @@ int  ocsfs2_del_dirent(struct inode *dir, const struct qstr *name);
 u64  ocsfs2_find_dirent(struct inode *dir, const struct qstr *name, u8 *ft_out);
 int  ocsfs2_empty_dir(struct inode *dir);
 int  ocsfs2_init_empty_dir(struct inode *dir, struct inode *parent);
+
+/* journal.c — WAL redo log + crash recovery */
+int  ocsfs2_journal_init(struct super_block *sb);
+void ocsfs2_journal_exit(struct super_block *sb);
+int  ocsfs2_journal_replay(struct super_block *sb);
+struct ocsfs2_txn *ocsfs2_txn_begin(struct super_block *sb);
+int  ocsfs2_txn_get(struct ocsfs2_txn *txn, struct buffer_head *bh);
+int  ocsfs2_txn_commit(struct ocsfs2_txn *txn);
+void ocsfs2_txn_abort(struct ocsfs2_txn *txn);
 
 /* rename.c */
 int  ocsfs2_rename(struct mnt_idmap *idmap, struct inode *old_dir,
