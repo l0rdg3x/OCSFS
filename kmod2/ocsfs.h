@@ -766,6 +766,7 @@ loff_t ocsfs2_llseek(struct file *file, loff_t offset, int whence);
 int  ocsfs2_alloc_blocks(struct super_block *sb, u32 ag_hint, u32 count,
 			 u64 *block_out);
 void ocsfs2_free_blocks(struct super_block *sb, u64 block, u32 count);
+u64  ocsfs2_recompute_free(struct super_block *sb);   /* A4: true free from bitmap */
 int  ocsfs2_fitrim(struct super_block *sb, struct fstrim_range *range);  /* D4 */
 
 /* D2 autonomous online autogrow */

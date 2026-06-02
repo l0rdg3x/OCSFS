@@ -219,6 +219,11 @@ int ocsfs2_statfs(struct dentry *dentry, struct kstatfs *buf)
 	buf->f_type = OCSFS2_MAGIC;
 	buf->f_bsize = sb->s_blocksize;
 	buf->f_blocks = sbi->s_total_blocks;
+	/* A4: in cluster mode the cached free count is only a per-node view and
+	 * drifts; recompute the true value from the (authoritative) bitmaps so df
+	 * reflects every node's activity. Single-node keeps the cheap cached count. */
+	if (sbi->s_cluster)
+		ocsfs2_recompute_free(sb);
 	spin_lock(&sbi->s_free_lock);
 	buf->f_bfree = sbi->s_free_blocks;
 	buf->f_bavail = sbi->s_free_blocks;
@@ -242,6 +247,8 @@ static void ocsfs2_put_super(struct super_block *sb)
 	if (!sbi)
 		return;
 	ocsfs2_grow_stop(sb);      /* stop the autogrow watcher before tearing down */
+	if (sbi->s_clustered)      /* A4: persist a true free count (coherent read) */
+		ocsfs2_recompute_free(sb);
 	ocsfs2_cluster_exit(sb);   /* stop heartbeat + release node slot first */
 	write_back_meta(sb);
 	ocsfs2_journal_exit(sb);

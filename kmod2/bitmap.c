@@ -278,6 +278,58 @@ int ocsfs2_alloc_blocks(struct super_block *sb, u32 ag_hint, u32 count,
 	return -ENOSPC;
 }
 
+/* A4: recompute the true free-block count from the on-disk bitmaps (the
+ * authoritative source) and refresh the per-AG hints. In cluster mode the cached
+ * s_free_blocks / ag_free_blocks are only per-node views (peers alloc/free
+ * without us seeing it), so `df` drifts; recomputing here (coherent reads) makes
+ * statfs accurate. Returns the total free blocks, or s_free_blocks on OOM. */
+u64 ocsfs2_recompute_free(struct super_block *sb)
+{
+	struct ocsfs2_sb_info *sbi = OCSFS2_SB(sb);
+	u32 bs = sb->s_blocksize, bpb = bs * 8, ag;
+	u64 total = 0;
+	u8 *buf = kmalloc(bs, GFP_NOFS);
+
+	if (!buf)
+		return sbi->s_free_blocks;
+
+	for (ag = 0; ag < READ_ONCE(sbi->s_ag_count); ag++) {
+		struct ocsfs2_ag_info *ai = &sbi->s_ags[ag];
+		u64 done = 0, agfree = 0;
+
+		while (done < ai->block_count) {
+			u32 bits = (u32)min_t(u64, bpb, ai->block_count - done);
+			u64 bbyte = ai->bitmap_off + (done / bpb) * bs;
+			u32 fullb = bits / 8, rem = bits % 8, set = 0, k;
+
+			if (sbi->s_cluster) {
+				if (ocsfs2_cl_bio(sb, bbyte, buf, bs, REQ_OP_READ))
+					break;
+			} else {
+				struct buffer_head *bh = sb_bread(sb, bbyte / bs);
+
+				if (!bh)
+					break;
+				memcpy(buf, bh->b_data, bs);
+				brelse(bh);
+			}
+			for (k = 0; k < fullb; k++)
+				set += hweight8(buf[k]);
+			if (rem)
+				set += hweight8(buf[fullb] & ((1u << rem) - 1));
+			agfree += bits - set;
+			done += bits;
+		}
+		ai->free_blocks = agfree;          /* refresh the alloc hint */
+		total += agfree;
+	}
+	kfree(buf);
+	spin_lock(&sbi->s_free_lock);
+	sbi->s_free_blocks = total;
+	spin_unlock(&sbi->s_free_lock);
+	return total;
+}
+
 void ocsfs2_free_blocks(struct super_block *sb, u64 block, u32 count)
 {
 	struct ocsfs2_sb_info *sbi = OCSFS2_SB(sb);
