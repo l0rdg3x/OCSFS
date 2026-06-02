@@ -279,12 +279,15 @@ struct ocsfs2_ag_info {
 	u64   data_off;          /* absolute byte offset of first data block */
 	u64   data_blocks;
 	u64   rc_btree_root;
+	u64   next_blk_hint;     /* AG-relative search start for block alloc */
+	u64   next_ino_hint;     /* AG-local search start for inode alloc */
 	struct mutex ag_lock;    /* protects this AG's bitmap + inode table */
 };
 
 struct ocsfs2_sb_info {
 	struct super_block  *s_sb;
-	struct buffer_head  *s_sbh;      /* superblock buffer (block 0) */
+	struct buffer_head  *s_sbh;      /* superblock buffer (block 0 or mirror) */
+	struct ocsfs2_disk_super *s_ds;  /* points into s_sbh->b_data */
 
 	/* cached geometry */
 	u32  s_block_size;
@@ -440,22 +443,30 @@ static inline bool ocsfs2_dirent_csum_ok(const struct ocsfs2_disk_dirent *de)
 /* ═══════════════════════ inter-file API ═══════════════════════ */
 
 /* super.c */
-extern const struct super_operations ocsfs2_sops;
 int  ocsfs2_statfs(struct dentry *dentry, struct kstatfs *buf);
-int  ocsfs2_write_super(struct super_block *sb);
 
 /* inode.c */
+extern struct kmem_cache *ocsfs2_inode_cachep;
 extern const struct inode_operations ocsfs2_file_iops;
 extern const struct inode_operations ocsfs2_special_iops;
+extern const struct file_operations ocsfs2_file_fops;
 struct inode *ocsfs2_iget(struct super_block *sb, u64 ino);
 int  ocsfs2_write_inode_block(struct inode *inode);
 int  ocsfs2_write_inode(struct inode *inode, struct writeback_control *wbc);
 void ocsfs2_evict_inode(struct inode *inode);
-struct inode *ocsfs2_new_inode(struct inode *dir, umode_t mode, dev_t rdev);
+struct inode *ocsfs2_new_inode(struct mnt_idmap *idmap, struct inode *dir,
+			       umode_t mode, dev_t rdev);
 int  ocsfs2_alloc_inode_num(struct super_block *sb, u32 ag_hint, u64 *ino_out);
 void ocsfs2_free_inode_num(struct super_block *sb, u64 ino);
 struct inode *ocsfs2_alloc_inode(struct super_block *sb);
 void ocsfs2_free_in_core_inode(struct inode *inode);
+int  ocsfs2_getattr(struct mnt_idmap *idmap, const struct path *path,
+		    struct kstat *stat, u32 request_mask, unsigned int flags);
+int  ocsfs2_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+		    struct iattr *attr);
+/* extent map (Plan 1: inline extents only) */
+int  ocsfs2_bmap(struct inode *inode, u64 logical_block, u64 *phys_out);
+int  ocsfs2_inode_append_block(struct inode *inode, u64 *phys_out);
 
 /* bitmap.c */
 int  ocsfs2_alloc_blocks(struct super_block *sb, u32 ag_hint, u32 count,
