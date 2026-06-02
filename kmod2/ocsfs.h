@@ -76,6 +76,9 @@
 /* reserved lease resource id (never an inode number) for the global metadata
  * lease that serialises cross-node namespace + allocation (L4b). */
 #define OCSFS2_META_RESOURCE  1ULL
+/* recovery-leader lease resource per dead slot (L5). High bit keeps it clear of
+ * real inode numbers (which start at 2 and never reach 2^48). */
+#define OCSFS2_RECOVERY_RESOURCE(slot)  ((2ULL << 48) | (u64)(slot))
 
 /* file types (de_file_type / inode helpers) */
 #define OCSFS2_FT_UNKNOWN 0
@@ -480,6 +483,7 @@ struct ocsfs2_cluster {
 	struct mutex lease_lock;     /* serialises lease-table CAW read-modify-CAS */
 	unsigned long hb_interval_j; /* heartbeat period (jiffies) */
 	unsigned long death_j;       /* death window (jiffies) */
+	struct workqueue_struct *recover_wq; /* L5: off-heartbeat recovery */
 };
 
 struct ocsfs2_sb_info {
@@ -771,6 +775,7 @@ struct ocsfs2_txn *ocsfs2_txn_begin(struct super_block *sb);
 int  ocsfs2_txn_get(struct ocsfs2_txn *txn, struct buffer_head *bh);
 int  ocsfs2_txn_commit(struct ocsfs2_txn *txn);
 void ocsfs2_txn_abort(struct ocsfs2_txn *txn);
+int  ocsfs2_journal_replay_slot(struct super_block *sb, u16 slot);  /* L5 recovery */
 
 /* The transaction the current task is building (jbd2-style), or NULL. Metadata
  * write helpers enrol their buffers here so the op commits atomically. */

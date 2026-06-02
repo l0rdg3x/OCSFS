@@ -17,6 +17,7 @@
 #include <linux/writeback.h>
 #include <linux/blkdev.h>
 #include <linux/delay.h>
+#include <linux/workqueue.h>
 
 #define LEASE_PROBE_MAX  64
 #define LEASE_CAS_TRIES  16
@@ -303,11 +304,159 @@ void ocsfs2_meta_unlock(struct super_block *sb)
 	ocsfs2_lease_release(sb, OCSFS2_META_RESOURCE, OCSFS2_LEASE_EX);
 }
 
+/* L5: eagerly reclaim every lease entry held by a dead instance {slot, gen}.
+ * Scans the whole table block-by-block; each block with stale holders is
+ * rewritten atomically via CAW (so it races safely with live peers' lazy
+ * reclaim). Caller holds the metadata lease + recovery-leader lease. */
+static void reclaim_dead_leases(struct super_block *sb, u16 slot, u32 gen)
+{
+	struct ocsfs2_sb_info *sbi = OCSFS2_SB(sb);
+	struct ocsfs2_cluster *c = sbi->s_cluster;
+	unsigned int lbs = bdev_logical_block_size(sb->s_bdev);
+	unsigned int per_blk = lbs / OCSFS2_LEASE_ENTRY_SIZE;
+	u64 total_blks = (sbi->s_lease_count + per_blk - 1) / per_blk;
+	u64 base_blk = sbi->s_lease_table_off / lbs;
+	u8 *old, *new;
+	u64 b;
+	int reclaimed = 0;
+
+	old = kmalloc(lbs, GFP_NOFS);
+	new = kmalloc(lbs, GFP_NOFS);
+	if (!old || !new) { kfree(old); kfree(new); return; }
+
+	mutex_lock(&c->lease_lock);
+	for (b = 0; b < total_blks; b++) {
+		u64 blk = base_blk + b;
+		int tries;
+
+		for (tries = 0; tries < LEASE_CAS_TRIES; tries++) {
+			bool changed = false;
+			unsigned int e;
+
+			if (ocsfs2_cl_bio(sb, blk * lbs, old, lbs, REQ_OP_READ))
+				break;
+			memcpy(new, old, lbs);
+			for (e = 0; e < per_blk; e++) {
+				struct ocsfs2_disk_lease *le =
+					(struct ocsfs2_disk_lease *)(new + e * OCSFS2_LEASE_ENTRY_SIZE);
+				bool touched = false;
+
+				if (le32_to_cpu(le->l_magic) != OCSFS2_LEASE_MAGIC)
+					continue;
+				if (le16_to_cpu(le->l_owner_slot) == slot &&
+				    le32_to_cpu(le->l_owner_gen) == gen) {
+					le->l_owner_slot = cpu_to_le16(OCSFS2_SLOT_NONE);
+					le->l_owner_gen = 0;
+					touched = true;
+				}
+				if (sh_test(le->l_sh_holders, slot)) {
+					sh_clr(le->l_sh_holders, slot);
+					touched = true;
+				}
+				if (!touched)
+					continue;
+				/* recompute the surviving mode */
+				if (le16_to_cpu(le->l_owner_slot) != OCSFS2_SLOT_NONE) {
+					le->l_mode = cpu_to_le16(OCSFS2_LEASE_EX);
+				} else {
+					u16 s; bool any = false;
+					for (s = 0; s < c->max_nodes; s++)
+						if (sh_test(le->l_sh_holders, s)) { any = true; break; }
+					le->l_mode = cpu_to_le16(any ? OCSFS2_LEASE_SH
+								     : OCSFS2_LEASE_NONE);
+				}
+				le->l_seq = cpu_to_le32(le32_to_cpu(le->l_seq) + 1);
+				le_csum(le);
+				changed = true;
+			}
+			if (!changed)
+				break;                  /* nothing stale in this block */
+			if (ocsfs2_scsi_caw(sb, blk, old, new, lbs) == 0) {
+				reclaimed++;
+				break;                  /* committed */
+			}
+			/* miscompare: a peer mutated the block — re-read and retry */
+		}
+	}
+	mutex_unlock(&c->lease_lock);
+	kfree(old);
+	kfree(new);
+	if (reclaimed)
+		pr_info("ocsfs2: recovery: reclaimed leases of dead slot %u gen %u (%d block(s))\n",
+			slot, gen, reclaimed);
+}
+
+struct ocsfs2_recover_work {
+	struct work_struct work;
+	struct super_block *sb;
+	u16 slot;
+	u32 gen;
+};
+
+/* Recovery body (runs on the recovery workqueue, off the heartbeat path).
+ * 1. become recovery leader for this dead slot (EX lease, lost => peer leads);
+ * 2. take the metadata lease so no live peer mutates shared metadata;
+ * 3. replay the dead node's journal (redo its committed dir-block txn);
+ * 4. reclaim every lease the dead instance held;
+ * 5. drop the metadata + recovery leases. */
+static void recover_work_fn(struct work_struct *w)
+{
+	struct ocsfs2_recover_work *rw =
+		container_of(w, struct ocsfs2_recover_work, work);
+	struct super_block *sb = rw->sb;
+	u64 rres = OCSFS2_RECOVERY_RESOURCE(rw->slot);
+	int ret;
+
+	ret = ocsfs2_lease_acquire(sb, rres, OCSFS2_LEASE_EX);
+	if (ret) {
+		/* another live node is (or just finished) recovering this slot */
+		pr_info("ocsfs2: recovery of slot %u led by a peer (%d)\n",
+			rw->slot, ret);
+		goto done;
+	}
+
+	pr_info("ocsfs2: recovery leader for dead slot %u gen %u\n",
+		rw->slot, rw->gen);
+
+	ocsfs2_meta_lock(sb, NULL, NULL);
+	ret = ocsfs2_journal_replay_slot(sb, rw->slot);
+	if (ret && ret != -EUCLEAN)
+		pr_warn("ocsfs2: recovery: journal replay of slot %u: %d\n",
+			rw->slot, ret);
+	reclaim_dead_leases(sb, rw->slot, rw->gen);
+	ocsfs2_meta_unlock(sb);
+
+	ocsfs2_lease_release(sb, rres, OCSFS2_LEASE_EX);
+	pr_info("ocsfs2: recovery of slot %u complete\n", rw->slot);
+done:
+	kfree(rw);
+}
+
 void ocsfs2_recover_node(struct super_block *sb, u16 slot, u32 gen)
 {
-	pr_warn("ocsfs2: recovery for dead node slot %u gen %u (journal replay + lease reclaim: L5 pending)\n",
-		slot, gen);
-	/* TODO L5: elect a recovery leader, replay the dead node's journal, then
-	 * reclaim every lease entry owned by {slot, gen}. Until then, dead-owner
-	 * leases are reclaimed lazily by acquirers (entry_reclaimable). */
+	struct ocsfs2_cluster *c = OCSFS2_SB(sb)->s_cluster;
+	struct ocsfs2_recover_work *rw;
+
+	if (!c)
+		return;
+	/* Offload to a workqueue: doing CAW loops + journal replay inline in the
+	 * heartbeat thread would starve our own heartbeat (the v1 cascade). If we
+	 * have no workqueue, dead leases are still reclaimed lazily by acquirers
+	 * (entry_reclaimable); only eager replay is skipped. */
+	if (!c->recover_wq) {
+		pr_warn("ocsfs2: dead slot %u gen %u — lazy reclaim only (no recover_wq)\n",
+			slot, gen);
+		return;
+	}
+	rw = kzalloc(sizeof(*rw), GFP_ATOMIC);
+	if (!rw) {
+		pr_warn("ocsfs2: dead slot %u gen %u — recovery deferred (ENOMEM)\n",
+			slot, gen);
+		return;
+	}
+	INIT_WORK(&rw->work, recover_work_fn);
+	rw->sb = sb;
+	rw->slot = slot;
+	rw->gen = gen;
+	queue_work(c->recover_wq, &rw->work);
 }

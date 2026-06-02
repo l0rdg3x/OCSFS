@@ -401,6 +401,12 @@ int ocsfs2_cluster_init(struct super_block *sb)
 	}
 	sbi->s_node_slot = c->self_slot;
 	sbi->s_mount_gen = c->mount_gen;
+	/* off-heartbeat recovery worker; if it can't be made we fall back to lazy
+	 * lease reclaim (entry_reclaimable) and defer journal replay to remount */
+	c->recover_wq = alloc_ordered_workqueue("ocsfs2-recover/%s", WQ_MEM_RECLAIM,
+						sb->s_id);
+	if (!c->recover_wq)
+		pr_warn("ocsfs2: no recovery workqueue — leases reclaimed lazily only\n");
 	pr_info("ocsfs2: cluster joined — slot %u, gen %u, %u max nodes\n",
 		c->self_slot, c->mount_gen, c->max_nodes);
 	return 0;       /* heartbeat starts later, after journal/root are up */
@@ -445,6 +451,8 @@ void ocsfs2_cluster_exit(struct super_block *sb)
 		return;
 	if (c->hb_thread)
 		kthread_stop(c->hb_thread);
+	if (c->recover_wq)
+		destroy_workqueue(c->recover_wq);   /* drains in-flight recovery */
 
 	/* release our node slot (mark FREE) so peers don't fence us */
 	off = sbi->s_node_table_off + (u64)c->self_slot * OCSFS2_NODE_SLOT_SIZE;

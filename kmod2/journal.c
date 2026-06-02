@@ -402,3 +402,101 @@ out:
 	mutex_unlock(&j->j_lock);
 	return ret;
 }
+
+/* L5: replay a DEAD peer's per-slot journal during recovery. Reads the dead
+ * node's journal coherently (bio) and re-applies its committed-but-not-
+ * checkpointed transaction to the home blocks, then empties that journal. The
+ * caller holds the metadata lease (serialising vs live nodes) and has fenced
+ * the dead node. */
+int ocsfs2_journal_replay_slot(struct super_block *sb, u16 slot)
+{
+	struct ocsfs2_sb_info *sbi = OCSFS2_SB(sb);
+	u32 bs = sb->s_blocksize, nr, i, crc;
+	u64 joff = sbi->s_journal_off + (u64)slot * sbi->s_journal_size;
+	u64 first_blk = joff / bs;
+	u64 ring_len = sbi->s_journal_size / bs - 1;
+	struct buffer_head *hbh, *dbh = NULL, *cbh = NULL;
+	struct ocsfs2_disk_journal_hdr *jh;
+	struct ocsfs2_disk_jdesc *desc;
+	struct ocsfs2_disk_jcommit *commit;
+	u64 tail, head, seq;
+	int ret = 0;
+
+	if (sbi->s_journal_size / bs < 4)
+		return 0;
+	hbh = ocsfs2_meta_bread(sb, first_blk);
+	if (!hbh)
+		return -EIO;
+	jh = (struct ocsfs2_disk_journal_hdr *)hbh->b_data;
+	crc = ocsfs2_crc32c(~0U, jh,
+			    offsetof(struct ocsfs2_disk_journal_hdr, jh_checksum));
+	if (le32_to_cpu(jh->jh_magic) != OCSFS2_JOURNAL_MAGIC ||
+	    crc != le32_to_cpu(jh->jh_checksum)) {
+		brelse(hbh);
+		return -EUCLEAN;
+	}
+	tail = le64_to_cpu(jh->jh_tail);
+	head = le64_to_cpu(jh->jh_head);
+	if (tail == head)
+		goto clean;             /* dead node had no in-flight txn */
+
+	dbh = ocsfs2_meta_bread(sb, first_blk + 1 + (tail % ring_len));
+	if (!dbh) { ret = -EIO; goto out; }
+	desc = (struct ocsfs2_disk_jdesc *)dbh->b_data;
+	crc = ocsfs2_crc32c(~0U, desc,
+			    offsetof(struct ocsfs2_disk_jdesc, jd_checksum));
+	if (le32_to_cpu(desc->jd_magic) != OCSFS2_JOURNAL_MAGIC ||
+	    le32_to_cpu(desc->jd_type) != OCSFS2_JREC_DESC ||
+	    crc != le32_to_cpu(desc->jd_checksum))
+		goto clean;             /* torn: nothing committed to redo */
+	nr = le32_to_cpu(desc->jd_nr);
+	seq = le64_to_cpu(desc->jd_seq);
+	if (nr > OCSFS2_JTXN_MAX_BLOCKS || 1 + nr + 1 > head - tail)
+		goto clean;
+
+	cbh = ocsfs2_meta_bread(sb, first_blk + 1 + ((tail + 1 + nr) % ring_len));
+	if (!cbh) { ret = -EIO; goto out; }
+	commit = (struct ocsfs2_disk_jcommit *)cbh->b_data;
+	crc = ocsfs2_crc32c(~0U, commit,
+			    offsetof(struct ocsfs2_disk_jcommit, jc_checksum));
+	if (le32_to_cpu(commit->jc_magic) != OCSFS2_JOURNAL_MAGIC ||
+	    le32_to_cpu(commit->jc_type) != OCSFS2_JREC_COMMIT ||
+	    le64_to_cpu(commit->jc_seq) != seq ||
+	    crc != le32_to_cpu(commit->jc_checksum))
+		goto clean;             /* not committed: undo (drop) */
+
+	for (i = 0; i < nr; i++) {
+		struct buffer_head *aibh =
+			ocsfs2_meta_bread(sb, first_blk + 1 + ((tail + 1 + i) % ring_len));
+		u64 home = le64_to_cpu(desc->jd_ent[i].je_home);
+		u32 ecrc = le32_to_cpu(desc->jd_ent[i].je_crc);
+
+		if (!aibh) { ret = -EIO; goto out; }
+		if (ocsfs2_crc32c(~0U, aibh->b_data, bs) == ecrc)
+			ret = write_block(sb, home, aibh->b_data);
+		brelse(aibh);
+		if (ret)
+			goto out;
+	}
+	blkdev_issue_flush(sb->s_bdev);
+	pr_info("ocsfs2: recovery: replayed dead slot %u txn seq %llu (%u blocks)\n",
+		slot, seq, nr);
+clean:
+	/* empty the dead node's journal so it isn't replayed again. jh aliases
+	 * hbh->b_data (the cached block for first_blk), so flush hbh in place
+	 * rather than write_block()-ing it onto itself. */
+	jh->jh_tail = jh->jh_head;
+	jh->jh_checksum = cpu_to_le32(ocsfs2_crc32c(~0U, jh,
+			  offsetof(struct ocsfs2_disk_journal_hdr, jh_checksum)));
+	mark_buffer_dirty(hbh);
+	if (sync_dirty_buffer(hbh))
+		ret = ret ? ret : -EIO;
+	blkdev_issue_flush(sb->s_bdev);
+out:
+	brelse(hbh);
+	if (dbh)
+		brelse(dbh);
+	if (cbh)
+		brelse(cbh);
+	return ret;
+}
