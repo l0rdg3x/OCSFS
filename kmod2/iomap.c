@@ -42,8 +42,8 @@ static int cow_rw_block(struct super_block *sb, u64 phys, struct page *page,
 	return ret;
 }
 
-static int cow_copy_blocks(struct super_block *sb, u64 oldphys, u64 newphys,
-			   u32 n)
+int ocsfs2_copy_blocks(struct super_block *sb, u64 oldphys, u64 newphys,
+		       u32 n)
 {
 	struct page *page = alloc_page(GFP_NOFS);
 	u32 i;
@@ -100,7 +100,7 @@ static int ocsfs2_cow_range(struct inode *inode, const struct ocsfs2_extent *cov
 	ret = ocsfs2_alloc_blocks(sb, oi->i_ag, n, &newphys);  /* bitmap in txn */
 	if (ret)
 		goto abort;
-	ret = cow_copy_blocks(sb, oldphys, newphys, n);
+	ret = ocsfs2_copy_blocks(sb, oldphys, newphys, n);
 	if (ret) {
 		ocsfs2_free_blocks(sb, newphys, n);
 		goto abort;

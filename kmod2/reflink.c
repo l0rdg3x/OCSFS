@@ -294,6 +294,23 @@ long ocsfs2_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			return -EFAULT;
 		return 0;                       /* findings are reported in res.errors */
 	}
+	case OCSFS_IOC_DEFRAG: {          /* online extent compaction */
+		struct ocsfs2_defrag_result res;
+		int ret;
+
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+		ret = mnt_want_write_file(file);
+		if (ret)
+			return ret;
+		ret = ocsfs2_defrag_file(file_inode(file), &res);
+		mnt_drop_write_file(file);
+		if (ret)
+			return ret;
+		if (copy_to_user((void __user *)arg, &res, sizeof(res)))
+			return -EFAULT;
+		return 0;
+	}
 	case FITRIM: {                      /* D4: thin-reclaim via SCSI UNMAP */
 		struct super_block *sb = file_inode(file)->i_sb;
 		struct fstrim_range range;

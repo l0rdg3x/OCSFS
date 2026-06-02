@@ -400,6 +400,17 @@ struct ocsfs2_scrub_result {
 };
 #define OCSFS_IOC_SCRUB        _IOWR('O', 0x03, struct ocsfs2_scrub_result)
 
+/* OCSFS_IOC_DEFRAG: called on a regular-file fd; relocate the file's private
+ * (non-shared, written) data into contiguous runs, shrinking its extent count.
+ * Online, journaled, leaves shared (reflink/snapshot/dedup) extents untouched. */
+struct ocsfs2_defrag_result {
+	__u64 extents_before;
+	__u64 extents_after;
+	__u64 blocks_relocated;
+	__u64 runs_relocated;
+};
+#define OCSFS_IOC_DEFRAG       _IOWR('O', 0x04, struct ocsfs2_defrag_result)
+
 /* reservation unit sizes used by mkfs to size the cluster regions */
 #define OCSFS2_NODE_SLOT_SIZE   256
 #define OCSFS2_HEARTBEAT_SIZE   256
@@ -764,6 +775,12 @@ void ocsfs2_grow_stop(struct super_block *sb);
 
 /* D5 online metadata scrub */
 int  ocsfs2_scrub(struct super_block *sb, struct ocsfs2_scrub_result *res);
+
+/* online defragmentation (extent compaction) */
+int  ocsfs2_defrag_file(struct inode *inode, struct ocsfs2_defrag_result *res);
+
+/* coherent block-range copy (bio-based), shared by CoW and defrag */
+int  ocsfs2_copy_blocks(struct super_block *sb, u64 oldphys, u64 newphys, u32 n);
 
 /* refcount.c — per-AG reflink/snapshot refcount tree (Plan 4) */
 u32  ocsfs2_refcount_get(struct super_block *sb, u64 phys);
