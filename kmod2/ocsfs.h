@@ -27,6 +27,7 @@
 #include <linux/mutex.h>
 #include <linux/uuid.h>
 #include <linux/time64.h>
+#include <linux/dma-direction.h>
 
 /* ═══════════════════════ on-disk constants ═══════════════════════ */
 
@@ -476,8 +477,30 @@ int  ocsfs2_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 		   struct dentry *old_dentry, struct inode *new_dir,
 		   struct dentry *new_dentry, unsigned int flags);
 
-/* transport/scsi_pr.c — salvaged, dormant in Plan 1 */
+/* transport/scsi_pr.c — salvaged, dormant in Plan 1 (compiles, not exercised).
+ * SCSI-3 Persistent Reservations + Compare-And-Write. Used by the cluster
+ * layer (Plan 2+) for fencing and lease-table CAS. */
+#define OCSFS2_PR_TYPE_WRITE_EXCL       0x01
+#define OCSFS2_PR_TYPE_EXCL_ACCESS      0x03
+#define OCSFS2_PR_TYPE_WRITE_EXCL_REG   0x05
+#define OCSFS2_PR_TYPE_EXCL_ACCESS_REG  0x06
+
 int  ocsfs2_scsi_pool_init(void);
 void ocsfs2_scsi_pool_destroy(void);
+int  ocsfs2_pr_register(struct super_block *sb, u64 key);
+int  ocsfs2_pr_unregister(struct super_block *sb);
+int  ocsfs2_pr_reserve(struct super_block *sb, u8 type);
+int  ocsfs2_pr_release(struct super_block *sb, u8 type);
+int  ocsfs2_pr_preempt(struct super_block *sb, u64 victim_key, u8 type);
+int  ocsfs2_pr_preempt_abort(struct super_block *sb, u64 victim_key, u8 type);
+bool ocsfs2_pr_probe(struct super_block *sb);
+u64  ocsfs2_pr_make_key(const u8 *uuid, u32 mount_gen);
+void ocsfs2_build_caw_cdb(u8 cdb[16], u64 lba, u32 num_blocks);
+bool ocsfs2_scsi_caw_probe(struct super_block *sb);
+int  ocsfs2_scsi_caw(struct super_block *sb, u64 lba, const void *expected,
+		     const void *new_data, unsigned int lbs);
+int  ocsfs2_bsg_execute_cdb(struct super_block *sb, const u8 cdb[16],
+			    void *buf, unsigned int buf_len,
+			    enum dma_data_direction data_dir);
 
 #endif /* _OCSFS2_KMOD_H */

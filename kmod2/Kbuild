@@ -4,7 +4,6 @@
 
 obj-m += ocsfs2.o
 
-# A1: skeleton only. A2 appends transport/scsi_pr.o; later tasks append more.
-ocsfs2-y := super.o
+ocsfs2-y := super.o transport/scsi_pr.o
 
 ccflags-y := -I$(src) -Wall
