@@ -576,6 +576,9 @@ int  ocsfs2_extent_update_phys(struct inode *inode, u64 logical, u32 len,
 			       u64 new_phys, u16 flags);
 int  ocsfs2_extent_remap_range(struct inode *inode, u64 logical, u32 len,
 			       u64 new_phys, u16 new_flags);
+/* Free (refcount-aware) and remove every extent or part within [lblk, end).
+ * Caller holds i_meta_lock. -ENOSPC if a mid-extent split needs more slots. */
+int  ocsfs2_extent_punch_range(struct inode *inode, u64 lblk, u64 end);
 void ocsfs2_extent_truncate_from(struct inode *inode, u64 from_block);
 /* Discard in-core extent map / size and re-read it from the on-disk inode
  * (used to roll back after a failed reflink whose journal txn was aborted). */
@@ -583,8 +586,19 @@ void ocsfs2_reload_extents(struct inode *inode);
 
 /* iomap.c — file data path */
 extern const struct address_space_operations ocsfs2_file_aops;
+extern const struct iomap_ops ocsfs2_iomap_ops;
 ssize_t ocsfs2_file_read_iter(struct kiocb *iocb, struct iov_iter *to);
 ssize_t ocsfs2_file_write_iter(struct kiocb *iocb, struct iov_iter *from);
+
+/* Cap a single block allocation (8 MiB at 4 KiB blocks) — shared by the write
+ * path and fallocate so one mapping call never scans/claims too much. */
+#define OCSFS2_ALLOC_CAP_BLOCKS  2048u
+
+/* file.c — fallocate, fiemap, SEEK_HOLE/DATA (L2 completeness) */
+long ocsfs2_fallocate(struct file *file, int mode, loff_t offset, loff_t len);
+int  ocsfs2_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
+		   u64 start, u64 len);
+loff_t ocsfs2_llseek(struct file *file, loff_t offset, int whence);
 
 /* bitmap.c */
 int  ocsfs2_alloc_blocks(struct super_block *sb, u32 ag_hint, u32 count,

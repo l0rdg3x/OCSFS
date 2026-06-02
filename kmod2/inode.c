@@ -709,6 +709,73 @@ int ocsfs2_extent_remap_range(struct inode *inode, u64 logical, u32 len,
 	return -ENOENT;
 }
 
+/* Free (refcount-aware) and remove every extent or part within [lblk, end),
+ * splitting a straddling extent. Used by hole-punch and reflink range clear.
+ * Caller holds i_meta_lock. -ENOSPC if a mid-extent split lacks inline slots. */
+int ocsfs2_extent_punch_range(struct inode *inode, u64 lblk, u64 end)
+{
+	struct ocsfs2_inode_info *oi = OCSFS2_I(inode);
+	struct super_block *sb = inode->i_sb;
+	u32 spb = sb->s_blocksize / 512;
+	u16 i = 0;
+
+	while (i < oi->i_extent_count) {
+		struct ocsfs2_extent *e = &oi->i_extents[i];
+		u64 e_end = e->logical + e->length;
+
+		if (e_end <= lblk || e->logical >= end) {
+			i++;
+			continue;
+		}
+		if (e->logical >= lblk && e_end <= end) {
+			ocsfs2_free_blocks_rc(sb, e->physical, e->length);
+			inode->i_blocks -= (u64)e->length * spb;
+			memmove(e, e + 1,
+				(oi->i_extent_count - i - 1) * sizeof(*e));
+			oi->i_extent_count--;
+			continue;
+		}
+		if (e->logical < lblk && e_end > end) {
+			u32 head = (u32)(lblk - e->logical);
+			u32 holelen = (u32)(end - lblk);
+
+			if (oi->i_extent_count >= OCSFS2_INLINE_EXTENTS)
+				return -ENOSPC;
+			ocsfs2_free_blocks_rc(sb, e->physical + head, holelen);
+			inode->i_blocks -= (u64)holelen * spb;
+			memmove(e + 1, e, (oi->i_extent_count - i) * sizeof(*e));
+			oi->i_extent_count++;
+			e[1].logical  = end;
+			e[1].physical = e->physical + head + holelen;
+			e[1].length   = (u32)(e_end - end);
+			e->length = head;
+			i += 2;
+			continue;
+		}
+		if (e->logical < lblk) {
+			u32 keep = (u32)(lblk - e->logical);
+
+			ocsfs2_free_blocks_rc(sb, e->physical + keep,
+					      e->length - keep);
+			inode->i_blocks -= (u64)(e->length - keep) * spb;
+			e->length = keep;
+			i++;
+			continue;
+		}
+		{
+			u32 cut = (u32)(end - e->logical);
+
+			ocsfs2_free_blocks_rc(sb, e->physical, cut);
+			inode->i_blocks -= (u64)cut * spb;
+			e->logical = end;
+			e->physical += cut;
+			e->length -= cut;
+			i++;
+		}
+	}
+	return 0;
+}
+
 /* Allocate one block and append it as the next logical block of @inode (dirs).
  * Returns the physical block in *phys_out. Caller holds i_meta_lock. */
 int ocsfs2_inode_append_block(struct inode *inode, u64 *phys_out)
@@ -776,6 +843,7 @@ int ocsfs2_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 const struct inode_operations ocsfs2_file_iops = {
 	.setattr = ocsfs2_setattr,
 	.getattr = ocsfs2_getattr,
+	.fiemap  = ocsfs2_fiemap,
 };
 
 const struct inode_operations ocsfs2_special_iops = {

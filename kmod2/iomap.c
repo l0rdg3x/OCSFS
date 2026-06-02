@@ -19,8 +19,7 @@
 #include <linux/bio.h>
 #include <linux/fs.h>
 
-/* Cap a single allocation so one iomap_begin doesn't scan/claim too much. */
-#define OCSFS2_ALLOC_CAP_BLOCKS  2048u   /* 8 MiB at 4 KiB blocks */
+/* OCSFS2_ALLOC_CAP_BLOCKS lives in ocsfs.h (shared with fallocate). */
 
 /* ── copy-on-write (reflink/snapshot, Plan 4) ──
  * File data never lives in the buffer cache (it flows through file folios +
@@ -144,13 +143,19 @@ static int ocsfs2_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 	mutex_lock(&oi->i_meta_lock);
 	nofs = memalloc_nofs_save();
 
+	/* A modifying op is a buffered/direct write OR a zero-range (fallocate /
+	 * hole-punch edges). Both must copy-on-write a shared block; only a real
+	 * write allocates holes and converts unwritten extents. */
+	{
+	bool modifying = flags & (IOMAP_WRITE | IOMAP_ZERO);
+
 	ret = ocsfs2_extent_find(inode, lblk, &cover, &next_logical);
 	if (ret == 0) {
 		u64 off_in, remaining;
 
-		/* shared (reflink/snapshot) block on a write -> copy-on-write so the
-		 * other sharers stay isolated, then map the new private blocks */
-		if ((flags & IOMAP_WRITE) && (cover.flags & OCSFS2_EXT_SHARED)) {
+		/* shared (reflink/snapshot) block being modified -> copy-on-write so
+		 * the other sharers stay isolated, then map the new private blocks */
+		if (modifying && (cover.flags & OCSFS2_EXT_SHARED)) {
 			u64 blk_phys = cover.physical + (lblk - cover.logical);
 
 			if (ocsfs2_needs_cow(inode->i_sb, blk_phys)) {
@@ -171,6 +176,24 @@ static int ocsfs2_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 			}
 		}
 
+		/* a real write to a preallocated UNWRITTEN extent converts the
+		 * touched sub-range to WRITTEN (same blocks); IOMAP_F_NEW makes
+		 * iomap zero the partial-block remainder, correct since unwritten
+		 * blocks read as zero */
+		if ((flags & IOMAP_WRITE) && (cover.flags & OCSFS2_EXT_UNWRITTEN)) {
+			u64 ce = min(cover.logical + cover.length, end_blk);
+			u64 cphys = cover.physical + (lblk - cover.logical);
+
+			ret = ocsfs2_extent_remap_range(inode, lblk,
+					(u32)(ce - lblk), cphys, OCSFS2_EXT_WRITTEN);
+			if (ret)
+				goto out;
+			ret = ocsfs2_extent_find(inode, lblk, &cover, &next_logical);
+			if (ret)
+				goto out;
+			iomap->flags |= IOMAP_F_NEW;
+		}
+
 		off_in = lblk - cover.logical;
 		remaining = cover.length - off_in;
 		iomap->addr = (cover.physical + off_in) * (u64)bs;
@@ -179,6 +202,7 @@ static int ocsfs2_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 			      IOMAP_UNWRITTEN : IOMAP_MAPPED;
 		ret = 0;
 		goto out;
+	}
 	}
 
 	if (flags & IOMAP_WRITE) {
@@ -235,7 +259,7 @@ out:
 	return ret;
 }
 
-static const struct iomap_ops ocsfs2_iomap_ops = {
+const struct iomap_ops ocsfs2_iomap_ops = {
 	.iomap_begin = ocsfs2_iomap_begin,
 };
 
@@ -371,10 +395,11 @@ static int ocsfs2_file_open(struct inode *inode, struct file *file)
 
 const struct file_operations ocsfs2_file_fops = {
 	.open             = ocsfs2_file_open,
-	.llseek           = generic_file_llseek,
+	.llseek           = ocsfs2_llseek,           /* + SEEK_HOLE / SEEK_DATA */
 	.read_iter        = ocsfs2_file_read_iter,
 	.write_iter       = ocsfs2_file_write_iter,
 	.fsync            = ocsfs2_fsync,
+	.fallocate        = ocsfs2_fallocate,        /* prealloc / punch / zero */
 	.splice_read      = filemap_splice_read,
 	.splice_write     = iter_file_splice_write,
 	.unlocked_ioctl   = ocsfs2_ioctl,           /* OCSFS_IOC_SNAP_CREATE */

@@ -19,78 +19,6 @@
 #include <linux/minmax.h>
 #include <linux/pagemap.h>
 
-/* Free (refcount-aware) and remove every dst extent (or part) overlapping
- * [lblk, end). Caller holds dst's i_meta_lock. Returns 0, or -ENOSPC if a
- * mid-extent punch would need more than the inline extent slots. */
-static int reflink_punch_dst(struct inode *dst, u64 lblk, u64 end)
-{
-	struct ocsfs2_inode_info *oi = OCSFS2_I(dst);
-	struct super_block *sb = dst->i_sb;
-	u32 spb = sb->s_blocksize / 512;
-	u16 i = 0;
-
-	while (i < oi->i_extent_count) {
-		struct ocsfs2_extent *e = &oi->i_extents[i];
-		u64 e_end = e->logical + e->length;
-
-		if (e_end <= lblk || e->logical >= end) {
-			i++;
-			continue;            /* no overlap */
-		}
-		if (e->logical >= lblk && e_end <= end) {
-			/* fully covered: free and remove */
-			ocsfs2_free_blocks_rc(sb, e->physical, e->length);
-			dst->i_blocks -= (u64)e->length * spb;
-			memmove(e, e + 1,
-				(oi->i_extent_count - i - 1) * sizeof(*e));
-			oi->i_extent_count--;
-			continue;            /* shifted next into i */
-		}
-		if (e->logical < lblk && e_end > end) {
-			/* range strictly inside the extent: split into head + tail */
-			u32 head = (u32)(lblk - e->logical);
-			u32 holelen = (u32)(end - lblk);
-
-			if (oi->i_extent_count >= OCSFS2_INLINE_EXTENTS)
-				return -ENOSPC;
-			ocsfs2_free_blocks_rc(sb, e->physical + head, holelen);
-			dst->i_blocks -= (u64)holelen * spb;
-			memmove(e + 1, e, (oi->i_extent_count - i) * sizeof(*e));
-			oi->i_extent_count++;
-			e[1].logical  = end;
-			e[1].physical = e->physical + head + holelen;
-			e[1].length   = (u32)(e_end - end);
-			/* e[1].flags inherited from e via memmove */
-			e->length = head;
-			i += 2;
-			continue;
-		}
-		if (e->logical < lblk) {
-			/* overlaps the start of [lblk,end): trim the extent tail */
-			u32 keep = (u32)(lblk - e->logical);
-
-			ocsfs2_free_blocks_rc(sb, e->physical + keep,
-					      e->length - keep);
-			dst->i_blocks -= (u64)(e->length - keep) * spb;
-			e->length = keep;
-			i++;
-			continue;
-		}
-		/* overlaps the end of [lblk,end): trim the extent head */
-		{
-			u32 cut = (u32)(end - e->logical);
-
-			ocsfs2_free_blocks_rc(sb, e->physical, cut);
-			dst->i_blocks -= (u64)cut * spb;
-			e->logical = end;
-			e->physical += cut;
-			e->length -= cut;
-			i++;
-		}
-	}
-	return 0;
-}
-
 /* Share src's extents overlapping [src_lblk, src_lblk+nblk) into dst at
  * dst_lblk: bump refcount on each shared phys sub-range, insert a SHARED extent
  * into dst, and flag the source extent SHARED. Callers hold both i_meta_locks. */
@@ -178,7 +106,7 @@ loff_t ocsfs2_reflink_range(struct file *src_file, loff_t soff,
 		mutex_lock(m1);
 	}
 
-	ret = reflink_punch_dst(dst, dst_lblk, dst_lblk + nblk);
+	ret = ocsfs2_extent_punch_range(dst, dst_lblk, dst_lblk + nblk);
 	if (!ret)
 		ret = reflink_share_extents(src, src_lblk, dst, dst_lblk, nblk);
 	if (!ret) {
