@@ -566,12 +566,103 @@ done:
 	return ret;
 }
 
+/* Free only the node blocks of the tree rooted at @blk (NOT the data extents) —
+ * used when rebuilding the tree structure after a delete. */
+static void free_tree_nodes(struct inode *inode, u64 blk)
+{
+	struct super_block *sb = inode->i_sb;
+	struct buffer_head *bh = node_read(sb, blk);
+	struct ocsfs2_disk_ext_node *n;
+	u16 nr, j;
+
+	if (!bh)
+		return;
+	n = (struct ocsfs2_disk_ext_node *)bh->b_data;
+	nr = le16_to_cpu(n->en_nr);
+	if (le16_to_cpu(n->en_level) > 0)
+		for (j = 0; j < nr; j++)
+			free_tree_nodes(inode, le64_to_cpu(PTRS(n)[j].ep_child));
+	brelse(bh);
+	ocsfs2_free_blocks(sb, blk, 1);
+}
+
+/* A2: a delete (punch/truncate) that empties a leaf leaves the internal routing
+ * keys stale — a later wide insert into that key-range would split-brain (reads
+ * past the first leaf see a hole). The B+tree has no delete-time rebalance, so
+ * rebuild it from its leaf chain, which stays reliable (en_next is intact and
+ * the leftmost-child descent doesn't depend on the stale keys): collect every
+ * surviving record, free the node blocks (not the data), then re-insert via the
+ * normal path (clean inline map or freshly-built tree with correct routing).
+ * Caller holds i_meta_lock and an open txn. */
+static int ext_tree_collapse(struct inode *inode)
+{
+	struct super_block *sb = inode->i_sb;
+	struct ocsfs2_inode_info *oi = OCSFS2_I(inode);
+	struct ocsfs2_extent *recs;
+	struct buffer_head *bh;
+	int cap = 512, nrec = 0, i, ret = 0;
+	u64 root = oi->i_extent_tree_root;
+
+	if (!root)
+		return 0;
+	recs = kmalloc_array(cap, sizeof(*recs), GFP_NOFS);
+	if (!recs)
+		return -ENOMEM;
+
+	/* descend to the leftmost leaf (child 0 at every level) */
+	bh = node_read(sb, root);
+	while (bh && le16_to_cpu(((struct ocsfs2_disk_ext_node *)bh->b_data)->en_level) > 0) {
+		struct ocsfs2_disk_ext_node *n =
+			(struct ocsfs2_disk_ext_node *)bh->b_data;
+		u64 child = le64_to_cpu(PTRS(n)[0].ep_child);
+
+		brelse(bh);
+		bh = node_read(sb, child);
+	}
+	/* walk the leaf chain, collecting every record in order */
+	while (bh) {
+		struct ocsfs2_disk_ext_node *n =
+			(struct ocsfs2_disk_ext_node *)bh->b_data;
+		u64 next = le64_to_cpu(n->en_next);
+		u16 j, nr = le16_to_cpu(n->en_nr);
+
+		for (j = 0; j < nr; j++) {
+			if (nrec == cap) {
+				struct ocsfs2_extent *t =
+					krealloc(recs, (size_t)cap * 2 * sizeof(*recs),
+						 GFP_NOFS);
+				if (!t) { brelse(bh); ret = -ENOMEM; goto out; }
+				recs = t; cap *= 2;
+			}
+			rec_load(&RECS(n)[j], &recs[nrec++]);
+		}
+		brelse(bh);
+		bh = next ? node_read(sb, next) : NULL;
+	}
+
+	/* tear down the node blocks (data untouched) and rebuild from scratch */
+	free_tree_nodes(inode, root);
+	oi->i_extent_tree_root = 0;
+	oi->i_extent_count = 0;
+	for (i = 0; i < nrec; i++) {
+		ret = ocsfs2_extent_insert(inode, recs[i].logical,
+					   recs[i].physical, recs[i].length,
+					   recs[i].flags);
+		if (ret)
+			goto out;
+	}
+	ret = ocsfs2_write_inode_block(inode);
+out:
+	kfree(recs);
+	return ret;
+}
+
 int ocsfs2_ext_tree_punch_range(struct inode *inode, u64 lblk, u64 end)
 {
 	struct super_block *sb = inode->i_sb;
 	u32 spb = sb->s_blocksize / 512;
 	struct buffer_head *bh;
-	bool tail_valid = false, stop = false;
+	bool tail_valid = false, stop = false, emptied = false;
 	u64 tail_log = 0, tail_phys = 0;
 	u32 tail_len = 0;
 	u16 tail_flags = 0;
@@ -636,6 +727,8 @@ int ocsfs2_ext_tree_punch_range(struct inode *inode, u64 lblk, u64 end)
 				  (u32)(re - end), e.flags);
 			j++;
 		}
+		if (le16_to_cpu(n->en_nr) == 0)
+			emptied = true;        /* A2: stale routing -> rebuild */
 		node_finish(sb, bh);
 		brelse(bh);
 		bh = (next && !stop) ? node_read(sb, next) : NULL;
@@ -645,6 +738,8 @@ int ocsfs2_ext_tree_punch_range(struct inode *inode, u64 lblk, u64 end)
 	if (tail_valid)
 		ret = tree_insert_locked(inode, tail_log, tail_phys, tail_len,
 					 tail_flags);
+	if (!ret && emptied)
+		ret = ext_tree_collapse(inode);
 	TREE_TXN_END(inode, ret);
 	return ret;
 }
@@ -654,6 +749,7 @@ int ocsfs2_ext_tree_truncate_from(struct inode *inode, u64 from)
 	struct super_block *sb = inode->i_sb;
 	u32 spb = sb->s_blocksize / 512;
 	struct buffer_head *bh;
+	bool emptied = false;
 	int ret = 0;
 	TREE_TXN_BEGIN(sb);
 
@@ -690,6 +786,8 @@ int ocsfs2_ext_tree_truncate_from(struct inode *inode, u64 from)
 				  (u32)(from - e.logical), e.flags);
 			j++;
 		}
+		if (le16_to_cpu(n->en_nr) == 0)
+			emptied = true;
 		node_finish(sb, bh);
 		brelse(bh);
 		bh = next ? node_read(sb, next) : NULL;
@@ -699,6 +797,8 @@ int ocsfs2_ext_tree_truncate_from(struct inode *inode, u64 from)
 		/* whole tree empty: drop every node and revert to inline */
 		ocsfs2_ext_tree_free_all(inode);
 		ret = ocsfs2_write_inode_block(inode);
+	} else if (emptied) {
+		ret = ext_tree_collapse(inode);   /* A2: rebuild, stale routing */
 	}
 	TREE_TXN_END(inode, ret);
 	return ret;
