@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly OCSFS v2 online defragmentation
+Documentation=man:ocsfs2-defrag
+
+[Timer]
+OnCalendar=Sun *-*-* 04:00:00
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,40 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# ocsfs2-maint — run periodic online maintenance on every mounted OCSFS v2
+# filesystem. Driven by the ocsfs2-scrub.timer / ocsfs2-defrag.timer units, or
+# run by hand. All actions are ONLINE (no unmount, no downtime).
+#
+#   ocsfs2-maint scrub     # verify metadata checksums on each ocsfs2 mount
+#   ocsfs2-maint defrag    # defragment fragmented files under each ocsfs2 mount
+#
+# Tunables (env): OCSFS2_DEFRAG_MINEXT (min extents to defrag a file, default 16)
+set -u
+
+mode="${1:-}"
+case "$mode" in
+	scrub|defrag) ;;
+	*) echo "usage: $0 <scrub|defrag>" >&2; exit 2 ;;
+esac
+
+minext="${OCSFS2_DEFRAG_MINEXT:-16}"
+rc=0
+found=0
+
+while read -r mp; do
+	[ -n "$mp" ] || continue
+	found=1
+	case "$mode" in
+	scrub)
+		echo "ocsfs2-maint: scrubbing $mp"
+		/usr/sbin/ocsfs2-scrub "$mp" || rc=1
+		;;
+	defrag)
+		echo "ocsfs2-maint: defragmenting $mp (min $minext extents)"
+		/usr/sbin/ocsfs2-defrag -r -t "$minext" "$mp" || rc=1
+		;;
+	esac
+done < <(findmnt -rn -t ocsfs2 -o TARGET 2>/dev/null)
+
+[ "$found" -eq 1 ] || echo "ocsfs2-maint: no ocsfs2 filesystems mounted"
+exit $rc

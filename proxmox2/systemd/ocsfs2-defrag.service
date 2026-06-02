@@ -1,0 +1,10 @@
+[Unit]
+Description=OCSFS v2 online defragmentation (all mounts)
+Documentation=man:ocsfs2-defrag
+ConditionPathExists=/usr/sbin/ocsfs2-maint
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/ocsfs2-maint defrag
+Nice=15
+IOSchedulingClass=idle

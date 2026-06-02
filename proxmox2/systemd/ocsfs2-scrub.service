@@ -1,0 +1,10 @@
+[Unit]
+Description=OCSFS v2 online metadata scrub (all mounts)
+Documentation=man:ocsfs2-scrub
+ConditionPathExists=/usr/sbin/ocsfs2-maint
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/ocsfs2-maint scrub
+Nice=10
+IOSchedulingClass=idle

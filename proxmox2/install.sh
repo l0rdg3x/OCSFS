@@ -36,12 +36,16 @@ install -m 0644 "$ROOT/kmod2/ocsfs2.ko" "$DEST/ocsfs2.ko"
 depmod -a
 say "installed module -> $DEST/ocsfs2.ko"
 
-# 2. on-disk tools
+# 2. on-disk + online tools
 say "building tools"
-cc -O2 -std=gnu11 "$ROOT/tools2/mkfs.c" -o /usr/sbin/mkfs.ocsfs2
-cc -O2 -std=gnu11 "$ROOT/tools2/fsck.c" -o /usr/sbin/fsck.ocsfs2
-chmod 0755 /usr/sbin/mkfs.ocsfs2 /usr/sbin/fsck.ocsfs2
-say "installed /usr/sbin/{mkfs,fsck}.ocsfs2"
+cc -O2 -std=gnu11 "$ROOT/tools2/mkfs.c"          -o /usr/sbin/mkfs.ocsfs2
+cc -O2 -std=gnu11 "$ROOT/tools2/fsck.c"          -o /usr/sbin/fsck.ocsfs2
+cc -O2 -std=gnu11 "$ROOT/tools2/ocsfs2_scrub.c"  -o /usr/sbin/ocsfs2-scrub
+cc -O2 -std=gnu11 "$ROOT/tools2/ocsfs2_defrag.c" -o /usr/sbin/ocsfs2-defrag
+cc -O2 -std=gnu11 "$ROOT/tools2/ocsfs2_tool.c"   -o /usr/sbin/ocsfs2-tool
+chmod 0755 /usr/sbin/mkfs.ocsfs2 /usr/sbin/fsck.ocsfs2 \
+           /usr/sbin/ocsfs2-scrub /usr/sbin/ocsfs2-defrag /usr/sbin/ocsfs2-tool
+say "installed /usr/sbin/{mkfs,fsck}.ocsfs2, ocsfs2-{scrub,defrag,tool}"
 
 # 3. mount helper
 install -m 0755 "$HERE/mount.ocsfs2" /sbin/mount.ocsfs2
@@ -58,7 +62,23 @@ else
     say "PVE not detected — skipping storage plugin (module + tools still installed)"
 fi
 
-# 5. load the module now
+# 5. periodic online maintenance (scrub + defrag timers)
+say "installing periodic maintenance services"
+install -m 0755 "$HERE/ocsfs2-maint" /usr/sbin/ocsfs2-maint
+if [ -d /run/systemd/system ]; then
+    install -m 0644 "$HERE/systemd/ocsfs2-scrub.service"  /etc/systemd/system/
+    install -m 0644 "$HERE/systemd/ocsfs2-scrub.timer"    /etc/systemd/system/
+    install -m 0644 "$HERE/systemd/ocsfs2-defrag.service" /etc/systemd/system/
+    install -m 0644 "$HERE/systemd/ocsfs2-defrag.timer"   /etc/systemd/system/
+    systemctl daemon-reload
+    systemctl enable --now ocsfs2-scrub.timer ocsfs2-defrag.timer 2>/dev/null || \
+        say "enable timers manually: systemctl enable --now ocsfs2-scrub.timer ocsfs2-defrag.timer"
+    say "enabled ocsfs2-scrub.timer (weekly) + ocsfs2-defrag.timer (weekly)"
+else
+    say "systemd not detected — run 'ocsfs2-maint scrub|defrag' from cron instead"
+fi
+
+# 6. load the module now
 modprobe ocsfs2 2>/dev/null || insmod "$DEST/ocsfs2.ko" 2>/dev/null || true
 lsmod | grep -q '^ocsfs2 ' && say "module loaded" || say "module not loaded (load with: modprobe ocsfs2)"
 
