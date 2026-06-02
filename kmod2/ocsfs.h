@@ -39,6 +39,7 @@
 #define OCSFS2_JOURNAL_MAGIC  0x4A524C32u   /* 'JRL2' */
 #define OCSFS2_LEASE_MAGIC    0x4C455332u   /* 'LES2' */
 #define OCSFS2_NODE_MAGIC     0x4E4F4432u   /* 'NOD2' */
+#define OCSFS2_RC_NODE_MAGIC  0x52434E32u   /* 'RCN2' — refcount btree node */
 
 #define OCSFS2_VERSION_MAJOR  2
 #define OCSFS2_VERSION_MINOR  0
@@ -280,6 +281,38 @@ struct ocsfs2_disk_jcommit {         /* commit block */
 } __packed;
 static_assert(sizeof(struct ocsfs2_disk_jcommit) == 4096, "jcommit 4096");
 
+/* ── refcount B+tree (reflink/snapshot, Plan 4) ──
+ * A per-AG tree maps a physical block range -> reference count. Only SHARED
+ * ranges (refcount >= 2) get a record; a sole-owner block has no record and an
+ * implicit refcount of 1. The root block number lives in ag_rc_btree_root
+ * (0 = empty tree). Plan 4 uses a single leaf node (level 0); growth to an
+ * internal level is a bounded future extension (records cap at one node). */
+struct ocsfs2_disk_rc_rec {          /* 16 bytes — one refcounted phys range */
+	__le64  rr_phys;             /* first physical block of the range */
+	__le32  rr_len;              /* contiguous block count */
+	__le32  rr_refcount;         /* reference count (>= 2 when stored) */
+} __packed;
+static_assert(sizeof(struct ocsfs2_disk_rc_rec) == 16, "rc_rec 16");
+
+#define OCSFS2_RC_MAX_RECS  254
+struct ocsfs2_disk_rc_node {         /* one 4096-byte metadata block */
+	__le32  rn_magic;            /* OCSFS2_RC_NODE_MAGIC */
+	__le16  rn_level;            /* 0 = leaf (only level in Plan 4) */
+	__le16  rn_nr;               /* number of valid records */
+	__le32  rn_ag;               /* owning AG number (sanity) */
+	__le32  rn_pad;
+	struct ocsfs2_disk_rc_rec rn_recs[OCSFS2_RC_MAX_RECS];  /* 254*16 = 4064 */
+	__u8    rn_reserved[12];
+	__le32  rn_checksum;         /* crc32c(~0, [0..4091]) */
+} __packed;
+static_assert(sizeof(struct ocsfs2_disk_rc_node) == 4096, "rc_node 4096");
+
+/* ── reflink/snapshot ioctl ──
+ * OCSFS_IOC_SNAP_CREATE: called on a regular-file fd; arg points at a
+ * NUL-terminated name (<= OCSFS2_MAX_NAME) for a point-in-time reflink copy
+ * created in the source's parent directory. */
+#define OCSFS_IOC_SNAP_CREATE  _IOW('O', 0x01, char[OCSFS2_MAX_NAME + 1])
+
 /* reservation unit sizes used by mkfs to size the cluster regions */
 #define OCSFS2_NODE_SLOT_SIZE   256
 #define OCSFS2_HEARTBEAT_SIZE   256
@@ -312,10 +345,11 @@ struct ocsfs2_ag_info {
 	u64   inodes_per_ag;
 	u64   data_off;          /* absolute byte offset of first data block */
 	u64   data_blocks;
-	u64   rc_btree_root;
+	u64   rc_btree_root;     /* physical block of the refcount tree root, 0=empty */
 	u64   next_blk_hint;     /* AG-relative search start for block alloc */
 	u64   next_ino_hint;     /* AG-local search start for inode alloc */
 	struct mutex ag_lock;    /* protects this AG's bitmap + inode table */
+	struct mutex rc_lock;    /* protects this AG's refcount tree (ordered before ag_lock) */
 };
 
 /* In-memory journal state (single-node: this node's slot-0 WAL). */
@@ -538,7 +572,14 @@ int  ocsfs2_extent_find(struct inode *inode, u64 lblk,
 			struct ocsfs2_extent *cover, u64 *next_logical);
 int  ocsfs2_extent_insert(struct inode *inode, u64 logical, u64 phys,
 			  u32 len, u16 flags);
+int  ocsfs2_extent_update_phys(struct inode *inode, u64 logical, u32 len,
+			       u64 new_phys, u16 flags);
+int  ocsfs2_extent_remap_range(struct inode *inode, u64 logical, u32 len,
+			       u64 new_phys, u16 new_flags);
 void ocsfs2_extent_truncate_from(struct inode *inode, u64 from_block);
+/* Discard in-core extent map / size and re-read it from the on-disk inode
+ * (used to roll back after a failed reflink whose journal txn was aborted). */
+void ocsfs2_reload_extents(struct inode *inode);
 
 /* iomap.c — file data path */
 extern const struct address_space_operations ocsfs2_file_aops;
@@ -549,6 +590,32 @@ ssize_t ocsfs2_file_write_iter(struct kiocb *iocb, struct iov_iter *from);
 int  ocsfs2_alloc_blocks(struct super_block *sb, u32 ag_hint, u32 count,
 			 u64 *block_out);
 void ocsfs2_free_blocks(struct super_block *sb, u64 block, u32 count);
+
+/* refcount.c — per-AG reflink/snapshot refcount tree (Plan 4) */
+u32  ocsfs2_refcount_get(struct super_block *sb, u64 phys);
+int  ocsfs2_refcount_inc(struct super_block *sb, u64 phys, u32 len);
+/* Decrement the refcount of [phys, phys+len); release to the bitmap any block
+ * that drops to refcount 0 (was sole-owned). The refcount-aware free used by
+ * truncate / evict / CoW in place of ocsfs2_free_blocks. */
+void ocsfs2_free_blocks_rc(struct super_block *sb, u64 phys, u32 len);
+
+/* True when a write to @phys must copy-on-write (it is shared, refcount > 1). */
+static inline bool ocsfs2_needs_cow(struct super_block *sb, u64 phys)
+{
+	return ocsfs2_refcount_get(sb, phys) > 1;
+}
+
+/* reflink.c — FICLONE/clone + snapshot ioctl (Plan 4) */
+loff_t ocsfs2_remap_file_range(struct file *src_file, loff_t src_off,
+			       struct file *dst_file, loff_t dst_off,
+			       loff_t len, unsigned int remap_flags);
+long ocsfs2_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
+/* Share src's extents [soff,soff+len) into dst at doff (callers hold the two
+ * inode locks). Used by remap_file_range and the snapshot ioctl. Returns the
+ * number of bytes cloned, or a negative errno. */
+loff_t ocsfs2_reflink_range(struct file *src_file, loff_t soff,
+			    struct file *dst_file, loff_t doff,
+			    loff_t len, unsigned int remap_flags);
 
 /* dir.c */
 extern const struct inode_operations ocsfs2_dir_iops;

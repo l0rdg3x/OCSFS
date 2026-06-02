@@ -123,6 +123,7 @@ static int read_ag_headers(struct super_block *sb)
 		ai->next_blk_hint  = (ai->data_off / sb->s_blocksize) - ai->block_start;
 		ai->next_ino_hint  = (i == 0) ? OCSFS2_FIRST_USER_INO : 0;
 		mutex_init(&ai->ag_lock);
+		mutex_init(&ai->rc_lock);
 		brelse(bh);
 	}
 	return 0;

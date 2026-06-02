@@ -20,6 +20,7 @@
 #define OCSFS2_JOURNAL_MAGIC  0x4A524C32u   /* 'JRL2' */
 #define OCSFS2_LEASE_MAGIC    0x4C455332u   /* 'LES2' */
 #define OCSFS2_NODE_MAGIC     0x4E4F4432u   /* 'NOD2' */
+#define OCSFS2_RC_NODE_MAGIC  0x52434E32u   /* 'RCN2' — refcount btree node */
 
 #define OCSFS2_VERSION_MAJOR  2
 #define OCSFS2_VERSION_MINOR  0
@@ -211,5 +212,26 @@ struct ocsfs2_disk_journal_hdr {
 	uint32_t jh_checksum;
 } OCSFS2_PACKED;
 _Static_assert(sizeof(struct ocsfs2_disk_journal_hdr) == 4096, "journal_hdr 4096");
+
+/* refcount B+tree leaf node (reflink/snapshot, Plan 4) */
+#define OCSFS2_RC_MAX_RECS  254
+struct ocsfs2_disk_rc_rec {
+	uint64_t rr_phys;
+	uint32_t rr_len;
+	uint32_t rr_refcount;
+} OCSFS2_PACKED;
+_Static_assert(sizeof(struct ocsfs2_disk_rc_rec) == 16, "rc_rec 16");
+
+struct ocsfs2_disk_rc_node {
+	uint32_t rn_magic;
+	uint16_t rn_level;
+	uint16_t rn_nr;
+	uint32_t rn_ag;
+	uint32_t rn_pad;
+	struct ocsfs2_disk_rc_rec rn_recs[OCSFS2_RC_MAX_RECS];
+	uint8_t  rn_reserved[12];
+	uint32_t rn_checksum;
+} OCSFS2_PACKED;
+_Static_assert(sizeof(struct ocsfs2_disk_rc_node) == 4096, "rc_node 4096");
 
 #endif /* OCSFS2_ONDISK_H */

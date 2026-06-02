@@ -16,10 +16,113 @@
 #include <linux/uio.h>
 #include <linux/pagemap.h>
 #include <linux/sched/mm.h>
+#include <linux/bio.h>
 #include <linux/fs.h>
 
 /* Cap a single allocation so one iomap_begin doesn't scan/claim too much. */
 #define OCSFS2_ALLOC_CAP_BLOCKS  2048u   /* 8 MiB at 4 KiB blocks */
+
+/* ── copy-on-write (reflink/snapshot, Plan 4) ──
+ * File data never lives in the buffer cache (it flows through file folios +
+ * bios), so the CoW copy must use bios too — using sb_bread/sb_getblk here
+ * would create a buffer-cache alias that goes stale against later writeback
+ * bios (the v1 cow_extent coherence bug). One on-stack bio per block. */
+static int cow_rw_block(struct super_block *sb, u64 phys, struct page *page,
+			blk_opf_t op)
+{
+	struct bio bio;
+	struct bio_vec bvec;
+	int ret;
+
+	bio_init(&bio, sb->s_bdev, &bvec, 1, op);
+	bio.bi_iter.bi_sector = phys * (u64)(sb->s_blocksize >> 9);
+	__bio_add_page(&bio, page, sb->s_blocksize, 0);
+	ret = submit_bio_wait(&bio);
+	bio_uninit(&bio);
+	return ret;
+}
+
+static int cow_copy_blocks(struct super_block *sb, u64 oldphys, u64 newphys,
+			   u32 n)
+{
+	struct page *page = alloc_page(GFP_NOFS);
+	u32 i;
+	int ret = 0;
+
+	if (!page)
+		return -ENOMEM;
+	for (i = 0; i < n; i++) {
+		ret = cow_rw_block(sb, oldphys + i, page, REQ_OP_READ);
+		if (ret)
+			break;
+		ret = cow_rw_block(sb, newphys + i, page, REQ_OP_WRITE);
+		if (ret)
+			break;
+	}
+	__free_page(page);
+	if (!ret)
+		blkdev_issue_flush(sb->s_bdev);
+	return ret;
+}
+
+/* Copy-on-write only the part of the shared extent @cover that this write
+ * touches, [lblk, end_blk) clamped to the extent and the allocation cap, to
+ * freshly allocated private blocks — atomically (Plan 3 txn). Block-granular so
+ * a small write to a large reflinked extent copies little (real space-efficient
+ * sharing), splitting the extent into kept-shared head/tail + a new written
+ * middle. The data copy is durable before the extent is repointed, so a later
+ * sub-block write RMW reads the correct base. Caller holds i_meta_lock; the
+ * inode write lock serialises writers. */
+static int ocsfs2_cow_range(struct inode *inode, const struct ocsfs2_extent *cover,
+			    u64 lblk, u64 end_blk)
+{
+	struct super_block *sb = inode->i_sb;
+	struct ocsfs2_inode_info *oi = OCSFS2_I(inode);
+	struct ocsfs2_txn *txn;
+	u64 cover_end = cover->logical + cover->length;
+	u64 cs = lblk;
+	u64 ce = min(cover_end, end_blk);
+	u64 oldphys, newphys;
+	u32 n;
+	int ret;
+
+	if (ce <= cs)
+		ce = cs + 1;
+	if (ce - cs > OCSFS2_ALLOC_CAP_BLOCKS)
+		ce = cs + OCSFS2_ALLOC_CAP_BLOCKS;
+	n = (u32)(ce - cs);
+	oldphys = cover->physical + (cs - cover->logical);
+
+	txn = ocsfs2_txn_begin(sb);
+	if (!txn)
+		return -ENOMEM;
+
+	ret = ocsfs2_alloc_blocks(sb, oi->i_ag, n, &newphys);  /* bitmap in txn */
+	if (ret)
+		goto abort;
+	ret = cow_copy_blocks(sb, oldphys, newphys, n);
+	if (ret) {
+		ocsfs2_free_blocks(sb, newphys, n);
+		goto abort;
+	}
+	ret = ocsfs2_extent_remap_range(inode, cs, n, newphys, OCSFS2_EXT_WRITTEN);
+	if (ret) {
+		ocsfs2_free_blocks(sb, newphys, n);
+		goto abort;
+	}
+	ocsfs2_free_blocks_rc(sb, oldphys, n);     /* dec the CoW'd sub-range */
+
+	ret = ocsfs2_write_inode_block(inode);     /* new extent map, in txn */
+	if (ret) {
+		ocsfs2_txn_abort(txn);
+		ocsfs2_reload_extents(inode);      /* undo the in-core split */
+		return ret;
+	}
+	return ocsfs2_txn_commit(txn);
+abort:
+	ocsfs2_txn_abort(txn);
+	return ret;
+}
 
 static int ocsfs2_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 			      unsigned flags, struct iomap *iomap,
@@ -43,9 +146,33 @@ static int ocsfs2_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 
 	ret = ocsfs2_extent_find(inode, lblk, &cover, &next_logical);
 	if (ret == 0) {
-		u64 off_in = lblk - cover.logical;
-		u64 remaining = cover.length - off_in;
+		u64 off_in, remaining;
 
+		/* shared (reflink/snapshot) block on a write -> copy-on-write so the
+		 * other sharers stay isolated, then map the new private blocks */
+		if ((flags & IOMAP_WRITE) && (cover.flags & OCSFS2_EXT_SHARED)) {
+			u64 blk_phys = cover.physical + (lblk - cover.logical);
+
+			if (ocsfs2_needs_cow(inode->i_sb, blk_phys)) {
+				ret = ocsfs2_cow_range(inode, &cover, lblk,
+						       end_blk);
+				if (ret)
+					goto out;
+				ret = ocsfs2_extent_find(inode, lblk, &cover,
+							 &next_logical);
+				if (ret)
+					goto out;   /* must exist after CoW */
+			} else {
+				/* stale SHARED hint (refcount fell to 1): clear it */
+				ocsfs2_extent_update_phys(inode, cover.logical,
+							  cover.length, cover.physical,
+							  OCSFS2_EXT_WRITTEN);
+				cover.flags = OCSFS2_EXT_WRITTEN;
+			}
+		}
+
+		off_in = lblk - cover.logical;
+		remaining = cover.length - off_in;
 		iomap->addr = (cover.physical + off_in) * (u64)bs;
 		iomap->length = remaining * (u64)bs;
 		iomap->type = (cover.flags & OCSFS2_EXT_UNWRITTEN) ?
@@ -243,11 +370,13 @@ static int ocsfs2_file_open(struct inode *inode, struct file *file)
 }
 
 const struct file_operations ocsfs2_file_fops = {
-	.open         = ocsfs2_file_open,
-	.llseek       = generic_file_llseek,
-	.read_iter    = ocsfs2_file_read_iter,
-	.write_iter   = ocsfs2_file_write_iter,
-	.fsync        = ocsfs2_fsync,
-	.splice_read  = filemap_splice_read,
-	.splice_write = iter_file_splice_write,
+	.open             = ocsfs2_file_open,
+	.llseek           = generic_file_llseek,
+	.read_iter        = ocsfs2_file_read_iter,
+	.write_iter       = ocsfs2_file_write_iter,
+	.fsync            = ocsfs2_fsync,
+	.splice_read      = filemap_splice_read,
+	.splice_write     = iter_file_splice_write,
+	.unlocked_ioctl   = ocsfs2_ioctl,           /* OCSFS_IOC_SNAP_CREATE */
+	.remap_file_range = ocsfs2_remap_file_range, /* FICLONE / cp --reflink */
 };

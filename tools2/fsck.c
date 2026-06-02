@@ -61,6 +61,55 @@ static unsigned popcount_bits(const uint8_t *bm, uint64_t nbits)
 	return (unsigned)set;  /* caller AGs are <= 2^32 blocks */
 }
 
+/* Validate an AG's refcount B+tree leaf (reflink/snapshot, Plan 4): magic/crc,
+ * single leaf level, records sorted + non-overlapping + refcount >= 2, every
+ * referenced block (and the node block itself) within the AG and allocated. */
+static void check_rc_tree(uint32_t agno, uint64_t root, const uint8_t *bm,
+			  uint64_t ag_start, uint64_t ag_block_count)
+{
+	struct ocsfs2_disk_rc_node node;
+	uint64_t prev_end = 0;
+	uint16_t nr, k;
+
+	if (root == 0)
+		return;
+	if (read_at(&node, sizeof(node), root * BS)) { ERR("AG%u rc node read\n", agno); return; }
+	if (le32toh(node.rn_magic) != OCSFS2_RC_NODE_MAGIC) { ERR("AG%u rc node magic\n", agno); return; }
+	if (!crc_ok(&node, offsetof(struct ocsfs2_disk_rc_node, rn_checksum), le32toh(node.rn_checksum))) { ERR("AG%u rc node crc\n", agno); return; }
+	if (le16toh(node.rn_level) != 0) { ERR("AG%u rc node level %u unsupported\n", agno, le16toh(node.rn_level)); return; }
+	if (le32toh(node.rn_ag) != agno) ERR("AG%u rc node ag field %u\n", agno, le32toh(node.rn_ag));
+	nr = le16toh(node.rn_nr);
+	if (nr > OCSFS2_RC_MAX_RECS) { ERR("AG%u rc node nr %u too large\n", agno, nr); return; }
+
+	for (k = 0; k < nr; k++) {
+		uint64_t phys = le64toh(node.rn_recs[k].rr_phys);
+		uint32_t len = le32toh(node.rn_recs[k].rr_len);
+		uint32_t rc = le32toh(node.rn_recs[k].rr_refcount);
+		uint64_t rel;
+
+		if (len == 0) { ERR("AG%u rc rec %u zero length\n", agno, k); continue; }
+		if (rc < 2) ERR("AG%u rc rec %u refcount %u < 2\n", agno, k, rc);
+		if (phys < prev_end) ERR("AG%u rc rec %u unsorted/overlap (%llu < %llu)\n", agno, k,
+					 (unsigned long long)phys, (unsigned long long)prev_end);
+		if (phys < ag_start || phys + len > ag_start + ag_block_count)
+			ERR("AG%u rc rec %u range [%llu,%llu) outside AG\n", agno, k,
+			    (unsigned long long)phys, (unsigned long long)(phys + len));
+		else
+			for (rel = phys - ag_start; rel < phys - ag_start + len; rel++)
+				if (!(bm[rel >> 3] & (1u << (rel & 7)))) {
+					ERR("AG%u rc rec %u block %llu not allocated\n", agno, k,
+					    (unsigned long long)(ag_start + rel));
+					break;
+				}
+		prev_end = phys + len;
+	}
+	if (root >= ag_start && root < ag_start + ag_block_count) {
+		uint64_t rel = root - ag_start;
+		if (!(bm[rel >> 3] & (1u << (rel & 7))))
+			ERR("AG%u rc node block %llu not allocated\n", agno, (unsigned long long)root);
+	}
+}
+
 static int check_dirent(const struct ocsfs2_disk_dirent *de, const char *want,
 			uint64_t want_ino)
 {
@@ -171,6 +220,7 @@ int main(int argc, char **argv)
 		for (b = 0; b < meta_blocks; b++)
 			if (!(bm[b >> 3] & (1u << (b & 7)))) { ERR("AG%u meta block %u not marked used\n", i, b); break; }
 		used = popcount_bits(bm, expect_count);
+		check_rc_tree(i, le64toh(ag.ag_rc_btree_root), bm, start, expect_count);
 		free(bm);
 		free_stored = le64toh(ag.ag_free_blocks);
 		if (free_stored != expect_count - used)

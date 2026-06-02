@@ -191,6 +191,27 @@ int ocsfs2_write_inode(struct inode *inode, struct writeback_control *wbc)
 	return ret;
 }
 
+/* Re-read the on-disk inode and restore the in-core extent map, size and block
+ * count from it. Used to undo in-core changes after a reflink whose journal
+ * transaction was aborted (the on-disk inode is back to its before-image).
+ * Caller holds i_meta_lock. */
+void ocsfs2_reload_extents(struct inode *inode)
+{
+	struct ocsfs2_inode_info *oi = OCSFS2_I(inode);
+	struct ocsfs2_disk_inode di;
+
+	if (read_disk_inode(inode->i_sb, oi->i_disk_ino, &di) ||
+	    validate_disk_inode(&di, oi->i_disk_ino)) {
+		pr_err_ratelimited("ocsfs2: inode %llu: reload failed\n",
+				   oi->i_disk_ino);
+		return;
+	}
+	parse_extents(oi, &di);
+	oi->i_extent_tree_root = le64_to_cpu(di.i_extent_tree_root);
+	inode->i_size = le64_to_cpu(di.i_size);
+	inode->i_blocks = le64_to_cpu(di.i_blocks);
+}
+
 /* ── iget ── */
 
 struct inode *ocsfs2_iget(struct super_block *sb, u64 ino)
@@ -270,10 +291,12 @@ void ocsfs2_evict_inode(struct inode *inode)
 	truncate_inode_pages_final(&inode->i_data);
 
 	if (freeing && !is_bad_inode(inode)) {
-		/* free data blocks held by inline extents, then the inode number */
+		/* free data blocks held by inline extents (refcount-aware: a shared
+		 * reflink/snapshot block is only released at refcount 0), then the
+		 * inode number */
 		for (i = 0; i < oi->i_extent_count; i++)
-			ocsfs2_free_blocks(inode->i_sb, oi->i_extents[i].physical,
-					   oi->i_extents[i].length);
+			ocsfs2_free_blocks_rc(inode->i_sb, oi->i_extents[i].physical,
+					      oi->i_extents[i].length);
 		oi->i_extent_count = 0;
 	}
 
@@ -587,7 +610,7 @@ void ocsfs2_extent_truncate_from(struct inode *inode, u64 from_block)
 		u64 e_end = e->logical + e->length;
 
 		if (e->logical >= from_block) {
-			ocsfs2_free_blocks(sb, e->physical, e->length);
+			ocsfs2_free_blocks_rc(sb, e->physical, e->length);
 			inode->i_blocks -= (u64)e->length * spb;
 			memmove(&ex[i], &ex[i + 1],
 				(oi->i_extent_count - i - 1) * sizeof(*ex));
@@ -597,12 +620,93 @@ void ocsfs2_extent_truncate_from(struct inode *inode, u64 from_block)
 		if (e_end > from_block) {
 			u32 keep = (u32)(from_block - e->logical);
 
-			ocsfs2_free_blocks(sb, e->physical + keep, e->length - keep);
+			ocsfs2_free_blocks_rc(sb, e->physical + keep, e->length - keep);
 			inode->i_blocks -= (u64)(e->length - keep) * spb;
 			e->length = keep;
 		}
 		i++;
 	}
+}
+
+/* Repoint the extent starting at @logical (a whole extent of @len blocks) to
+ * @new_phys with @flags, after a copy-on-write. The logical range and length
+ * are unchanged, so no split/merge is needed. Caller holds i_meta_lock.
+ * Returns 0, or -ENOENT if no such extent. */
+int ocsfs2_extent_update_phys(struct inode *inode, u64 logical, u32 len,
+			      u64 new_phys, u16 flags)
+{
+	struct ocsfs2_inode_info *oi = OCSFS2_I(inode);
+	u16 i;
+
+	for (i = 0; i < oi->i_extent_count; i++) {
+		struct ocsfs2_extent *e = &oi->i_extents[i];
+
+		if (e->logical == logical && e->length == len) {
+			e->physical = new_phys;
+			e->flags = flags;
+			return 0;
+		}
+	}
+	return -ENOENT;
+}
+
+/* Repoint a sub-range [logical, logical+len) of an existing covering extent to
+ * @new_phys with @new_flags, splitting the extent into up to three pieces
+ * (kept head, remapped middle, kept tail). Used by copy-on-write to give the
+ * written blocks fresh private storage while leaving the rest shared. Caller
+ * holds i_meta_lock. Returns 0, -ENOENT if no covering extent, or -ENOSPC if
+ * the split would exceed the inline extent slots (B+tree spill is Plan 2b). */
+int ocsfs2_extent_remap_range(struct inode *inode, u64 logical, u32 len,
+			      u64 new_phys, u16 new_flags)
+{
+	struct ocsfs2_inode_info *oi = OCSFS2_I(inode);
+	struct ocsfs2_extent *ex = oi->i_extents;
+	u64 end = logical + len;
+	u16 i;
+
+	for (i = 0; i < oi->i_extent_count; i++) {
+		struct ocsfs2_extent *e = &ex[i];
+		u64 e_end = e->logical + e->length;
+		struct ocsfs2_extent orig;
+		u32 left, right;
+		int pieces, pos;
+
+		if (!(logical >= e->logical && end <= e_end))
+			continue;
+
+		left  = (u32)(logical - e->logical);
+		right = (u32)(e_end - end);
+		pieces = (left ? 1 : 0) + 1 + (right ? 1 : 0);
+		if (oi->i_extent_count + (pieces - 1) > OCSFS2_INLINE_EXTENTS)
+			return -ENOSPC;
+
+		orig = *e;
+		memmove(&ex[i + pieces], &ex[i + 1],
+			(oi->i_extent_count - i - 1) * sizeof(*ex));
+		oi->i_extent_count += (pieces - 1);
+
+		pos = i;
+		if (left) {
+			ex[pos].logical  = orig.logical;
+			ex[pos].physical = orig.physical;
+			ex[pos].length   = left;
+			ex[pos].flags    = orig.flags;
+			pos++;
+		}
+		ex[pos].logical  = logical;
+		ex[pos].physical = new_phys;
+		ex[pos].length   = len;
+		ex[pos].flags    = new_flags;
+		pos++;
+		if (right) {
+			ex[pos].logical  = end;
+			ex[pos].physical = orig.physical + (end - orig.logical);
+			ex[pos].length   = right;
+			ex[pos].flags    = orig.flags;
+		}
+		return 0;
+	}
+	return -ENOENT;
 }
 
 /* Allocate one block and append it as the next logical block of @inode (dirs).

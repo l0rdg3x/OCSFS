@@ -4,6 +4,7 @@
 
 obj-m += ocsfs2.o
 
-ocsfs2-y := super.o inode.o bitmap.o dir.o rename.o iomap.o journal.o transport/scsi_pr.o
+ocsfs2-y := super.o inode.o bitmap.o dir.o rename.o iomap.o journal.o \
+	    refcount.o reflink.o transport/scsi_pr.o
 
 ccflags-y := -I$(src) -Wall
