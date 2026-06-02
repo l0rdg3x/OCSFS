@@ -90,7 +90,15 @@ static int read_ag_headers(struct super_block *sb)
 	u64 ag_region_start = sbi->s_ag_desc_off / sb->s_blocksize;
 	u32 i;
 
-	sbi->s_ags = kvcalloc(sbi->s_ag_count, sizeof(*sbi->s_ags), GFP_KERNEL);
+	/* Online autogrow appends AGs into the in-core array without reallocating
+	 * it (its entries hold mutexes — moving them is unsafe). So pre-size to a
+	 * capacity with headroom; growth beyond it needs a remount. */
+	sbi->s_growable = (sbi->s_feat_compat & OCSFS2_FEAT_COMPAT_AUTOGROW) != 0;
+	sbi->s_ag_capacity = sbi->s_ag_count;
+	if (sbi->s_growable)   /* generous headroom: many repeated grows, no remount */
+		sbi->s_ag_capacity += clamp_t(u32, sbi->s_ag_count * 15, 256u, 65536u);
+
+	sbi->s_ags = kvcalloc(sbi->s_ag_capacity, sizeof(*sbi->s_ags), GFP_KERNEL);
 	if (!sbi->s_ags)
 		return -ENOMEM;
 
@@ -223,6 +231,7 @@ static void ocsfs2_put_super(struct super_block *sb)
 
 	if (!sbi)
 		return;
+	ocsfs2_grow_stop(sb);      /* stop the autogrow watcher before tearing down */
 	ocsfs2_cluster_exit(sb);   /* stop heartbeat + release node slot first */
 	write_back_meta(sb);
 	ocsfs2_journal_exit(sb);
@@ -265,6 +274,7 @@ static int ocsfs2_fill_super(struct super_block *sb, struct fs_context *fc)
 	sbi->s_sb = sb;
 	spin_lock_init(&sbi->s_free_lock);
 	mutex_init(&sbi->s_super_lock);
+	mutex_init(&sbi->s_grow_lock);
 
 	bh = sb_bread(sb, 0);
 	if (!bh) {
@@ -385,6 +395,10 @@ static int ocsfs2_fill_super(struct super_block *sb, struct fs_context *fc)
 		sb->s_root = NULL;
 		goto fail_journal;
 	}
+
+	/* D2: autonomous online autogrow watcher (no-op on rdonly / non-growable) */
+	if (!sb_rdonly(sb))
+		ocsfs2_grow_start(sb);
 
 	pr_info("ocsfs2: mounted %s (%u AGs, %llu blocks)\n",
 		sb->s_id, sbi->s_ag_count,

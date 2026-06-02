@@ -261,6 +261,10 @@ long ocsfs2_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	switch (cmd) {
 	case OCSFS_IOC_SNAP_CREATE:
 		return ocsfs2_ioc_snap_create(file, (void __user *)arg);
+	case OCSFS_IOC_GROWFS:              /* D2: force an autogrow check now */
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+		return ocsfs2_grow_check(file_inode(file)->i_sb, true);
 	case FITRIM: {                      /* D4: thin-reclaim via SCSI UNMAP */
 		struct super_block *sb = file_inode(file)->i_sb;
 		struct fstrim_range range;

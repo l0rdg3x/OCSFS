@@ -194,11 +194,17 @@ int main(int argc, char **argv)
 			ERR("zero ag_count/ag_blocks/inodes_per_ag\n");
 	}
 
+	/* AUTOGROW volumes use uniform AGs (every AG == ag_blocks, any sub-AG
+	 * device tail left unformatted); legacy volumes let the last AG absorb the
+	 * remainder. */
+	int uniform_ags = (le64toh(sb.s_feat_compat) & OCSFS2_FEAT_COMPAT_AUTOGROW) != 0;
+
 	/* ── per-AG ── */
 	for (i = 0; i < ag_count && g_errors < 100; i++) {
 		struct ocsfs2_disk_ag ag;
 		uint64_t start = ag_region_start + (uint64_t)i * ag_blocks;
-		uint64_t expect_count = (i == ag_count - 1) ? dev_blocks - start : ag_blocks;
+		uint64_t expect_count = (!uniform_ags && i == ag_count - 1) ?
+					dev_blocks - start : ag_blocks;
 		uint64_t bitmap_blocks = divup(divup(expect_count, 8), BS);
 		uint64_t itable_blocks = (inodes_per_ag * OCSFS2_INODE_SIZE) / BS;
 		uint64_t meta_blocks = 1 + bitmap_blocks + itable_blocks;

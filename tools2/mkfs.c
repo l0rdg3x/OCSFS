@@ -109,10 +109,11 @@ static void ag_geometry(const struct layout *L, uint32_t idx, struct ag_geom *g)
 {
 	memset(g, 0, sizeof(*g));
 	g->start_block = L->ag_region_start + (uint64_t)idx * L->ag_blocks;
-	if (idx == L->ag_count - 1)
-		g->block_count = L->dev_blocks - g->start_block;   /* last absorbs remainder */
-	else
-		g->block_count = L->ag_blocks;
+	/* Uniform AGs (every AG == ag_blocks): the descriptor formula
+	 * ag_region_start + idx*ag_blocks stays valid for AGs appended by online
+	 * grow, with no overlap. Any final < ag_blocks tail is left unformatted
+	 * (reclaimed by a later grow once it reaches a full AG). */
+	g->block_count = L->ag_blocks;
 
 	g->bitmap_blocks = divup(divup(g->block_count, 8), BS);
 	g->itable_blocks = (L->inodes_per_ag * OCSFS2_INODE_SIZE) / BS;
@@ -161,19 +162,20 @@ int main(int argc, char **argv)
 	uint64_t journal_size = 16ULL << 20;
 	int force = 0, opt, fd;
 	const char *dev;
-	uint64_t dev_size = 0;
+	uint64_t dev_size = 0, format_size = 0;
 	struct stat st;
 	struct layout L;
 	uint64_t total_data_blocks = 0;
 
-	while ((opt = getopt(argc, argv, "L:N:j:f")) != -1) {
+	while ((opt = getopt(argc, argv, "L:N:j:s:f")) != -1) {
 		switch (opt) {
 		case 'L': label = optarg; break;
 		case 'N': max_nodes = (uint16_t)atoi(optarg); break;
 		case 'j': journal_size = strtoull(optarg, NULL, 0); break;
+		case 's': format_size = strtoull(optarg, NULL, 0); break;  /* format a prefix (test grow) */
 		case 'f': force = 1; break;
 		default:
-			fprintf(stderr, "usage: %s [-L label] [-N max_nodes] [-j journal_bytes] [-f] <device>\n", argv[0]);
+			fprintf(stderr, "usage: %s [-L label] [-N max_nodes] [-j journal_bytes] [-s format_bytes] [-f] <device>\n", argv[0]);
 			return 2;
 		}
 	}
@@ -206,6 +208,15 @@ int main(int argc, char **argv)
 			fprintf(stderr, "error: %s already has an ocsfs2 superblock (use -f)\n", dev);
 			close(fd); return 1;
 		}
+	}
+
+	if (format_size) {
+		if (format_size > dev_size) {
+			fprintf(stderr, "error: -s %llu exceeds device size %llu\n",
+				(unsigned long long)format_size, (unsigned long long)dev_size);
+			close(fd); return 1;
+		}
+		dev_size = format_size;   /* pretend the device is this small (grow testing) */
 	}
 
 	if (compute_layout(dev_size, max_nodes, journal_size, &L)) {
@@ -367,8 +378,11 @@ int main(int argc, char **argv)
 		strncpy((char *)sb.s_label, label, OCSFS2_MAX_LABEL - 1);
 		sb.s_block_size = htole32(BS);
 		sb.s_inode_size = htole32(OCSFS2_INODE_SIZE);
-		sb.s_total_blocks = htole64(L.dev_blocks);
+		/* span the FS manages: the uniform AG region (any sub-AG device tail is
+		 * unformatted until a grow reaches a full AG). */
+		sb.s_total_blocks = htole64(L.ag_region_start + (uint64_t)L.ag_count * L.ag_blocks);
 		sb.s_free_blocks = htole64(total_data_blocks - 1);  /* minus root dir block */
+		sb.s_feat_compat = htole64(OCSFS2_FEAT_COMPAT_AUTOGROW);
 		sb.s_total_inodes = htole64((uint64_t)L.ag_count * L.inodes_per_ag);
 		sb.s_free_inodes = htole64((uint64_t)L.ag_count * L.inodes_per_ag - 1);
 		sb.s_ag_count = htole32(L.ag_count);

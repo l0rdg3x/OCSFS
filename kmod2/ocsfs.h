@@ -99,10 +99,14 @@
 #define OCSFS2_IFLAG_IMMUTABLE 0x0001
 #define OCSFS2_IFLAG_APPEND    0x0002
 
-/* feature bitmasks (none required by Plan 1) */
+/* compat features (safe to ignore if unknown): AUTOGROW guarantees the
+ * uniform-AG layout that online grow needs (all AGs == s_ag_blocks). */
+#define OCSFS2_FEAT_COMPAT_AUTOGROW    0x1ULL
+
+/* feature bitmasks */
 #define OCSFS2_FEATURE_INCOMPAT_SUPP   0ULL
 #define OCSFS2_FEATURE_RO_COMPAT_SUPP  0ULL
-#define OCSFS2_FEATURE_COMPAT_SUPP     0ULL
+#define OCSFS2_FEATURE_COMPAT_SUPP     (OCSFS2_FEAT_COMPAT_AUTOGROW)
 
 /* ═══════════════════════ on-disk structures ═══════════════════════ */
 
@@ -380,6 +384,10 @@ static_assert(sizeof(struct ocsfs2_disk_ext_node) == 4096, "ext_node 4096");
  * created in the source's parent directory. */
 #define OCSFS_IOC_SNAP_CREATE  _IOW('O', 0x01, char[OCSFS2_MAX_NAME + 1])
 
+/* OCSFS_IOC_GROWFS: called on any fd; force an autogrow check now (admin/udev
+ * after a SAN LUN resize). Same work the autonomous grow thread does. */
+#define OCSFS_IOC_GROWFS       _IO('O', 0x02)
+
 /* reservation unit sizes used by mkfs to size the cluster regions */
 #define OCSFS2_NODE_SLOT_SIZE   256
 #define OCSFS2_HEARTBEAT_SIZE   256
@@ -518,7 +526,11 @@ struct ocsfs2_sb_info {
 	u64  s_ag_desc_off;
 	u64  s_data_off;
 
-	struct ocsfs2_ag_info *s_ags;    /* [0..s_ag_count) */
+	struct ocsfs2_ag_info *s_ags;    /* [0..s_ag_count), allocated [0..s_ag_capacity) */
+	u32   s_ag_capacity;             /* slots in s_ags (autogrow headroom) */
+	bool  s_growable;                /* COMPAT_AUTOGROW: uniform AGs, online-grow ok */
+	struct task_struct *s_grow_thread;
+	struct mutex s_grow_lock;        /* serialises online grow + geometry refresh */
 
 	spinlock_t  s_free_lock;         /* protects s_free_blocks/s_free_inodes */
 	struct mutex s_super_lock;       /* serialises superblock writeback */
@@ -731,6 +743,11 @@ int  ocsfs2_alloc_blocks(struct super_block *sb, u32 ag_hint, u32 count,
 			 u64 *block_out);
 void ocsfs2_free_blocks(struct super_block *sb, u64 block, u32 count);
 int  ocsfs2_fitrim(struct super_block *sb, struct fstrim_range *range);  /* D4 */
+
+/* D2 autonomous online autogrow */
+int  ocsfs2_grow_check(struct super_block *sb, bool force);
+int  ocsfs2_grow_start(struct super_block *sb);
+void ocsfs2_grow_stop(struct super_block *sb);
 
 /* refcount.c — per-AG reflink/snapshot refcount tree (Plan 4) */
 u32  ocsfs2_refcount_get(struct super_block *sb, u64 phys);

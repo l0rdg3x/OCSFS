@@ -25,6 +25,9 @@
 #define OCSFS2_VERSION_MAJOR  2
 #define OCSFS2_VERSION_MINOR  0
 
+/* compat feature: uniform-AG layout that online autogrow needs */
+#define OCSFS2_FEAT_COMPAT_AUTOGROW  0x1ULL
+
 #define OCSFS2_BLOCK_SIZE     4096
 #define OCSFS2_INODE_SIZE     512
 #define OCSFS2_ROOT_INO       2
