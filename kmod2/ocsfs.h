@@ -809,6 +809,7 @@ int  ocsfs2_txn_get(struct ocsfs2_txn *txn, struct buffer_head *bh);
 int  ocsfs2_txn_commit(struct ocsfs2_txn *txn);
 void ocsfs2_txn_abort(struct ocsfs2_txn *txn);
 int  ocsfs2_journal_replay_slot(struct super_block *sb, u16 slot);  /* L5 recovery */
+void ocsfs2_txn_forget(struct super_block *sb, u64 start, u32 count); /* revoke on free */
 
 /* The transaction the current task is building (jbd2-style), or NULL. Metadata
  * write helpers enrol their buffers here so the op commits atomically. */

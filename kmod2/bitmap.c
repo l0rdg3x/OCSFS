@@ -290,6 +290,10 @@ void ocsfs2_free_blocks(struct super_block *sb, u64 block, u32 count)
 
 	if (count == 0)
 		return;
+	/* revoke any stale metadata buffer / txn entry for these blocks before they
+	 * can be reused as data (prevents stale B+tree/refcount-node writeback from
+	 * clobbering reallocated data — found via bpftrace under fsx clone churn) */
+	ocsfs2_txn_forget(sb, block, count);
 	if (sbi->s_cluster) {
 		clustered_free(sb, block, count);
 		return;

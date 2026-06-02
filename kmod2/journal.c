@@ -173,6 +173,37 @@ int ocsfs2_txn_get(struct ocsfs2_txn *txn, struct buffer_head *bh)
 	return 0;
 }
 
+/* Revoke blocks being freed: a just-freed metadata block (B+tree / refcount
+ * node) may still be enrolled in the live transaction (modified before it was
+ * freed) and/or carry a dirty buffer-cache buffer. If that physical block is
+ * then reused as file DATA, the transaction's checkpoint or a stray buffer
+ * writeback would stamp the stale metadata over the new data (found via
+ * bpftrace: an ext-tree node checkpoint clobbering a reallocated data block).
+ * So on free: drop the block from the current txn (don't journal/checkpoint it)
+ * and clean any buffer-cache alias so nothing writes it back. */
+void ocsfs2_txn_forget(struct super_block *sb, u64 start, u32 count)
+{
+	struct ocsfs2_txn *txn = ocsfs2_current_txn();
+
+	if (txn) {
+		struct ocsfs2_txn_buf *tb, *n;
+
+		list_for_each_entry_safe(tb, n, &txn->t_bufs, link) {
+			if (tb->home_block < start || tb->home_block >= start + count)
+				continue;
+			clear_buffer_dirty(tb->bh);   /* don't write the stale node back */
+			list_del(&tb->link);
+			brelse(tb->bh);
+			kfree(tb->before);
+			kfree(tb);
+			txn->t_nr--;
+		}
+	}
+	/* drop clean/dirty buffer-cache aliases for the freed range so a later data
+	 * reuse of these blocks is never overwritten by stale metadata writeback */
+	clean_bdev_aliases(sb->s_bdev, start, count);
+}
+
 static void txn_free(struct ocsfs2_txn *txn, bool restore)
 {
 	struct ocsfs2_txn_buf *tb, *n;
