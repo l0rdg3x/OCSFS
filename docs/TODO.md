@@ -1,10 +1,28 @@
 # OCSFS v2 — Open items & security analysis
 
-Status as of 2026-06-02 (HEAD `0d8f39c`). The single-node data path is
-differentially validated vs XFS (clean) and `fsck`-clean; cluster L3–L5 +
-maintenance services are validated on 3 nodes. This file tracks what is left:
-**[FIX]** = worth doing, **[DISCARD]** = decided out of scope, with priority
-(P1 highest). Security findings are in Part B.
+Status as of 2026-06-02. The single-node data path is differentially validated
+vs XFS (clean) and `fsck`-clean; cluster L3–L5 + maintenance services are
+validated on 3 nodes. **[FIX]** = worth doing, **[DISCARD]** = out of scope.
+
+### ✅ Resolved 2026-06-02 (all triaged items addressed)
+- **A1** refcount cluster-coherence — FIXED (`d93036d`): coherent reads + CAW;
+  cross-node reflink corruption repro now clean.
+- **A2** extent B+tree delete-collapse — FIXED (`c3afa3b`): rebuild on emptied
+  leaf; repro (`tests/v2/repro_a2.c`) 181/400 corrupt → 0/400.
+- **A3** evict-time free coordination — VERIFIED already handled (clustered_free
+  + cl_caw_record + A1); 3-node churn test clean.
+- **A4** df free-count drift — FIXED (`6d59004`): statfs/unmount recompute from
+  bitmap; df accurate cross-node.
+- **A5** zero_range WARN — VERIFIED resolved (no repro after data-path hardening).
+- **A6 / S4** AG geometry bound-check — FIXED (`174ef12`).
+- **S1** snapshot permission bypass — FIXED (`a11a593`): inode_permission check.
+- **S2** maintenance markers tamperable — FIXED (`a11a593`): root-only 0700 dir.
+- **S3** result-struct stack leak — VERIFIED clean (already memset).
+- **A7** inline compression — DISCARDED (out of scope).
+- **A8** per-data-block checksums — DEFERRED (optional, format-v3).
+- **S5** shared-disk single-trust-domain — documented assumption (by design).
+
+The detailed analysis below is kept for reference.
 
 ---
 
