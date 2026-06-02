@@ -346,6 +346,11 @@ void ocsfs2_free_blocks(struct super_block *sb, u64 block, u32 count)
 	 * can be reused as data (prevents stale B+tree/refcount-node writeback from
 	 * clobbering reallocated data — found via bpftrace under fsx clone churn) */
 	ocsfs2_txn_forget(sb, block, count);
+	/* A8: blocks returning to the allocator must drop their stale data checksum,
+	 * else a later reuse that writes no data (fallocate preallocation) would read
+	 * the previous owner's CRC over a zeroed block and false-positive. No-op
+	 * unless checksums are enabled / for metadata blocks. */
+	ocsfs2_csum_clear_range(sb, block, count);
 	if (sbi->s_cluster) {
 		clustered_free(sb, block, count);
 		return;

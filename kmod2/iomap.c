@@ -19,6 +19,9 @@
 #include <linux/bio.h>
 #include <linux/fs.h>
 #include <linux/splice.h>
+#include <linux/highmem.h>
+#include <linux/slab.h>
+#include <linux/mm.h>
 
 /* OCSFS2_ALLOC_CAP_BLOCKS lives in ocsfs.h (shared with fallocate). */
 
@@ -58,6 +61,15 @@ int ocsfs2_copy_blocks(struct super_block *sb, u64 oldphys, u64 newphys,
 		ret = cow_rw_block(sb, newphys + i, page, REQ_OP_WRITE);
 		if (ret)
 			break;
+		/* A8: carry the data checksum to the block's new physical home so
+		 * CoW'd / defrag'd data stays verifiable (the source's CRC remains
+		 * valid for any sharer left behind). No-op unless checksums are on. */
+		if (OCSFS2_SB(sb)->s_datacsum) {
+			void *k = kmap_local_page(page);
+
+			ocsfs2_csum_set(sb, newphys + i, ocsfs2_data_crc(sb, k));
+			kunmap_local(k);
+		}
 	}
 	__free_page(page);
 	if (!ret)
@@ -270,14 +282,115 @@ const struct iomap_ops ocsfs2_iomap_ops = {
 
 /* ── address_space operations ── */
 
+/* ── A8 inline read verification (buffered) ──
+ * When data checksums are enabled we replace iomap's default async bio read ops
+ * with a synchronous read_folio_range that, after reading each MAPPED range,
+ * recomputes the per-block CRC and compares it to the stored value. A mismatch
+ * is reported via iomap_finish_folio_read(..., -EIO): the folio is left
+ * not-uptodate so the read syscall returns -EIO instead of serving corruption.
+ * iomap only calls read_folio_range for real IOMAP_MAPPED data within i_size
+ * (holes / unwritten / post-EOF blocks are zeroed without a read), so every
+ * range we see here has a backing physical block to verify. Synchronous and
+ * opt-in: non-checksummed volumes keep iomap's fast async path untouched. */
+static int ocsfs2_csum_read_folio_range(const struct iomap_iter *iter,
+					struct iomap_read_folio_ctx *ctx,
+					size_t plen)
+{
+	struct folio *folio = ctx->cur_folio;
+	struct inode *inode = iter->inode;
+	struct super_block *sb = inode->i_sb;
+	const struct iomap *iomap = &iter->iomap;
+	loff_t pos = iter->pos;
+	size_t poff = offset_in_folio(folio, pos);
+	u32 bs = sb->s_blocksize;
+	u64 phys0 = (iomap->addr + (pos - iomap->offset)) >> sb->s_blocksize_bits;
+	struct bio bio;
+	struct bio_vec bvec;
+	u32 nb = plen >> sb->s_blocksize_bits;
+	u32 *want;
+	int err;
+	size_t b;
+
+	/* one synchronous read of the whole range — folio memory is contiguous */
+	bio_init(&bio, sb->s_bdev, &bvec, 1, REQ_OP_READ);
+	bio.bi_iter.bi_sector = iomap_sector(iomap, pos);
+	bio_add_folio_nofail(&bio, folio, plen, poff);
+	err = submit_bio_wait(&bio);
+	bio_uninit(&bio);
+
+	/* batch the stored CRCs (one read per checksum block, not per data block) */
+	want = err ? NULL : kmalloc_array(nb, sizeof(u32), GFP_NOFS);
+	if (want) {
+		ocsfs2_csum_read_range(sb, phys0, want, nb);
+		for (b = 0; !err && b < plen; b += bs) {
+			u32 w = want[b >> sb->s_blocksize_bits];
+			void *k;
+			u32 got;
+
+			if (!w)
+				continue;          /* unset -> skip */
+			k = kmap_local_folio(folio, poff + b);
+			got = ocsfs2_data_crc(sb, k);
+			kunmap_local(k);
+			if (got != w) {
+				pr_err_ratelimited("ocsfs2: DATA checksum mismatch on read at block %llu (have 0x%08x want 0x%08x)\n",
+					(unsigned long long)(phys0 + (b >> sb->s_blocksize_bits)),
+					got, w);
+				err = -EIO;
+			}
+		}
+		kfree(want);
+	} else if (!err) {
+		/* allocation failed: fall back to the per-block coherent check */
+		for (b = 0; !err && b < plen; b += bs) {
+			void *k = kmap_local_folio(folio, poff + b);
+
+			err = ocsfs2_csum_check(sb,
+					phys0 + (b >> sb->s_blocksize_bits), k);
+			kunmap_local(k);
+		}
+	}
+	/* contract: we took ownership of this range — always finish it, conveying
+	 * success/failure via @err; return 0 so the core does not double-clean. */
+	iomap_finish_folio_read(folio, poff, plen, err);
+	return 0;
+}
+
+static const struct iomap_read_ops ocsfs2_csum_read_ops = {
+	.read_folio_range = ocsfs2_csum_read_folio_range,
+	/* .submit_read = NULL: reads complete synchronously in read_folio_range */
+};
+
 static int ocsfs2_read_folio(struct file *file, struct folio *folio)
 {
+	struct super_block *sb = folio->mapping->host->i_sb;
+
+	if (OCSFS2_SB(sb)->s_datacsum) {
+		struct iomap_read_folio_ctx ctx = {
+			.ops	   = &ocsfs2_csum_read_ops,
+			.cur_folio = folio,
+		};
+
+		iomap_read_folio(&ocsfs2_iomap_ops, &ctx, NULL);
+		return 0;
+	}
 	iomap_bio_read_folio(folio, &ocsfs2_iomap_ops);
 	return 0;
 }
 
 static void ocsfs2_readahead(struct readahead_control *rac)
 {
+	struct super_block *sb = rac->mapping->host->i_sb;
+
+	if (OCSFS2_SB(sb)->s_datacsum) {
+		struct iomap_read_folio_ctx ctx = {
+			.ops = &ocsfs2_csum_read_ops,
+			.rac = rac,
+		};
+
+		iomap_readahead(&ocsfs2_iomap_ops, &ctx, NULL);
+		return;
+	}
 	iomap_bio_readahead(rac, &ocsfs2_iomap_ops);
 }
 
@@ -302,14 +415,122 @@ static const struct iomap_writeback_ops ocsfs2_writeback_ops = {
 	.writeback_submit = iomap_ioend_writeback_submit,
 };
 
+/* ── A8 inline read verification (O_DIRECT) ──
+ * A read bio's bi_end_io runs in interrupt/softirq context, but reading a stored
+ * checksum slot sleeps (coherent metadata read). So we split the work: at submit
+ * time (process context, may sleep) we pre-read the expected CRC of every block
+ * the bio covers into a small context; in the bio completion (no sleeping) we
+ * only recompute the data CRCs (crc32c + kmap_local — both atomic-safe) and
+ * compare. A mismatch turns the bio into an I/O error so the read returns -EIO.
+ * iomap owns bio->bi_private (the iomap_dio) and bi_end_io; we save and restore
+ * them, chaining to iomap_dio_bio_end_io at the end. Opt-in (s_datacsum); on any
+ * setup failure we just submit the read unverified (the scrub still covers it). */
+struct ocsfs2_dio_rv {
+	struct super_block *sb;
+	u64		phys0;		/* first data block in the bio */
+	unsigned int	nblk;		/* number of blocks covered */
+	void		*orig_private;	/* the iomap_dio */
+	bio_end_io_t	*orig_end_io;	/* iomap_dio_bio_end_io */
+	u32		expected[];	/* stored CRC per block (0 = unset/skip) */
+};
+
+static void ocsfs2_dio_read_end(struct bio *bio)
+{
+	struct ocsfs2_dio_rv *rv = bio->bi_private;
+	struct super_block *sb = rv->sb;
+	u32 bs = sb->s_blocksize;
+
+	if (!bio->bi_status) {			/* device read ok — verify data */
+		struct bvec_iter_all iter_all;
+		struct bio_vec *bvl;
+		unsigned int blk = 0;
+
+		bio_for_each_segment_all(bvl, bio, iter_all) {
+			unsigned int off = 0;
+
+			while (off + bs <= bvl->bv_len && blk < rv->nblk) {
+				u32 want = rv->expected[blk];
+
+				if (want) {
+					unsigned int abs = bvl->bv_offset + off;
+					struct page *pg = bvl->bv_page +
+							(abs >> PAGE_SHIFT);
+					void *k = kmap_local_page(pg);
+					u32 got = ocsfs2_data_crc(sb,
+							k + (abs & ~PAGE_MASK));
+
+					kunmap_local(k);
+					if (got != want) {
+						pr_err_ratelimited("ocsfs2: DATA checksum mismatch on O_DIRECT read at block %llu (have 0x%08x want 0x%08x)\n",
+							(unsigned long long)(rv->phys0 + blk),
+							got, want);
+						bio->bi_status = BLK_STS_IOERR;
+						break;
+					}
+				}
+				off += bs;
+				blk++;
+			}
+			if (bio->bi_status)
+				break;
+		}
+	}
+	bio->bi_private = rv->orig_private;	/* restore the iomap_dio */
+	bio->bi_end_io = rv->orig_end_io;
+	kfree(rv);
+	iomap_dio_bio_end_io(bio);
+}
+
+/* Arm @bio (a read) for inline verification. Returns 0 if armed, negative if it
+ * should be submitted unverified. */
+static int ocsfs2_dio_read_arm(struct super_block *sb, struct bio *bio)
+{
+	u32 bs = sb->s_blocksize;
+	unsigned int nblk = bio->bi_iter.bi_size / bs;
+	u64 phys0 = bio->bi_iter.bi_sector >> (sb->s_blocksize_bits - 9);
+	struct ocsfs2_dio_rv *rv;
+	unsigned int i;
+	bool any = false;
+
+	if (!nblk)
+		return -EINVAL;
+	rv = kmalloc(struct_size(rv, expected, nblk), GFP_NOFS);
+	if (!rv)
+		return -ENOMEM;
+	/* one coherent read per checksum block, not per data block */
+	ocsfs2_csum_read_range(sb, phys0, rv->expected, nblk);
+	for (i = 0; i < nblk; i++)
+		if (rv->expected[i]) {
+			any = true;
+			break;
+		}
+	if (!any) {			/* nothing stored to verify (e.g. fresh) */
+		kfree(rv);
+		return -ENODATA;
+	}
+	rv->sb		 = sb;
+	rv->phys0	 = phys0;
+	rv->nblk	 = nblk;
+	rv->orig_private = bio->bi_private;
+	rv->orig_end_io	 = bio->bi_end_io;
+	bio->bi_private	 = rv;
+	bio->bi_end_io	 = ocsfs2_dio_read_end;
+	return 0;
+}
+
 /* A8: O_DIRECT submit hook — checksum a write bio's blocks before submission
- * (the user data is in the bio and final here), then submit normally. */
+ * (the user data is in the bio and final here), or arm a read bio for inline
+ * verification, then submit. */
 static void ocsfs2_dio_submit(const struct iomap_iter *iter, struct bio *bio,
 			      loff_t file_offset)
 {
+	struct super_block *sb = iter->inode->i_sb;
+
 	(void)file_offset;
 	if (op_is_write(bio_op(bio)))
-		ocsfs2_csum_bio(iter->inode->i_sb, bio);
+		ocsfs2_csum_bio(sb, bio);
+	else if (OCSFS2_SB(sb)->s_datacsum)
+		ocsfs2_dio_read_arm(sb, bio);	/* best-effort; unverified on failure */
 	submit_bio(bio);
 }
 

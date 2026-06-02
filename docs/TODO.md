@@ -4,6 +4,16 @@ Status as of 2026-06-02. The single-node data path is differentially validated
 vs XFS (clean) and `fsck`-clean; cluster L3–L5 + maintenance services are
 validated on 3 nodes. **[FIX]** = worth doing, **[DISCARD]** = out of scope.
 
+### 🧹 [CHORE · P2] Remove v1 leftovers from `main` — keep the branch clean
+The whole v1 codebase is preserved on the **`v1-legacy`** branch, so `main` (=v2)
+should carry *only* v2. Delete these superseded v1 directories from `main` (they
+remain fully available via `git checkout v1-legacy`):
+`kmod/` · `tools/` · `src/` (v1 FUSE) · `include/` (v1 headers) · `proxmox/`
+(v1 plugin) · `conf/` · `man/` (ocsfs(8), not ocsfs2) · `debian/` (v1 packaging).
+Keep: `kmod2/ tools2/ proxmox2/ docs/ tests/ LICENSE README.md`. After removal,
+update the "Project structure" block in `README.md` (drop the `kmod/ tools/ …`
+line) and re-check no v2 file `#include`s anything under the v1 trees.
+
 ### ✅ Resolved 2026-06-02 (all triaged items addressed)
 - **A1** refcount cluster-coherence — FIXED (`d93036d`): coherent reads + CAW;
   cross-node reflink corruption repro now clean.
@@ -25,8 +35,24 @@ validated on 3 nodes. **[FIX]** = worth doing, **[DISCARD]** = out of scope.
   coherent via CAW; verified by the scrub (reads every data block — any SAN, any
   cache mode, cross-node). CoW/reflink-safe (checksum follows the physical block).
   Validated single-node + 2-node: `dd`-corrupt a block → scrub detects it; no
-  regression on non-`-C` volumes. Follow-ups: inline read-time reject (today the
-  scrub detects); checksum autogrow-added AGs; crash-mid-writeback false-positive.
+  regression on non-`-C` volumes.
+- **A8-inline** read-time verification — **DONE** (2026-06-03): every data read
+  now recomputes the block CRC and returns `-EIO` on mismatch instead of serving
+  corruption, on **both** paths — buffered (custom `iomap_read_ops` synchronous
+  `read_folio_range`) and **O_DIRECT** (the dio `submit_io` pre-reads the expected
+  CRCs, the bio `end_io` compares them; `crc32c`+`kmap_local`, no sleeping). Fixed
+  a latent bug it exposed: a freed block kept its stale CRC, so a later reuse that
+  writes no data (`fallocate` preallocation) false-positived — now `ocsfs2_free_blocks`
+  drops the CRC (`csum_clear_range`) and `copy_blocks` carries it (CoW/defrag stay
+  verifiable). **Write-path accelerated** so `-C` is cheap: the per-block `sync`/CAW
+  became one per checksum block (`csum_set_range`) — seqwrite `-C` 14.5→94.7 MB/s
+  (−2% vs no-`-C`); and the cluster read verify batches the coherent CRC read
+  (`csum_read_range`) — cluster seqread `-C` 12→32.5 MB/s/node (≈ no-`-C`).
+  Validated single-node + 3-node `-o cluster` (cross-node `dd`-corrupt → n2 detects
+  on both paths), fsx `-C` differential vs XFS clean, fsck clean. Remaining
+  follow-ups (minor): checksum the AGs added by online autogrow; the benign
+  crash-mid-writeback window (a rewrite/scrub clears it); a `sync` vs async-`-C`
+  mount tunable for pure-4K-random-write workloads (today −~30%, the crash-safe cost).
 - **S5** shared-disk single-trust-domain — **DISCARDED** (won't fix in the FS):
   inherent to shared-disk FSes; handled operationally — the LUN is exposed only
   to authenticated initiators (iSCSI CHAP / FC zoning + LUN masking).

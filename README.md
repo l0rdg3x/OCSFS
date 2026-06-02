@@ -69,6 +69,7 @@ It is also exactly the Proxmox workload, which is why VMFS works the same way.
 | 🪞 **Space efficiency** | Reflink (`FICLONE`), CoW snapshots, **cross-file dedup** (`FIDEDUPERANGE`), thin/sparse, **discard/TRIM** |
 | 📈 **Autonomous online autogrow** | Grow the LUN any number of times — each node detects it and grows into the new space hot, **repeatedly** |
 | 🩺 **Online metadata scrub** | Verify every on-disk checksum on a live volume (`OCSFS_IOC_SCRUB`) to catch silent bitrot |
+| 🔐 **End-to-end data checksums** | Opt-in `mkfs -C`: per-physical-block CRC32c, **verified inline on every read** (buffered + O_DIRECT, cross-node) → `-EIO` not corruption, on **any** SAN; cheap (batched), CoW/reflink-safe |
 | 🏎️ **Near-raw VM-disk I/O** | O_DIRECT (`cache=none`) seq write **scales with node count**; random is bound by the shared LUN, with no clustering tax |
 | 🧱 **Proxmox-native** | `mount -t ocsfs2 -o cluster`; live migration *is* the lease hand-off |
 
@@ -141,11 +142,15 @@ O_DIRECT artifact. This is how the real reflink data-loss bug above was confirme
 (minimal deterministic repro; XFS correct, OCSFS not) and how the O_DIRECT path
 was cleared.
 
-### What's deferred (see [Known limitations](#️-known-limitations))
+### Data integrity — end-to-end checksums (opt-in `mkfs -C`)
 
-- ✅ per-**data-block** checksums (opt-in `mkfs -C`) — per-physical-block CRC32c
-  in a per-AG region; stored on every write (buffered + O_DIRECT, cluster-coherent
-  via CAW), verified by the scrub on any SAN/cache mode; CoW/reflink-safe
+- ✅ per-**data-block** CRC32c in a per-AG region; stored on every write (buffered
+  + O_DIRECT, cluster-coherent via CAW), **verified inline on every read** on both
+  paths — a mismatch returns `-EIO` instead of corruption — plus the online scrub
+  for bulk verification. Validated single-node **and** 3-node `-o cluster`: a raw
+  `dd` corruption of a block on the LUN is caught on a *peer's* buffered and
+  O_DIRECT read; CoW/reflink-safe (the CRC follows the physical block); fsx `-C`
+  differential vs XFS clean (no false positives), `fsck` clean.
 
 > **Inline compression is out of scope** (not a TODO): it breaks the iomap 1:1
 > logical↔physical mapping and O_DIRECT (`cache=none`, the Proxmox default), so it
@@ -156,22 +161,75 @@ was cleared.
 
 ## ⚡ Performance
 
-Random 4 KiB O_DIRECT (`--direct=1 --ioengine=libaio`) is what a running VM does
-to its disk, measured against a **2 GiB file** on a clustered OCSFS v2 volume,
-real **TrueNAS SCALE iSCSI LUN** (1 GbE, SSD-backed zvol, SCSI PR + CAW), each
-node writing **its own** file (single-writer ownership).
+All numbers are O_DIRECT (`fio --direct=1 --ioengine=libaio`, the Proxmox
+`cache=none` path) against a **TrueNAS SCALE iSCSI LUN** over **1 GbE**, SSD-backed
+zvol, SCSI PR + CAW. QD32 for random, QD1 for sequential (1 MiB). Treat absolute
+values as *this rig* (1 GbE + a single shared SSD are the ceilings) — the **ratios**
+are the story.
 
-| Workload (O_DIRECT) | 1 node | 2 nodes concurrent (aggregate) | Note |
+### Single node — checksums (`-C`) are near-free except pure random write
+
+`-C` = per-data-block CRC32c, stored on write + **verified inline on every read**.
+
+| Workload (O_DIRECT) | no `-C` | with `-C` | Δ |
 |---|--:|--:|---|
-| Sequential write, 1 MiB | 80.7 MB/s | **160 MB/s** (91 + 68) | **scales ~2×** |
-| Random write, 4 KiB QD32 | 4 084 IOPS | 3 833 IOPS (1 906 + 1 927) | LUN-bound, no collapse |
-| Random read, 4 KiB QD32 | 26 900 IOPS | ~28 000 IOPS | LUN / 1 GbE-bound |
+| Sequential write 1 MiB | 96.5 MB/s | 94.7 MB/s | **−2%** |
+| Sequential read 1 MiB  | 99.2 MB/s | 95.4 MB/s | −4% |
+| Random **read** 4 KiB  | 26 423 IOPS | 26 833 IOPS | **≈0%** (verify ≈ free) |
+| Random read 16 KiB     | 7 104 IOPS | 7 109 IOPS | ≈0% |
+| Random write 16 KiB    | 44.7 MB/s | 40.8 MB/s | −9% |
+| Random **write** 4 KiB | 5 369 IOPS | 3 644 IOPS | −32% ← the one real cost |
 
-The point is the **shape**: because ownership is coarse and long-held, the second
-node adds throughput on independent files (sequential scales) and the random
-ceiling is the **shared LUN/network**, not OCSFS — there is no per-operation
-clustering tax. (v1, by contrast, collapsed to a few hundred IOPS under cluster
-load because every 4 KiB I/O did synchronous on-disk lock work.)
+Reads, sequential and large/aligned writes pay almost nothing; only **pure 4 KiB
+random write** is capped (~3.5k IOPS) by the crash-safe checksum `sync` (one per
+4 KiB write that can't be batched). That ceiling is the *integrity* price and is
+independent of the underlying LUN speed (see below).
+
+### Making `-C` cheap — what changed
+
+The naïve checksum path synced/CAW'd the slot **per block**; a 1 MiB write (256
+blocks sharing one checksum block) did 256 syncs. Batching to **one sync/CAW and
+one coherent read per checksum block** (`csum_set_range` / `csum_read_range`)
+restored full speed:
+
+| `-C` workload | before | after | gain |
+|---|--:|--:|---|
+| Sequential write (single node) | 14.5 MB/s | **94.7 MB/s** | **6.5×** |
+| Random write 16 KiB (single node) | 14.7 MB/s | 40.8 MB/s | 2.8× |
+| **Cluster** sequential read /node | 12.2 MB/s | **32.5 MB/s** | 2.7× (≈ no-`-C`) |
+| Cluster random read 16 KiB /node | 13.5 MB/s | 27.0 MB/s | 2.0× |
+
+### The biggest lever is on the SAN, not the FS — match `volblocksize`
+
+A 4 KiB random write to a **16 KiB-`volblocksize`** zvol forces a 16 KiB ZFS
+read-modify-write (4× amplification). Re-testing on a **4 KiB-`volblocksize`** zvol
+(single node, no `-C`):
+
+| Random write, O_DIRECT | 16 KiB-`volblocksize` | 4 KiB-`volblocksize` | gain |
+|---|--:|--:|---|
+| 4 KiB QD32  | 5 369 IOPS / 21 MB/s | **18 234 IOPS / 71 MB/s** | **3.4×** |
+| 16 KiB QD32 | 2 858 IOPS / 45 MB/s | 5 250 IOPS / 82 MB/s | 1.8× |
+
+> **Tuning takeaway — most performant *and* safe combination:**
+> 1. **Match the zvol `volblocksize` to the guest** (4 KiB for random-heavy VM
+>    disks) — the single biggest win (3.4× random write), entirely on the SAN side.
+> 2. **Keep `-C` on** — it is ≈free for reads, sequential and large writes (the
+>    dominant Proxmox patterns) and gives silent-corruption protection on any SAN.
+> 3. Accept the ~3.5k-IOPS cap on *sustained pure-4 KiB-random-write* as the
+>    crash-safe checksum cost (a future async-`-C` mount option could lift it for
+>    workloads that prefer speed over post-crash checksum durability).
+> 4. On the SAN: `sync=standard` (+ SLOG) for power-loss durability, or
+>    `sync=disabled` for speed if the SAN has battery/UPS-backed cache.
+
+### Cluster — aggregate is bound by the shared LUN, not OCSFS
+
+With three nodes each writing **their own** files on **one** SSD-backed LUN, the
+aggregate is the device/1 GbE ceiling (~100 MB/s sequential), not a clustering
+tax: steady-state file I/O does **zero** per-operation on-disk locking (single-
+writer ownership), so the second and third node add no coordination cost on
+independent files — they just share the one physical disk. (v1, by contrast,
+collapsed to a few hundred IOPS under cluster load because every 4 KiB I/O did
+synchronous on-disk lock work.) Real scaling needs multiple LUNs / a faster pool.
 
 ---
 
@@ -254,6 +312,10 @@ load because every 4 KiB I/O did synchronous on-disk lock work.)
 
 ## 🔨 Building
 
+The one-step installer (below) is the supported path — it installs the module
+via **DKMS**, so it is **rebuilt automatically on every kernel upgrade**. To build
+by hand:
+
 ```bash
 # Kernel module (build on the node whose kernel will run it)
 make -C /lib/modules/$(uname -r)/build M=$PWD/kmod2 modules
@@ -266,10 +328,14 @@ cc -O2 -std=gnu11 tools2/fsck.c -o fsck.ocsfs2
 ## 🚀 Quick start
 
 ```bash
-# Format for up to N cluster nodes (one node only — destroys data)
-sudo ./mkfs.ocsfs2 -L vmstore -N 3 -f /dev/sdb
+# Format ONCE from a single node (destroys data).
+#   -N = max cluster nodes baked into the layout (default 32; 1 = single-node).
+#        Format headroom, not a runtime cap — raising it later needs a reformat.
+#   -C = enable per-data-block checksums (recommended on any SAN without its own
+#        end-to-end integrity; cheap on writes, detects silent corruption on read).
+sudo ./mkfs.ocsfs2 -L vmstore -N 32 -C -f /dev/sdb
 
-sudo insmod kmod2/ocsfs2.ko          # on every node
+sudo modprobe ocsfs2                  # on every node (DKMS-installed; see below)
 
 # Single node (no clustering overhead): plain mount
 sudo mount -t ocsfs2 /dev/sdb /mnt/ocsfs
@@ -280,7 +346,9 @@ sudo mount -t ocsfs2 -o cluster /dev/sdb /mnt/ocsfs
 
 `-o cluster` opts into multinode mode (claims a node slot, registers an SCSI PR
 key, starts the heartbeat). Without it the volume is single-node even if formatted
-with `-N > 1` — so there is zero clustering overhead for a lone host.
+with `-N > 1` — so there is zero clustering overhead for a lone host. **All nodes
+sharing a LUN must mount with `-o cluster`** (mounting the same LUN on two nodes
+*without* it is two independent single-node mounts = corruption).
 
 ### Growing, trimming, scrubbing
 
@@ -298,20 +366,25 @@ and the full validation scripts.
 
 ## 🖥️ Proxmox VE
 
-A one-step installer builds and wires everything on a node — kernel module,
-on-disk tools, mount helper, and the PVE storage plugin:
+A one-step installer wires up everything on a node — prerequisites, the kernel
+module **via DKMS**, on-disk/online tools, mount helper, the PVE storage plugin,
+and the weekly scrub/defrag timers:
 
 ```bash
-sudo ./proxmox2/install.sh        # run on EACH node; re-run after a kernel upgrade
+sudo ./proxmox2/install.sh        # run ONCE on EACH node — no re-run after a kernel upgrade
 ```
 
-It builds `ocsfs2.ko` into `/lib/modules/$(uname -r)/extra` (+`depmod`), installs
-`/usr/sbin/{mkfs,fsck}.ocsfs2` and `/sbin/mount.ocsfs2`, and — on a PVE node —
-the `PVE::Storage::Custom::OCSFS2Plugin` storage plugin. Then:
+It installs the prerequisites (`dkms`, `build-essential`, the matching kernel
+headers), registers + builds `ocsfs2` through **DKMS** (so the module is rebuilt
+**automatically on every future kernel upgrade** — no manual step), installs
+`/usr/sbin/{mkfs,fsck}.ocsfs2`, `ocsfs2-{scrub,defrag,tool}` and
+`/sbin/mount.ocsfs2`, enables the periodic online maintenance timers, and — on a
+PVE node — the `PVE::Storage::Custom::OCSFS2Plugin` storage plugin. The debug
+tools (bpftrace, xfsprogs, …) are **not** prerequisites — they are dev-only. Then:
 
 ```bash
-# format the shared LUN once, from a single node:
-mkfs.ocsfs2 -L vmstore -N 3 -f /dev/disk/by-id/<your-lun>
+# format the shared LUN once, from a single node (-C = data checksums, recommended):
+mkfs.ocsfs2 -L vmstore -N 32 -C -f /dev/disk/by-id/<your-lun>
 ```
 ```ini
 # /etc/pve/storage.cfg  (or via the GUI once the plugin loads)
@@ -336,7 +409,8 @@ destination node.
 |---|---|
 | **Maturity** | Alpha / research — not production-ready, AI-generated, unreviewed |
 | **Inline compression** | **Out of scope — not planned.** Transparent compression breaks the iomap 1:1 logical↔physical mapping and O_DIRECT (`cache=none`, the Proxmox default), and would require a parallel non-iomap data path that sacrifices hot-path integrity/performance — explicitly avoided. Space savings come from dedup + thin + discard instead. |
-| **Per-data-block checksums** | Available **opt-in** (`mkfs -C`): per-physical-block CRC32c in a per-AG region, stored on every write (buffered + O_DIRECT, cluster-coherent via CAW) and verified by the scrub on any SAN. Follow-ups: inline read-time reject (today the scrub detects + reports); checksumming AGs added by online autogrow. |
+| **Per-data-block checksums** | Available **opt-in** (`mkfs -C`): per-physical-block CRC32c in a per-AG region, stored on every write and **verified inline on every read** (buffered + O_DIRECT) — a mismatch returns `-EIO` instead of serving corruption, on any SAN/cache mode, cross-node — plus the online scrub for bulk verification. Cheap by design (batched 1 sync/CAW + 1 coherent read per checksum block); the only measurable cost is pure 4 KiB-random-write (~30%, the crash-safe checksum-`sync`). Follow-up: checksum the AGs added by online autogrow. |
+| **Cluster size (max nodes)** | Fixed at format time by `mkfs -N` (default **32**), like OCFS2 node slots / GFS2 journals — each node reserves a private journal (~16 MiB) + slot + heartbeat. It is **format headroom, not a runtime cap** (on-disk addressing supports far more); raising it later needs a reformat, so pick the cluster's eventual max up front. 32 covers any realistic Proxmox cluster at ~512 MiB reserved. |
 | **Maturity of cluster paths** | The single-node data path is differentially validated (`fsx_diff.sh` vs XFS, 24/24 clean incl. clone/reflink) and `fsck`-clean. The multi-node coherence/recovery paths are validated on 2–3 nodes but have had less soak time than a production FS. |
 | **Metadata-op throughput under cross-node contention** | Namespace ops on a *shared* directory serialise on one metadata lease; fine for the VM-disk workload (rare namespace churn), not tuned for many nodes hammering one directory. The **data path is unaffected** (single-writer, no per-I/O CAW). |
 | **Concurrent evict-time free under cluster** | Concurrent delete+alloc across nodes is not yet fully coordinated at evict time (known follow-up). |
@@ -370,7 +444,7 @@ ocsfs/
 4. ✅ ~~L5 recovery (peer journal replay + eager lease reclaim)~~
 5. ✅ ~~discard/TRIM, autonomous repeatable autogrow, online metadata scrub~~
 6. ✅ ~~multinode performance + curated xfstests~~
-7. per-data-block checksums (format-v3), if/when the trade-offs are worth it — *(inline compression is **out of scope**: incompatible with O_DIRECT + the iomap 1:1 mapping)*
+7. ✅ ~~per-data-block checksums (opt-in `mkfs -C`) with inline read verification + DKMS packaging~~ — *(inline compression stays **out of scope**: incompatible with O_DIRECT + the iomap 1:1 mapping)*
 8. Corosync membership provider (the L3 interface is already pluggable); parallel multi-node recovery; out-of-band STONITH
 
 ---

@@ -49,18 +49,20 @@ from one host.
 
 ### Prerequisites (install on every node)
 
-The module is built per node against its running kernel, so each node needs the
-build toolchain and matching headers:
+The module is built per node against its running kernel via **DKMS**, so each
+node needs `dkms`, the build toolchain and matching kernel headers:
 
 ```bash
-apt-get install -y build-essential pve-headers-$(uname -r)
+apt-get install -y dkms build-essential proxmox-headers-$(uname -r) proxmox-default-headers
+# (on stock Debian: dkms build-essential linux-headers-$(uname -r) linux-headers-amd64)
 ```
 
-That is the entire end-user prerequisite set — no debug or test tooling is
-needed in production. `proxmox2/install.sh` **installs these automatically** if they are missing (it
-calls `apt-get` for `build-essential` + `pve-headers-$(uname -r)`), so on a
-standard Debian/PVE node you can run the installer directly. After a kernel
-upgrade, re-run the installer to rebuild the module against the new kernel.
+That is the entire end-user prerequisite set — no debug or test tooling is needed
+in production. `proxmox2/install.sh` **installs all of these automatically** if
+missing, so on a standard Debian/PVE node you can run the installer directly.
+Because the module is managed by DKMS, it is **rebuilt automatically on every
+kernel upgrade** — you do *not* re-run the installer after an upgrade (the
+`proxmox-default-headers` meta-package keeps headers available for new kernels).
 
 ---
 
@@ -76,13 +78,16 @@ cd OCSFS/proxmox2
 
 It performs:
 
-1. `make -C kmod2` against the running kernel → installs `ocsfs2.ko` to
-   `/lib/modules/$(uname -r)/extra/` and runs `depmod`.
-2. Builds `mkfs.ocsfs2`, `fsck.ocsfs2`, `ocsfs2-scrub`, `ocsfs2-defrag` → `/usr/sbin`.
-3. Installs the PVE storage plugin `OCSFS2Plugin.pm` and `mount.ocsfs2`.
-4. Installs and enables the periodic `ocsfs2-scrub.timer` and `ocsfs2-defrag.timer`.
+1. Installs prerequisites (`dkms`, `build-essential`, kernel headers).
+2. Registers + builds `ocsfs2` via **DKMS** (`/usr/src/ocsfs2-2.0`) → installs to
+   `/lib/modules/$(uname -r)/updates/dkms/` and runs `depmod`. DKMS rebuilds it
+   for every future kernel automatically.
+3. Builds `mkfs.ocsfs2`, `fsck.ocsfs2`, `ocsfs2-{scrub,defrag,tool}` → `/usr/sbin`.
+4. Installs the PVE storage plugin `OCSFS2Plugin.pm` and `mount.ocsfs2`.
+5. Installs and enables the periodic `ocsfs2-scrub.timer` and `ocsfs2-defrag.timer`.
 
-Run it on **every** node. Build on a node with the exact target kernel.
+Run it **once on every** node. `dkms status` shows the module state; after a
+kernel upgrade it is rebuilt automatically (no re-run needed).
 
 ---
 
@@ -92,13 +97,14 @@ Run it on **every** node. Build on a node with the exact target kernel.
 # single node (no cluster services), whole device:
 mkfs.ocsfs2 -f -N 1 /dev/disk/by-id/scsi-XXXX
 
-# clustered, up to 3 nodes:
-mkfs.ocsfs2 -f -N 3 /dev/disk/by-id/scsi-XXXX
+# clustered with data checksums (recommended), headroom for up to 32 nodes:
+mkfs.ocsfs2 -f -N 32 -C /dev/disk/by-id/scsi-XXXX
 ```
 
 | Flag | Meaning |
 |---|---|
-| `-N <n>` | maximum number of cluster nodes (slots). `1` = single-node. |
+| `-N <n>` | maximum cluster nodes baked into the layout (slots). `1` = single-node. **Default 32.** Format headroom, not a runtime cap — each node reserves a ~16 MiB journal + slot + heartbeat, so 32 ≈ 512 MiB; raising it later needs a reformat, so pick the cluster's eventual max now. |
+| `-C` | enable **per-data-block checksums** (CRC32c) — silent-corruption detection on any SAN; verified inline on every read. Recommended. Near-free except sustained 4 KiB-random-write (see §10). |
 | `-f` | force (overwrite an existing filesystem) |
 | `-s <MiB>` | format only the first *N* MiB and let autogrow extend later |
 
@@ -212,15 +218,16 @@ The installer enables `ocsfs2-scrub.timer` (weekly) to scrub every mounted
 Format with **`-C`** to enable per-data-block CRC32c checksums — silent-data-
 corruption detection that works on **any** SAN (not only one with its own
 integrity like ZFS). A CRC is stored on every write (buffered and O_DIRECT, kept
-coherent across nodes via CAW) and **verified by the scrub**, which now reads and
-checks every data block (`ocsfs2-scrub` / the weekly timer); a mismatch is logged
-as `DATA checksum mismatch at block N` and counted as a scrub error — restore the
-affected file from backup. Checksums follow the physical block, so reflink/
-snapshot/CoW stay correct. Opt-in (small space + per-write cost); existing
-volumes are unaffected. Caveats: detection is via the scrub (not yet inline on
-read — a follow-up); a crash mid-writeback can leave a block whose stored CRC
-doesn't match the un-written data (a benign false-positive a rewrite clears);
-and AGs added by online autogrow are not checksummed.
+coherent across nodes via CAW) and **verified inline on every read** on both
+paths: a mismatch returns **`-EIO`** to the reader (the app/VM sees a read error
+instead of corrupt data) and logs `DATA checksum mismatch on read at block N` —
+restore the affected file from backup. The online scrub does the same check in
+bulk (`ocsfs2-scrub` / the weekly timer). Checksums follow the physical block, so
+reflink/snapshot/CoW stay correct, and a freed block's CRC is dropped so reuse
+never false-positives. Opt-in; existing volumes are unaffected. The cost is
+deliberately small — see §10. Caveats: a crash mid-writeback can leave a block
+whose stored CRC doesn't match the not-yet-written data (a benign false-positive
+that a rewrite/scrub clears); AGs added by online autogrow are not yet checksummed.
 
 ### Defragment (periodic + on-demand)
 
@@ -397,7 +404,46 @@ umount /mnt/vmstore && fsck.ocsfs2 /dev/disk/by-id/scsi-3600abcd   # offline
 
 ---
 
-## 10. Troubleshooting
+## 10. Performance tuning
+
+All guidance below is for the Proxmox `cache=none` (O_DIRECT) VM-disk workload,
+measured on a 1 GbE iSCSI LUN backed by an SSD zvol.
+
+**1. Match the SAN `volblocksize` to the guest — the single biggest lever.**
+A 4 KiB random write to a **16 KiB-`volblocksize`** zvol forces a 16 KiB ZFS
+read-modify-write (4× amplification). Creating the zvol with `volblocksize=4K`
+gave **3.4× the random-write IOPS** (≈5.4k → ≈18k IOPS, 4 KiB QD32) — far more
+than any FS-level effect. Use 4 KiB for random-heavy VM disks; 16 KiB is fine for
+large-sequential / backup volumes. This is a TrueNAS/ZFS setting, set at zvol
+creation (it cannot be changed later).
+
+**2. Keep data checksums (`-C`) on — they are nearly free where it matters.**
+Inline read verification and large/sequential writes cost ≈0–5 %; the *only*
+measurable cost is **sustained pure 4 KiB-random-write**, capped at ~3.5k IOPS by
+the crash-safe per-write checksum `sync` (independent of LUN speed). For typical
+VM workloads (mixed, buffered, larger I/O) this is invisible; for a benchmark that
+does nothing but 4 KiB O_DIRECT random writes, expect that ceiling.
+
+| Workload (O_DIRECT, single node) | `-C` cost |
+|---|---|
+| reads (seq + random, any size) | ≈0 % |
+| sequential / large-aligned writes | ≈2–5 % |
+| 16 KiB random write | ≈10 % |
+| pure 4 KiB random write | capped ~3.5k IOPS (integrity price) |
+
+**3. SAN durability vs speed.** `sync=disabled` on the zvol is fastest but loses
+recent writes on a SAN power failure; use `sync=standard` (optionally with a SLOG)
+when the SAN lacks battery/UPS-backed cache. (Orthogonal to `-C`, which detects
+*corruption*, not *lost* writes.)
+
+**4. Cluster scaling needs multiple LUNs.** Three nodes on one LUN share that one
+device's ceiling (there is no per-I/O clustering tax — single-writer ownership
+does zero on-disk locking in steady state, so the limit is the disk/network, not
+OCSFS). Spread VMs across several LUNs / a faster pool to scale aggregate I/O.
+
+---
+
+## 11. Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
@@ -413,7 +459,7 @@ umount /mnt/vmstore && fsck.ocsfs2 /dev/disk/by-id/scsi-3600abcd   # offline
 
 ---
 
-## 11. Limits & caveats
+## 12. Limits & caveats
 
 - Encryption is **out of scope** — encrypt the LUN (LUKS on the zvol) or the
   guest. `-K` provides cluster-auth HMAC only.

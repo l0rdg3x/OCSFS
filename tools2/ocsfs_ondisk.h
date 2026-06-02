@@ -36,7 +36,10 @@
 #define OCSFS2_INLINE_EXTENTS 16
 #define OCSFS2_MAX_NAME       255
 #define OCSFS2_MAX_LABEL      64
-#define OCSFS2_DEFAULT_MAX_NODES 8
+/* mkfs default when -N is omitted: format headroom for the cluster, not a
+ * runtime cap. 32 = any realistic Proxmox cluster, ~512 MiB reserved journal.
+ * Override with -N (1 single-node .. 256 max). Raising it later needs a reformat. */
+#define OCSFS2_DEFAULT_MAX_NODES 32
 
 #define OCSFS2_DIRENT_SIZE        512
 #define OCSFS2_DIRENTS_PER_BLOCK  (OCSFS2_BLOCK_SIZE / OCSFS2_DIRENT_SIZE)

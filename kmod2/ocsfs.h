@@ -55,7 +55,13 @@
 #define OCSFS2_SYMLINK_INLINE_MAX  (OCSFS2_INLINE_EXTENTS * 24)   /* 384 */
 #define OCSFS2_MAX_NAME       255
 #define OCSFS2_MAX_LABEL      64
-#define OCSFS2_DEFAULT_MAX_NODES 8
+/* Default cluster size baked into the on-disk layout when `mkfs -N` is omitted.
+ * Each node reserves a private journal (default 16 MiB) + slot + heartbeat, so
+ * this is "format headroom", not a runtime cap. 32 covers any realistic Proxmox
+ * cluster (corosync tops out around that) at ~512 MiB of reserved journal — set
+ * it once at format time; raising it later means reformatting. Override with -N
+ * (1 for a single-node volume, up to 256). */
+#define OCSFS2_DEFAULT_MAX_NODES 32
 
 /* Fixed-stride directory entries: 8 per 4096-byte block. Simple and correct
  * (no block-straddle, no rec_len juggling); space cost is negligible for the
@@ -780,6 +786,14 @@ u64  ocsfs2_recompute_free(struct super_block *sb);   /* A4: true free from bitm
 /* A8 — per-data-block CRC32c checksums (csum.c); no-ops unless s_datacsum */
 void ocsfs2_csum_set(struct super_block *sb, u64 phys, u32 crc);  /* store */
 u32  ocsfs2_csum_read(struct super_block *sb, u64 phys);          /* 0 = unset */
+int  ocsfs2_csum_check(struct super_block *sb, u64 phys,          /* inline read */
+		       const void *data);                        /* 0 ok / -EIO bad */
+void ocsfs2_csum_clear_range(struct super_block *sb, u64 phys,    /* on free */
+			     u32 count);                          /* drop stale CRCs */
+void ocsfs2_csum_set_range(struct super_block *sb, u64 phys0,     /* batched store */
+			   const u32 *crcs, u32 n);              /* 1 sync/CAW per blk */
+void ocsfs2_csum_read_range(struct super_block *sb, u64 phys0,    /* batched read */
+			    u32 *out, u32 n);                    /* 1 read per csum blk */
 struct folio;
 struct iomap;
 struct bio;
