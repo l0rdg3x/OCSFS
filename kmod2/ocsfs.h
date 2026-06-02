@@ -63,6 +63,17 @@
 #define OCSFS2_DIRENT_SIZE        512
 #define OCSFS2_DIRENTS_PER_BLOCK  (OCSFS2_BLOCK_SIZE / OCSFS2_DIRENT_SIZE)
 
+/* cluster node slot states (ns_state) */
+#define OCSFS2_NODE_FREE    0
+#define OCSFS2_NODE_ACTIVE  1
+#define OCSFS2_NODE_DEAD    2
+
+/* lease modes (l_mode) */
+#define OCSFS2_LEASE_NONE   0
+#define OCSFS2_LEASE_SH     1
+#define OCSFS2_LEASE_EX     2
+#define OCSFS2_SLOT_NONE    0xFFFF
+
 /* file types (de_file_type / inode helpers) */
 #define OCSFS2_FT_UNKNOWN 0
 #define OCSFS2_FT_REG     1
@@ -433,6 +444,41 @@ struct ocsfs2_txn {
 	bool   t_failed;
 };
 
+/* ═══════════════════════ cluster (L3-L5) ═══════════════════════ */
+
+/* L3 membership/fencing provider interface (spec §4). The v1 provider is the
+ * on-disk heartbeat; a corosync provider can replace it without touching L4/L5. */
+struct ocsfs2_cluster_ops {
+	int  (*node_alive)(struct super_block *sb, u16 slot, u32 gen);
+	void (*on_node_dead)(struct super_block *sb, u16 slot, u32 gen);
+	int  (*self_liveness_ok)(struct super_block *sb);
+};
+
+/* Per-peer liveness tracking (observer-clock based, avoids cross-node clocks). */
+struct ocsfs2_peer {
+	u64           last_seq;       /* last heartbeat sequence we observed */
+	unsigned long last_change;    /* jiffies when last_seq last advanced */
+	u32           gen;            /* observed mount generation */
+	u8            state;          /* OCSFS2_NODE_* as last read */
+	bool          seen;
+};
+
+struct ocsfs2_cluster {
+	bool   active;
+	bool   caw_ok;
+	u16    self_slot;
+	u32    mount_gen;
+	u64    pr_key;
+	u16    max_nodes;
+	struct task_struct *hb_thread;
+	u64    hb_seq;                /* our monotonic heartbeat sequence */
+	struct ocsfs2_peer *peers;   /* [max_nodes] */
+	const struct ocsfs2_cluster_ops *ops;
+	struct mutex lease_lock;     /* serialises lease-table CAW read-modify-CAS */
+	unsigned long hb_interval_j; /* heartbeat period (jiffies) */
+	unsigned long death_j;       /* death window (jiffies) */
+};
+
 struct ocsfs2_sb_info {
 	struct super_block  *s_sb;
 	struct buffer_head  *s_sbh;      /* superblock buffer (block 0 or mirror) */
@@ -472,11 +518,12 @@ struct ocsfs2_sb_info {
 
 	struct ocsfs2_journal s_journal; /* WAL redo log (single-node slot 0) */
 
-	/* cluster identity — reserved, unused in Plan 1 */
+	/* cluster identity */
 	struct ocsfs2_pr_info s_pr;
 	u16   s_node_slot;
 	u32   s_mount_gen;
 	bool  s_clustered;
+	struct ocsfs2_cluster *s_cluster;   /* L3-L5 state, NULL if single-node */
 };
 
 struct ocsfs2_inode_info {
@@ -751,6 +798,19 @@ int  ocsfs2_init_acl(struct inode *inode, struct inode *dir);   /* inherit on cr
 int  ocsfs2_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 		   struct dentry *old_dentry, struct inode *new_dir,
 		   struct dentry *new_dentry, unsigned int flags);
+
+/* cluster.c — L3 membership: node-slot claim, heartbeat, cluster_ops.
+ * No-op (returns 0, leaves s_cluster NULL) when the volume is single-node. */
+int  ocsfs2_cluster_init(struct super_block *sb);
+void ocsfs2_cluster_exit(struct super_block *sb);
+/* True iff the peer owning @slot at @gen is currently alive (per L3). */
+bool ocsfs2_node_alive(struct super_block *sb, u16 slot, u32 gen);
+
+/* lease.c — L4 ownership leases (single-writer) + L5 recovery.
+ * acquire/release are no-ops on a single-node volume. */
+int  ocsfs2_lease_acquire(struct super_block *sb, u64 resource, int mode);
+void ocsfs2_lease_release(struct super_block *sb, u64 resource, int mode);
+void ocsfs2_recover_node(struct super_block *sb, u16 slot, u32 gen);
 
 /* transport/scsi_pr.c — salvaged, dormant in Plan 1 (compiles, not exercised).
  * SCSI-3 Persistent Reservations + Compare-And-Write. Used by the cluster

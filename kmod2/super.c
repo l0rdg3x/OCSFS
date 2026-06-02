@@ -10,10 +10,17 @@
 #include <linux/init.h>
 #include <linux/fs.h>
 #include <linux/fs_context.h>
+#include <linux/fs_parser.h>
 #include <linux/statfs.h>
 #include <linux/writeback.h>
 #include <linux/blkdev.h>
 #include <linux/unaligned.h>
+
+/* mount options: the only one is "cluster" (opt-in multinode). Without it a
+ * volume — even one formatted with mkfs -N >1 — mounts single-node. */
+struct ocsfs2_fc {
+	bool cluster;
+};
 
 /* ── inode slab lifecycle ── */
 
@@ -216,6 +223,7 @@ static void ocsfs2_put_super(struct super_block *sb)
 
 	if (!sbi)
 		return;
+	ocsfs2_cluster_exit(sb);   /* stop heartbeat + release node slot first */
 	write_back_meta(sb);
 	ocsfs2_journal_exit(sb);
 	kvfree(sbi->s_ags);
@@ -313,7 +321,11 @@ static int ocsfs2_fill_super(struct super_block *sb, struct fs_context *fc)
 	sbi->s_journal_size   = le64_to_cpu(ds->s_journal_size);
 	sbi->s_ag_desc_off    = le64_to_cpu(ds->s_ag_desc_off);
 	sbi->s_data_off       = le64_to_cpu(ds->s_data_off);
-	sbi->s_clustered = false;   /* Plan 1: single-node only */
+	{
+		struct ocsfs2_fc *ctx = fc->fs_private;
+
+		sbi->s_clustered = ctx && ctx->cluster && sbi->s_max_nodes > 1;
+	}
 
 	/* Bring up the journal and replay any committed-but-uncheckpointed txn
 	 * BEFORE reading AG headers / the root inode, so we read consistent
@@ -333,6 +345,11 @@ static int ocsfs2_fill_super(struct super_block *sb, struct fs_context *fc)
 	}
 
 	ret = read_ag_headers(sb);
+	if (ret)
+		goto fail_journal;
+
+	/* L3: join the cluster (no-op unless mounted -o cluster on a -N volume) */
+	ret = ocsfs2_cluster_init(sb);
 	if (ret)
 		goto fail_journal;
 
@@ -366,6 +383,7 @@ static int ocsfs2_fill_super(struct super_block *sb, struct fs_context *fc)
 	return 0;
 
 fail_journal:
+	ocsfs2_cluster_exit(sb);   /* no-op if the cluster never came up */
 	ocsfs2_journal_exit(sb);
 	kvfree(sbi->s_ags);
 	sbi->s_ags = NULL;
@@ -380,17 +398,51 @@ fail:
 
 /* ── mount glue ── */
 
+enum { Opt_cluster };
+static const struct fs_parameter_spec ocsfs2_param_specs[] = {
+	fsparam_flag("cluster", Opt_cluster),
+	{}
+};
+
+static int ocsfs2_parse_param(struct fs_context *fc, struct fs_parameter *param)
+{
+	struct ocsfs2_fc *ctx = fc->fs_private;
+	struct fs_parse_result result;
+	int opt = fs_parse(fc, ocsfs2_param_specs, param, &result);
+
+	if (opt < 0)
+		return opt;
+	switch (opt) {
+	case Opt_cluster:
+		ctx->cluster = true;
+		break;
+	}
+	return 0;
+}
+
 static int ocsfs2_get_tree(struct fs_context *fc)
 {
 	return get_tree_bdev(fc, ocsfs2_fill_super);
 }
 
+static void ocsfs2_free_fc(struct fs_context *fc)
+{
+	kfree(fc->fs_private);
+}
+
 static const struct fs_context_operations ocsfs2_context_ops = {
-	.get_tree = ocsfs2_get_tree,
+	.parse_param = ocsfs2_parse_param,
+	.get_tree    = ocsfs2_get_tree,
+	.free        = ocsfs2_free_fc,
 };
 
 static int ocsfs2_init_fs_context(struct fs_context *fc)
 {
+	struct ocsfs2_fc *ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+
+	if (!ctx)
+		return -ENOMEM;
+	fc->fs_private = ctx;
 	fc->ops = &ocsfs2_context_ops;
 	return 0;
 }
