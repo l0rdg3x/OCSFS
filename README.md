@@ -425,14 +425,17 @@ destination node.
 ```
 ocsfs/
 ├── kmod2/      OCSFS v2 kernel module (C, GPL-2.0) — single-writer ownership
-│   └── transport/scsi_pr.c   SCSI-3 PR + Compare-And-Write
-├── tools2/     mkfs.ocsfs2, fsck.ocsfs2 (authoritative on-disk format)
+│   ├── transport/scsi_pr.c   SCSI-3 PR + Compare-And-Write
+│   └── dkms.conf             DKMS packaging (auto-rebuild on kernel upgrade)
+├── tools2/     mkfs.ocsfs2, fsck.ocsfs2, ocsfs2-{scrub,defrag,tool}
 ├── proxmox2/   PVE storage plugin + mount helper + one-step install.sh
 ├── tests/v2/   single-node + real-cluster validation scripts
-├── docs/       design-v2.md (spec), admin/developer guides, plans/
-├── kmod/ tools/ ...   v1 (superseded; kept for reference on `main`)
+├── docs/       design-v2.md (spec), admin/developer guides, TODO, plans/
 └── LICENSE     GPL-2.0-only
 ```
+
+> The v1 codebase (FUSE prototype + first kernel module) lives on the **`v1-legacy`**
+> branch; `main` carries only v2.
 
 ---
 

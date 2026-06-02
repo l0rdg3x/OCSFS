@@ -4,15 +4,13 @@ Status as of 2026-06-02. The single-node data path is differentially validated
 vs XFS (clean) and `fsck`-clean; cluster L3–L5 + maintenance services are
 validated on 3 nodes. **[FIX]** = worth doing, **[DISCARD]** = out of scope.
 
-### 🧹 [CHORE · P2] Remove v1 leftovers from `main` — keep the branch clean
-The whole v1 codebase is preserved on the **`v1-legacy`** branch, so `main` (=v2)
-should carry *only* v2. Delete these superseded v1 directories from `main` (they
-remain fully available via `git checkout v1-legacy`):
-`kmod/` · `tools/` · `src/` (v1 FUSE) · `include/` (v1 headers) · `proxmox/`
-(v1 plugin) · `conf/` · `man/` (ocsfs(8), not ocsfs2) · `debian/` (v1 packaging).
-Keep: `kmod2/ tools2/ proxmox2/ docs/ tests/ LICENSE README.md`. After removal,
-update the "Project structure" block in `README.md` (drop the `kmod/ tools/ …`
-line) and re-check no v2 file `#include`s anything under the v1 trees.
+### ✅ [CHORE · P2] Remove v1 leftovers from `main` — DONE (2026-06-03)
+The v1 codebase is preserved on the **`v1-legacy`** branch; `main` now carries only
+v2. Removed `kmod/ tools/ src/ include/ proxmox/ conf/ man/ debian/` + the v1 root
+`Makefile` (75 files, −32 469 lines); README "Project structure" updated; verified
+no v2 file references the v1 trees. (Minor residue kept on purpose under `tests/`
+per instruction — a few loose v1 test files: `test_ocsfs.c`, `ocsfs_fsx.c`,
+`repro13.c`, `cluster/`; harmless, not built by v2.)
 
 ### ✅ Resolved 2026-06-02 (all triaged items addressed)
 - **A1** refcount cluster-coherence — FIXED (`d93036d`): coherent reads + CAW;
