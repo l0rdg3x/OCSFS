@@ -33,6 +33,9 @@ struct rc_seg {
 /* sized to hold a full leaf plus the few extra records a split can introduce */
 #define RC_WORK_RECS  (OCSFS2_RC_MAX_RECS + 4)
 
+/* CAW retry budget for the cluster-coherent refcount path (A1) */
+#define OCSFS2_RC_CAW_RETRIES  16
+
 static struct ocsfs2_ag_info *ag_of_block(struct ocsfs2_sb_info *sbi, u64 phys)
 {
 	u32 ag;
@@ -48,10 +51,14 @@ static struct ocsfs2_ag_info *ag_of_block(struct ocsfs2_sb_info *sbi, u64 phys)
 }
 
 /* Read + validate the refcount leaf at @blk. Returns a held bh or NULL. */
+/* forward decl: coherent AG-header read (defined with the cluster path below) */
+static int rc_read_hdr(struct super_block *sb, struct ocsfs2_ag_info *ai,
+		       u8 *hdr, u64 *root);
+
 static struct buffer_head *rc_read_node(struct super_block *sb, u64 blk,
 					struct ocsfs2_disk_rc_node **node_out)
 {
-	struct buffer_head *bh = sb_bread(sb, blk);
+	struct buffer_head *bh = ocsfs2_meta_bread(sb, blk);   /* coherent in cluster */
 	struct ocsfs2_disk_rc_node *node;
 	u32 crc;
 
@@ -86,6 +93,17 @@ u32 ocsfs2_refcount_get(struct super_block *sb, u64 phys)
 	if (!ai)
 		return 1;
 	mutex_lock(&ai->rc_lock);
+	if (sbi->s_cluster) {            /* A1: refresh the tree root from disk so a
+					  * peer's just-created tree is visible (else
+					  * we'd read root=0 and skip a needed CoW) */
+		u8 *hdr = kmalloc(sb->s_blocksize, GFP_NOFS);
+		u64 root;
+
+		if (hdr) {
+			rc_read_hdr(sb, ai, hdr, &root);   /* updates ai->rc_btree_root */
+			kfree(hdr);
+		}
+	}
 	if (!ai->rc_btree_root)
 		goto out;
 	bh = rc_read_node(sb, ai->rc_btree_root, &node);
@@ -325,6 +343,169 @@ static int rc_apply(const struct rc_seg *in, int nin, u64 a, u64 b, int delta,
 	return no > OCSFS2_RC_MAX_RECS ? -1 : no;
 }
 
+/* ── cluster-coherent path (A1) ──
+ * The refcount tree is per-AG SHARED metadata that any node touches via reflink/
+ * snapshot/dedup/CoW. The single-node path below (sb_bread + journal/sync) is not
+ * cross-node coherent: a node can read a stale tree root / leaf and skip a needed
+ * CoW, corrupting another sharer. So in cluster mode we treat the refcount block
+ * exactly like the allocation bitmap — read it coherently (bypassing the per-node
+ * buffer cache) and publish updates with SCSI Compare-and-Write, retrying on a
+ * peer's concurrent change. CAW-direct (not journaled), like the bitmap; ordering
+ * (inc before share, dec after un-reference) keeps a crash safe-to-leak (fsck
+ * reconciles), and the root pointer in the AG header is updated by CAW too. */
+
+static u64 rc_ag_hdr_blk(struct ocsfs2_sb_info *sbi, struct ocsfs2_ag_info *ai)
+{
+	return sbi->s_ag_desc_off / OCSFS2_BLOCK_SIZE +
+	       (u64)ai->ag_no * sbi->s_ag_blocks;
+}
+
+/* coherently read the AG header into @hdr (bs bytes); out *root = rc tree root */
+static int rc_read_hdr(struct super_block *sb, struct ocsfs2_ag_info *ai,
+		       u8 *hdr, u64 *root)
+{
+	u64 ag_blk = rc_ag_hdr_blk(OCSFS2_SB(sb), ai);
+	int ret = ocsfs2_cl_bio(sb, ag_blk * (u64)sb->s_blocksize, hdr,
+				sb->s_blocksize, REQ_OP_READ);
+	if (ret)
+		return ret;
+	*root = le64_to_cpu(((struct ocsfs2_disk_ag *)hdr)->ag_rc_btree_root);
+	ai->rc_btree_root = *root;
+	return 0;
+}
+
+/* CAW the AG header to set ag_rc_btree_root = @new_root. @hdr is the freshly-read
+ * header (the CAW expected image). 0 = done, -EAGAIN = peer changed it (retry). */
+static int rc_caw_root(struct super_block *sb, struct ocsfs2_ag_info *ai,
+		       const u8 *hdr, u64 new_root)
+{
+	u64 ag_blk = rc_ag_hdr_blk(OCSFS2_SB(sb), ai);
+	u32 bs = sb->s_blocksize;
+	struct ocsfs2_disk_ag *dag;
+	u8 *nbuf = kmalloc(bs, GFP_NOFS);
+	int ret;
+
+	if (!nbuf)
+		return -ENOMEM;
+	memcpy(nbuf, hdr, bs);
+	dag = (struct ocsfs2_disk_ag *)nbuf;
+	dag->ag_rc_btree_root = cpu_to_le64(new_root);
+	dag->ag_checksum = cpu_to_le32(ocsfs2_crc32c(~0U, dag,
+			   offsetof(struct ocsfs2_disk_ag, ag_checksum)));
+	ret = ocsfs2_scsi_caw(sb, ag_blk, hdr, nbuf, bs);
+	kfree(nbuf);
+	if (ret)
+		return -EAGAIN;
+	ai->rc_btree_root = new_root;
+	return 0;
+}
+
+/* serialise @recs into a leaf node image in @buf (bs, zeroed by caller) */
+static void rc_build_node(struct super_block *sb, struct ocsfs2_ag_info *ai,
+			  u8 *buf, const struct rc_seg *recs, int nr)
+{
+	struct ocsfs2_disk_rc_node *node = (struct ocsfs2_disk_rc_node *)buf;
+	int i;
+
+	node->rn_magic = cpu_to_le32(OCSFS2_RC_NODE_MAGIC);
+	node->rn_level = cpu_to_le16(0);
+	node->rn_nr = cpu_to_le16((u16)nr);
+	node->rn_ag = cpu_to_le32(ai->ag_no);
+	for (i = 0; i < nr; i++) {
+		node->rn_recs[i].rr_phys = cpu_to_le64(recs[i].phys);
+		node->rn_recs[i].rr_len = cpu_to_le32(recs[i].len);
+		node->rn_recs[i].rr_refcount = cpu_to_le32(recs[i].rc);
+	}
+	node->rn_checksum = cpu_to_le32(ocsfs2_crc32c(~0U, node,
+			    offsetof(struct ocsfs2_disk_rc_node, rn_checksum)));
+}
+
+/* Apply @delta to [a,b) coherently in cluster mode. Caller holds rc_lock; on
+ * success fills @freed/@nfreed (the caller releases those to the bitmap). */
+static int rc_mutate_cluster(struct super_block *sb, struct ocsfs2_ag_info *ai,
+			     u64 a, u64 b, int delta,
+			     struct rc_seg *freed, int *nfreed)
+{
+	u32 bs = sb->s_blocksize;
+	struct rc_seg *in, *out;
+	u8 *oldblk, *hdr, *nbuf;
+	int nin, no, nf = 0, attempt, ret = -EBUSY;
+
+	in = kmalloc_array(RC_WORK_RECS, sizeof(*in), GFP_NOFS);
+	out = kmalloc_array(RC_WORK_RECS, sizeof(*out), GFP_NOFS);
+	oldblk = kmalloc(bs, GFP_NOFS);
+	hdr = kmalloc(bs, GFP_NOFS);
+	nbuf = kmalloc(bs, GFP_NOFS);
+	if (!in || !out || !oldblk || !hdr || !nbuf) { ret = -ENOMEM; goto out; }
+
+	for (attempt = 0; attempt < OCSFS2_RC_CAW_RETRIES; attempt++) {
+		struct ocsfs2_disk_rc_node *node;
+		u64 root;
+
+		if (rc_read_hdr(sb, ai, hdr, &root)) { ret = -EIO; goto out; }
+		if (root) {
+			if (ocsfs2_cl_bio(sb, root * (u64)bs, oldblk, bs,
+					  REQ_OP_READ)) { ret = -EIO; goto out; }
+			node = (struct ocsfs2_disk_rc_node *)oldblk;
+			if (le32_to_cpu(node->rn_magic) != OCSFS2_RC_NODE_MAGIC ||
+			    le16_to_cpu(node->rn_nr) > OCSFS2_RC_MAX_RECS) {
+				ret = -EUCLEAN; goto out;
+			}
+			nin = le16_to_cpu(node->rn_nr);
+			for (no = 0; no < nin; no++) {
+				in[no].phys = le64_to_cpu(node->rn_recs[no].rr_phys);
+				in[no].len  = le32_to_cpu(node->rn_recs[no].rr_len);
+				in[no].rc   = le32_to_cpu(node->rn_recs[no].rr_refcount);
+			}
+		} else {
+			nin = 0;
+		}
+
+		no = rc_apply(in, nin, a, b, delta, out, freed, &nf);
+		if (no < 0) { ret = -ENOSPC; goto out; }
+
+		if (no == 0) {                       /* tree becomes empty */
+			if (!root) { ret = 0; goto done; }
+			ret = rc_caw_root(sb, ai, hdr, 0);
+			if (ret == -EAGAIN) continue;
+			if (ret) goto out;
+			ocsfs2_free_blocks(sb, root, 1);
+			ret = 0; goto done;
+		}
+		if (!root) {                         /* create the tree */
+			u64 blk;
+
+			ret = ocsfs2_alloc_blocks(sb, ai->ag_no, 1, &blk);
+			if (ret) goto out;
+			memset(nbuf, 0, bs);
+			rc_build_node(sb, ai, nbuf, out, no);
+			if (ocsfs2_cl_bio(sb, blk * (u64)bs, nbuf, bs,
+					  REQ_OP_WRITE)) {
+				ocsfs2_free_blocks(sb, blk, 1);
+				ret = -EIO; goto out;
+			}
+			ret = rc_caw_root(sb, ai, hdr, blk);
+			if (ret) {                   /* peer won / error: undo */
+				ocsfs2_free_blocks(sb, blk, 1);
+				if (ret == -EAGAIN) continue;
+				goto out;
+			}
+			ret = 0; goto done;
+		}
+		/* update the existing node via CAW (expected = oldblk) */
+		memset(nbuf, 0, bs);
+		rc_build_node(sb, ai, nbuf, out, no);
+		ret = ocsfs2_scsi_caw(sb, root, oldblk, nbuf, bs);
+		if (ret) { ret = -EAGAIN; continue; }
+		ret = 0; goto done;
+	}
+done:
+	*nfreed = (ret == 0) ? nf : 0;
+out:
+	kfree(in); kfree(out); kfree(oldblk); kfree(hdr); kfree(nbuf);
+	return ret;
+}
+
 /* ── public mutators ── */
 
 int ocsfs2_refcount_inc(struct super_block *sb, u64 phys, u32 len)
@@ -345,6 +526,10 @@ int ocsfs2_refcount_inc(struct super_block *sb, u64 phys, u32 len)
 	}
 
 	mutex_lock(&ai->rc_lock);
+	if (sbi->s_cluster) {                    /* A1: coherent CAW path */
+		ret = rc_mutate_cluster(sb, ai, phys, phys + len, +1, freed, &nf);
+		goto unlock;                     /* inc frees nothing */
+	}
 	ret = rc_load(sb, ai, in, &nin);
 	if (ret)
 		goto unlock;
@@ -390,6 +575,12 @@ void ocsfs2_free_blocks_rc(struct super_block *sb, u64 phys, u32 len)
 	}
 
 	mutex_lock(&ai->rc_lock);
+	if (sbi->s_cluster) {                    /* A1: coherent CAW path */
+		if (rc_mutate_cluster(sb, ai, phys, phys + len, -1, freed, &nf) == 0)
+			for (i = 0; i < nf; i++)
+				ocsfs2_free_blocks(sb, freed[i].phys, freed[i].len);
+		goto unlock;
+	}
 	if (rc_load(sb, ai, in, &nin))
 		goto unlock;
 	no = rc_apply(in, nin, phys, phys + len, -1, out, freed, &nf);

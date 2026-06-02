@@ -158,9 +158,19 @@ static int write_back_meta(struct super_block *sb)
 	mutex_lock(&sbi->s_super_lock);
 	for (i = 0; i < sbi->s_ag_count; i++) {
 		u64 start = ag_region_start + (u64)i * sbi->s_ag_blocks;
-		struct buffer_head *bh = sb_bread(sb, start);
+		struct buffer_head *bh;
 		struct ocsfs2_disk_ag *dag;
 
+		/* Cluster: the AG header is SHARED metadata. ag_free_blocks/_inodes
+		 * here are only this node's local hints (peers alloc/free without us
+		 * seeing it) and writing them from our stale buffer cache would also
+		 * CLOBBER ag_rc_btree_root, which the refcount path maintains by CAW
+		 * (A1). The on-disk bitmap is authoritative; fsck/scrub recompute the
+		 * counts (A4). So skip the per-AG header rewrite on a clustered volume. */
+		if (sbi->s_cluster)
+			continue;
+
+		bh = sb_bread(sb, start);
 		if (!bh)
 			continue;
 		dag = (struct ocsfs2_disk_ag *)bh->b_data;
