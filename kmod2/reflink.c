@@ -25,26 +25,33 @@
 static int reflink_share_extents(struct inode *src, u64 src_lblk,
 				 struct inode *dst, u64 dst_lblk, u64 nblk)
 {
-	struct ocsfs2_inode_info *soi = OCSFS2_I(src);
 	struct super_block *sb = src->i_sb;
 	u32 spb = sb->s_blocksize / 512;
 	u64 src_end = src_lblk + nblk;
-	u16 i;
+	u64 cur = src_lblk;
 	int ret;
 
-	for (i = 0; i < soi->i_extent_count; i++) {
-		struct ocsfs2_extent *e = &soi->i_extents[i];
-		u64 e_end = e->logical + e->length;
-		u64 ov_s, ov_e, sphys, dlogical;
+	/* Walk the source range by LOGICAL position via ocsfs2_extent_find: this
+	 * re-reads the map each step, so it is robust to the destination inserts
+	 * shifting the array when src == dst (same-file clone — generic prep
+	 * forbids overlapping src/dst ranges), and it works for both the inline
+	 * and the B+tree extent maps (the old index walk handled only inline). */
+	while (cur < src_end) {
+		struct ocsfs2_extent e;
+		u64 next = U64_MAX, ov_e, sphys, dlogical;
 		u32 ov_len;
 
-		if (e_end <= src_lblk || e->logical >= src_end)
+		ret = ocsfs2_extent_find(src, cur, &e, &next);
+		if (ret) {                       /* hole in the source: skip it */
+			if (next == U64_MAX || next >= src_end)
+				break;
+			cur = next;
 			continue;
-		ov_s = max(e->logical, src_lblk);
-		ov_e = min(e_end, src_end);
-		ov_len = (u32)(ov_e - ov_s);
-		sphys = e->physical + (ov_s - e->logical);
-		dlogical = dst_lblk + (ov_s - src_lblk);
+		}
+		ov_e = min(e.logical + e.length, src_end);
+		ov_len = (u32)(ov_e - cur);
+		sphys = e.physical + (cur - e.logical);
+		dlogical = dst_lblk + (cur - src_lblk);
 
 		ret = ocsfs2_refcount_inc(sb, sphys, ov_len);
 		if (ret)
@@ -56,7 +63,12 @@ static int reflink_share_extents(struct inode *src, u64 src_lblk,
 			return ret;
 		}
 		dst->i_blocks += (u64)ov_len * spb;
-		e->flags |= OCSFS2_EXT_SHARED;   /* mark the source extent shared */
+		/* flag the whole source extent shared so a later write CoWs it
+		 * (exact-match update; the insert above never splits it as the
+		 * src and dst logical ranges are disjoint) */
+		ocsfs2_extent_update_phys(src, e.logical, e.length, e.physical,
+					  e.flags | OCSFS2_EXT_SHARED);
+		cur = ov_e;
 	}
 	return 0;
 }
@@ -141,8 +153,12 @@ loff_t ocsfs2_reflink_range(struct file *src_file, loff_t soff,
 	if (ret)
 		return ret;
 
-	/* drop dst's now-stale cached pages so reads hit the shared blocks */
-	truncate_inode_pages(dst->i_mapping, doff);
+	/* Drop dst's now-stale cached pages over the CLONED RANGE ONLY so reads
+	 * hit the shared blocks. Must NOT be truncate_inode_pages(.., doff) (to
+	 * EOF): that would discard a dirty folio *outside* the clone range whose
+	 * data generic_remap_file_range_prep never flushed (it only flushes the
+	 * src/dst ranges), silently losing that write — caught by fsx. */
+	truncate_inode_pages_range(dst->i_mapping, doff, doff + len - 1);
 	mark_inode_dirty(dst);
 	mark_inode_dirty(src);
 	return len;
