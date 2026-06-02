@@ -27,6 +27,7 @@
 
 /* compat feature: uniform-AG layout that online autogrow needs */
 #define OCSFS2_FEAT_COMPAT_AUTOGROW  0x1ULL
+#define OCSFS2_FEAT_RO_COMPAT_DATACSUM 0x1ULL   /* A8: per-data-block CRC */
 
 #define OCSFS2_BLOCK_SIZE     4096
 #define OCSFS2_INODE_SIZE     512
@@ -143,7 +144,9 @@ struct ocsfs2_disk_ag {
 	uint64_t ag_data_off;
 	uint64_t ag_data_blocks;
 	uint64_t ag_rc_btree_root;
-	uint8_t  ag_reserved[3996];
+	uint64_t ag_csum_off;        /* A8: data-checksum region byte offset (0=none) */
+	uint64_t ag_csum_blocks;
+	uint8_t  ag_reserved[3980];
 	uint32_t ag_checksum;
 } OCSFS2_PACKED;
 _Static_assert(sizeof(struct ocsfs2_disk_ag) == 4096, "disk_ag 4096");

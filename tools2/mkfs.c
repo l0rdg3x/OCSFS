@@ -43,6 +43,7 @@ struct layout {
 	uint64_t inodes_per_ag;
 	uint32_t ag_count;
 	uint16_t max_nodes;
+	int      datacsum;                /* A8: reserve per-data-block CRC region */
 };
 
 static uint64_t divup(uint64_t a, uint64_t b) { return (a + b - 1) / b; }
@@ -100,9 +101,9 @@ static int compute_layout(uint64_t dev_size, uint16_t max_nodes,
 /* Per-AG geometry derived from the layout (all in blocks / absolute byte offsets). */
 struct ag_geom {
 	uint64_t start_block, block_count;
-	uint64_t bitmap_blocks, itable_blocks, meta_blocks;
+	uint64_t bitmap_blocks, itable_blocks, csum_blocks, meta_blocks;
 	uint64_t data_start_block, data_blocks;
-	uint64_t bitmap_off, itable_off, data_off;
+	uint64_t bitmap_off, itable_off, csum_off, data_off;
 };
 
 static void ag_geometry(const struct layout *L, uint32_t idx, struct ag_geom *g)
@@ -117,12 +118,17 @@ static void ag_geometry(const struct layout *L, uint32_t idx, struct ag_geom *g)
 
 	g->bitmap_blocks = divup(divup(g->block_count, 8), BS);
 	g->itable_blocks = (L->inodes_per_ag * OCSFS2_INODE_SIZE) / BS;
-	g->meta_blocks   = 1 + g->bitmap_blocks + g->itable_blocks;
+	/* A8: a per-data-block u32 CRC region (opt-in). Sized for the whole AG block
+	 * span (>= the data-block count), indexed by data-block number. */
+	g->csum_blocks = L->datacsum ? divup(g->block_count * 4, BS) : 0;
+	g->meta_blocks   = 1 + g->bitmap_blocks + g->itable_blocks + g->csum_blocks;
 	g->data_start_block = g->start_block + g->meta_blocks;
 	g->data_blocks   = g->block_count - g->meta_blocks;
 
 	g->bitmap_off = (g->start_block + 1) * BS;
 	g->itable_off = (g->start_block + 1 + g->bitmap_blocks) * BS;
+	g->csum_off   = L->datacsum ?
+		(g->start_block + 1 + g->bitmap_blocks + g->itable_blocks) * BS : 0;
 	g->data_off   = g->data_start_block * BS;
 }
 
@@ -163,19 +169,21 @@ int main(int argc, char **argv)
 	int force = 0, opt, fd;
 	const char *dev;
 	uint64_t dev_size = 0, format_size = 0;
+	int datacsum = 0;
 	struct stat st;
 	struct layout L;
 	uint64_t total_data_blocks = 0;
 
-	while ((opt = getopt(argc, argv, "L:N:j:s:f")) != -1) {
+	while ((opt = getopt(argc, argv, "L:N:j:s:fC")) != -1) {
 		switch (opt) {
 		case 'L': label = optarg; break;
 		case 'N': max_nodes = (uint16_t)atoi(optarg); break;
 		case 'j': journal_size = strtoull(optarg, NULL, 0); break;
 		case 's': format_size = strtoull(optarg, NULL, 0); break;  /* format a prefix (test grow) */
 		case 'f': force = 1; break;
+		case 'C': datacsum = 1; break;   /* A8: per-data-block checksums */
 		default:
-			fprintf(stderr, "usage: %s [-L label] [-N max_nodes] [-j journal_bytes] [-s format_bytes] [-f] <device>\n", argv[0]);
+			fprintf(stderr, "usage: %s [-L label] [-N max_nodes] [-j journal_bytes] [-s format_bytes] [-C] [-f] <device>\n", argv[0]);
 			return 2;
 		}
 	}
@@ -224,6 +232,7 @@ int main(int argc, char **argv)
 			(unsigned long long)dev_size);
 		close(fd); return 1;
 	}
+	L.datacsum = datacsum;
 
 	printf("mkfs.ocsfs2: device=%s size=%llu MiB blocks=%llu\n",
 	       dev, (unsigned long long)(dev_size >> 20), (unsigned long long)L.dev_blocks);
@@ -268,6 +277,12 @@ int main(int argc, char **argv)
 			perror("zero itable"); close(fd); return 1;
 		}
 
+		/* A8: zero the data-checksum region (0 = "unset", skipped by scrub) */
+		if (g.csum_blocks &&
+		    write_zeros(fd, g.csum_off, g.csum_blocks * BS)) {
+			perror("zero csum region"); close(fd); return 1;
+		}
+
 		/* bitmap: mark metadata blocks used; AG0 also marks the root dir block */
 		bm = calloc(g.bitmap_blocks, BS);
 		if (!bm) { perror("calloc bitmap"); close(fd); return 1; }
@@ -298,6 +313,8 @@ int main(int argc, char **argv)
 		ag.ag_data_off = htole64(g.data_off);
 		ag.ag_data_blocks = htole64(g.data_blocks);
 		ag.ag_rc_btree_root = htole64(0);
+		ag.ag_csum_off = htole64(g.csum_off);
+		ag.ag_csum_blocks = htole64(g.csum_blocks);
 		ag.ag_checksum = htole32(ocsfs2_crc32c(~0u, &ag,
 				 offsetof(struct ocsfs2_disk_ag, ag_checksum)));
 		if (pwrite_all(fd, &ag, sizeof(ag), g.start_block * BS)) {
@@ -383,6 +400,7 @@ int main(int argc, char **argv)
 		sb.s_total_blocks = htole64(L.ag_region_start + (uint64_t)L.ag_count * L.ag_blocks);
 		sb.s_free_blocks = htole64(total_data_blocks - 1);  /* minus root dir block */
 		sb.s_feat_compat = htole64(OCSFS2_FEAT_COMPAT_AUTOGROW);
+	sb.s_feat_ro_compat = htole64(datacsum ? OCSFS2_FEAT_RO_COMPAT_DATACSUM : 0);
 		sb.s_total_inodes = htole64((uint64_t)L.ag_count * L.inodes_per_ag);
 		sb.s_free_inodes = htole64((uint64_t)L.ag_count * L.inodes_per_ag - 1);
 		sb.s_ag_count = htole32(L.ag_count);

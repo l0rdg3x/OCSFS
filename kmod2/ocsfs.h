@@ -102,10 +102,14 @@
 /* compat features (safe to ignore if unknown): AUTOGROW guarantees the
  * uniform-AG layout that online grow needs (all AGs == s_ag_blocks). */
 #define OCSFS2_FEAT_COMPAT_AUTOGROW    0x1ULL
+/* A8: per-data-block CRC32c checksums in a per-AG region (silent-corruption
+ * detection on any SAN). ro_compat: an unaware build may mount read-only (reads
+ * don't touch checksums) but not read-write (writes would leave them stale). */
+#define OCSFS2_FEAT_RO_COMPAT_DATACSUM 0x1ULL
 
 /* feature bitmasks */
 #define OCSFS2_FEATURE_INCOMPAT_SUPP   0ULL
-#define OCSFS2_FEATURE_RO_COMPAT_SUPP  0ULL
+#define OCSFS2_FEATURE_RO_COMPAT_SUPP  (OCSFS2_FEAT_RO_COMPAT_DATACSUM)
 #define OCSFS2_FEATURE_COMPAT_SUPP     (OCSFS2_FEAT_COMPAT_AUTOGROW)
 
 /* ═══════════════════════ on-disk structures ═══════════════════════ */
@@ -198,7 +202,9 @@ struct ocsfs2_disk_ag {
 	__le64  ag_data_off;         /* absolute byte offset of first data block */
 	__le64  ag_data_blocks;
 	__le64  ag_rc_btree_root;    /* reserved (reflink/snapshot, Plan 3) */
-	__u8    ag_reserved[3996];
+	__le64  ag_csum_off;         /* A8: byte offset of the data-checksum region (0 = none) */
+	__le64  ag_csum_blocks;      /* A8: blocks in the data-checksum region */
+	__u8    ag_reserved[3980];
 	__le32  ag_checksum;         /* crc32c(~0, [0..4091]) */
 } __packed;
 static_assert(sizeof(struct ocsfs2_disk_ag) == 4096, "disk_ag must be 4096");
@@ -443,6 +449,8 @@ struct ocsfs2_ag_info {
 	u64   inodes_per_ag;
 	u64   data_off;          /* absolute byte offset of first data block */
 	u64   data_blocks;
+	u64   csum_off;          /* A8: byte offset of the data-checksum region (0=none) */
+	u64   csum_blocks;       /* A8: blocks in the checksum region */
 	u64   rc_btree_root;     /* physical block of the refcount tree root, 0=empty */
 	u64   next_blk_hint;     /* AG-relative search start for block alloc */
 	u64   next_ino_hint;     /* AG-local search start for inode alloc */
@@ -552,6 +560,7 @@ struct ocsfs2_sb_info {
 	struct ocsfs2_ag_info *s_ags;    /* [0..s_ag_count), allocated [0..s_ag_capacity) */
 	u32   s_ag_capacity;             /* slots in s_ags (autogrow headroom) */
 	bool  s_growable;                /* COMPAT_AUTOGROW: uniform AGs, online-grow ok */
+	bool  s_datacsum;                /* A8: RO_COMPAT_DATACSUM — per-data-block CRC */
 	struct task_struct *s_grow_thread;
 	struct mutex s_grow_lock;        /* serialises online grow + geometry refresh */
 
@@ -767,6 +776,20 @@ int  ocsfs2_alloc_blocks(struct super_block *sb, u32 ag_hint, u32 count,
 			 u64 *block_out);
 void ocsfs2_free_blocks(struct super_block *sb, u64 block, u32 count);
 u64  ocsfs2_recompute_free(struct super_block *sb);   /* A4: true free from bitmap */
+
+/* A8 — per-data-block CRC32c checksums (csum.c); no-ops unless s_datacsum */
+void ocsfs2_csum_set(struct super_block *sb, u64 phys, u32 crc);  /* store */
+u32  ocsfs2_csum_read(struct super_block *sb, u64 phys);          /* 0 = unset */
+struct folio;
+struct iomap;
+struct bio;
+void ocsfs2_csum_folio_range(struct super_block *sb, struct folio *folio,
+			     u64 pos, unsigned int len, const struct iomap *iomap);
+void ocsfs2_csum_bio(struct super_block *sb, struct bio *bio);  /* O_DIRECT write */
+static inline u32 ocsfs2_data_crc(struct super_block *sb, const void *data)
+{
+	return ocsfs2_crc32c(~0U, data, sb->s_blocksize);
+}
 int  ocsfs2_fitrim(struct super_block *sb, struct fstrim_range *range);  /* D4 */
 
 /* D2 autonomous online autogrow */

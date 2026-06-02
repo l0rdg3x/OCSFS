@@ -292,12 +292,29 @@ static ssize_t ocsfs2_writeback_range(struct iomap_writepage_ctx *wpc,
 		return ret;
 	/* a dirty folio always has blocks allocated from the write path; a HOLE
 	 * here would just be skipped by iomap (Plan 2 has no punch/truncate race) */
+	/* A8: record per-block CRCs for the data hitting disk (no-op unless enabled) */
+	ocsfs2_csum_folio_range(wpc->inode->i_sb, folio, pos, len, &wpc->iomap);
 	return iomap_add_to_ioend(wpc, folio, pos, end_pos, len);
 }
 
 static const struct iomap_writeback_ops ocsfs2_writeback_ops = {
 	.writeback_range  = ocsfs2_writeback_range,
 	.writeback_submit = iomap_ioend_writeback_submit,
+};
+
+/* A8: O_DIRECT submit hook — checksum a write bio's blocks before submission
+ * (the user data is in the bio and final here), then submit normally. */
+static void ocsfs2_dio_submit(const struct iomap_iter *iter, struct bio *bio,
+			      loff_t file_offset)
+{
+	(void)file_offset;
+	if (op_is_write(bio_op(bio)))
+		ocsfs2_csum_bio(iter->inode->i_sb, bio);
+	submit_bio(bio);
+}
+
+static const struct iomap_dio_ops ocsfs2_dio_ops = {
+	.submit_io = ocsfs2_dio_submit,
 };
 
 static int ocsfs2_writepages(struct address_space *mapping,
@@ -337,7 +354,8 @@ ssize_t ocsfs2_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		ssize_t ret;
 
 		inode_lock_shared(inode);
-		ret = iomap_dio_rw(iocb, to, &ocsfs2_iomap_ops, NULL, 0, NULL, 0);
+		ret = iomap_dio_rw(iocb, to, &ocsfs2_iomap_ops, &ocsfs2_dio_ops,
+				   0, NULL, 0);
 		inode_unlock_shared(inode);
 		return ret;
 	}
@@ -355,7 +373,8 @@ ssize_t ocsfs2_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		goto out;
 
 	if (iocb->ki_flags & IOCB_DIRECT) {
-		ret = iomap_dio_rw(iocb, from, &ocsfs2_iomap_ops, NULL, 0, NULL, 0);
+		ret = iomap_dio_rw(iocb, from, &ocsfs2_iomap_ops, &ocsfs2_dio_ops,
+				   0, NULL, 0);
 		/* iomap_file_buffered_write extends i_size itself; iomap_dio_rw
 		 * does not — the FS owns it. For a synchronous O_DIRECT write
 		 * ki_pos is advanced to the end offset, so grow i_size to match. */

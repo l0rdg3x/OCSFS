@@ -207,6 +207,21 @@ ocsfs2-scrub /mnt/vmstore              # OCSFS_IOC_SCRUB; prints a summary
 The installer enables `ocsfs2-scrub.timer` (weekly) to scrub every mounted
 `ocsfs2` volume and log findings to the journal. See §8.
 
+### Data integrity (data checksums)
+
+Format with **`-C`** to enable per-data-block CRC32c checksums — silent-data-
+corruption detection that works on **any** SAN (not only one with its own
+integrity like ZFS). A CRC is stored on every write (buffered and O_DIRECT, kept
+coherent across nodes via CAW) and **verified by the scrub**, which now reads and
+checks every data block (`ocsfs2-scrub` / the weekly timer); a mismatch is logged
+as `DATA checksum mismatch at block N` and counted as a scrub error — restore the
+affected file from backup. Checksums follow the physical block, so reflink/
+snapshot/CoW stay correct. Opt-in (small space + per-write cost); existing
+volumes are unaffected. Caveats: detection is via the scrub (not yet inline on
+read — a follow-up); a crash mid-writeback can leave a block whose stored CRC
+doesn't match the un-written data (a benign false-positive a rewrite clears);
+and AGs added by online autogrow are not checksummed.
+
 ### Defragment (periodic + on-demand)
 
 Coalesces a file's extent map by relocating its **private** (non-shared) data
@@ -278,7 +293,7 @@ All tools accept `-h`/`--help`.
 ### `mkfs.ocsfs2` — create a filesystem
 
 ```
-mkfs.ocsfs2 [-f] -N <max-nodes> [-s <MiB>] <device>
+mkfs.ocsfs2 [-f] -N <max-nodes> [-s <MiB>] [-C] <device>
 ```
 Writes a fresh OCSFS v2 filesystem onto `<device>` (a whole disk/LUN or a
 partition). **Destroys existing data.**
@@ -288,6 +303,7 @@ partition). **Destroys existing data.**
 | `-N <n>` | maximum cluster nodes (lease/HB slots). `1` = single-node, no cluster services. **Required.** |
 | `-f` | force: overwrite an existing filesystem/signature |
 | `-s <MiB>` | format only the first *MiB* and rely on autogrow to extend later (thin initial layout) |
+| `-C` | **data checksums**: reserve a per-AG CRC32c region so silent data corruption is detectable on *any* SAN (see §7 *Data integrity*). Opt-in (small space + write overhead). |
 
 ```bash
 # 3-node clustered FS on the whole LUN:

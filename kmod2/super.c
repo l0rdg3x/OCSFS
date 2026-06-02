@@ -135,6 +135,8 @@ static int read_ag_headers(struct super_block *sb)
 		ai->data_off       = le64_to_cpu(dag->ag_data_off);
 		ai->data_blocks    = le64_to_cpu(dag->ag_data_blocks);
 		ai->rc_btree_root  = le64_to_cpu(dag->ag_rc_btree_root);
+		ai->csum_off       = le64_to_cpu(dag->ag_csum_off);
+		ai->csum_blocks    = le64_to_cpu(dag->ag_csum_blocks);
 
 		/* A6/S4: the AG header is CRC-valid but still attacker-/corruption-
 		 * controlled. Bound-check its geometry against the device before we use
@@ -157,7 +159,12 @@ static int read_ag_headers(struct super_block *sb)
 			    ai->inodes_per_ag > sbi->s_inodes_per_ag ||
 			    it_blk >= dev_blocks ||
 			    ai->data_off / sb->s_blocksize < ai->block_start ||
-			    ai->data_off / sb->s_blocksize >= dev_blocks) {
+			    ai->data_off / sb->s_blocksize >= dev_blocks ||
+			    (ai->csum_off &&                       /* A8 csum region */
+			     (ai->csum_off / sb->s_blocksize +
+			      ai->csum_blocks > dev_blocks ||
+			      ai->csum_blocks * (sb->s_blocksize / sizeof(__le32)) <
+			      ai->data_blocks))) {
 				pr_err("ocsfs2: AG%u geometry out of range\n", i);
 				brelse(bh);
 				return -EUCLEAN;
@@ -367,6 +374,16 @@ static int ocsfs2_fill_super(struct super_block *sb, struct fs_context *fc)
 	sbi->s_feat_compat   = le64_to_cpu(ds->s_feat_compat);
 	sbi->s_feat_incompat = le64_to_cpu(ds->s_feat_incompat);
 	sbi->s_feat_ro_compat = le64_to_cpu(ds->s_feat_ro_compat);
+	sbi->s_datacsum = (sbi->s_feat_ro_compat & OCSFS2_FEAT_RO_COMPAT_DATACSUM) != 0;
+	/* an unsupported ro_compat feature means we must not write (we'd corrupt its
+	 * on-disk state) — mount read-only, like ext4. */
+	if ((sbi->s_feat_ro_compat & ~OCSFS2_FEATURE_RO_COMPAT_SUPP) &&
+	    !sb_rdonly(sb)) {
+		pr_warn("ocsfs2: unsupported ro_compat features 0x%llx — mounting read-only\n",
+			(unsigned long long)(sbi->s_feat_ro_compat &
+					     ~OCSFS2_FEATURE_RO_COMPAT_SUPP));
+		sb->s_flags |= SB_RDONLY;
+	}
 	sbi->s_node_table_off = le64_to_cpu(ds->s_node_table_off);
 	sbi->s_heartbeat_off  = le64_to_cpu(ds->s_heartbeat_off);
 	sbi->s_lease_table_off = le64_to_cpu(ds->s_lease_table_off);

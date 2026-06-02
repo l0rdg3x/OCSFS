@@ -257,6 +257,7 @@ int main(int argc, char **argv)
 		if (le32toh(ag.ag_number) != i) ERR("AG%u number=%u\n", i, le32toh(ag.ag_number));
 		if (le64toh(ag.ag_block_start) != start) ERR("AG%u start %llu != %llu\n", i, (unsigned long long)le64toh(ag.ag_block_start), (unsigned long long)start);
 		if (le64toh(ag.ag_block_count) != expect_count) ERR("AG%u count %llu != %llu\n", i, (unsigned long long)le64toh(ag.ag_block_count), (unsigned long long)expect_count);
+		meta_blocks += le64toh(ag.ag_csum_blocks);   /* A8: csum region is metadata */
 
 		/* bitmap */
 		bm = malloc(bitmap_blocks * BS);

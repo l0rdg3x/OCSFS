@@ -143,9 +143,9 @@ was cleared.
 
 ### What's deferred (see [Known limitations](#️-known-limitations))
 
-- ⏳ per-**data-block** checksums — needs a format-v3 region + write hooks on
-  both the buffered and O_DIRECT paths; metadata is already fully checksummed and
-  the scrub verifies it
+- ✅ per-**data-block** checksums (opt-in `mkfs -C`) — per-physical-block CRC32c
+  in a per-AG region; stored on every write (buffered + O_DIRECT, cluster-coherent
+  via CAW), verified by the scrub on any SAN/cache mode; CoW/reflink-safe
 
 > **Inline compression is out of scope** (not a TODO): it breaks the iomap 1:1
 > logical↔physical mapping and O_DIRECT (`cache=none`, the Proxmox default), so it
@@ -336,7 +336,7 @@ destination node.
 |---|---|
 | **Maturity** | Alpha / research — not production-ready, AI-generated, unreviewed |
 | **Inline compression** | **Out of scope — not planned.** Transparent compression breaks the iomap 1:1 logical↔physical mapping and O_DIRECT (`cache=none`, the Proxmox default), and would require a parallel non-iomap data path that sacrifices hot-path integrity/performance — explicitly avoided. Space savings come from dedup + thin + discard instead. |
-| **Per-data-block checksums (Fase F)** | Not implemented. All **metadata** is CRC32c-checksummed and the online scrub verifies it; per-data-block checksums need a format-v3 per-AG region plus write hooks on both the buffered and O_DIRECT paths (a half-correct version would false-positive on every VM write). |
+| **Per-data-block checksums** | Available **opt-in** (`mkfs -C`): per-physical-block CRC32c in a per-AG region, stored on every write (buffered + O_DIRECT, cluster-coherent via CAW) and verified by the scrub on any SAN. Follow-ups: inline read-time reject (today the scrub detects + reports); checksumming AGs added by online autogrow. |
 | **Maturity of cluster paths** | The single-node data path is differentially validated (`fsx_diff.sh` vs XFS, 24/24 clean incl. clone/reflink) and `fsck`-clean. The multi-node coherence/recovery paths are validated on 2–3 nodes but have had less soak time than a production FS. |
 | **Metadata-op throughput under cross-node contention** | Namespace ops on a *shared* directory serialise on one metadata lease; fine for the VM-disk workload (rare namespace churn), not tuned for many nodes hammering one directory. The **data path is unaffected** (single-writer, no per-I/O CAW). |
 | **Concurrent evict-time free under cluster** | Concurrent delete+alloc across nodes is not yet fully coordinated at evict time (known follow-up). |

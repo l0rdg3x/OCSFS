@@ -19,8 +19,17 @@ validated on 3 nodes. **[FIX]** = worth doing, **[DISCARD]** = out of scope.
 - **S2** maintenance markers tamperable — FIXED (`a11a593`): root-only 0700 dir.
 - **S3** result-struct stack leak — VERIFIED clean (already memset).
 - **A7** inline compression — DISCARDED (out of scope).
-- **A8** per-data-block checksums — DEFERRED (optional, format-v3).
-- **S5** shared-disk single-trust-domain — documented assumption (by design).
+- **A8** per-data-block checksums — **DONE** (opt-in `mkfs -C`, RO_COMPAT_DATACSUM):
+  per-physical-block CRC32c in a per-AG region (`csum.c`); stored on every write
+  (buffered via writeback_range, O_DIRECT via the dio submit hook), cluster-
+  coherent via CAW; verified by the scrub (reads every data block — any SAN, any
+  cache mode, cross-node). CoW/reflink-safe (checksum follows the physical block).
+  Validated single-node + 2-node: `dd`-corrupt a block → scrub detects it; no
+  regression on non-`-C` volumes. Follow-ups: inline read-time reject (today the
+  scrub detects); checksum autogrow-added AGs; crash-mid-writeback false-positive.
+- **S5** shared-disk single-trust-domain — **DISCARDED** (won't fix in the FS):
+  inherent to shared-disk FSes; handled operationally — the LUN is exposed only
+  to authenticated initiators (iSCSI CHAP / FC zoning + LUN masking).
 
 The detailed analysis below is kept for reference.
 

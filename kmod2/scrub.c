@@ -109,6 +109,84 @@ static void scrub_xattr(struct super_block *sb, u64 blk,
 	brelse(bh);
 }
 
+/* A8: verify the stored CRC of every data block in an extent (skip unset=0) */
+static void scrub_data_extent(struct super_block *sb, u64 phys, u32 len,
+			      struct ocsfs2_scrub_result *res)
+{
+	u32 i;
+
+	for (i = 0; i < len; i++) {
+		u32 stored = ocsfs2_csum_read(sb, phys + i);
+		struct buffer_head *bh;
+		u32 crc;
+
+		if (!stored)
+			continue;
+		bh = ocsfs2_meta_bread(sb, phys + i);
+		if (!bh) { res->errors++; continue; }
+		crc = ocsfs2_data_crc(sb, bh->b_data);
+		res->checked++;
+		if (crc != stored) {
+			pr_warn("ocsfs2: scrub: DATA checksum mismatch at block %llu (have 0x%08x want 0x%08x)\n",
+				(unsigned long long)(phys + i), crc, stored);
+			res->errors++;
+		}
+		brelse(bh);
+		cond_resched();
+	}
+}
+
+/* walk an extent tree (or one leaf), verifying each record's data checksums */
+static void scrub_data_node(struct super_block *sb, u64 blk,
+			    struct ocsfs2_scrub_result *res, int depth)
+{
+	struct buffer_head *bh;
+	struct ocsfs2_disk_ext_node *n;
+	u16 level, nr, i;
+
+	if (!blk || depth > SCRUB_MAX_DEPTH)
+		return;
+	bh = ocsfs2_meta_bread(sb, blk);
+	if (!bh) { res->errors++; return; }
+	n = (struct ocsfs2_disk_ext_node *)bh->b_data;
+	if (le32_to_cpu(n->en_magic) != OCSFS2_EXT_NODE_MAGIC) { brelse(bh); return; }
+	level = le16_to_cpu(n->en_level);
+	nr = le16_to_cpu(n->en_nr);
+	if (level == 0) {
+		struct ocsfs2_disk_ext_rec *r = (void *)n->en_body;
+		u16 cap = sizeof(n->en_body) / sizeof(*r);
+
+		for (i = 0; i < nr && i < cap; i++)
+			scrub_data_extent(sb, le64_to_cpu(r[i].er_physical),
+					  le32_to_cpu(r[i].er_length), res);
+	} else {
+		struct ocsfs2_disk_ext_ptr *p = (void *)n->en_body;
+		u16 cap = sizeof(n->en_body) / sizeof(*p);
+
+		for (i = 0; i < nr && i < cap; i++)
+			scrub_data_node(sb, le64_to_cpu(p[i].ep_child), res, depth + 1);
+	}
+	brelse(bh);
+}
+
+/* A8: verify all data-block checksums of a regular file */
+static void scrub_data_inode(struct super_block *sb, struct ocsfs2_disk_inode *in,
+			     struct ocsfs2_scrub_result *res)
+{
+	if (!OCSFS2_SB(sb)->s_datacsum || !S_ISREG(le16_to_cpu(in->i_mode)))
+		return;
+	if (in->i_extent_tree_root) {
+		scrub_data_node(sb, le64_to_cpu(in->i_extent_tree_root), res, 0);
+	} else {
+		struct ocsfs2_disk_extent *de = (void *)in->i_inline_extents;
+		u16 n = le16_to_cpu(in->i_extent_count), i;
+
+		for (i = 0; i < n && i < OCSFS2_INLINE_EXTENTS; i++)
+			scrub_data_extent(sb, le64_to_cpu(de[i].e_physical),
+					  le32_to_cpu(de[i].e_length), res);
+	}
+}
+
 int ocsfs2_scrub(struct super_block *sb, struct ocsfs2_scrub_result *res)
 {
 	struct ocsfs2_sb_info *sbi = OCSFS2_SB(sb);
@@ -186,6 +264,7 @@ int ocsfs2_scrub(struct super_block *sb, struct ocsfs2_scrub_result *res)
 				}
 				scrub_ext_node(sb, le64_to_cpu(in->i_extent_tree_root), res, 0);
 				scrub_xattr(sb, le64_to_cpu(in->i_xattr_block), res);
+				scrub_data_inode(sb, in, res);   /* A8 data checksums */
 			}
 			brelse(bh);
 			cond_resched();
