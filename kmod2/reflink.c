@@ -265,6 +265,19 @@ long ocsfs2_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		if (!capable(CAP_SYS_ADMIN))
 			return -EPERM;
 		return ocsfs2_grow_check(file_inode(file)->i_sb, true);
+	case OCSFS_IOC_SCRUB: {            /* D5: online metadata scrub */
+		struct ocsfs2_scrub_result res;
+		int ret;
+
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+		ret = ocsfs2_scrub(file_inode(file)->i_sb, &res);
+		if (ret && ret != -EUCLEAN)
+			return ret;             /* hard error; not a scrub finding */
+		if (copy_to_user((void __user *)arg, &res, sizeof(res)))
+			return -EFAULT;
+		return 0;                       /* findings are reported in res.errors */
+	}
 	case FITRIM: {                      /* D4: thin-reclaim via SCSI UNMAP */
 		struct super_block *sb = file_inode(file)->i_sb;
 		struct fstrim_range range;

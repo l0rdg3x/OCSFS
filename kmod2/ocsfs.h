@@ -388,6 +388,18 @@ static_assert(sizeof(struct ocsfs2_disk_ext_node) == 4096, "ext_node 4096");
  * after a SAN LUN resize). Same work the autonomous grow thread does. */
 #define OCSFS_IOC_GROWFS       _IO('O', 0x02)
 
+/* OCSFS_IOC_SCRUB: online metadata scrub — verify every on-disk checksum
+ * (super, AG headers, used inodes, extent/refcount B+tree nodes, xattr blocks)
+ * across the live filesystem, reading coherently. Read-only; reports counts. */
+struct ocsfs2_scrub_result {
+	__u64 checked;     /* structures verified */
+	__u64 errors;      /* checksum / magic failures */
+	__u64 inodes;      /* used inodes scanned */
+	__u32 ag_count;
+	__u32 flags;       /* reserved (0) */
+};
+#define OCSFS_IOC_SCRUB        _IOWR('O', 0x03, struct ocsfs2_scrub_result)
+
 /* reservation unit sizes used by mkfs to size the cluster regions */
 #define OCSFS2_NODE_SLOT_SIZE   256
 #define OCSFS2_HEARTBEAT_SIZE   256
@@ -748,6 +760,9 @@ int  ocsfs2_fitrim(struct super_block *sb, struct fstrim_range *range);  /* D4 *
 int  ocsfs2_grow_check(struct super_block *sb, bool force);
 int  ocsfs2_grow_start(struct super_block *sb);
 void ocsfs2_grow_stop(struct super_block *sb);
+
+/* D5 online metadata scrub */
+int  ocsfs2_scrub(struct super_block *sb, struct ocsfs2_scrub_result *res);
 
 /* refcount.c — per-AG reflink/snapshot refcount tree (Plan 4) */
 u32  ocsfs2_refcount_get(struct super_block *sb, u64 phys);
