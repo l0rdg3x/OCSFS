@@ -733,6 +733,7 @@ int  ocsfs2_ext_tree_truncate_from(struct inode *inode, u64 from_block);
 void ocsfs2_ext_tree_free_all(struct inode *inode);   /* evict: free data + nodes */
 int  ocsfs2_extent_spill(struct inode *inode, u64 logical, u64 phys, u32 len,
 			 u16 flags);   /* migrate inline -> tree, then insert */
+int  ocsfs2_extent_spill_only(struct inode *inode); /* migrate inline -> tree */
 
 /* iomap.c — file data path */
 extern const struct address_space_operations ocsfs2_file_aops;

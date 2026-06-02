@@ -821,8 +821,17 @@ int ocsfs2_extent_remap_range(struct inode *inode, u64 logical, u32 len,
 		left  = (u32)(logical - e->logical);
 		right = (u32)(e_end - end);
 		pieces = (left ? 1 : 0) + 1 + (right ? 1 : 0);
-		if (oi->i_extent_count + (pieces - 1) > OCSFS2_INLINE_EXTENTS)
-			return -ENOSPC;
+		if (oi->i_extent_count + (pieces - 1) > OCSFS2_INLINE_EXTENTS) {
+			/* inline map full: spill to the B+tree and redo the remap
+			 * there (the tree splits without limit) instead of failing
+			 * with a spurious -ENOSPC on a fragmented file. */
+			int sret = ocsfs2_extent_spill_only(inode);
+
+			if (sret)
+				return sret;
+			return ocsfs2_ext_tree_remap_range(inode, logical, len,
+							   new_phys, new_flags);
+		}
 
 		orig = *e;
 		memmove(&ex[i + pieces], &ex[i + 1],
@@ -886,8 +895,19 @@ int ocsfs2_extent_punch_range(struct inode *inode, u64 lblk, u64 end)
 			u32 head = (u32)(lblk - e->logical);
 			u32 holelen = (u32)(end - lblk);
 
-			if (oi->i_extent_count >= OCSFS2_INLINE_EXTENTS)
-				return -ENOSPC;
+			if (oi->i_extent_count >= OCSFS2_INLINE_EXTENTS) {
+				/* mid-extent punch needs an extra slot and the
+				 * inline map is full: spill to the B+tree (no
+				 * extents freed yet — a straddling extent is the
+				 * only one in [lblk,end)) and redo the punch there
+				 * rather than returning a spurious -ENOSPC. */
+				int sret = ocsfs2_extent_spill_only(inode);
+
+				if (sret)
+					return sret;
+				return ocsfs2_ext_tree_punch_range(inode, lblk,
+								   end);
+			}
 			ocsfs2_free_blocks_rc(sb, e->physical + head, holelen);
 			inode->i_blocks -= (u64)holelen * spb;
 			memmove(e + 1, e, (oi->i_extent_count - i) * sizeof(*e));

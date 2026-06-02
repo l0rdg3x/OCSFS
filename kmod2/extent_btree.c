@@ -424,6 +424,44 @@ done:
 	return ret;
 }
 
+/* Migrate the 16 inline extents into a fresh leaf and switch the inode to tree
+ * mode WITHOUT inserting a record. Lets the punch/remap split paths grow past
+ * the inline slot limit (they would otherwise fail with a spurious -ENOSPC on a
+ * heavily fragmented file even with the volume nearly empty). After this the
+ * extent count is effectively unbounded — same as the write/insert path which
+ * already spills via ocsfs2_extent_spill. */
+int ocsfs2_extent_spill_only(struct inode *inode)
+{
+	struct super_block *sb = inode->i_sb;
+	struct ocsfs2_inode_info *oi = OCSFS2_I(inode);
+	struct buffer_head *bh;
+	struct ocsfs2_disk_ext_node *n;
+	u64 root;
+	int ret;
+	u16 i;
+	TREE_TXN_BEGIN(sb);
+
+	ret = node_alloc(inode, 0, &bh);
+	if (ret)
+		goto done;
+	n = (struct ocsfs2_disk_ext_node *)bh->b_data;
+	for (i = 0; i < oi->i_extent_count; i++)
+		rec_store(&RECS(n)[i], oi->i_extents[i].logical,
+			  oi->i_extents[i].physical, oi->i_extents[i].length,
+			  oi->i_extents[i].flags);
+	n->en_nr = cpu_to_le16(oi->i_extent_count);
+	root = node_blk(bh);
+	node_finish(sb, bh);
+	brelse(bh);
+
+	oi->i_extent_tree_root = root;
+	oi->i_extent_count = 0;             /* inline now empty; tree authoritative */
+	ret = ocsfs2_write_inode_block(inode);
+done:
+	TREE_TXN_END(inode, ret);
+	return ret;
+}
+
 /* ── descend to the leaf covering @lblk (no split); returns held bh ── */
 static struct buffer_head *leaf_for(struct inode *inode, u64 lblk)
 {
