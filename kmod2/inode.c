@@ -9,6 +9,7 @@
 #include "ocsfs.h"
 #include <linux/writeback.h>
 #include <linux/mpage.h>
+#include <linux/iomap.h>
 #include <linux/time.h>
 
 struct kmem_cache *ocsfs2_inode_cachep;
@@ -312,13 +313,18 @@ void ocsfs2_evict_inode(struct inode *inode)
 	truncate_inode_pages_final(&inode->i_data);
 
 	if (freeing && !is_bad_inode(inode)) {
-		/* free data blocks held by inline extents (refcount-aware: a shared
-		 * reflink/snapshot block is only released at refcount 0), then the
-		 * inode number */
-		for (i = 0; i < oi->i_extent_count; i++)
-			ocsfs2_free_blocks_rc(inode->i_sb, oi->i_extents[i].physical,
-					      oi->i_extents[i].length);
-		oi->i_extent_count = 0;
+		/* free data blocks (refcount-aware: a shared reflink/snapshot block
+		 * is only released at refcount 0) from the tree or inline map, then
+		 * the xattr block and the inode number */
+		if (oi->i_extent_tree_root) {
+			ocsfs2_ext_tree_free_all(inode);
+		} else {
+			for (i = 0; i < oi->i_extent_count; i++)
+				ocsfs2_free_blocks_rc(inode->i_sb,
+						      oi->i_extents[i].physical,
+						      oi->i_extents[i].length);
+			oi->i_extent_count = 0;
+		}
 		ocsfs2_xattr_free(inode);   /* release the xattr/ACL block */
 	}
 
@@ -530,6 +536,9 @@ int ocsfs2_extent_find(struct inode *inode, u64 lblk,
 	u64 next = U64_MAX;
 	u16 i;
 
+	if (oi->i_extent_tree_root)
+		return ocsfs2_ext_tree_find(inode, lblk, cover, next_logical);
+
 	for (i = 0; i < oi->i_extent_count; i++) {
 		struct ocsfs2_extent *e = &oi->i_extents[i];
 
@@ -565,6 +574,9 @@ int ocsfs2_extent_insert(struct inode *inode, u64 logical, u64 phys,
 	struct ocsfs2_inode_info *oi = OCSFS2_I(inode);
 	struct ocsfs2_extent *ex = oi->i_extents;
 	u16 pos;
+
+	if (oi->i_extent_tree_root)
+		return ocsfs2_ext_tree_insert(inode, logical, phys, len, flags);
 
 	/* find insertion position (first extent with logical > new logical) */
 	for (pos = 0; pos < oi->i_extent_count; pos++)
@@ -606,11 +618,8 @@ int ocsfs2_extent_insert(struct inode *inode, u64 logical, u64 phys,
 		}
 	}
 	/* insert a new extent at pos */
-	if (oi->i_extent_count >= OCSFS2_INLINE_EXTENTS) {
-		pr_warn_ratelimited("ocsfs2: inode %llu: >%u extents (B+tree spill is Plan 2b)\n",
-				    oi->i_disk_ino, OCSFS2_INLINE_EXTENTS);
-		return -ENOSPC;
-	}
+	if (oi->i_extent_count >= OCSFS2_INLINE_EXTENTS)
+		return ocsfs2_extent_spill(inode, logical, phys, len, flags);
 	memmove(&ex[pos + 1], &ex[pos],
 		(oi->i_extent_count - pos) * sizeof(*ex));
 	ex[pos].logical = logical;
@@ -629,6 +638,15 @@ void ocsfs2_extent_truncate_from(struct inode *inode, u64 from_block)
 	struct ocsfs2_extent *ex = oi->i_extents;
 	u32 spb = sb->s_blocksize / 512;
 	u16 i = 0;
+
+	if (oi->i_extent_tree_root) {
+		int ret = ocsfs2_ext_tree_truncate_from(inode, from_block);
+
+		if (ret)
+			pr_err_ratelimited("ocsfs2: inode %llu: tree truncate %d\n",
+					   oi->i_disk_ino, ret);
+		return;
+	}
 
 	while (i < oi->i_extent_count) {
 		struct ocsfs2_extent *e = &ex[i];
@@ -663,6 +681,10 @@ int ocsfs2_extent_update_phys(struct inode *inode, u64 logical, u32 len,
 	struct ocsfs2_inode_info *oi = OCSFS2_I(inode);
 	u16 i;
 
+	if (oi->i_extent_tree_root)
+		return ocsfs2_ext_tree_update_phys(inode, logical, len,
+						   new_phys, flags);
+
 	for (i = 0; i < oi->i_extent_count; i++) {
 		struct ocsfs2_extent *e = &oi->i_extents[i];
 
@@ -688,6 +710,10 @@ int ocsfs2_extent_remap_range(struct inode *inode, u64 logical, u32 len,
 	struct ocsfs2_extent *ex = oi->i_extents;
 	u64 end = logical + len;
 	u16 i;
+
+	if (oi->i_extent_tree_root)
+		return ocsfs2_ext_tree_remap_range(inode, logical, len,
+						   new_phys, new_flags);
 
 	for (i = 0; i < oi->i_extent_count; i++) {
 		struct ocsfs2_extent *e = &ex[i];
@@ -743,6 +769,9 @@ int ocsfs2_extent_punch_range(struct inode *inode, u64 lblk, u64 end)
 	struct super_block *sb = inode->i_sb;
 	u32 spb = sb->s_blocksize / 512;
 	u16 i = 0;
+
+	if (oi->i_extent_tree_root)
+		return ocsfs2_ext_tree_punch_range(inode, lblk, end);
 
 	while (i < oi->i_extent_count) {
 		struct ocsfs2_extent *e = &oi->i_extents[i];
@@ -847,11 +876,22 @@ int ocsfs2_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 
 	if ((attr->ia_valid & ATTR_SIZE) && attr->ia_size != inode->i_size) {
 		loff_t oldsize = inode->i_size;
+		u32 bs = inode->i_sb->s_blocksize;
+
+		/* Shrinking to a non-block-aligned size: zero the partial tail of
+		 * the last kept block ON DISK, else a later grow + cold read would
+		 * expose the stale bytes beyond the new EOF (the v1 truncate-tail
+		 * bug). iomap_truncate_page dirties the folio so writeback persists. */
+		if (attr->ia_size < oldsize && (attr->ia_size & (bs - 1))) {
+			ret = iomap_truncate_page(inode, attr->ia_size, NULL,
+						  &ocsfs2_iomap_ops, NULL, NULL);
+			if (ret)
+				return ret;
+		}
 
 		truncate_setsize(inode, attr->ia_size);   /* sets i_size, trims cache */
 		if (attr->ia_size < oldsize) {
-			u64 from = DIV_ROUND_UP_ULL(attr->ia_size,
-						   inode->i_sb->s_blocksize);
+			u64 from = DIV_ROUND_UP_ULL(attr->ia_size, bs);
 
 			mutex_lock(&OCSFS2_I(inode)->i_meta_lock);
 			ocsfs2_extent_truncate_from(inode, from);

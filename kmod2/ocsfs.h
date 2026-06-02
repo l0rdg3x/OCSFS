@@ -41,6 +41,7 @@
 #define OCSFS2_NODE_MAGIC     0x4E4F4432u   /* 'NOD2' */
 #define OCSFS2_RC_NODE_MAGIC  0x52434E32u   /* 'RCN2' — refcount btree node */
 #define OCSFS2_XATTR_MAGIC    0x58415432u   /* 'XAT2' — extended attr block */
+#define OCSFS2_EXT_NODE_MAGIC 0x45584E32u   /* 'EXN2' — extent btree node */
 
 #define OCSFS2_VERSION_MAJOR  2
 #define OCSFS2_VERSION_MINOR  0
@@ -324,6 +325,38 @@ struct ocsfs2_disk_xattr_header {
 static_assert(sizeof(struct ocsfs2_disk_xattr_header) == 16, "xattr_header 16");
 #define OCSFS2_XATTR_SPACE  (OCSFS2_BLOCK_SIZE - sizeof(struct ocsfs2_disk_xattr_header))
 
+/* ── extent B+tree (large/fragmented files, Plan 2b) ──
+ * When an inode's inline extents (16) overflow, the whole map spills to a
+ * per-inode B+tree rooted at i_extent_tree_root. Leaf nodes (level 0) hold
+ * sorted extent records; internal nodes hold {min_logical, child} pointers.
+ * Each node is one 4 KiB CoW-journaled metadata block. */
+struct ocsfs2_disk_ext_rec {         /* 24 — a leaf extent record */
+	__le64  er_logical;
+	__le64  er_physical;
+	__le32  er_length;
+	__le16  er_flags;
+	__le16  er_pad;
+} __packed;
+static_assert(sizeof(struct ocsfs2_disk_ext_rec) == 24, "ext_rec 24");
+
+struct ocsfs2_disk_ext_ptr {         /* 16 — an internal child pointer */
+	__le64  ep_logical;          /* lowest logical block in the child */
+	__le64  ep_child;            /* child node block number */
+} __packed;
+static_assert(sizeof(struct ocsfs2_disk_ext_ptr) == 16, "ext_ptr 16");
+
+#define OCSFS2_EXT_LEAF_MAX  169     /* 169 * 24 = 4056 <= 4076 */
+#define OCSFS2_EXT_INT_MAX   254     /* 254 * 16 = 4064 <= 4076 */
+struct ocsfs2_disk_ext_node {        /* one 4096-byte metadata block */
+	__le32  en_magic;            /* OCSFS2_EXT_NODE_MAGIC */
+	__le16  en_level;            /* 0 = leaf, >0 = internal */
+	__le16  en_nr;               /* number of records / pointers */
+	__le64  en_next;             /* leaf chain: next leaf block (0 = last) */
+	__u8    en_body[4076];       /* ext_rec[] (leaf) or ext_ptr[] (internal) */
+	__le32  en_checksum;         /* crc32c(~0, [0..4091]) */
+} __packed;
+static_assert(sizeof(struct ocsfs2_disk_ext_node) == 4096, "ext_node 4096");
+
 /* ── reflink/snapshot ioctl ──
  * OCSFS_IOC_SNAP_CREATE: called on a regular-file fd; arg points at a
  * NUL-terminated name (<= OCSFS2_MAX_NAME) for a point-in-time reflink copy
@@ -602,6 +635,22 @@ void ocsfs2_extent_truncate_from(struct inode *inode, u64 from_block);
 /* Discard in-core extent map / size and re-read it from the on-disk inode
  * (used to roll back after a failed reflink whose journal txn was aborted). */
 void ocsfs2_reload_extents(struct inode *inode);
+
+/* extent_btree.c — spilled extent map for large/fragmented files (Plan 2b).
+ * Active when i_extent_tree_root != 0; the inode.c extent ops dispatch here. */
+int  ocsfs2_ext_tree_find(struct inode *inode, u64 lblk,
+			  struct ocsfs2_extent *cover, u64 *next_logical);
+int  ocsfs2_ext_tree_insert(struct inode *inode, u64 logical, u64 phys,
+			    u32 len, u16 flags);
+int  ocsfs2_ext_tree_update_phys(struct inode *inode, u64 logical, u32 len,
+				 u64 new_phys, u16 flags);
+int  ocsfs2_ext_tree_remap_range(struct inode *inode, u64 logical, u32 len,
+				 u64 new_phys, u16 new_flags);
+int  ocsfs2_ext_tree_punch_range(struct inode *inode, u64 lblk, u64 end);
+int  ocsfs2_ext_tree_truncate_from(struct inode *inode, u64 from_block);
+void ocsfs2_ext_tree_free_all(struct inode *inode);   /* evict: free data + nodes */
+int  ocsfs2_extent_spill(struct inode *inode, u64 logical, u64 phys, u32 len,
+			 u16 flags);   /* migrate inline -> tree, then insert */
 
 /* iomap.c — file data path */
 extern const struct address_space_operations ocsfs2_file_aops;

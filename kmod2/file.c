@@ -14,7 +14,10 @@
 #include <linux/align.h>
 #include <linux/pagemap.h>
 
-/* ── preallocate: reserve blocks as UNWRITTEN over [offset, offset+len) ── */
+/* ── preallocate: reserve WRITTEN blocks over [offset, offset+len), zeroed on
+ * disk so they read back as zero. (We deliberately avoid UNWRITTEN extents:
+ * the unwritten->written conversion was a data-integrity hazard under mixed
+ * O_DIRECT/buffered I/O. Trade-off: fallocate is not thin — holes still are.) */
 static int ocsfs2_preallocate(struct inode *inode, loff_t offset, loff_t len,
 			      int mode)
 {
@@ -45,8 +48,17 @@ static int ocsfs2_preallocate(struct inode *inode, loff_t offset, loff_t len,
 		}
 		if (ret)
 			break;
+		/* zero the reserved blocks on disk before mapping them */
+		ret = blkdev_issue_zeroout(inode->i_sb->s_bdev,
+					   phys * (u64)(bs >> 9),
+					   (u64)want * (bs >> 9), GFP_NOFS,
+					   BLKDEV_ZERO_NOUNMAP);
+		if (ret) {
+			ocsfs2_free_blocks(inode->i_sb, phys, want);
+			break;
+		}
 		ret = ocsfs2_extent_insert(inode, lblk, phys, want,
-					   OCSFS2_EXT_UNWRITTEN);
+					   OCSFS2_EXT_WRITTEN);
 		if (ret) {
 			ocsfs2_free_blocks(inode->i_sb, phys, want);
 			break;
