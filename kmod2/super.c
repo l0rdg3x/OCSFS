@@ -327,29 +327,30 @@ static int ocsfs2_fill_super(struct super_block *sb, struct fs_context *fc)
 		sbi->s_clustered = ctx && ctx->cluster && sbi->s_max_nodes > 1;
 	}
 
-	/* Bring up the journal and replay any committed-but-uncheckpointed txn
-	 * BEFORE reading AG headers / the root inode, so we read consistent
-	 * metadata. */
+	/* L3: join the cluster (claim our node slot) BEFORE the journal, so the
+	 * journal uses our own per-node region (journal[self_slot]). No-op unless
+	 * mounted -o cluster on a -N volume. */
+	ret = ocsfs2_cluster_init(sb);
+	if (ret)
+		goto fail_sbh;
+
+	/* Bring up the (per-node) journal and replay any committed-but-
+	 * uncheckpointed txn BEFORE reading AG headers / the root inode. */
 	if (!sb_rdonly(sb)) {
 		ret = ocsfs2_journal_init(sb);
 		if (ret) {
 			pr_err("ocsfs2: journal init failed: %d\n", ret);
-			goto fail_sbh;
+			goto fail_cluster;
 		}
 		ret = ocsfs2_journal_replay(sb);
 		if (ret) {
 			pr_err("ocsfs2: journal replay failed: %d\n", ret);
 			ocsfs2_journal_exit(sb);
-			goto fail_sbh;
+			goto fail_cluster;
 		}
 	}
 
 	ret = read_ag_headers(sb);
-	if (ret)
-		goto fail_journal;
-
-	/* L3: join the cluster (no-op unless mounted -o cluster on a -N volume) */
-	ret = ocsfs2_cluster_init(sb);
 	if (ret)
 		goto fail_journal;
 
@@ -377,16 +378,25 @@ static int ocsfs2_fill_super(struct super_block *sb, struct fs_context *fc)
 		goto fail_journal;
 	}
 
+	/* L3: now fully mounted — start heartbeating so peers see us alive */
+	ret = ocsfs2_cluster_start(sb);
+	if (ret) {
+		dput(sb->s_root);
+		sb->s_root = NULL;
+		goto fail_journal;
+	}
+
 	pr_info("ocsfs2: mounted %s (%u AGs, %llu blocks)\n",
 		sb->s_id, sbi->s_ag_count,
 		(unsigned long long)sbi->s_total_blocks);
 	return 0;
 
 fail_journal:
-	ocsfs2_cluster_exit(sb);   /* no-op if the cluster never came up */
 	ocsfs2_journal_exit(sb);
 	kvfree(sbi->s_ags);
 	sbi->s_ags = NULL;
+fail_cluster:
+	ocsfs2_cluster_exit(sb);   /* stops heartbeat + releases slot if joined */
 fail_sbh:
 	if (sbi->s_sbh)
 		brelse(sbi->s_sbh);

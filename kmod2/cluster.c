@@ -342,19 +342,10 @@ int ocsfs2_cluster_init(struct super_block *sb)
 	}
 	sbi->s_node_slot = c->self_slot;
 	sbi->s_mount_gen = c->mount_gen;
-
-	c->hb_thread = kthread_run(hb_thread_fn, sb, "ocsfs2-hb/%s", sb->s_id);
-	if (IS_ERR(c->hb_thread)) {
-		ret = PTR_ERR(c->hb_thread);
-		c->hb_thread = NULL;
-		goto fail_slot;
-	}
-	pr_info("ocsfs2: cluster up — slot %u, gen %u, %u max nodes\n",
+	pr_info("ocsfs2: cluster joined — slot %u, gen %u, %u max nodes\n",
 		c->self_slot, c->mount_gen, c->max_nodes);
-	return 0;
+	return 0;       /* heartbeat starts later, after journal/root are up */
 
-fail_slot:
-	/* best-effort release of the claimed slot */
 fail_pr:
 	ocsfs2_pr_unregister(sb);
 fail_clear:
@@ -363,6 +354,25 @@ fail:
 	kfree(c->peers);
 	kfree(c);
 	return ret;
+}
+
+/* Start the heartbeat — called once the journal/AGs/root are up so peers only
+ * see us alive when we are fully mounted. */
+int ocsfs2_cluster_start(struct super_block *sb)
+{
+	struct ocsfs2_cluster *c = OCSFS2_SB(sb)->s_cluster;
+
+	if (!c)
+		return 0;
+	c->hb_thread = kthread_run(hb_thread_fn, sb, "ocsfs2-hb/%s", sb->s_id);
+	if (IS_ERR(c->hb_thread)) {
+		int ret = PTR_ERR(c->hb_thread);
+
+		c->hb_thread = NULL;
+		return ret;
+	}
+	pr_info("ocsfs2: cluster up — heartbeat running (slot %u)\n", c->self_slot);
+	return 0;
 }
 
 void ocsfs2_cluster_exit(struct super_block *sb)

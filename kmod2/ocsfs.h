@@ -805,7 +805,8 @@ int  ocsfs2_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 
 /* cluster.c — L3 membership: node-slot claim, heartbeat, cluster_ops.
  * No-op (returns 0, leaves s_cluster NULL) when the volume is single-node. */
-int  ocsfs2_cluster_init(struct super_block *sb);
+int  ocsfs2_cluster_init(struct super_block *sb);   /* join: claim slot, PR (no hb) */
+int  ocsfs2_cluster_start(struct super_block *sb);  /* start the heartbeat */
 void ocsfs2_cluster_exit(struct super_block *sb);
 /* True iff the peer owning @slot at @gen is currently alive (per L3). */
 bool ocsfs2_node_alive(struct super_block *sb, u16 slot, u32 gen);

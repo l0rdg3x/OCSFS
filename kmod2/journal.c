@@ -77,8 +77,11 @@ int ocsfs2_journal_init(struct super_block *sb)
 	struct buffer_head *bh;
 	u32 crc;
 
+	/* each node uses its own per-slot journal region (slot 0 single-node) */
+	u16 slot = sbi->s_cluster ? sbi->s_cluster->self_slot : 0;
+
 	j->j_sb = sb;
-	j->j_off = sbi->s_journal_off;
+	j->j_off = sbi->s_journal_off + (u64)slot * sbi->s_journal_size;
 	j->j_first_blk = j->j_off / sb->s_blocksize;
 	j->j_blocks = sbi->s_journal_size / sb->s_blocksize;
 	if (j->j_blocks < 4)
