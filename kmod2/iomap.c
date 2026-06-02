@@ -18,6 +18,7 @@
 #include <linux/sched/mm.h>
 #include <linux/bio.h>
 #include <linux/fs.h>
+#include <linux/splice.h>
 
 /* OCSFS2_ALLOC_CAP_BLOCKS lives in ocsfs.h (shared with fallocate). */
 
@@ -404,6 +405,16 @@ static const struct vm_operations_struct ocsfs2_file_vm_ops = {
 	.page_mkwrite = ocsfs2_page_mkwrite,
 };
 
+/* copy_file_range: byte-granular server-side copy. We go through the generic
+ * splice helper (read + buffered write) so unaligned ranges work; block-aligned
+ * fast cloning is available separately via FICLONE (->remap_file_range). */
+static ssize_t ocsfs2_copy_file_range(struct file *in, loff_t pos_in,
+				      struct file *out, loff_t pos_out,
+				      size_t len, unsigned int flags)
+{
+	return splice_copy_file_range(in, pos_in, out, pos_out, len);
+}
+
 static int ocsfs2_file_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	/* Cluster: a shared-writable mmap would need an EX lease re-check on every
@@ -428,6 +439,7 @@ const struct file_operations ocsfs2_file_fops = {
 	.fallocate        = ocsfs2_fallocate,        /* prealloc / punch / zero */
 	.splice_read      = filemap_splice_read,
 	.splice_write     = iter_file_splice_write,
+	.copy_file_range  = ocsfs2_copy_file_range,  /* splice; reflink is FICLONE */
 	.unlocked_ioctl   = ocsfs2_ioctl,           /* OCSFS_IOC_SNAP_CREATE */
 	.remap_file_range = ocsfs2_remap_file_range, /* FICLONE / cp --reflink */
 };
