@@ -275,6 +275,40 @@ and the full validation scripts.
 
 ---
 
+## 🖥️ Proxmox VE
+
+A one-step installer builds and wires everything on a node — kernel module,
+on-disk tools, mount helper, and the PVE storage plugin:
+
+```bash
+sudo ./proxmox2/install.sh        # run on EACH node; re-run after a kernel upgrade
+```
+
+It builds `ocsfs2.ko` into `/lib/modules/$(uname -r)/extra` (+`depmod`), installs
+`/usr/sbin/{mkfs,fsck}.ocsfs2` and `/sbin/mount.ocsfs2`, and — on a PVE node —
+the `PVE::Storage::Custom::OCSFS2Plugin` storage plugin. Then:
+
+```bash
+# format the shared LUN once, from a single node:
+mkfs.ocsfs2 -L vmstore -N 3 -f /dev/disk/by-id/<your-lun>
+```
+```ini
+# /etc/pve/storage.cfg  (or via the GUI once the plugin loads)
+ocsfs2: vmstore
+    path /mnt/pve/vmstore
+    device /dev/disk/by-id/<your-lun>
+    content images,iso,vztmpl,backup,rootdir,snippets
+    cluster 1
+    shared 1
+```
+
+The plugin owns the clustered mount/unmount, prefers **reflink** for fast VM
+clones, and supports every PVE content type. **Live migration** needs no data
+copy — it *is* the OCSFS write-ownership lease handing off from source to
+destination node.
+
+---
+
 ## ⚠️ Known limitations
 
 | Area | Status |
@@ -296,6 +330,7 @@ ocsfs/
 ├── kmod2/      OCSFS v2 kernel module (C, GPL-2.0) — single-writer ownership
 │   └── transport/scsi_pr.c   SCSI-3 PR + Compare-And-Write
 ├── tools2/     mkfs.ocsfs2, fsck.ocsfs2 (authoritative on-disk format)
+├── proxmox2/   PVE storage plugin + mount helper + one-step install.sh
 ├── tests/v2/   single-node + real-cluster validation scripts
 ├── docs/       design-v2.md (spec), admin/developer guides, plans/
 ├── kmod/ tools/ ...   v1 (superseded; kept for reference on `main`)

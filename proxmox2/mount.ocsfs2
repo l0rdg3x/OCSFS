@@ -1,0 +1,23 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# mount.ocsfs2 — mount(8) helper for OCSFS v2.
+# Lets `mount -t ocsfs2 ...` and fstab entries work by ensuring the (out-of-tree)
+# module is loaded first, then doing the real mount. Invoked automatically by
+# mount(8) as /sbin/mount.ocsfs2.
+#
+# usage (as called by mount):  mount.ocsfs2 <device> <dir> [-o opts]
+set -e
+modprobe ocsfs2 2>/dev/null || true
+dev="$1"; dir="$2"; shift 2 || true
+opts=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) opts="$2"; shift 2 ;;
+        *)  shift ;;
+    esac
+done
+if [ -n "$opts" ]; then
+    exec mount -i -t ocsfs2 -o "$opts" "$dev" "$dir"
+else
+    exec mount -i -t ocsfs2 "$dev" "$dir"
+fi
