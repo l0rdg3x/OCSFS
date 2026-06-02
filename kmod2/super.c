@@ -135,6 +135,34 @@ static int read_ag_headers(struct super_block *sb)
 		ai->data_off       = le64_to_cpu(dag->ag_data_off);
 		ai->data_blocks    = le64_to_cpu(dag->ag_data_blocks);
 		ai->rc_btree_root  = le64_to_cpu(dag->ag_rc_btree_root);
+
+		/* A6/S4: the AG header is CRC-valid but still attacker-/corruption-
+		 * controlled. Bound-check its geometry against the device before we use
+		 * it to compute block addresses or size allocations (else a crafted
+		 * header could drive out-of-range I/O or a huge kvmalloc / OOM). */
+		{
+			u64 dev_blocks = bdev_nr_bytes(sb->s_bdev) / sb->s_blocksize;
+			u64 bm_blk = ai->bitmap_off / sb->s_blocksize;
+			u64 it_blk = ai->inode_table_off / sb->s_blocksize;
+			u64 bpb = (u64)sb->s_blocksize * 8;
+
+			if (ai->block_count == 0 ||
+			    ai->block_count > sbi->s_ag_blocks ||
+			    ai->block_start + ai->block_count > dev_blocks ||
+			    ai->bitmap_blocks == 0 ||
+			    ai->bitmap_blocks > sbi->s_ag_blocks ||
+			    ai->bitmap_blocks * bpb < ai->block_count ||
+			    bm_blk + ai->bitmap_blocks > dev_blocks ||
+			    ai->inodes_per_ag == 0 ||
+			    ai->inodes_per_ag > sbi->s_inodes_per_ag ||
+			    it_blk >= dev_blocks ||
+			    ai->data_off / sb->s_blocksize < ai->block_start ||
+			    ai->data_off / sb->s_blocksize >= dev_blocks) {
+				pr_err("ocsfs2: AG%u geometry out of range\n", i);
+				brelse(bh);
+				return -EUCLEAN;
+			}
+		}
 		ai->next_blk_hint  = (ai->data_off / sb->s_blocksize) - ai->block_start;
 		ai->next_ino_hint  = (i == 0) ? OCSFS2_FIRST_USER_INO : 0;
 		mutex_init(&ai->ag_lock);
