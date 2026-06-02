@@ -52,6 +52,7 @@ kmod2/            the v2 kernel module (the only kernel code)
   lease.c         L4 ownership + L4b metadata leases, L5 recovery
   grow.c          autonomous, repeatable online autogrow
   scrub.c         online metadata-checksum + structural scrub (online fsck engine)
+  csum.c          per-data-block CRC32c (mkfs -C): store (batched), inline read verify
   defrag.c        online extent compaction (OCSFS_IOC_DEFRAG)
   transport/scsi_pr.c   SCSI PR + CAW via the block layer
 tools2/           userspace: mkfs.ocsfs2, fsck.ocsfs2, scrub/defrag/snap tools
@@ -200,6 +201,11 @@ insmod kmod2/ocsfs2.ko          # or: modprobe ocsfs2 (after install.sh + depmod
 
 > The module is out-of-tree: **build it on a node whose `uname -r` matches**, not
 > on a workstation (mismatched kernel → "Invalid module format").
+
+For deployment, `proxmox2/install.sh` builds it through **DKMS** (`kmod2/dkms.conf`,
+source staged to `/usr/src/ocsfs2-2.0`), which rebuilds the module automatically on
+every kernel upgrade. Iterate with the plain `make` above; use DKMS for the
+install/upgrade path (`dkms status`, `dkms build/install -m ocsfs2 -v 2.0`).
 
 ### Build the tools
 

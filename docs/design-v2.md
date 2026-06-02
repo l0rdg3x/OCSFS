@@ -112,7 +112,20 @@ testing on a cluster stack.
 
 - **Checksums everywhere (crc32c).** Every metadata block is self-describing:
   common header `{ h_magic, h_type, h_seq, h_crc }` covering the whole block.
-  Data-block integrity is via extent checksums where enabled.
+- **Per-data-block checksums (opt-in `mkfs -C`, `RO_COMPAT_DATACSUM`).** A per-AG
+  region holds one CRC32c per **physical** data block (`csum.c`). Keyed by physical
+  block ⇒ CoW/reflink/dedup-safe (a shared block has one CRC all sharers read; a
+  CoW writes a new block with its own). Written on every write — buffered (at
+  writeback) and O_DIRECT (at bio submit) — and **verified inline on every read**
+  on both paths: a mismatch returns `-EIO` instead of serving corruption (plus the
+  scrub for bulk verification). Cluster-coherent: stores via SCSI CAW on the 4-byte
+  slot, reads via coherent `meta_bread`. Cost is kept low by **batching per checksum
+  block** — one sync/CAW (`csum_set_range`) and one coherent read (`csum_read_range`)
+  per ~1024 contiguous data blocks, not per block. A freed block's CRC is dropped
+  (`csum_clear_range`) so reuse never false-positives; `copy_blocks` carries the CRC
+  so defrag/CoW stay verifiable. The residual cost is pure 4 KiB-random-write,
+  capped by the crash-safe per-write checksum `sync` (an async-`-C` mount option is
+  a possible future relaxation).
 - **Per-node WAL (redo) journal.** A transaction journals *after-images* of metadata
   blocks; COMMIT is the durability point; replay re-applies committed txns.
 - **Ordered durability.** Data blocks referenced by a new/changed extent are flushed
