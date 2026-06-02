@@ -29,7 +29,7 @@ MODULE_PARM_DESC(hb_pause, "TEST: stop heartbeating to simulate node death");
 #define CAW_RETRIES      8
 
 /* ── coherent block I/O for coordination regions (bypasses the buffer cache) ── */
-static int cl_bio(struct super_block *sb, u64 byte_off, void *buf,
+int ocsfs2_cl_bio(struct super_block *sb, u64 byte_off, void *buf,
 		  unsigned int len, blk_opf_t op)
 {
 	struct bio bio;
@@ -49,7 +49,7 @@ static int cl_bio(struct super_block *sb, u64 byte_off, void *buf,
 /* Read-modify-CAW one record inside its logical block, retrying on contention.
  * @cur must already hold our intended record; we re-read the block, splice our
  * record back in, and CAW. Returns 0 on success, -EBUSY if it never settled. */
-static int cl_caw_record(struct super_block *sb, u64 byte_off,
+int ocsfs2_cl_caw_record(struct super_block *sb, u64 byte_off,
 			 const void *rec, unsigned int rec_len)
 {
 	struct ocsfs2_sb_info *sbi = OCSFS2_SB(sb);
@@ -69,7 +69,7 @@ static int cl_caw_record(struct super_block *sb, u64 byte_off,
 		return -ENOMEM;
 	}
 	for (i = 0; i < CAW_RETRIES; i++) {
-		ret = cl_bio(sb, blk_off, old, lbs, REQ_OP_READ);
+		ret = ocsfs2_cl_bio(sb, blk_off, old, lbs, REQ_OP_READ);
 		if (ret)
 			break;
 		memcpy(new, old, lbs);
@@ -109,7 +109,7 @@ static int hb_write_self(struct super_block *sb)
 
 	c->hb_seq++;
 	hb_fill(&hb, c->self_slot, c->mount_gen, c->hb_seq, OCSFS2_NODE_ACTIVE);
-	return cl_caw_record(sb, off, &hb, sizeof(hb));
+	return ocsfs2_cl_caw_record(sb, off, &hb, sizeof(hb));
 }
 
 /* Read every peer heartbeat and refresh liveness tracking; declare death after
@@ -135,7 +135,7 @@ static void hb_scan_peers(struct super_block *sb)
 
 		if (slot == c->self_slot)
 			continue;
-		if (cl_bio(sb, blk, buf, lbs, REQ_OP_READ))
+		if (ocsfs2_cl_bio(sb, blk, buf, lbs, REQ_OP_READ))
 			continue;
 		hb = (struct ocsfs2_disk_heartbeat *)(buf + (off - blk));
 		seq = le64_to_cpu(hb->hb_sequence);
@@ -200,6 +200,20 @@ bool ocsfs2_node_alive(struct super_block *sb, u16 slot, u32 gen)
 	       !time_after(jiffies, p->last_change + c->death_j);
 }
 
+bool ocsfs2_node_alive_any(struct super_block *sb, u16 slot)
+{
+	struct ocsfs2_cluster *c = OCSFS2_SB(sb)->s_cluster;
+	struct ocsfs2_peer *p;
+
+	if (!c || slot >= c->max_nodes)
+		return false;
+	if (slot == c->self_slot)
+		return true;
+	p = &c->peers[slot];
+	return p->state == OCSFS2_NODE_ACTIVE &&
+	       !time_after(jiffies, p->last_change + c->death_j);
+}
+
 static int prov_node_alive(struct super_block *sb, u16 slot, u32 gen)
 {
 	return ocsfs2_node_alive(sb, slot, gen);
@@ -244,7 +258,7 @@ static int claim_node_slot(struct super_block *sb, struct ocsfs2_cluster *c)
 		struct ocsfs2_disk_node_slot *ns;
 		u8 state;
 
-		if (cl_bio(sb, blk, buf, lbs, REQ_OP_READ)) {
+		if (ocsfs2_cl_bio(sb, blk, buf, lbs, REQ_OP_READ)) {
 			ret = -EIO;
 			break;
 		}
@@ -263,7 +277,7 @@ static int claim_node_slot(struct super_block *sb, struct ocsfs2_cluster *c)
 		ns->ns_pr_key = cpu_to_le64(c->pr_key);
 		ns->ns_checksum = cpu_to_le32(ocsfs2_crc32c(~0U, ns,
 			offsetof(struct ocsfs2_disk_node_slot, ns_checksum)));
-		ret = cl_caw_record(sb, off, ns, sizeof(*ns));
+		ret = ocsfs2_cl_caw_record(sb, off, ns, sizeof(*ns));
 		if (ret == 0) {
 			c->self_slot = slot;
 			break;
@@ -371,7 +385,7 @@ void ocsfs2_cluster_exit(struct super_block *sb)
 	ns.ns_slot_id = cpu_to_le16(c->self_slot);
 	ns.ns_checksum = cpu_to_le32(ocsfs2_crc32c(~0U, &ns,
 			 offsetof(struct ocsfs2_disk_node_slot, ns_checksum)));
-	cl_caw_record(sb, off, &ns, sizeof(ns));
+	ocsfs2_cl_caw_record(sb, off, &ns, sizeof(ns));
 
 	ocsfs2_pr_unregister(sb);
 	sbi->s_cluster = NULL;

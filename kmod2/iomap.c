@@ -371,12 +371,26 @@ static int ocsfs2_fsync(struct file *file, loff_t start, loff_t end, int datasyn
  * advertises FMODE_CAN_ODIRECT (the v1 ODIRECT-1 bug was the missing flag). */
 static int ocsfs2_file_open(struct inode *inode, struct file *file)
 {
+	int ret;
+
 	file->f_mode |= FMODE_CAN_ODIRECT;
-	return generic_file_open(inode, file);
+	ret = generic_file_open(inode, file);
+	if (ret)
+		return ret;
+	/* single-writer ownership: EX lease for write opens, SH for read-only.
+	 * Fails (-EBUSY) if a live peer holds a conflicting lease. */
+	return ocsfs2_inode_open_lease(inode, file->f_mode & FMODE_WRITE);
+}
+
+static int ocsfs2_file_release(struct inode *inode, struct file *file)
+{
+	ocsfs2_inode_close_lease(inode);
+	return 0;
 }
 
 const struct file_operations ocsfs2_file_fops = {
 	.open             = ocsfs2_file_open,
+	.release          = ocsfs2_file_release,     /* drop the ownership lease */
 	.llseek           = ocsfs2_llseek,           /* + SEEK_HOLE / SEEK_DATA */
 	.read_iter        = ocsfs2_file_read_iter,
 	.write_iter       = ocsfs2_file_write_iter,

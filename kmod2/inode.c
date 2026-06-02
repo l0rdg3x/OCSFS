@@ -224,6 +224,57 @@ void ocsfs2_reload_extents(struct inode *inode)
 	inode->i_blocks = le64_to_cpu(di.i_blocks);
 }
 
+/* Coherently re-read this inode from disk (bypassing the per-node buffer cache)
+ * and drop its stale page cache. Called when a node takes EX ownership of a
+ * file from another node, so it sees the previous owner's latest metadata and
+ * data. Single-writer ownership means only the owner mutates, so once we hold
+ * EX this snapshot stays valid until we hand off. */
+void ocsfs2_inode_refresh_coherent(struct inode *inode)
+{
+	struct super_block *sb = inode->i_sb;
+	struct ocsfs2_sb_info *sbi = OCSFS2_SB(sb);
+	struct ocsfs2_inode_info *oi = OCSFS2_I(inode);
+	u64 byte = ocsfs2_inode_disk_off(sbi, oi->i_disk_ino);
+	unsigned int lbs = bdev_logical_block_size(sb->s_bdev);
+	u64 blk;
+	struct ocsfs2_disk_inode *di;
+	u8 *buf;
+
+	if (!byte)
+		return;
+	blk = byte & ~((u64)lbs - 1);
+	buf = kmalloc(lbs, GFP_NOFS);
+	if (!buf)
+		return;
+	if (ocsfs2_cl_bio(sb, blk, buf, lbs, REQ_OP_READ)) {
+		kfree(buf);
+		return;
+	}
+	di = (struct ocsfs2_disk_inode *)(buf + (byte - blk));
+	if (validate_disk_inode(di, oi->i_disk_ino)) {
+		kfree(buf);
+		return;
+	}
+
+	mutex_lock(&oi->i_meta_lock);
+	inode->i_mode = le16_to_cpu(di->i_mode);
+	set_nlink(inode, le16_to_cpu(di->i_nlink));
+	inode->i_size = le64_to_cpu(di->i_size);
+	inode->i_blocks = le64_to_cpu(di->i_blocks);
+	inode_set_mtime_to_ts(inode, ns_to_timespec64(le64_to_cpu(di->i_mtime)));
+	inode_set_ctime_to_ts(inode, ns_to_timespec64(le64_to_cpu(di->i_ctime)));
+	oi->i_extent_tree_root = le64_to_cpu(di->i_extent_tree_root);
+	oi->i_xattr_block = le64_to_cpu(di->i_xattr_block);
+	oi->i_dir_btree_root = le64_to_cpu(di->i_dir_btree_root);
+	oi->i_dirent_count = le32_to_cpu(di->i_dirent_count);
+	parse_extents(oi, di);
+	mutex_unlock(&oi->i_meta_lock);
+	kfree(buf);
+
+	/* drop stale cached data so reads re-fetch the previous owner's writes */
+	truncate_inode_pages(inode->i_mapping, 0);
+}
+
 /* ── iget ── */
 
 struct inode *ocsfs2_iget(struct super_block *sb, u64 ino)

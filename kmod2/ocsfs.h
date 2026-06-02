@@ -537,6 +537,8 @@ struct ocsfs2_inode_info {
 	u64   i_dir_btree_root;
 	u64   i_xattr_block;             /* xattr/ACL block, 0 = none */
 	u32   i_dirent_count;
+	u8    i_lease_mode;              /* OCSFS2_LEASE_* currently held (cluster) */
+	u32   i_lease_count;            /* opens needing the lease */
 	struct mutex i_meta_lock;        /* protects extent map + dir metadata */
 	struct inode vfs_inode;          /* must be last */
 };
@@ -682,6 +684,8 @@ void ocsfs2_extent_truncate_from(struct inode *inode, u64 from_block);
 /* Discard in-core extent map / size and re-read it from the on-disk inode
  * (used to roll back after a failed reflink whose journal txn was aborted). */
 void ocsfs2_reload_extents(struct inode *inode);
+/* Coherent re-read of the inode from disk + page-cache drop (cluster handoff). */
+void ocsfs2_inode_refresh_coherent(struct inode *inode);
 
 /* extent_btree.c — spilled extent map for large/fragmented files (Plan 2b).
  * Active when i_extent_tree_root != 0; the inode.c extent ops dispatch here. */
@@ -805,12 +809,22 @@ int  ocsfs2_cluster_init(struct super_block *sb);
 void ocsfs2_cluster_exit(struct super_block *sb);
 /* True iff the peer owning @slot at @gen is currently alive (per L3). */
 bool ocsfs2_node_alive(struct super_block *sb, u16 slot, u32 gen);
+/* coherent coordination-block I/O (bypass the per-node buffer cache) */
+int  ocsfs2_cl_bio(struct super_block *sb, u64 byte_off, void *buf,
+		   unsigned int len, blk_opf_t op);
+int  ocsfs2_cl_caw_record(struct super_block *sb, u64 byte_off,
+			  const void *rec, unsigned int rec_len);
 
 /* lease.c — L4 ownership leases (single-writer) + L5 recovery.
  * acquire/release are no-ops on a single-node volume. */
 int  ocsfs2_lease_acquire(struct super_block *sb, u64 resource, int mode);
 void ocsfs2_lease_release(struct super_block *sb, u64 resource, int mode);
 void ocsfs2_recover_node(struct super_block *sb, u16 slot, u32 gen);
+/* per-inode lease management driven by open()/release() (cluster only). */
+int  ocsfs2_inode_open_lease(struct inode *inode, bool want_ex);
+void ocsfs2_inode_close_lease(struct inode *inode);
+/* True if @slot is currently alive at any generation (for stale SH bits). */
+bool ocsfs2_node_alive_any(struct super_block *sb, u16 slot);
 
 /* transport/scsi_pr.c — salvaged, dormant in Plan 1 (compiles, not exercised).
  * SCSI-3 Persistent Reservations + Compare-And-Write. Used by the cluster
