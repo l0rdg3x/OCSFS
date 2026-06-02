@@ -388,12 +388,42 @@ static int ocsfs2_file_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
+/* mmap write fault goes through iomap so a store to a mapped page allocates its
+ * backing blocks (iomap_begin WRITE) and sets per-block folio state — keeping
+ * mmap coherent with the read/write_iter + fallocate paths. (filemap's generic
+ * page_mkwrite would leave an mmap write to a hole unbacked and lose it on
+ * writeback — caught by fsx's MAPWRITE/MAPREAD.) */
+static vm_fault_t ocsfs2_page_mkwrite(struct vm_fault *vmf)
+{
+	return iomap_page_mkwrite(vmf, &ocsfs2_iomap_ops, NULL);
+}
+
+static const struct vm_operations_struct ocsfs2_file_vm_ops = {
+	.fault        = filemap_fault,
+	.map_pages    = filemap_map_pages,
+	.page_mkwrite = ocsfs2_page_mkwrite,
+};
+
+static int ocsfs2_file_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	/* Cluster: a shared-writable mmap would need an EX lease re-check on every
+	 * page fault to stay coherent — not wired yet, so refuse it (the file is
+	 * single-writer-owned anyway). Read-only / private-COW mappings are safe. */
+	if (OCSFS2_SB(file_inode(file)->i_sb)->s_cluster &&
+	    (vma->vm_flags & VM_SHARED) && (vma->vm_flags & VM_WRITE))
+		return -EOPNOTSUPP;
+	file_accessed(file);
+	vma->vm_ops = &ocsfs2_file_vm_ops;
+	return 0;
+}
+
 const struct file_operations ocsfs2_file_fops = {
 	.open             = ocsfs2_file_open,
 	.release          = ocsfs2_file_release,     /* drop the ownership lease */
 	.llseek           = ocsfs2_llseek,           /* + SEEK_HOLE / SEEK_DATA */
 	.read_iter        = ocsfs2_file_read_iter,
 	.write_iter       = ocsfs2_file_write_iter,
+	.mmap             = ocsfs2_file_mmap,        /* iomap page_mkwrite */
 	.fsync            = ocsfs2_fsync,
 	.fallocate        = ocsfs2_fallocate,        /* prealloc / punch / zero */
 	.splice_read      = filemap_splice_read,
