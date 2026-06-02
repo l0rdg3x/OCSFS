@@ -148,6 +148,13 @@ loff_t ocsfs2_reflink_range(struct file *src_file, loff_t soff,
 	return len;
 }
 
+/* Handles both FICLONE/copy_file_range (clone) and FIDEDUPERANGE (dedup).
+ * For dedup the VFS path (vfs_dedupe_file_range_one) does NOT lock the inodes —
+ * we do, as for clone — and generic_remap_file_range_prep (called inside
+ * ocsfs2_reflink_range) performs the mandatory byte-for-byte compare of the two
+ * ranges under those locks, only then letting us share the storage. So dedup is
+ * exactly "share-if-identical": reuse the refcount/CoW path, the content compare
+ * is the only extra step and the VFS gives it to us for free. */
 loff_t ocsfs2_remap_file_range(struct file *src_file, loff_t src_off,
 			       struct file *dst_file, loff_t dst_off,
 			       loff_t len, unsigned int remap_flags)
@@ -156,8 +163,8 @@ loff_t ocsfs2_remap_file_range(struct file *src_file, loff_t src_off,
 	struct inode *dst = file_inode(dst_file);
 	loff_t ret;
 
-	if (remap_flags & REMAP_FILE_DEDUP)
-		return -EOPNOTSUPP;            /* dedup is out of Plan-4 scope */
+	if (remap_flags & ~(REMAP_FILE_DEDUP | REMAP_FILE_CAN_SHORTEN))
+		return -EINVAL;               /* unknown remap flag */
 	if (!S_ISREG(src->i_mode) || !S_ISREG(dst->i_mode))
 		return -EINVAL;
 
