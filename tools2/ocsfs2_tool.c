@@ -24,7 +24,14 @@ static int do_snapshot(int argc, char **argv)
 	int fd;
 
 	if (argc != 4) {
-		fprintf(stderr, "usage: %s snapshot <srcfile> <snapname>\n", argv[0]);
+		fprintf(stderr, "usage: %s snapshot <srcfile> <snapname>\n"
+				"  <snapname> is a plain name (no '/'); the snapshot is\n"
+				"  created next to <srcfile> in the same directory.\n", argv[0]);
+		return 2;
+	}
+	if (strchr(argv[3], '/')) {
+		fprintf(stderr, "%s: <snapname> must be a bare name (no '/') — the "
+				"snapshot is created in <srcfile>'s directory\n", argv[0]);
 		return 2;
 	}
 	fd = open(argv[2], O_RDONLY);

@@ -309,7 +309,7 @@ mount -t ocsfs2 -o cluster /dev/disk/by-id/scsi-3600abcd /mnt/vmstore
 ### `ocsfs2-tool` — snapshots, grow and tuning
 
 ```
-ocsfs2-tool snapshot <src-file> <new-snap-file>   # point-in-time reflink copy
+ocsfs2-tool snapshot <src-file> <snap-name>       # point-in-time reflink copy (snap-name is a bare name, created next to <src-file>)
 ocsfs2-tool growfs   <mountpoint>                 # force an autogrow check now
 ```
 `snapshot` creates a new file that shares all of `<src-file>`'s blocks and
@@ -317,7 +317,7 @@ diverges on the next write to either side. `growfs` makes the FS notice that the
 underlying LUN got bigger and append new allocation groups (safe to repeat).
 
 ```bash
-ocsfs2-tool snapshot /mnt/vmstore/vm-100-disk-0.raw /mnt/vmstore/vm-100-disk-0.snap
+ocsfs2-tool snapshot /mnt/vmstore/vm-100-disk-0.raw vm-100-disk-0.snap
 ocsfs2-tool growfs /mnt/vmstore
 ```
 

@@ -225,6 +225,14 @@ static int ocsfs2_ioc_snap_create(struct file *src_file, void __user *arg)
 	dir = d_inode(parent);
 	inode_lock_nested(dir, I_MUTEX_PARENT);
 
+	/* S1: this custom ioctl creates a file in the source's parent dir directly
+	 * via ->create, bypassing the VFS may_create() the FICLONE path gets for
+	 * free. Enforce the caller may write the directory (honouring the mount
+	 * idmap) so a read-only fd can't drop a snapshot into a dir it can't write. */
+	ret = inode_permission(idmap, dir, MAY_WRITE | MAY_EXEC);
+	if (ret)
+		goto unlock_dir;
+
 	qname = (struct qstr)QSTR_INIT(name, nlen);
 	new = lookup_one(idmap, &qname, parent);
 	if (IS_ERR(new)) {

@@ -63,8 +63,20 @@ claim_lock() {
 while read -r mp; do
 	[ -n "$mp" ] || continue
 	found=1
-	stamp="$mp/.ocsfs2-maint.$mode.stamp"
-	lock="$mp/.ocsfs2-maint.$mode.lock"
+	# S2: keep the coordination markers in a ROOT-only dir so a non-root local
+	# user can't pre-create a stamp (to suppress maintenance) or a lock. Refuse
+	# the mount if the dir exists but isn't a root-owned 0700 directory.
+	mdir="$mp/.ocsfs2-maint"
+	if [ -e "$mdir" ] && { [ ! -d "$mdir" ] || \
+	     [ "$(stat -c '%u %a' "$mdir" 2>/dev/null)" != "0 700" ]; }; then
+		echo "ocsfs2-maint: $mdir is unsafe (not a root-owned 0700 dir) — skip $mp"
+		rc=1
+		continue
+	fi
+	mkdir -p "$mdir" 2>/dev/null && chown 0:0 "$mdir" && chmod 700 "$mdir" || {
+		echo "ocsfs2-maint: cannot secure $mdir — skip $mp"; rc=1; continue; }
+	stamp="$mdir/$mode.stamp"
+	lock="$mdir/$mode.lock"
 
 	if recent "$stamp"; then
 		echo "ocsfs2-maint: $mode on $mp already done this cycle — skip"
