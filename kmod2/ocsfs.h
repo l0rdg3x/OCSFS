@@ -49,6 +49,8 @@
 #define OCSFS2_ROOT_INO       2
 #define OCSFS2_FIRST_USER_INO 64
 #define OCSFS2_INLINE_EXTENTS 16
+/* A fast symlink stores its target in the inode's inline-extent byte area. */
+#define OCSFS2_SYMLINK_INLINE_MAX  (OCSFS2_INLINE_EXTENTS * 24)   /* 384 */
 #define OCSFS2_MAX_NAME       255
 #define OCSFS2_MAX_LABEL      64
 #define OCSFS2_DEFAULT_MAX_NODES 8
@@ -550,6 +552,7 @@ int  ocsfs2_statfs(struct dentry *dentry, struct kstatfs *buf);
 extern struct kmem_cache *ocsfs2_inode_cachep;
 extern const struct inode_operations ocsfs2_file_iops;
 extern const struct inode_operations ocsfs2_special_iops;
+extern const struct inode_operations ocsfs2_symlink_iops;
 extern const struct file_operations ocsfs2_file_fops;
 struct inode *ocsfs2_iget(struct super_block *sb, u64 ino);
 int  ocsfs2_write_inode_block(struct inode *inode);

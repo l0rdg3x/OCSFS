@@ -129,12 +129,21 @@ static void fill_disk_inode(struct inode *inode, struct ocsfs2_disk_inode *di)
 	di->i_dir_btree_root = cpu_to_le64(oi->i_dir_btree_root);
 	di->i_dirent_count = cpu_to_le32(oi->i_dirent_count);
 
-	di->i_extent_count = cpu_to_le16(oi->i_extent_count);
-	for (i = 0; i < oi->i_extent_count && i < OCSFS2_INLINE_EXTENTS; i++) {
-		de[i].e_logical  = cpu_to_le64(oi->i_extents[i].logical);
-		de[i].e_physical = cpu_to_le64(oi->i_extents[i].physical);
-		de[i].e_length   = cpu_to_le32(oi->i_extents[i].length);
-		de[i].e_flags    = cpu_to_le16(oi->i_extents[i].flags);
+	if (S_ISLNK(inode->i_mode)) {
+		/* fast symlink: target stored in the inline-extent byte area */
+		size_t n = min_t(size_t, (size_t)inode->i_size + 1,
+				 OCSFS2_SYMLINK_INLINE_MAX);
+
+		di->i_extent_count = 0;
+		memcpy(di->i_inline_extents, (char *)oi->i_extents, n);
+	} else {
+		di->i_extent_count = cpu_to_le16(oi->i_extent_count);
+		for (i = 0; i < oi->i_extent_count && i < OCSFS2_INLINE_EXTENTS; i++) {
+			de[i].e_logical  = cpu_to_le64(oi->i_extents[i].logical);
+			de[i].e_physical = cpu_to_le64(oi->i_extents[i].physical);
+			de[i].e_length   = cpu_to_le32(oi->i_extents[i].length);
+			de[i].e_flags    = cpu_to_le16(oi->i_extents[i].flags);
+		}
 	}
 	di->i_checksum = cpu_to_le32(ocsfs2_crc32c(~0U, di,
 				offsetof(struct ocsfs2_disk_inode, i_checksum)));
@@ -270,6 +279,15 @@ struct inode *ocsfs2_iget(struct super_block *sb, u64 ino)
 	} else if (S_ISDIR(inode->i_mode)) {
 		inode->i_op = &ocsfs2_dir_iops;
 		inode->i_fop = &ocsfs2_dir_fops;
+	} else if (S_ISLNK(inode->i_mode)) {
+		/* fast symlink: cache the inline target and point i_link at it */
+		size_t n = min_t(size_t, (size_t)inode->i_size,
+				 OCSFS2_SYMLINK_INLINE_MAX - 1);
+
+		memcpy((char *)oi->i_extents, di.i_inline_extents, n);
+		((char *)oi->i_extents)[n] = '\0';
+		inode->i_link = (char *)oi->i_extents;
+		inode->i_op = &ocsfs2_symlink_iops;
 	} else {
 		inode->i_op = &ocsfs2_special_iops;
 		init_special_inode(inode, inode->i_mode,
@@ -479,6 +497,8 @@ struct inode *ocsfs2_new_inode(struct mnt_idmap *idmap, struct inode *dir,
 	} else if (S_ISDIR(mode)) {
 		inode->i_op = &ocsfs2_dir_iops;
 		inode->i_fop = &ocsfs2_dir_fops;
+	} else if (S_ISLNK(mode)) {
+		inode->i_op = &ocsfs2_symlink_iops;   /* caller stores the target */
 	} else {
 		inode->i_op = &ocsfs2_special_iops;
 		init_special_inode(inode, mode, rdev);
@@ -849,4 +869,10 @@ const struct inode_operations ocsfs2_file_iops = {
 const struct inode_operations ocsfs2_special_iops = {
 	.setattr = ocsfs2_setattr,
 	.getattr = ocsfs2_getattr,
+};
+
+const struct inode_operations ocsfs2_symlink_iops = {
+	.get_link = simple_get_link,   /* returns inode->i_link (inline target) */
+	.setattr  = ocsfs2_setattr,
+	.getattr  = ocsfs2_getattr,
 };

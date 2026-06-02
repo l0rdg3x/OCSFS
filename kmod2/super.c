@@ -413,9 +413,14 @@ static int __init ocsfs2_init(void)
 {
 	int ret;
 
-	ocsfs2_inode_cachep = kmem_cache_create("ocsfs2_inode_cache",
+	/* Whitelist the inline-extent byte area for usercopy: a fast symlink
+	 * stores its target there and readlink() copies it straight to user
+	 * space — without this, HARDENED_USERCOPY BUGs (mm/usercopy.c). */
+	ocsfs2_inode_cachep = kmem_cache_create_usercopy("ocsfs2_inode_cache",
 				sizeof(struct ocsfs2_inode_info), 0,
 				SLAB_RECLAIM_ACCOUNT | SLAB_ACCOUNT,
+				offsetof(struct ocsfs2_inode_info, i_extents),
+				sizeof_field(struct ocsfs2_inode_info, i_extents),
 				ocsfs2_inode_init_once);
 	if (!ocsfs2_inode_cachep)
 		return -ENOMEM;

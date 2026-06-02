@@ -249,8 +249,10 @@ static struct dentry *ocsfs2_lookup(struct inode *dir, struct dentry *dentry,
 	return d_splice_alias(inode, dentry);
 }
 
-static int ocsfs2_create(struct mnt_idmap *idmap, struct inode *dir,
-			 struct dentry *dentry, umode_t mode, bool excl)
+/* Shared create path for regular files (create) and special files (mknod):
+ * new inode + dirent + dir update, all in one journal transaction. */
+static int ocsfs2_mknod_common(struct mnt_idmap *idmap, struct inode *dir,
+			       struct dentry *dentry, umode_t mode, dev_t rdev)
 {
 	struct inode *inode;
 	struct ocsfs2_txn *txn;
@@ -260,7 +262,7 @@ static int ocsfs2_create(struct mnt_idmap *idmap, struct inode *dir,
 	if (!txn)
 		return -ENOMEM;
 
-	inode = ocsfs2_new_inode(idmap, dir, mode, 0);   /* reserve enrols the slot */
+	inode = ocsfs2_new_inode(idmap, dir, mode, rdev);  /* reserve enrols the slot */
 	if (IS_ERR(inode)) {
 		ocsfs2_txn_abort(txn);
 		return PTR_ERR(inode);
@@ -285,6 +287,98 @@ fail:
 fail_committed:
 	inode_dec_link_count(inode);
 	discard_new_inode(inode);
+	return ret;
+}
+
+static int ocsfs2_create(struct mnt_idmap *idmap, struct inode *dir,
+			 struct dentry *dentry, umode_t mode, bool excl)
+{
+	return ocsfs2_mknod_common(idmap, dir, dentry, mode, 0);
+}
+
+static int ocsfs2_mknod(struct mnt_idmap *idmap, struct inode *dir,
+			struct dentry *dentry, umode_t mode, dev_t rdev)
+{
+	return ocsfs2_mknod_common(idmap, dir, dentry, mode, rdev);
+}
+
+static int ocsfs2_symlink(struct mnt_idmap *idmap, struct inode *dir,
+			  struct dentry *dentry, const char *symname)
+{
+	struct inode *inode;
+	struct ocsfs2_txn *txn;
+	int ret, len = strlen(symname);
+
+	if (len + 1 > OCSFS2_SYMLINK_INLINE_MAX)
+		return -ENAMETOOLONG;          /* long-symlink (data block) not supported */
+
+	txn = ocsfs2_txn_begin(dir->i_sb);
+	if (!txn)
+		return -ENOMEM;
+	inode = ocsfs2_new_inode(idmap, dir, S_IFLNK | 0777, 0);
+	if (IS_ERR(inode)) {
+		ocsfs2_txn_abort(txn);
+		return PTR_ERR(inode);
+	}
+	memcpy((char *)OCSFS2_I(inode)->i_extents, symname, len + 1);
+	inode->i_link = (char *)OCSFS2_I(inode)->i_extents;
+	inode->i_size = len;
+	ret = ocsfs2_write_inode_block(inode);
+	if (ret)
+		goto fail;
+	ret = ocsfs2_add_dirent(dir, &dentry->d_name,
+				OCSFS2_I(inode)->i_disk_ino, OCSFS2_FT_SYMLINK);
+	if (ret)
+		goto fail;
+	ret = ocsfs2_write_inode_block(dir);
+	if (ret)
+		goto fail;
+	ret = ocsfs2_txn_commit(txn);
+	if (ret)
+		goto fail_committed;
+	d_instantiate(dentry, inode);
+	return 0;
+fail:
+	ocsfs2_txn_abort(txn);
+fail_committed:
+	inode_dec_link_count(inode);
+	discard_new_inode(inode);
+	return ret;
+}
+
+static int ocsfs2_link(struct dentry *old_dentry, struct inode *dir,
+		       struct dentry *dentry)
+{
+	struct inode *inode = d_inode(old_dentry);
+	struct ocsfs2_txn *txn;
+	int ret;
+
+	txn = ocsfs2_txn_begin(dir->i_sb);
+	if (!txn)
+		return -ENOMEM;
+	inode_set_ctime_current(inode);
+	inc_nlink(inode);
+	ihold(inode);                          /* d_instantiate takes a ref */
+	ret = ocsfs2_add_dirent(dir, &dentry->d_name, inode->i_ino,
+				ocsfs2_mode_to_ft(inode->i_mode));
+	if (ret)
+		goto fail;
+	ret = ocsfs2_write_inode_block(inode);   /* nlink++ */
+	if (ret)
+		goto fail;
+	ret = ocsfs2_write_inode_block(dir);
+	if (ret)
+		goto fail;
+	ret = ocsfs2_txn_commit(txn);
+	if (ret)
+		goto fail_committed;
+	d_instantiate(dentry, inode);
+	return 0;
+fail:
+	ocsfs2_txn_abort(txn);
+fail_committed:
+	drop_nlink(inode);
+	iput(inode);
 	return ret;
 }
 
@@ -422,6 +516,9 @@ const struct inode_operations ocsfs2_dir_iops = {
 	.unlink  = ocsfs2_unlink,
 	.rmdir   = ocsfs2_rmdir,
 	.rename  = ocsfs2_rename,
+	.symlink = ocsfs2_symlink,
+	.link    = ocsfs2_link,
+	.mknod   = ocsfs2_mknod,
 	.setattr = ocsfs2_setattr,
 	.getattr = ocsfs2_getattr,
 };
