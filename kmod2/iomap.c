@@ -157,9 +157,27 @@ static int ocsfs2_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 		/* shared (reflink/snapshot) block being modified -> copy-on-write so
 		 * the other sharers stay isolated, then map the new private blocks */
 		if (modifying && (cover.flags & OCSFS2_EXT_SHARED)) {
-			u64 blk_phys = cover.physical + (lblk - cover.logical);
+			/* An extent flagged SHARED can hold a MIX of still-shared
+			 * (refcount >= 2) and now-private (refcount == 1) blocks:
+			 * sharing flags the whole source extent but bumps only the
+			 * cloned sub-range, and a peer's later CoW drops some blocks
+			 * back to 1. Decide from EVERY block the write touches, not
+			 * just the first. Checking only the first block could either
+			 * skip a needed CoW (a buffered store then lands on the shared
+			 * block and writeback corrupts the other sharer) or clear the
+			 * SHARED flag over blocks that are still shared. */
+			u64 cover_end = cover.logical + cover.length;
+			u64 last = min(end_blk, cover_end);
+			u64 b;
+			bool any_shared = false;
 
-			if (ocsfs2_needs_cow(inode->i_sb, blk_phys)) {
+			for (b = lblk; b < last; b++)
+				if (ocsfs2_needs_cow(inode->i_sb, cover.physical +
+						     (b - cover.logical))) {
+					any_shared = true;
+					break;
+				}
+			if (any_shared) {
 				ret = ocsfs2_cow_range(inode, &cover, lblk,
 						       end_blk);
 				if (ret)
@@ -168,13 +186,17 @@ static int ocsfs2_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 							 &next_logical);
 				if (ret)
 					goto out;   /* must exist after CoW */
-			} else {
-				/* stale SHARED hint (refcount fell to 1): clear it */
+			} else if (lblk == cover.logical && last == cover_end) {
+				/* the whole extent is private now: drop the stale
+				 * SHARED hint so later writes skip the recheck */
 				ocsfs2_extent_update_phys(inode, cover.logical,
 							  cover.length, cover.physical,
-							  OCSFS2_EXT_WRITTEN);
-				cover.flags = OCSFS2_EXT_WRITTEN;
+							  cover.flags & ~OCSFS2_EXT_SHARED);
+				cover.flags &= ~OCSFS2_EXT_SHARED;
 			}
+			/* else: the touched range is private but the extent still
+			 * has shared blocks elsewhere — write it in place (those
+			 * blocks aren't touched) and keep the SHARED flag. */
 		}
 
 		off_in = lblk - cover.logical;
