@@ -27,6 +27,36 @@
 
 #define BS OCSFS2_BLOCK_SIZE
 
+/* Online mode: given a mountpoint, check the LIVE filesystem via the scrub
+ * ioctl (verifies every metadata checksum + per-AG structure with no downtime).
+ * The full off-disk structural pass below runs only on an unmounted device. */
+struct ocsfs2_scrub_result {
+	uint64_t checked, errors, inodes;
+	uint32_t ag_count, flags;
+};
+#define OCSFS_IOC_SCRUB _IOWR('O', 0x03, struct ocsfs2_scrub_result)
+
+static int online_fsck(const char *path)
+{
+	struct ocsfs2_scrub_result r;
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+
+	if (fd < 0) { perror("open"); return 2; }
+	memset(&r, 0, sizeof(r));
+	if (ioctl(fd, OCSFS_IOC_SCRUB, &r)) {
+		perror("fsck.ocsfs2: OCSFS_IOC_SCRUB (is it an ocsfs2 mount?)");
+		close(fd);
+		return 2;
+	}
+	close(fd);
+	printf("fsck.ocsfs2: %s (online) — checked %llu objects / %llu inodes / %u AGs\n",
+	       path, (unsigned long long)r.checked,
+	       (unsigned long long)r.inodes, r.ag_count);
+	printf("fsck.ocsfs2: %s — %llu errors -> %s\n", path,
+	       (unsigned long long)r.errors, r.errors ? "FINDINGS" : "clean");
+	return r.errors ? 1 : 0;
+}
+
 static int g_fd;
 static uint64_t g_errors;
 
@@ -141,8 +171,17 @@ int main(int argc, char **argv)
 	while ((opt = getopt(argc, argv, "r")) != -1) {
 		if (opt == 'r') { fprintf(stderr, "fsck.ocsfs2: -r (repair) not implemented in Plan 1\n"); }
 	}
-	if (optind >= argc) { fprintf(stderr, "usage: %s <device>\n", argv[0]); return 2; }
+	if (optind >= argc) {
+		fprintf(stderr, "usage: %s <device>        (offline, unmounted)\n"
+				"       %s <mountpoint>    (online, live — via scrub)\n",
+			argv[0], argv[0]);
+		return 2;
+	}
 	dev = argv[optind];
+
+	/* a directory argument => an online check of the mounted filesystem */
+	if (stat(dev, &st) == 0 && S_ISDIR(st.st_mode))
+		return online_fsck(dev);
 
 	g_fd = open(dev, O_RDONLY | O_CLOEXEC);
 	if (g_fd < 0) { perror("open"); return 2; }
