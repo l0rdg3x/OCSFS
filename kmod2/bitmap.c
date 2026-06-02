@@ -75,6 +75,132 @@ static inline bool test_bit_le8(const u8 *bm, u64 i)
 static inline void set_bit_le8(u8 *bm, u64 i)   { bm[i >> 3] |=  (u8)(1u << (i & 7)); }
 static inline void clear_bit_le8(u8 *bm, u64 i) { bm[i >> 3] &= (u8)~(1u << (i & 7)); }
 
+#define OCSFS2_BM_CAW_RETRIES  16
+
+/* Clustered allocation: claim a run of @count free blocks via CAW on a single
+ * bitmap block, so two nodes never double-allocate (lock-free, coherent — no
+ * meta lease needed even on the data path). Runs stay within one bitmap block
+ * (32768 blocks), well above the 2048-block allocation cap. */
+static int clustered_alloc(struct super_block *sb, u32 ag_hint, u32 count,
+			   u64 *block_out)
+{
+	struct ocsfs2_sb_info *sbi = OCSFS2_SB(sb);
+	u32 bs = sb->s_blocksize, bpb = bs * 8;
+	u8 *old, *new;
+	u32 tried;
+	int ret = -ENOSPC;
+
+	old = kmalloc(bs, GFP_NOFS);
+	new = kmalloc(bs, GFP_NOFS);
+	if (!old || !new) { kfree(old); kfree(new); return -ENOMEM; }
+
+	for (tried = 0; tried < sbi->s_ag_count && ret == -ENOSPC; tried++) {
+		u32 ag = (ag_hint + tried) % sbi->s_ag_count;
+		struct ocsfs2_ag_info *ai = &sbi->s_ags[ag];
+		u64 b;
+
+		mutex_lock(&ai->ag_lock);
+		for (b = 0; (u64)b * bpb < ai->block_count; b++) {
+			u64 base = (u64)b * bpb;
+			u32 blk_bits = (u32)min_t(u64, bpb, ai->block_count - base);
+			u64 bbyte = ai->bitmap_off + (u64)b * bs;
+			int attempt;
+
+			for (attempt = 0; attempt < OCSFS2_BM_CAW_RETRIES; attempt++) {
+				u32 run_start = 0, run_len = 0, i;
+				bool found = false;
+
+				if (ocsfs2_cl_bio(sb, bbyte, old, bs, REQ_OP_READ)) {
+					ret = -EIO;
+					goto unlock;
+				}
+				for (i = 0; i < blk_bits; i++) {
+					if (test_bit_le8(old, i)) { run_len = 0; continue; }
+					if (run_len == 0) run_start = i;
+					if (++run_len == count) { found = true; break; }
+				}
+				if (!found)
+					break;   /* not in this block; try next */
+				memcpy(new, old, bs);
+				for (i = 0; i < count; i++)
+					set_bit_le8(new, run_start + i);
+				if (ocsfs2_scsi_caw(sb, bbyte / bs, old, new, bs) == 0) {
+					ai->free_blocks -= count;   /* per-node hint */
+					*block_out = ai->block_start + base + run_start;
+					ret = 0;
+					goto unlock;
+				}
+				/* miscompare: a peer changed this block, re-read + retry */
+			}
+		}
+unlock:
+		mutex_unlock(&ai->ag_lock);
+	}
+	kfree(old);
+	kfree(new);
+	return ret;
+}
+
+/* Clustered free: clear the bits of [block, block+count) via CAW per touched
+ * bitmap block (coherent against concurrent allocators). */
+static void clustered_free(struct super_block *sb, u64 block, u32 count)
+{
+	struct ocsfs2_sb_info *sbi = OCSFS2_SB(sb);
+	u32 bs = sb->s_blocksize, bpb = bs * 8, ag;
+	struct ocsfs2_ag_info *ai;
+	u8 *old, *new;
+	u64 rel, done = 0;
+
+	for (ag = 0; ag < sbi->s_ag_count; ag++) {
+		ai = &sbi->s_ags[ag];
+		if (block >= ai->block_start &&
+		    block < ai->block_start + ai->block_count)
+			break;
+	}
+	if (ag >= sbi->s_ag_count)
+		return;
+	ai = &sbi->s_ags[ag];
+	rel = block - ai->block_start;
+	if (rel + count > ai->block_count)
+		count = ai->block_count - rel;
+
+	old = kmalloc(bs, GFP_NOFS);
+	new = kmalloc(bs, GFP_NOFS);
+	if (!old || !new) { kfree(old); kfree(new); return; }
+
+	mutex_lock(&ai->ag_lock);
+	while (done < count) {
+		u64 cur = rel + done;
+		u64 b = cur / bpb;
+		u64 bbyte = ai->bitmap_off + b * bs;
+		u32 first = cur % bpb;
+		u32 n = (u32)min_t(u64, count - done, bpb - first);   /* bits in this block */
+		int attempt;
+
+		for (attempt = 0; attempt < OCSFS2_BM_CAW_RETRIES; attempt++) {
+			u32 i, cleared = 0;
+
+			if (ocsfs2_cl_bio(sb, bbyte, old, bs, REQ_OP_READ))
+				goto next;
+			memcpy(new, old, bs);
+			for (i = 0; i < n; i++)
+				if (test_bit_le8(new, first + i)) {
+					clear_bit_le8(new, first + i);
+					cleared++;
+				}
+			if (ocsfs2_scsi_caw(sb, bbyte / bs, old, new, bs) == 0) {
+				ai->free_blocks += cleared;
+				break;
+			}
+		}
+next:
+		done += n;
+	}
+	mutex_unlock(&ai->ag_lock);
+	kfree(old);
+	kfree(new);
+}
+
 int ocsfs2_alloc_blocks(struct super_block *sb, u32 ag_hint, u32 count,
 			u64 *block_out)
 {
@@ -83,6 +209,8 @@ int ocsfs2_alloc_blocks(struct super_block *sb, u32 ag_hint, u32 count,
 
 	if (count == 0)
 		return -EINVAL;
+	if (sbi->s_cluster)
+		return clustered_alloc(sb, ag_hint, count, block_out);
 
 	for (tried = 0; tried < sbi->s_ag_count; tried++) {
 		u32 ag = (ag_hint + tried) % sbi->s_ag_count;
@@ -161,6 +289,10 @@ void ocsfs2_free_blocks(struct super_block *sb, u64 block, u32 count)
 
 	if (count == 0)
 		return;
+	if (sbi->s_cluster) {
+		clustered_free(sb, block, count);
+		return;
+	}
 	/* locate the AG containing this block */
 	for (ag = 0; ag < sbi->s_ag_count; ag++) {
 		ai = &sbi->s_ags[ag];

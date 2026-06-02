@@ -58,7 +58,7 @@ static int read_disk_inode(struct super_block *sb, u64 ino,
 	blk = byte_off / sb->s_blocksize;
 	off_in_blk = byte_off % sb->s_blocksize;
 
-	bh = sb_bread(sb, blk);
+	bh = ocsfs2_meta_bread(sb, blk);   /* fresh on a clustered volume */
 	if (!bh)
 		return -EIO;
 	memcpy(di, bh->b_data + off_in_blk, sizeof(*di));
@@ -165,6 +165,22 @@ int ocsfs2_write_inode_block(struct inode *inode)
 
 	if (!byte_off)
 		return -EINVAL;
+
+	/* clustered: write this 512-byte inode atomically via CAW. The 4 KiB
+	 * inode-table block holds 8 inodes owned by different nodes; a plain RMW
+	 * would clobber a peer's concurrent inode write (incl. async writeback).
+	 * CAW reads fresh, splices our slot, writes only if unchanged. */
+	if (sbi->s_cluster) {
+		struct ocsfs2_disk_inode *di = kmalloc(sizeof(*di), GFP_NOFS);
+
+		if (!di)
+			return -ENOMEM;
+		fill_disk_inode(inode, di);
+		ret = ocsfs2_cl_caw_record(sb, byte_off, di, sizeof(*di));
+		kfree(di);
+		return ret;
+	}
+
 	blk = byte_off / sb->s_blocksize;
 	off_in_blk = byte_off % sb->s_blocksize;
 
@@ -399,6 +415,22 @@ static int reserve_inode_slot(struct super_block *sb, u32 ag, u64 local)
 	struct ocsfs2_disk_inode *di;
 	struct buffer_head *bh;
 
+	if (sbi->s_cluster) {
+		/* atomic + coherent claim of the slot (shared inode-table block) */
+		int ret;
+
+		di = kzalloc(sizeof(*di), GFP_NOFS);
+		if (!di)
+			return -ENOMEM;
+		di->i_magic = cpu_to_le32(OCSFS2_INODE_MAGIC);
+		di->i_ino = cpu_to_le64((u64)ag * sbi->s_ag_size + local);
+		di->i_checksum = cpu_to_le32(ocsfs2_crc32c(~0U, di,
+					offsetof(struct ocsfs2_disk_inode, i_checksum)));
+		ret = ocsfs2_cl_caw_record(sb, byte_off, di, sizeof(*di));
+		kfree(di);
+		return ret;
+	}
+
 	bh = sb_bread(sb, blk);
 	if (!bh)
 		return -EIO;
@@ -426,7 +458,7 @@ static int slot_is_free(struct super_block *sb, u32 ag, u64 local, bool *freep)
 	struct buffer_head *bh;
 	struct ocsfs2_disk_inode *di;
 
-	bh = sb_bread(sb, blk);
+	bh = ocsfs2_meta_bread(sb, blk);   /* fresh on a clustered volume */
 	if (!bh)
 		return -EIO;
 	di = (struct ocsfs2_disk_inode *)(bh->b_data + off);
@@ -498,14 +530,24 @@ void ocsfs2_free_inode_num(struct super_block *sb, u64 ino)
 	off = byte_off % sb->s_blocksize;
 
 	mutex_lock(&ai->ag_lock);
-	bh = sb_bread(sb, blk);
-	if (bh) {
-		ocsfs2_jbuf(bh);   /* enrol if within a txn (else writeback) */
-		memset(bh->b_data + off, 0, OCSFS2_INODE_SIZE);
-		mark_buffer_dirty(bh);
-		if (!ocsfs2_current_txn())
-			sync_dirty_buffer(bh);
-		brelse(bh);
+	if (sbi->s_cluster) {
+		/* atomic + coherent free of the slot (shared inode-table block) */
+		void *zero = kzalloc(OCSFS2_INODE_SIZE, GFP_NOFS);
+
+		if (zero) {
+			ocsfs2_cl_caw_record(sb, byte_off, zero, OCSFS2_INODE_SIZE);
+			kfree(zero);
+		}
+	} else {
+		bh = sb_bread(sb, blk);
+		if (bh) {
+			ocsfs2_jbuf(bh);   /* enrol if within a txn (else writeback) */
+			memset(bh->b_data + off, 0, OCSFS2_INODE_SIZE);
+			mark_buffer_dirty(bh);
+			if (!ocsfs2_current_txn())
+				sync_dirty_buffer(bh);
+			brelse(bh);
+		}
 	}
 	ai->free_inodes++;
 	if (local < ai->next_ino_hint)

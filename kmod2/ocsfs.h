@@ -73,6 +73,9 @@
 #define OCSFS2_LEASE_SH     1
 #define OCSFS2_LEASE_EX     2
 #define OCSFS2_SLOT_NONE    0xFFFF
+/* reserved lease resource id (never an inode number) for the global metadata
+ * lease that serialises cross-node namespace + allocation (L4b). */
+#define OCSFS2_META_RESOURCE  1ULL
 
 /* file types (de_file_type / inode helpers) */
 #define OCSFS2_FT_UNKNOWN 0
@@ -815,6 +818,8 @@ int  ocsfs2_cl_bio(struct super_block *sb, u64 byte_off, void *buf,
 		   unsigned int len, blk_opf_t op);
 int  ocsfs2_cl_caw_record(struct super_block *sb, u64 byte_off,
 			  const void *rec, unsigned int rec_len);
+/* fresh metadata read (clustered: bio-coherent; single-node: sb_bread) */
+struct buffer_head *ocsfs2_meta_bread(struct super_block *sb, u64 blk);
 
 /* lease.c — L4 ownership leases (single-writer) + L5 recovery.
  * acquire/release are no-ops on a single-node volume. */
@@ -824,6 +829,12 @@ void ocsfs2_recover_node(struct super_block *sb, u16 slot, u32 gen);
 /* per-inode lease management driven by open()/release() (cluster only). */
 int  ocsfs2_inode_open_lease(struct inode *inode, bool want_ex);
 void ocsfs2_inode_close_lease(struct inode *inode);
+/* global metadata lease around cross-node namespace ops: serialises + makes
+ * shared metadata (dirs, inode table, bitmap) coherent. No-op single-node.
+ * meta_lock refreshes @dir coherently if non-NULL. */
+void ocsfs2_meta_lock(struct super_block *sb, struct inode *dir,
+		      struct inode *dir2);
+void ocsfs2_meta_unlock(struct super_block *sb);
 /* True if @slot is currently alive at any generation (for stale SH bits). */
 bool ocsfs2_node_alive_any(struct super_block *sb, u16 slot);
 

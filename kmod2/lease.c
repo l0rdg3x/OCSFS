@@ -15,6 +15,8 @@
  */
 #include "ocsfs.h"
 #include <linux/writeback.h>
+#include <linux/blkdev.h>
+#include <linux/delay.h>
 
 #define LEASE_PROBE_MAX  64
 #define LEASE_CAS_TRIES  16
@@ -257,6 +259,48 @@ void ocsfs2_inode_close_lease(struct inode *inode)
 		sync_blockdev(inode->i_sb->s_bdev);
 	}
 	ocsfs2_lease_release(inode->i_sb, oi->i_disk_ino, mode);
+}
+
+/* ── global metadata lease (L4b: cross-node namespace + allocation) ──
+ * Serialises metadata-mutating ops cluster-wide and makes shared metadata
+ * (directories, inode table, bitmap) coherent: on acquire we drop stale clean
+ * metadata buffers (invalidate_bdev) and re-read the affected directory inode;
+ * on release we flush all dirty metadata so the next holder sees it. Coarse but
+ * correct — namespace ops are rare in the VM-disk workload. */
+void ocsfs2_meta_lock(struct super_block *sb, struct inode *dir, struct inode *dir2)
+{
+	int ret, tries = 0;
+
+	if (!OCSFS2_SB(sb)->s_cluster)
+		return;
+	do {
+		ret = ocsfs2_lease_acquire(sb, OCSFS2_META_RESOURCE, OCSFS2_LEASE_EX);
+		if (ret == 0 || ret != -EBUSY)
+			break;
+		msleep(5);
+	} while (++tries < 2000);          /* wait up to ~10s for a peer to release */
+	if (ret)
+		pr_warn_ratelimited("ocsfs2: meta lease acquire: %d\n", ret);
+
+	/* Coherence is by fresh reads (ocsfs2_meta_bread) + CAW (inode table,
+	 * bitmap), not a whole-device cache flush — invalidate_bdev/sync_blockdev
+	 * per op would starve the heartbeat (the v1 cascade). We only re-read the
+	 * directory inodes' in-core state here; their data blocks are read fresh. */
+	if (dir)
+		ocsfs2_inode_refresh_coherent(dir);
+	if (dir2 && dir2 != dir)
+		ocsfs2_inode_refresh_coherent(dir2);
+}
+
+void ocsfs2_meta_unlock(struct super_block *sb)
+{
+	if (!OCSFS2_SB(sb)->s_cluster)
+		return;
+	/* No sync_blockdev here: the op's journal commit already checkpointed +
+	 * flushed its metadata durably. A full device sync per namespace op would
+	 * starve the heartbeat under load (the v1 cascade). A barrier suffices. */
+	blkdev_issue_flush(sb->s_bdev);
+	ocsfs2_lease_release(sb, OCSFS2_META_RESOURCE, OCSFS2_LEASE_EX);
 }
 
 void ocsfs2_recover_node(struct super_block *sb, u16 slot, u32 gen)

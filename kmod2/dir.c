@@ -15,7 +15,7 @@ static struct buffer_head *dir_get_block(struct inode *dir, u64 lblk)
 
 	if (ocsfs2_bmap(dir, lblk, &phys))
 		return NULL;
-	return sb_bread(dir->i_sb, phys);
+	return ocsfs2_meta_bread(dir->i_sb, phys);   /* fresh on a clustered volume */
 }
 
 static struct ocsfs2_disk_dirent *slot_ptr(struct buffer_head *bh, unsigned s)
@@ -258,14 +258,17 @@ static int ocsfs2_mknod_common(struct mnt_idmap *idmap, struct inode *dir,
 	struct ocsfs2_txn *txn;
 	int ret;
 
+	ocsfs2_meta_lock(dir->i_sb, dir, NULL);   /* serialise + refresh dir (cluster) */
 	txn = ocsfs2_txn_begin(dir->i_sb);
-	if (!txn)
-		return -ENOMEM;
-
+	if (!txn) {
+		ret = -ENOMEM;
+		goto out;
+	}
 	inode = ocsfs2_new_inode(idmap, dir, mode, rdev);  /* reserve enrols the slot */
 	if (IS_ERR(inode)) {
 		ocsfs2_txn_abort(txn);
-		return PTR_ERR(inode);
+		ret = PTR_ERR(inode);
+		goto out;
 	}
 	ret = ocsfs2_init_acl(inode, dir);   /* inherit default ACL / apply umask */
 	if (ret)
@@ -284,12 +287,15 @@ static int ocsfs2_mknod_common(struct mnt_idmap *idmap, struct inode *dir,
 	if (ret)
 		goto fail_committed;
 	d_instantiate(dentry, inode);
-	return 0;
+	ret = 0;
+	goto out;
 fail:
 	ocsfs2_txn_abort(txn);
 fail_committed:
 	inode_dec_link_count(inode);
 	discard_new_inode(inode);
+out:
+	ocsfs2_meta_unlock(dir->i_sb);
 	return ret;
 }
 
@@ -315,13 +321,17 @@ static int ocsfs2_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	if (len + 1 > OCSFS2_SYMLINK_INLINE_MAX)
 		return -ENAMETOOLONG;          /* long-symlink (data block) not supported */
 
+	ocsfs2_meta_lock(dir->i_sb, dir, NULL);
 	txn = ocsfs2_txn_begin(dir->i_sb);
-	if (!txn)
-		return -ENOMEM;
+	if (!txn) {
+		ret = -ENOMEM;
+		goto out;
+	}
 	inode = ocsfs2_new_inode(idmap, dir, S_IFLNK | 0777, 0);
 	if (IS_ERR(inode)) {
 		ocsfs2_txn_abort(txn);
-		return PTR_ERR(inode);
+		ret = PTR_ERR(inode);
+		goto out;
 	}
 	memcpy((char *)OCSFS2_I(inode)->i_extents, symname, len + 1);
 	inode->i_link = (char *)OCSFS2_I(inode)->i_extents;
@@ -340,12 +350,15 @@ static int ocsfs2_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	if (ret)
 		goto fail_committed;
 	d_instantiate(dentry, inode);
-	return 0;
+	ret = 0;
+	goto out;
 fail:
 	ocsfs2_txn_abort(txn);
 fail_committed:
 	inode_dec_link_count(inode);
 	discard_new_inode(inode);
+out:
+	ocsfs2_meta_unlock(dir->i_sb);
 	return ret;
 }
 
@@ -356,9 +369,12 @@ static int ocsfs2_link(struct dentry *old_dentry, struct inode *dir,
 	struct ocsfs2_txn *txn;
 	int ret;
 
+	ocsfs2_meta_lock(dir->i_sb, dir, NULL);
 	txn = ocsfs2_txn_begin(dir->i_sb);
-	if (!txn)
-		return -ENOMEM;
+	if (!txn) {
+		ret = -ENOMEM;
+		goto out;
+	}
 	inode_set_ctime_current(inode);
 	inc_nlink(inode);
 	ihold(inode);                          /* d_instantiate takes a ref */
@@ -376,12 +392,15 @@ static int ocsfs2_link(struct dentry *old_dentry, struct inode *dir,
 	if (ret)
 		goto fail_committed;
 	d_instantiate(dentry, inode);
-	return 0;
+	ret = 0;
+	goto out;
 fail:
 	ocsfs2_txn_abort(txn);
 fail_committed:
 	drop_nlink(inode);
 	iput(inode);
+out:
+	ocsfs2_meta_unlock(dir->i_sb);
 	return ret;
 }
 
@@ -392,14 +411,17 @@ static struct dentry *ocsfs2_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	struct ocsfs2_txn *txn;
 	int ret;
 
+	ocsfs2_meta_lock(dir->i_sb, dir, NULL);
 	txn = ocsfs2_txn_begin(dir->i_sb);
-	if (!txn)
-		return ERR_PTR(-ENOMEM);
-
+	if (!txn) {
+		ret = -ENOMEM;
+		goto out;
+	}
 	inode = ocsfs2_new_inode(idmap, dir, S_IFDIR | mode, 0);
 	if (IS_ERR(inode)) {
 		ocsfs2_txn_abort(txn);
-		return ERR_CAST(inode);
+		ret = PTR_ERR(inode);
+		goto out;
 	}
 	ret = ocsfs2_init_acl(inode, dir);   /* inherit default ACL / apply umask */
 	if (ret)
@@ -423,13 +445,16 @@ static struct dentry *ocsfs2_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	if (ret)
 		goto fail_committed;
 	d_instantiate(dentry, inode);
-	return NULL;
+	ret = 0;
+	goto out;
 fail:
 	ocsfs2_txn_abort(txn);
 fail_committed:
 	clear_nlink(inode);
 	discard_new_inode(inode);
-	return ERR_PTR(ret);
+out:
+	ocsfs2_meta_unlock(dir->i_sb);
+	return ret ? ERR_PTR(ret) : NULL;
 }
 
 static int ocsfs2_unlink(struct inode *dir, struct dentry *dentry)
@@ -438,9 +463,12 @@ static int ocsfs2_unlink(struct inode *dir, struct dentry *dentry)
 	struct ocsfs2_txn *txn;
 	int ret;
 
+	ocsfs2_meta_lock(dir->i_sb, dir, NULL);
 	txn = ocsfs2_txn_begin(dir->i_sb);
-	if (!txn)
-		return -ENOMEM;
+	if (!txn) {
+		ret = -ENOMEM;
+		goto out;
+	}
 	ret = ocsfs2_del_dirent(dir, &dentry->d_name);
 	if (ret)
 		goto fail;
@@ -452,9 +480,12 @@ static int ocsfs2_unlink(struct inode *dir, struct dentry *dentry)
 	ret = ocsfs2_write_inode_block(dir);
 	if (ret)
 		goto fail;
-	return ocsfs2_txn_commit(txn);
+	ret = ocsfs2_txn_commit(txn);
+	goto out;
 fail:
 	ocsfs2_txn_abort(txn);
+out:
+	ocsfs2_meta_unlock(dir->i_sb);
 	return ret;
 }
 
@@ -464,11 +495,18 @@ static int ocsfs2_rmdir(struct inode *dir, struct dentry *dentry)
 	struct ocsfs2_txn *txn;
 	int ret;
 
-	if (!ocsfs2_empty_dir(inode))
-		return -ENOTEMPTY;
+	/* under the meta lease so the emptiness check sees peers' entries */
+	ocsfs2_meta_lock(dir->i_sb, dir, NULL);
+	ocsfs2_inode_refresh_coherent(inode);   /* the dir being removed, too */
+	if (!ocsfs2_empty_dir(inode)) {
+		ret = -ENOTEMPTY;
+		goto out;
+	}
 	txn = ocsfs2_txn_begin(dir->i_sb);
-	if (!txn)
-		return -ENOMEM;
+	if (!txn) {
+		ret = -ENOMEM;
+		goto out;
+	}
 	ret = ocsfs2_del_dirent(dir, &dentry->d_name);
 	if (ret)
 		goto fail;
@@ -480,9 +518,12 @@ static int ocsfs2_rmdir(struct inode *dir, struct dentry *dentry)
 	ret = ocsfs2_write_inode_block(dir);
 	if (ret)
 		goto fail;
-	return ocsfs2_txn_commit(txn);
+	ret = ocsfs2_txn_commit(txn);
+	goto out;
 fail:
 	ocsfs2_txn_abort(txn);
+out:
+	ocsfs2_meta_unlock(dir->i_sb);
 	return ret;
 }
 

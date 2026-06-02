@@ -24,7 +24,7 @@ static int repoint_dotdot(struct inode *dir, u64 new_parent_ino)
 
 		if (ocsfs2_bmap(dir, l, &phys))
 			continue;
-		bh = sb_bread(dir->i_sb, phys);
+		bh = ocsfs2_meta_bread(dir->i_sb, phys);
 		if (!bh)
 			continue;
 		for (s = 0; s < OCSFS2_DIRENTS_PER_BLOCK; s++) {
@@ -66,22 +66,37 @@ int ocsfs2_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 	if (flags & ~RENAME_NOREPLACE)
 		return -EINVAL;   /* RENAME_EXCHANGE / RENAME_WHITEOUT unsupported */
 
+	/* serialise + refresh both directories (and the displaced inode) so the
+	 * checks and edits below see peers' committed entries (cluster) */
+	ocsfs2_meta_lock(old_dir->i_sb, old_dir, new_dir);
+	if (new_inode)
+		ocsfs2_inode_refresh_coherent(new_inode);
+
 	if (new_inode) {
-		if (flags & RENAME_NOREPLACE)
-			return -EEXIST;
+		if (flags & RENAME_NOREPLACE) {
+			ret = -EEXIST;
+			goto out;
+		}
 		if (is_dir) {
-			if (!S_ISDIR(new_inode->i_mode))
-				return -ENOTDIR;
-			if (!ocsfs2_empty_dir(new_inode))
-				return -ENOTEMPTY;
+			if (!S_ISDIR(new_inode->i_mode)) {
+				ret = -ENOTDIR;
+				goto out;
+			}
+			if (!ocsfs2_empty_dir(new_inode)) {
+				ret = -ENOTEMPTY;
+				goto out;
+			}
 		} else if (S_ISDIR(new_inode->i_mode)) {
-			return -EISDIR;
+			ret = -EISDIR;
+			goto out;
 		}
 	}
 
 	txn = ocsfs2_txn_begin(old_dir->i_sb);
-	if (!txn)
-		return -ENOMEM;
+	if (!txn) {
+		ret = -ENOMEM;
+		goto out;
+	}
 
 	/* 1. install the new name pointing at old_inode */
 	if (new_inode) {
@@ -141,8 +156,11 @@ int ocsfs2_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 		if (ret)
 			goto fail;
 	}
-	return ocsfs2_txn_commit(txn);
+	ret = ocsfs2_txn_commit(txn);
+	goto out;
 fail:
 	ocsfs2_txn_abort(txn);
+out:
+	ocsfs2_meta_unlock(old_dir->i_sb);
 	return ret;
 }

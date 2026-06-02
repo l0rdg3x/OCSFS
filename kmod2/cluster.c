@@ -25,7 +25,9 @@ module_param_named(hb_pause, ocsfs2_hb_pause, bool, 0644);
 MODULE_PARM_DESC(hb_pause, "TEST: stop heartbeating to simulate node death");
 
 #define HB_INTERVAL_MS   2000
-#define HB_DEATH_FACTOR  4        /* dead after 4 missed intervals */
+#define HB_DEATH_FACTOR  15       /* dead after 30s — generous so heavy metadata
+				   * I/O can't starve a peer into a false death
+				   * (the v1 heartbeat-starvation cascade) */
 #define CAW_RETRIES      8
 
 /* ── coherent block I/O for coordination regions (bypasses the buffer cache) ── */
@@ -44,6 +46,32 @@ int ocsfs2_cl_bio(struct super_block *sb, u64 byte_off, void *buf,
 	ret = submit_bio_wait(&bio);
 	bio_uninit(&bio);
 	return ret;
+}
+
+/* Clustered: return a buffer_head for @blk whose contents are FRESH from disk
+ * (read via bio, bypassing this node's possibly-stale buffer cache). Single-node:
+ * a plain sb_bread. Used for shared-metadata reads (dirs, inode table, bitmap)
+ * so a node sees peers' committed changes. The caller mutates + journals/CAWs as
+ * usual; under serialisation (meta lease) the freshly-read buffer is correct. */
+struct buffer_head *ocsfs2_meta_bread(struct super_block *sb, u64 blk)
+{
+	struct buffer_head *bh;
+
+	if (!OCSFS2_SB(sb)->s_cluster)
+		return sb_bread(sb, blk);
+	bh = sb_getblk(sb, blk);
+	if (!bh)
+		return NULL;
+	lock_buffer(bh);
+	if (ocsfs2_cl_bio(sb, blk * (u64)sb->s_blocksize, bh->b_data,
+			  sb->s_blocksize, REQ_OP_READ)) {
+		unlock_buffer(bh);
+		brelse(bh);
+		return NULL;
+	}
+	set_buffer_uptodate(bh);
+	unlock_buffer(bh);
+	return bh;
 }
 
 /* Read-modify-CAW one record inside its logical block, retrying on contention.
@@ -186,6 +214,33 @@ static int hb_thread_fn(void *data)
 }
 
 /* ── cluster_ops: on-disk provider ── */
+
+/* Read a peer's on-disk node slot; true if it is ACTIVE (optionally at @gen).
+ * Used as a startup grace: a peer we have not yet observed via heartbeat but
+ * whose slot is claimed is treated as alive, so its leases are not wrongly
+ * reclaimed in the window before mutual liveness is established. */
+static bool node_slot_active(struct super_block *sb, u16 slot, u32 gen,
+			     bool check_gen)
+{
+	struct ocsfs2_sb_info *sbi = OCSFS2_SB(sb);
+	unsigned int lbs = bdev_logical_block_size(sb->s_bdev);
+	u64 off = sbi->s_node_table_off + (u64)slot * OCSFS2_NODE_SLOT_SIZE;
+	u64 blk = off & ~((u64)lbs - 1);
+	struct ocsfs2_disk_node_slot *ns;
+	u8 *buf = kmalloc(lbs, GFP_NOFS);
+	bool active = false;
+
+	if (!buf)
+		return true;     /* can't tell: be conservative (treat as alive) */
+	if (!ocsfs2_cl_bio(sb, blk, buf, lbs, REQ_OP_READ)) {
+		ns = (struct ocsfs2_disk_node_slot *)(buf + (off - blk));
+		active = ns->ns_state == OCSFS2_NODE_ACTIVE &&
+			 (!check_gen || le32_to_cpu(ns->ns_mount_gen) == gen);
+	}
+	kfree(buf);
+	return active;
+}
+
 bool ocsfs2_node_alive(struct super_block *sb, u16 slot, u32 gen)
 {
 	struct ocsfs2_cluster *c = OCSFS2_SB(sb)->s_cluster;
@@ -196,6 +251,8 @@ bool ocsfs2_node_alive(struct super_block *sb, u16 slot, u32 gen)
 	if (slot == c->self_slot)
 		return true;
 	p = &c->peers[slot];
+	if (!p->seen)
+		return node_slot_active(sb, slot, gen, true);   /* startup grace */
 	return p->state == OCSFS2_NODE_ACTIVE && p->gen == gen &&
 	       !time_after(jiffies, p->last_change + c->death_j);
 }
@@ -210,6 +267,8 @@ bool ocsfs2_node_alive_any(struct super_block *sb, u16 slot)
 	if (slot == c->self_slot)
 		return true;
 	p = &c->peers[slot];
+	if (!p->seen)
+		return node_slot_active(sb, slot, 0, false);   /* startup grace */
 	return p->state == OCSFS2_NODE_ACTIVE &&
 	       !time_after(jiffies, p->last_change + c->death_j);
 }
