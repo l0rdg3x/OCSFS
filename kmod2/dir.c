@@ -580,4 +580,5 @@ const struct file_operations ocsfs2_dir_fops = {
 	.read           = generic_read_dir,
 	.iterate_shared = ocsfs2_readdir,
 	.fsync          = noop_fsync,
+	.unlocked_ioctl = ocsfs2_ioctl,        /* FITRIM is issued on a dir fd */
 };

@@ -6,6 +6,7 @@
  */
 #include "ocsfs.h"
 #include <linux/vmalloc.h>
+#include <linux/blkdev.h>
 
 /* Load an AG's whole bitmap into a kmalloc buffer. Caller holds ag_lock. */
 static u8 *read_ag_bitmap(struct super_block *sb, struct ocsfs2_ag_info *ai,
@@ -336,4 +337,173 @@ void ocsfs2_free_blocks(struct super_block *sb, u64 block, u32 count)
 	spin_lock(&sbi->s_free_lock);
 	sbi->s_free_blocks += freed;
 	spin_unlock(&sbi->s_free_lock);
+}
+
+/* ── FITRIM / discard (D4 thin-reclaim) ──
+ * Issue device discard (SCSI UNMAP) over the free blocks of each AG's data
+ * region, so a thin-provisioned SAN can reclaim the space VM disks no longer
+ * use. The hard part is not discarding a block that is (or becomes) live:
+ *   - single-node: hold ag_lock across the discard (frees take ag_lock too);
+ *   - cluster: data-path allocation is lock-free CAW, so we CAW-CLAIM each free
+ *     run (mark it used) before discarding and CAW-RELEASE it after — a peer's
+ *     allocator then either loses the CAW race or sees the run as used, never
+ *     handing out a block under an in-flight discard. */
+
+static int discard_run(struct super_block *sb, u64 abs_block, u64 nblk)
+{
+	u32 spb = sb->s_blocksize / 512;
+	return blkdev_issue_discard(sb->s_bdev, abs_block * spb, nblk * spb,
+				    GFP_NOFS);
+}
+
+/* Single-node: scan [lo,hi) (absolute blocks) for free runs under ag_lock and
+ * discard each run >= @minlen. */
+static int trim_ag_single(struct super_block *sb, struct ocsfs2_ag_info *ai,
+			  u64 lo, u64 hi, u64 minlen, u64 *trimmed)
+{
+	struct buffer_head **bhs;
+	u8 *bm;
+	u64 rel_lo = lo - ai->block_start, rel_hi = hi - ai->block_start, i;
+	u64 run_start = 0, run_len = 0;
+	int ret = 0;
+
+	mutex_lock(&ai->ag_lock);
+	bm = read_ag_bitmap(sb, ai, &bhs);
+	if (!bm) { mutex_unlock(&ai->ag_lock); return -EIO; }
+
+	for (i = rel_lo; i <= rel_hi; i++) {
+		bool free = (i < rel_hi) && !test_bit_le8(bm, i);
+
+		if (free) {
+			if (run_len == 0) run_start = i;
+			run_len++;
+			continue;
+		}
+		if (run_len >= minlen) {
+			ret = discard_run(sb, ai->block_start + run_start, run_len);
+			if (ret) break;
+			*trimmed += run_len;
+		}
+		run_len = 0;
+	}
+	release_bhs(ai, bhs);
+	kvfree(bm);
+	mutex_unlock(&ai->ag_lock);
+	return ret;
+}
+
+/* Cluster: per bitmap block, find free runs in [lo,hi), CAW-claim, discard,
+ * CAW-release. Runs are clamped to one bitmap block (CAW granularity). */
+static int trim_ag_cluster(struct super_block *sb, struct ocsfs2_ag_info *ai,
+			   u64 lo, u64 hi, u64 minlen, u64 *trimmed)
+{
+	u32 bs = sb->s_blocksize, bpb = bs * 8;
+	u64 rel_lo = lo - ai->block_start, rel_hi = hi - ai->block_start;
+	u8 *old, *new;
+	u64 b;
+	int ret = 0;
+
+	old = kmalloc(bs, GFP_NOFS);
+	new = kmalloc(bs, GFP_NOFS);
+	if (!old || !new) { kfree(old); kfree(new); return -ENOMEM; }
+
+	for (b = rel_lo / bpb; b * bpb < rel_hi; b++) {
+		u64 bbyte = ai->bitmap_off + b * bs;
+		u32 base = 0;                          /* first bit of this block */
+		u32 lo_in = (b * bpb < rel_lo) ? (u32)(rel_lo - b * bpb) : 0;
+		u32 hi_in = (u32)min_t(u64, bpb, rel_hi - b * bpb);
+		u32 i, run_start = 0, run_len = 0;
+
+		(void)base;
+		if (ocsfs2_cl_bio(sb, bbyte, old, bs, REQ_OP_READ)) { ret = -EIO; break; }
+		for (i = lo_in; i <= hi_in; i++) {
+			bool free = (i < hi_in) && !test_bit_le8(old, i);
+
+			if (free) {
+				if (run_len == 0) run_start = i;
+				run_len++;
+				continue;
+			}
+			if (run_len >= minlen) {
+				u32 attempt, k;
+				bool claimed = false;
+
+				/* claim */
+				for (attempt = 0; attempt < OCSFS2_BM_CAW_RETRIES; attempt++) {
+					if (ocsfs2_cl_bio(sb, bbyte, old, bs, REQ_OP_READ))
+						break;
+					for (k = 0; k < run_len; k++)
+						if (test_bit_le8(old, run_start + k))
+							break;       /* someone took part of it */
+					if (k < run_len) break;          /* not all free now */
+					memcpy(new, old, bs);
+					for (k = 0; k < run_len; k++)
+						set_bit_le8(new, run_start + k);
+					if (ocsfs2_scsi_caw(sb, bbyte / bs, old, new, bs) == 0) {
+						claimed = true;
+						break;
+					}
+				}
+				if (claimed) {
+					ret = discard_run(sb,
+						ai->block_start + b * bpb + run_start, run_len);
+					/* release (clear the bits back) regardless */
+					for (attempt = 0; attempt < OCSFS2_BM_CAW_RETRIES; attempt++) {
+						if (ocsfs2_cl_bio(sb, bbyte, old, bs, REQ_OP_READ))
+							break;
+						memcpy(new, old, bs);
+						for (k = 0; k < run_len; k++)
+							clear_bit_le8(new, run_start + k);
+						if (ocsfs2_scsi_caw(sb, bbyte / bs, old, new, bs) == 0)
+							break;
+					}
+					if (ret) break;
+					*trimmed += run_len;
+					/* re-read the block for continued scanning */
+					if (ocsfs2_cl_bio(sb, bbyte, old, bs, REQ_OP_READ)) { ret = -EIO; break; }
+				}
+			}
+			run_len = 0;
+		}
+		if (ret) break;
+	}
+	kfree(old);
+	kfree(new);
+	return ret;
+}
+
+int ocsfs2_fitrim(struct super_block *sb, struct fstrim_range *range)
+{
+	struct ocsfs2_sb_info *sbi = OCSFS2_SB(sb);
+	u32 bs = sb->s_blocksize;
+	u64 minlen = max_t(u64, 1, range->minlen / bs);
+	u64 start_blk = range->start / bs;
+	u64 end_blk = (range->len >= (~0ULL - range->start)) ? sbi->s_total_blocks
+		      : (range->start + range->len) / bs;
+	u64 trimmed = 0;
+	u32 ag;
+	int ret = 0;
+
+	if (!bdev_max_discard_sectors(sb->s_bdev))
+		return -EOPNOTSUPP;
+	if (sbi->s_cluster)
+		ocsfs2_meta_lock(sb, NULL, NULL);   /* serialise vs namespace/grow */
+
+	for (ag = 0; ag < sbi->s_ag_count && !ret; ag++) {
+		struct ocsfs2_ag_info *ai = &sbi->s_ags[ag];
+		u64 dstart = ai->data_off / bs;
+		u64 dend = dstart + ai->data_blocks;
+		u64 lo = max(dstart, start_blk);
+		u64 hi = min(dend, end_blk);
+
+		if (lo >= hi)
+			continue;
+		ret = sbi->s_cluster ? trim_ag_cluster(sb, ai, lo, hi, minlen, &trimmed)
+				     : trim_ag_single(sb, ai, lo, hi, minlen, &trimmed);
+	}
+	if (sbi->s_cluster)
+		ocsfs2_meta_unlock(sb);
+
+	range->len = trimmed * bs;
+	return ret;
 }

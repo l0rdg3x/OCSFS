@@ -261,6 +261,22 @@ long ocsfs2_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	switch (cmd) {
 	case OCSFS_IOC_SNAP_CREATE:
 		return ocsfs2_ioc_snap_create(file, (void __user *)arg);
+	case FITRIM: {                      /* D4: thin-reclaim via SCSI UNMAP */
+		struct super_block *sb = file_inode(file)->i_sb;
+		struct fstrim_range range;
+		int ret;
+
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+		if (copy_from_user(&range, (void __user *)arg, sizeof(range)))
+			return -EFAULT;
+		ret = ocsfs2_fitrim(sb, &range);
+		if (ret)
+			return ret;
+		if (copy_to_user((void __user *)arg, &range, sizeof(range)))
+			return -EFAULT;
+		return 0;
+	}
 	default:
 		return -ENOTTY;
 	}

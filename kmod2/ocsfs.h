@@ -730,6 +730,7 @@ loff_t ocsfs2_llseek(struct file *file, loff_t offset, int whence);
 int  ocsfs2_alloc_blocks(struct super_block *sb, u32 ag_hint, u32 count,
 			 u64 *block_out);
 void ocsfs2_free_blocks(struct super_block *sb, u64 block, u32 count);
+int  ocsfs2_fitrim(struct super_block *sb, struct fstrim_range *range);  /* D4 */
 
 /* refcount.c — per-AG reflink/snapshot refcount tree (Plan 4) */
 u32  ocsfs2_refcount_get(struct super_block *sb, u64 phys);
