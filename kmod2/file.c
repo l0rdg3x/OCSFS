@@ -95,6 +95,13 @@ static int ocsfs2_punch_hole(struct inode *inode, loff_t offset, loff_t len)
 	if (ret)
 		return ret;
 
+	/* Drop the whole range's cached pages FIRST, then zero the partial edges.
+	 * (The old order zeroed the edges and then truncate_pagecache_range
+	 * discarded those just-dirtied edge folios without writeback, losing the
+	 * zeroing — caught by fsx clone+punch.) After this truncate, the edge
+	 * folios re-faulted by iomap_zero_range below stay dirty until writeback. */
+	truncate_pagecache_range(inode, offset, end - 1);
+
 	/* zero the partial head and tail sub-block bytes (mapped blocks only;
 	 * iomap_zero_range CoWs shared blocks and skips holes) */
 	ha = offset;
@@ -113,8 +120,6 @@ static int ocsfs2_punch_hole(struct inode *inode, loff_t offset, loff_t len)
 		if (ret)
 			return ret;
 	}
-
-	truncate_pagecache_range(inode, offset, end - 1);
 
 	/* free the fully-covered blocks -> a hole within i_size (reads zero) */
 	fstart = ((u64)offset + bs - 1) / bs;
