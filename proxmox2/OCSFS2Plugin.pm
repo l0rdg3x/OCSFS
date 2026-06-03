@@ -136,7 +136,9 @@ sub clone_image {
 
     if (!$snap) {
         my $src = $class->filesystem_path($scfg, $volname);
-        my $newname = $class->find_free_diskname($storeid, $scfg, $vmid, $fmt);
+        # $add_fmt_suffix=1: qcow2 volnames MUST carry the .qcow2 suffix or
+        # parse_volname rejects them ("unable to parse volume filename").
+        my $newname = $class->find_free_diskname($storeid, $scfg, $vmid, $fmt, 1);
         my $dstvol = "$vmid/$newname";
         my $dst = $class->filesystem_path($scfg, $dstvol);
         run_command(['cp', '--reflink=always', $src, $dst],
