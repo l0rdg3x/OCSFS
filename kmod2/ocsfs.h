@@ -984,6 +984,8 @@ int  ocsfs2_cl_bio(struct super_block *sb, u64 byte_off, void *buf,
 		   unsigned int len, blk_opf_t op);
 int  ocsfs2_cl_caw_record(struct super_block *sb, u64 byte_off,
 			  const void *rec, unsigned int rec_len);
+int  ocsfs2_cl_caw_slots(struct super_block *sb, u64 blk_byte,
+			 const u16 *off_in_blk, const __le32 *vals, u32 n);
 /* fresh metadata read (clustered: bio-coherent; single-node: sb_bread) */
 struct buffer_head *ocsfs2_meta_bread(struct super_block *sb, u64 blk);
 

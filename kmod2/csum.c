@@ -95,12 +95,14 @@ static inline bool csum_defer_on(struct ocsfs2_sb_info *sbi)
 void ocsfs2_csum_flush(struct super_block *sb)
 {
 	struct ocsfs2_sb_info *sbi = OCSFS2_SB(sb);
+	unsigned int lbs = bdev_logical_block_size(sb->s_bdev);
+	u32 cap = lbs / sizeof(__le32);        /* slots per logical block */
 	struct rb_root batch;
 	struct rb_node *n;
-	u32 *crcs;
-	u64 run0 = 0;
-	u32 runn = 0;
-	const u32 cap = 1024;
+	u16 *offs;
+	__le32 *vals;
+	u64 grp_blk = 0;
+	u32 grp_n = 0;
 
 	if (!csum_defer_on(sbi) || !READ_ONCE(sbi->s_csum_pending))
 		return;
@@ -110,28 +112,37 @@ void ocsfs2_csum_flush(struct super_block *sb)
 	sbi->s_csum_pending = 0;
 	spin_unlock(&sbi->s_csum_lock);
 
-	crcs = kmalloc_array(cap, sizeof(*crcs), GFP_NOFS);
+	/* Walk in physical (=> checksum-byte) order and emit ONE CAW per logical
+	 * checksum block, applying every dirty slot in it at once — so scattered
+	 * random writes that share a block cost one CAW, not one each. */
+	offs = kmalloc_array(cap, sizeof(*offs), GFP_NOFS);
+	vals = kmalloc_array(cap, sizeof(*vals), GFP_NOFS);
 	while ((n = rb_first(&batch))) {
 		struct ocsfs2_csum_pend *e =
 			rb_entry(n, struct ocsfs2_csum_pend, node);
+		u64 byte, blk;
 
-		if (!crcs) {                          /* OOM: one CAW per slot */
-			csum_write_range_sync(sb, e->phys, &e->crc, 1);
-		} else {
-			if (runn && (e->phys != run0 + runn || runn == cap)) {
-				csum_write_range_sync(sb, run0, crcs, runn);
-				runn = 0;
+		if (offs && vals && csum_slot(sb, e->phys, &byte) == 0) {
+			blk = byte & ~((u64)lbs - 1);
+			if (grp_n && (blk != grp_blk || grp_n == cap)) {
+				ocsfs2_cl_caw_slots(sb, grp_blk, offs, vals, grp_n);
+				grp_n = 0;
 			}
-			if (!runn)
-				run0 = e->phys;
-			crcs[runn++] = e->crc;
+			if (!grp_n)
+				grp_blk = blk;
+			offs[grp_n] = (u16)(byte - blk);
+			vals[grp_n] = cpu_to_le32(e->crc);
+			grp_n++;
+		} else {                              /* OOM / no slot: direct */
+			csum_write_range_sync(sb, e->phys, &e->crc, 1);
 		}
 		rb_erase(n, &batch);
 		kfree(e);
 	}
-	if (crcs && runn)
-		csum_write_range_sync(sb, run0, crcs, runn);
-	kfree(crcs);
+	if (grp_n)
+		ocsfs2_cl_caw_slots(sb, grp_blk, offs, vals, grp_n);
+	kfree(offs);
+	kfree(vals);
 }
 
 /* Record one pending (phys -> crc); overwrites a prior pending value so the

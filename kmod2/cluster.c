@@ -121,6 +121,50 @@ int ocsfs2_cl_caw_record(struct super_block *sb, u64 byte_off,
 	return ret;
 }
 
+/* Apply several 4-byte updates that all fall in ONE logical block in a single
+ * read-modify-CAW. Used by the deferred-csum flush: many dirty checksum slots in
+ * the same block go out as one CAW instead of one per slot. @blk_byte is the
+ * lbs-aligned byte offset of the block; off_in_blk[k] is each slot's offset
+ * within it, vals[k] its little-endian value. Stays atomic vs a peer touching a
+ * different slot of the same block (miscompare -> retry), so it is safe on a
+ * shared checksum block. */
+int ocsfs2_cl_caw_slots(struct super_block *sb, u64 blk_byte,
+			const u16 *off_in_blk, const __le32 *vals, u32 n)
+{
+	struct ocsfs2_sb_info *sbi = OCSFS2_SB(sb);
+	unsigned int lbs = bdev_logical_block_size(sb->s_bdev);
+	u8 *old, *new;
+	int ret = -EBUSY, i;
+	u32 k;
+
+	if (!sbi->s_cluster->caw_ok)
+		return -ENOTSUPP;
+	if (!n)
+		return 0;
+	old = kmalloc(lbs, GFP_NOFS);
+	new = kmalloc(lbs, GFP_NOFS);
+	if (!old || !new) {
+		kfree(old);
+		kfree(new);
+		return -ENOMEM;
+	}
+	for (i = 0; i < CAW_RETRIES; i++) {
+		ret = ocsfs2_cl_bio(sb, blk_byte, old, lbs, REQ_OP_READ);
+		if (ret)
+			break;
+		memcpy(new, old, lbs);
+		for (k = 0; k < n; k++)
+			memcpy(new + off_in_blk[k], &vals[k], sizeof(__le32));
+		ret = ocsfs2_scsi_caw(sb, blk_byte / lbs, old, new, lbs);
+		if (ret == 0)
+			break;
+		ret = -EBUSY;           /* miscompare: peer changed it, retry */
+	}
+	kfree(old);
+	kfree(new);
+	return ret;
+}
+
 /* ── heartbeat record ── */
 static void hb_fill(struct ocsfs2_disk_heartbeat *hb, u16 slot, u32 gen, u64 seq,
 		    u8 state)
