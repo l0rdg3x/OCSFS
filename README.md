@@ -345,6 +345,103 @@ corruption).
 
 ---
 
+## 🧰 Command-line reference (all flags)
+
+Only the positional argument (`<device>` / `<path>`) is ever mandatory — **every
+flag below has a default**. Sizes for `-j`/`-s` are **bytes** (accept `0x…` hex).
+The administrator guide (`docs/admin-guide.md` §9) carries the same reference with
+worked examples.
+
+### `mkfs.ocsfs2` — format a volume *(run once, destroys data)*
+
+```
+mkfs.ocsfs2 [-L <label>] [-N <max-nodes>] [-j <bytes>] [-s <bytes>] [-C] [-f] <device>
+```
+
+| Flag | Arg | Default | Meaning |
+|---|---|---|---|
+| `-N` | max nodes | **32** | Cluster nodes baked into the layout (lease/heartbeat slots), range `1..256`. `1` = single-node. **Format headroom, not a runtime cap** — each node reserves a ~16 MiB journal + slot + heartbeat (32 ≈ 512 MiB); raising it later needs a reformat, so pick the cluster's eventual maximum now. |
+| `-C` | — | off | Enable **per-physical-block data checksums** (CRC32c), verified inline on every read → `-EIO` not silent corruption. Recommended on any SAN without its own end-to-end integrity. Near-free now (deferred + batched). |
+| `-L` | label | none | Volume label stored in the superblock (shows up in `blkid`). |
+| `-j` | bytes | 16 MiB | Per-node journal (WAL) size, rounded up to a 4 KiB block; total journal area = `<bytes> × -N`. Rarely changed. |
+| `-s` | bytes | whole device | Format only the first *N* bytes and let **autogrow** extend into the rest later (thin initial layout / grow testing). |
+| `-f` | — | off | Force: overwrite an existing OCSFS/foreign signature instead of refusing. |
+
+### `mount` — attach the volume
+
+```
+mount -t ocsfs2 [-o cluster[,csum_async]] <device> <mountpoint>
+```
+
+| `-o` option | Default | Effect |
+|---|---|---|
+| `cluster` | off | Opt into **multinode** mode: claim a node slot, register the SCSI-PR key, start the heartbeat / liveness epoch, enable ownership + metadata leases and crash recovery. **Required on *every* node sharing a LUN.** |
+| `csum_async` | off | *(`-C` volumes, **single-node only**)* defer the per-write checksum `sync` to writeback — faster sustained 4 KiB random write, wider post-crash false-positive window (a rewrite/scrub clears it). **Ignored in cluster mode** (there the checksum *is* the coherence CAW). |
+
+### `ocsfs2-tool` — snapshots & online grow
+
+```
+ocsfs2-tool snapshot <src-file> <snap-name>   # CoW snapshot, created next to <src-file>
+ocsfs2-tool growfs   <path-on-fs>             # force an autogrow check now
+```
+
+`<snap-name>` must be a **bare name** (no `/`) — the snapshot lands in `<src-file>`'s
+directory and shares all its blocks until the next write. `growfs` makes the FS
+pick up a LUN that grew underneath it (safe to repeat any number of times).
+
+### `ocsfs2-scrub` — online checksum verify
+
+```
+ocsfs2-scrub [-q] <mountpoint>
+```
+
+| Flag | Meaning |
+|---|---|
+| `-q` | Print only the one-line summary. |
+
+Verifies every metadata checksum **and every data block** (on `-C` volumes) on the
+live filesystem. Exit `0` = clean, `1` = checksum findings, `2` = usage/error.
+
+### `ocsfs2-defrag` — online extent compaction
+
+```
+ocsfs2-defrag [-r] [-n] [-t <min-extents>] <path>
+```
+
+| Flag | Arg | Default | Meaning |
+|---|---|---|---|
+| `-r` | — | off | Recurse into a directory and defrag every regular file under it (stays within one mount). |
+| `-n` | — | off | Dry-run: only report each file's current extent count / fragmentation. |
+| `-t` | min extents | **8** | Only defrag files with **more than** *n* extents. |
+
+Relocates only a file's **private** extents — shared (reflink/snapshot/dedup)
+blocks are skipped, so defrag never breaks sharing or inflates space.
+
+### `fsck.ocsfs2` — check (online *or* offline)
+
+```
+fsck.ocsfs2 [-r] <device>        # OFFLINE: full structural + checksum pass (unmounted)
+fsck.ocsfs2 <mountpoint>         # ONLINE: live check via the scrub ioctl (no downtime)
+```
+
+| Flag | Meaning |
+|---|---|
+| `-r` | **Accepted but not yet implemented** — cross-referential *repair* is a roadmap item; today it prints a notice and runs the read-only check. Restore from backup if a check reports errors. |
+
+Read-only verifier. Pass a **mountpoint** to check a *running* filesystem (same
+engine as `ocsfs2-scrub`), or a **device** for the full off-disk pass unmounted.
+
+### `fstrim` — thin reclaim *(standard util-linux)*
+
+```
+fstrim <mountpoint>
+```
+
+OCSFS turns it into SCSI **UNMAP** over the volume's free blocks so the SAN can
+thin-reclaim them. The weekly discard is left to your own policy / `fstrim.timer`.
+
+---
+
 ## 🖥️ Proxmox VE
 
 A one-step installer wires up everything on a node — prerequisites, the kernel

@@ -101,12 +101,14 @@ mkfs.ocsfs2 -f -N 1 /dev/disk/by-id/scsi-XXXX
 mkfs.ocsfs2 -f -N 32 -C /dev/disk/by-id/scsi-XXXX
 ```
 
-| Flag | Meaning |
-|---|---|
-| `-N <n>` | maximum cluster nodes baked into the layout (slots). `1` = single-node. **Default 32.** Format headroom, not a runtime cap — each node reserves a ~16 MiB journal + slot + heartbeat, so 32 ≈ 512 MiB; raising it later needs a reformat, so pick the cluster's eventual max now. |
-| `-C` | enable **per-data-block checksums** (CRC32c) — silent-corruption detection on any SAN; verified inline on every read. Recommended. Near-free except sustained 4 KiB-random-write (see §10). |
-| `-f` | force (overwrite an existing filesystem) |
-| `-s <MiB>` | format only the first *N* MiB and let autogrow extend later |
+| Flag | Argument | Default | Meaning |
+|---|---|---|---|
+| `-N <n>` | max cluster nodes | **32** | nodes baked into the layout (lease/HB slots). `1` = single-node. Accepts `1..256`. Format headroom, not a runtime cap — each node reserves a ~16 MiB journal + slot + heartbeat, so 32 ≈ 512 MiB; raising it later needs a reformat, so pick the cluster's eventual max now. |
+| `-C` | — (flag) | off | enable **per-data-block checksums** (CRC32c) — silent-corruption detection on any SAN; verified inline on every read. Recommended. Near-free except sustained 4 KiB-random-write (see §10). |
+| `-L <label>` | volume label | none | set the volume label (stored in the superblock; shows in `blkid`). |
+| `-j <bytes>` | journal size / node | **16 MiB** | per-node WAL size **in bytes** (rounded up to a 4 KiB block). Total journal area = `<bytes> × -N`. Larger = more in-flight transactions before a forced checkpoint; rarely needs changing. |
+| `-s <bytes>` | format size | whole device | format only the first *N* **bytes** of the device and let **autogrow** extend into the rest later (used to validate repeatable online grow). |
+| `-f` | — (flag) | off | force: overwrite an existing OCSFS/foreign signature instead of refusing. |
 
 `mkfs` lays out uniform allocation groups (AG), each self-contained
 (header + block bitmap + inode table + per-AG refcount B+tree), a per-node
@@ -313,30 +315,41 @@ All tools accept `-h`/`--help`.
 ### `mkfs.ocsfs2` — create a filesystem
 
 ```
-mkfs.ocsfs2 [-f] -N <max-nodes> [-s <MiB>] [-C] <device>
+mkfs.ocsfs2 [-L <label>] [-N <max-nodes>] [-j <bytes>] [-s <bytes>] [-C] [-f] <device>
 ```
 Writes a fresh OCSFS v2 filesystem onto `<device>` (a whole disk/LUN or a
-partition). **Destroys existing data.**
+partition). **Destroys existing data.** Only `<device>` is mandatory — every flag
+has a default.
 
-| Option | Meaning |
-|---|---|
-| `-N <n>` | maximum cluster nodes (lease/HB slots). `1` = single-node, no cluster services. **Required.** |
-| `-f` | force: overwrite an existing filesystem/signature |
-| `-s <MiB>` | format only the first *MiB* and rely on autogrow to extend later (thin initial layout) |
-| `-C` | **data checksums**: reserve a per-AG CRC32c region so silent data corruption is detectable on *any* SAN (see §7 *Data integrity*). Opt-in (small space + write overhead). |
+| Option | Default | Meaning |
+|---|---|---|
+| `-N <n>` | **32** | maximum cluster nodes (lease/HB slots), `1..256`. `1` = single-node, no cluster services. Format headroom, **not** a runtime cap — raising it later needs a reformat. |
+| `-C` | off | **data checksums**: per-physical-block CRC32c so silent data corruption is detectable on *any* SAN, verified inline on every read (see §7 *Data integrity*). Recommended. Opt-in (small space + write overhead). |
+| `-L <label>` | none | volume label written to the superblock (visible via `blkid`). |
+| `-j <bytes>` | 16 MiB | per-node journal (WAL) size **in bytes**, rounded up to 4 KiB; total journal = `<bytes> × -N`. Rarely changed. |
+| `-s <bytes>` | whole device | format only the first *N* **bytes** and rely on **autogrow** to extend into the rest later (thin initial layout / grow testing). |
+| `-f` | off | force: overwrite an existing filesystem/signature instead of refusing. |
 
 ```bash
-# 3-node clustered FS on the whole LUN:
-mkfs.ocsfs2 -f -N 3 /dev/disk/by-id/scsi-3600abcd
+# 3-node clustered FS, data checksums, on the whole LUN:
+mkfs.ocsfs2 -f -N 3 -C /dev/disk/by-id/scsi-3600abcd
+
+# single-node, labelled, format only the first 64 GiB (grow into the rest later):
+mkfs.ocsfs2 -f -N 1 -L vmstore -s 68719476736 /dev/disk/by-id/scsi-3600abcd
 ```
 
 ### `mount` — attach the filesystem
 
 ```
-mount -t ocsfs2 [-o cluster] <device> <mountpoint>
+mount -t ocsfs2 [-o cluster[,csum_async]] <device> <mountpoint>
 ```
 Mounts the volume. Add `-o cluster` on a LUN shared by more than one node to
 turn on membership, fencing, leases and recovery; omit it for single-host use.
+
+| `-o` option | Default | Effect |
+|---|---|---|
+| `cluster` | off | opt into multinode mode — claim a heartbeat slot, register the SCSI-PR key, start the liveness epoch, enable leases + crash recovery. **Required on every node sharing a LUN** (two nodes mounting the same LUN *without* it = two independent single-node mounts = corruption). |
+| `csum_async` | off | (data-checksum volumes, **single-node only**) defer the per-write checksum `sync` to writeback — ~3.6× faster sustained 4 KiB-random-write, at the cost of a wider post-crash false-positive window (a rewrite/scrub clears it). **Ignored in cluster mode** (there the checksum *is* the coherence CAW). |
 
 ```bash
 mount -t ocsfs2 -o cluster /dev/disk/by-id/scsi-3600abcd /mnt/vmstore
@@ -403,12 +416,16 @@ blocks so the SAN can thin-reclaim them.
 ### `fsck.ocsfs2` — check, online or offline
 
 ```
-fsck.ocsfs2 <device>        # OFFLINE: full structural + checksum pass (unmounted)
-fsck.ocsfs2 <mountpoint>    # ONLINE: live check via OCSFS_IOC_SCRUB (no downtime)
+fsck.ocsfs2 [-r] <device>        # OFFLINE: full structural + checksum pass (unmounted)
+fsck.ocsfs2 <mountpoint>         # ONLINE: live check via OCSFS_IOC_SCRUB (no downtime)
 ```
 Read-only verifier. Pass a **mountpoint** to check a *running* filesystem without
 stopping it (it runs the same engine as `ocsfs2-scrub`), or a **device** for the
-full off-disk pass with the volume unmounted. Repair is offline-only.
+full off-disk pass with the volume unmounted.
+
+| Option | Meaning |
+|---|---|
+| `-r` | **accepted but not yet implemented** — cross-referential *repair* is a roadmap item; today `-r` prints a notice and runs the same read-only check. Recover from backup if a check reports errors. |
 
 ```bash
 fsck.ocsfs2 /mnt/vmstore                                   # online, no downtime
