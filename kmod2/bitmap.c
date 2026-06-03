@@ -92,13 +92,30 @@ static int clustered_alloc(struct super_block *sb, u32 ag_hint, u32 count,
 	u32 tried;
 	int ret = -ENOSPC;
 
+	u16 self = sbi->s_node_slot;
+	u16 nn = sbi->s_max_nodes ? sbi->s_max_nodes : 1;
+	int pass;
+
 	old = kmalloc(bs, GFP_NOFS);
 	new = kmalloc(bs, GFP_NOFS);
 	if (!old || !new) { kfree(old); kfree(new); return -ENOMEM; }
 
+	/* Node-owned-AG affinity: a node prefers the AGs it "owns" (ag % max_nodes ==
+	 * its slot), so concurrent allocators on different nodes touch DISJOINT bitmap
+	 * blocks — no SCSI-CAW miscompare/retry storm between nodes. Pass 0 scans only
+	 * own AGs; pass 1 falls back to any AG so a node never hits a false ENOSPC.
+	 * The CAW still guarantees correctness whichever AG wins (a stale hint just
+	 * costs a miscompare + retry), so this is a pure contention/locality hint with
+	 * no coherence change. */
+	for (pass = 0; pass < 2 && ret == -ENOSPC; pass++)
 	for (tried = 0; tried < sbi->s_ag_count && ret == -ENOSPC; tried++) {
 		u32 ag = (ag_hint + tried) % sbi->s_ag_count;
 		struct ocsfs2_ag_info *ai = &sbi->s_ags[ag];
+
+		if (pass == 0 && (u16)(ag % nn) != self)
+			continue;            /* first pass: AGs this node owns */
+		if (pass == 1 && (u16)(ag % nn) == self)
+			continue;            /* already tried in pass 0 */
 		/* number of bitmap blocks covering this AG */
 		u64 nbm = ((u64)ai->block_count + bpb - 1) / bpb;
 		/* Start scanning at the bitmap block of next_blk_hint (the allocation

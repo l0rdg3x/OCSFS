@@ -586,13 +586,25 @@ static int slot_is_free(struct super_block *sb, u32 ag, u64 local, bool *freep)
 int ocsfs2_alloc_inode_num(struct super_block *sb, u32 ag_hint, u64 *ino_out)
 {
 	struct ocsfs2_sb_info *sbi = OCSFS2_SB(sb);
+	u16 self = sbi->s_node_slot;
+	u16 nn = sbi->s_max_nodes ? sbi->s_max_nodes : 1;
 	u32 tried;
+	int pass;
 
+	/* Same node-owned-AG affinity as block allocation: new inodes land in AGs this
+	 * node owns, so concurrent cross-node create() touches disjoint inode tables
+	 * (no CAW contention) and a file's blocks then default to the same own AGs.
+	 * Pass 1 falls back to any AG. No-op single-node (max_nodes==1). */
+	for (pass = 0; pass < 2; pass++)
 	for (tried = 0; tried < sbi->s_ag_count; tried++) {
 		u32 ag = (ag_hint + tried) % sbi->s_ag_count;
 		struct ocsfs2_ag_info *ai = &sbi->s_ags[ag];
 		u64 start, local;
 
+		if (pass == 0 && (u16)(ag % nn) != self)
+			continue;
+		if (pass == 1 && (u16)(ag % nn) == self)
+			continue;
 		mutex_lock(&ai->ag_lock);
 		if (ai->free_inodes == 0) {
 			mutex_unlock(&ai->ag_lock);
