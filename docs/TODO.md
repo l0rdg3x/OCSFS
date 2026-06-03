@@ -82,7 +82,25 @@ The detailed analysis below is kept for reference.
 
 ## Part A — Open functional / correctness items
 
-### A9. [MAYBE · P3] Extend Plan 5 journal deferral to cluster volumes (perf)
+### A10. [DONE · 2026-06-03] Cluster allocator bitmap re-scan (the real #1 cluster cost)
+`clustered_alloc` restarted its bitmap scan at block 0 every allocation,
+coherently re-reading every full block — O(filled) cl_bio per alloc. A cluster
+`qemu-img convert` spent **~89% of its I/O** there (32k/36k cl_bio). FIXED
+(`3190d2e`): scan from `next_blk_hint` + wrap; cl_bio 68k→17k (4×), convert
+~60s→47s; fsx + churn clean. This was masking the journal cost (below).
+
+### A9. [FIX · P2] Extend Plan 5 journal deferral to cluster volumes (perf)
+After A10, a cluster convert (47s) is dominated by the **synchronous journal**:
+44k `sync_dirty_buffer` + 59k `blkdev_issue_flush` (per-op commit + checkpoint).
+The single-node deferred path does 21/122/63 of those. So journal deferral would
+take a cluster convert ~47s → ~17s (near single-node). **But it's the high-risk
+cross-node change**: (1) the deferred path can't simply replace the synchronous
+one — peers read home blocks coherently, and crash recovery (`replay_slot`)
+needs the records ordered before the header, so naively dropping the per-op
+flush/checkpoint risks torn cross-node metadata; (2) needs **checkpoint on every
+metadata-lease release/downgrade** (`ocsfs2_lease_release`, lease.c — a single
+missed site = stale cross-node read = corruption); (3) `replay_slot` must loop;
+(4) full 3-node crash + coherence validation. Its own focused session.
 Plan 5 (`50d2370`) makes the journal **batched + deferred** only on volumes that
 can never join a cluster (`s_max_nodes <= 1`): `qemu-img convert` there went
 52.4s → 12.7s (4.1×, at the data floor), crash-safe. **Cluster-capable volumes
