@@ -70,7 +70,7 @@ It is also exactly the Proxmox workload, which is why VMFS works the same way.
 | 📈 **Autonomous online autogrow** | Grow the LUN any number of times — each node detects it and grows into the new space hot, **repeatedly** |
 | 🩺 **Online metadata scrub** | Verify every on-disk checksum on a live volume (`OCSFS_IOC_SCRUB`) to catch silent bitrot |
 | 🔐 **End-to-end data checksums** | Opt-in `mkfs -C`: per-physical-block CRC32c, **verified inline on every read** (buffered + O_DIRECT, cross-node) → `-EIO` not corruption, on **any** SAN; cheap (batched), CoW/reflink-safe |
-| 🏎️ **Near-raw VM-disk I/O** | O_DIRECT (`cache=none`) seq write **scales with node count**; random is bound by the shared LUN, with no clustering tax |
+| 🏎️ **Near-raw VM-disk I/O** | O_DIRECT (`cache=none`); **zero per-I/O clustering tax** (single-writer) — a node hits the raw LUN; aggregate is bound by the shared LUN (scale with more LUNs) |
 | 🧱 **Proxmox-native** | `mount -t ocsfs2 -o cluster`; live migration *is* the lease hand-off |
 
 ---
@@ -101,9 +101,11 @@ fallback. **No loopback devices.**
 - ✅ `fallocate` preallocate / **punch-hole** / **zero-range**, sparse, truncate
 - ✅ **discard/TRIM** (`fstrim`) reclaims free space on the thin LUN (SCSI UNMAP)
 - ✅ **autonomous online autogrow**, including **repeated** grows in one mount
-  (2→6→14→28 GiB via dm-linear over the real LUN; data intact each step)
-- ✅ **online metadata scrub** verifies all checksums; detects an injected
-  inode-checksum corruption
+  (via dm-linear over the real LUN; data intact each step). Autogrow-added AGs are
+  **data-checksummed** like the original AGs (validated 3→23 AGs: inline + scrub
+  catch corruption in a grown AG)
+- ✅ **online scrub** verifies every metadata checksum **and every data block**
+  (`mkfs -C`); detects injected inode-checksum *and* data-block corruption
 - ✅ **crash recovery**: journal replay on mount reconstructs a committed-but-
   uncheckpointed transaction (validated by `sysrq` power-loss)
 
@@ -119,8 +121,9 @@ fallback. **No loopback devices.**
 - ✅ **L5 recovery** — a dead node's owner-leases are eagerly reclaimed and its
   per-node journal is replayed by the survivor (off the heartbeat path), so its
   files become usable again with content intact
-- ✅ **multinode performance** (see below) — sequential O_DIRECT write scales
-  with node count; no metadata collapse under concurrent load
+- ✅ **multinode performance** (see below) — 3-node aggregate on one LUN ≈ a
+  single node's (the shared LUN is the ceiling, **no per-I/O clustering tax**); no
+  metadata collapse under concurrent load (v1 collapsed here)
 - ✅ **differential data-path testing** (`tests/v2/fsx_diff.sh`) — identical
   `fsx` seeds/params on OCSFS vs **XFS** (a bug counts only when OCSFS diverges
   from XFS, filtering fuzzer/golden-output artifacts): **buffered**, **O_DIRECT**
@@ -161,85 +164,89 @@ was cleared.
 
 ## ⚡ Performance
 
-All numbers are O_DIRECT (`fio --direct=1 --ioengine=libaio`, the Proxmox
-`cache=none` path) against a **TrueNAS SCALE iSCSI LUN** over **1 GbE**, SSD-backed
-zvol, SCSI PR + CAW. QD32 for random, QD1 for sequential (1 MiB). Treat absolute
-values as *this rig* (1 GbE + a single shared SSD are the ceilings) — the **ratios**
-are the story.
+Measured on the real testbed: **Proxmox VE 9 (kernel 7.0.x-pve)**, a **TrueNAS
+SCALE iSCSI LUN** over **1 GbE**, **100 GiB zvol, `volblocksize=4K`, `sync=disabled`**,
+single SSD, SCSI PR + CAW. fio O_DIRECT (`--direct=1 --ioengine=libaio`, the Proxmox
+`cache=none` path), QD32 random / QD1 sequential (1 MiB). The 1 GbE link and the
+single shared SSD are the ceilings — treat absolutes as *this rig* and read the
+**ratios**.
 
 ### Single node — checksums (`-C`) are near-free except pure random write
 
-`-C` = per-data-block CRC32c, stored on write + **verified inline on every read**.
+`-C` = per-data-block CRC32c, stored on write + **verified inline on every read**
+(both O_DIRECT and buffered, async/pipelined).
 
 | Workload (O_DIRECT) | no `-C` | with `-C` | Δ |
 |---|--:|--:|---|
-| Sequential write 1 MiB | 96.5 MB/s | 94.7 MB/s | **−2%** |
-| Sequential read 1 MiB  | 99.2 MB/s | 95.4 MB/s | −4% |
-| Random **read** 4 KiB  | 26 423 IOPS | 26 833 IOPS | **≈0%** (verify ≈ free) |
-| Random read 16 KiB     | 7 104 IOPS | 7 109 IOPS | ≈0% |
-| Random write 16 KiB    | 44.7 MB/s | 40.8 MB/s | −9% |
-| Random **write** 4 KiB | 5 369 IOPS | 3 644 IOPS | −32% ← the one real cost |
+| Sequential write 1 MiB | 89.1 MB/s | 83.3 MB/s | −6% |
+| Sequential read 1 MiB  | 88.1 MB/s | 86.7 MB/s | −2% |
+| Random **read** 4 KiB  | 26 539 IOPS | 26 735 IOPS | **≈0%** (verify ≈ free) |
+| Random read 16 KiB     | 7 103 IOPS | 7 105 IOPS | ≈0% |
+| Random write 16 KiB    | 5 390 IOPS | 2 713 IOPS | −50% |
+| Random **write** 4 KiB | **20 988 IOPS** | 3 656 IOPS | −83% ← the one real cost |
+| Random write 4 KiB **`-o csum_async`** | 20 988 IOPS | **12 192 IOPS** | **−4%** |
 
-Reads, sequential and large/aligned writes pay almost nothing; only **pure 4 KiB
-random write** is capped (~3.5k IOPS) by the crash-safe checksum `sync` (one per
-4 KiB write that can't be batched). That ceiling is the *integrity* price and is
-independent of the underlying LUN speed (see below).
+Reads, sequential and large/aligned writes pay almost nothing. The only real cost
+is **sustained pure 4 KiB-random-write**, capped at ~3.5k IOPS by the crash-safe
+per-write checksum `sync` (independent of LUN speed). Mounting **`-o csum_async`**
+defers that `sync` to writeback and restores ~3.6× (≈ no-`-C`), trading a wider
+post-crash false-positive window (a rewrite/scrub clears it; single-node only).
 
-### Making `-C` cheap — what changed
+### Making `-C` cheap — the engineering
 
-The naïve checksum path synced/CAW'd the slot **per block**; a 1 MiB write (256
-blocks sharing one checksum block) did 256 syncs. Batching to **one sync/CAW and
-one coherent read per checksum block** (`csum_set_range` / `csum_read_range`)
-restored full speed:
+Three changes took the checksum cost from crippling to near-free (gains, *this rig*):
 
-| `-C` workload | before | after | gain |
-|---|--:|--:|---|
-| Sequential write (single node) | 14.5 MB/s | **94.7 MB/s** | **6.5×** |
-| Random write 16 KiB (single node) | 14.7 MB/s | 40.8 MB/s | 2.8× |
-| **Cluster** sequential read /node | 12.2 MB/s | **32.5 MB/s** | 2.7× (≈ no-`-C`) |
-| Cluster random read 16 KiB /node | 13.5 MB/s | 27.0 MB/s | 2.0× |
-| **Buffered** sequential read (single node) | 18 MB/s | **117 MB/s** | **6.5×** (line rate) |
+| `-C` change | workload | before | after |
+|---|---|--:|--:|
+| Batch the write (`csum_set_range`: 1 `sync`/CAW per checksum block, not per block) | seq write | 14.5 MB/s | **94.7 MB/s** (6.5×) |
+| Async inline read verify (pre-read CRCs, verify in the bio completion — not a sync bio-per-folio) | buffered seq read | 18 MB/s | **117 MB/s** (6.5×, line rate) |
+| Batch the cluster read (`csum_read_range`: 1 coherent read per checksum block) | cluster seq read /node | 12 MB/s | **32 MB/s** (≈ no-`-C`) |
 
-The inline read verify is async on both paths (O_DIRECT and buffered) — pre-read
-the stored CRCs, then verify in the bio completion — so reads stay pipelined; the
-online scrub reads data the same way (raw bio, batched 256 KiB), not via the
-buffer cache. For the one remaining write cost — sustained pure 4 KiB-random-write
-(~3.5k IOPS, the crash-safe per-write checksum `sync`) — mount **`-o csum_async`**
-to defer the checksum durability to writeback: **3 356 → 12 192 IOPS (3.6×, ≈
-no-`-C`)**, at the cost of a wider post-crash false-positive window (a rewrite or
-scrub clears it). Single-node only (in cluster the checksum *is* the coherence CAW).
+The online scrub reads DATA the same way (raw bio, batched 256 KiB) — *not* via the
+buffer cache, which is incoherent with the iomap data path (a bug that surfaced as
+spurious mismatches on autogrow-grown regions; fixed). Autogrow-added AGs are
+checksummed identically to the original ones.
 
 ### The biggest lever is on the SAN, not the FS — match `volblocksize`
 
 A 4 KiB random write to a **16 KiB-`volblocksize`** zvol forces a 16 KiB ZFS
-read-modify-write (4× amplification). Re-testing on a **4 KiB-`volblocksize`** zvol
-(single node, no `-C`):
+read-modify-write (4× amplification). Single-node, no `-C`:
 
 | Random write, O_DIRECT | 16 KiB-`volblocksize` | 4 KiB-`volblocksize` | gain |
 |---|--:|--:|---|
-| 4 KiB QD32  | 5 369 IOPS / 21 MB/s | **18 234 IOPS / 71 MB/s** | **3.4×** |
-| 16 KiB QD32 | 2 858 IOPS / 45 MB/s | 5 250 IOPS / 82 MB/s | 1.8× |
+| 4 KiB QD32  | 5 369 IOPS | **20 988 IOPS** | **3.9×** |
+| 16 KiB QD32 | 2 858 IOPS | 5 390 IOPS | 1.9× |
 
-> **Tuning takeaway — most performant *and* safe combination:**
+> **Most performant *and* safe combination:**
 > 1. **Match the zvol `volblocksize` to the guest** (4 KiB for random-heavy VM
->    disks) — the single biggest win (3.4× random write), entirely on the SAN side.
-> 2. **Keep `-C` on** — it is ≈free for reads, sequential and large writes (the
->    dominant Proxmox patterns) and gives silent-corruption protection on any SAN.
-> 3. Accept the ~3.5k-IOPS cap on *sustained pure-4 KiB-random-write* as the
->    crash-safe checksum cost (a future async-`-C` mount option could lift it for
->    workloads that prefer speed over post-crash checksum durability).
+>    disks) — the single biggest win (~4× random write), entirely on the SAN side.
+> 2. **Keep `-C` on** — ≈free for reads, sequential and large writes (the dominant
+>    Proxmox patterns); silent-corruption protection on any SAN.
+> 3. For sustained small-random-write *with* checksums, add **`-o csum_async`** (3.6×).
 > 4. On the SAN: `sync=standard` (+ SLOG) for power-loss durability, or
->    `sync=disabled` for speed if the SAN has battery/UPS-backed cache.
+>    `sync=disabled` for speed if the SAN cache is battery/UPS-backed.
 
-### Cluster — aggregate is bound by the shared LUN, not OCSFS
+### Cluster (3 nodes, one shared LUN) — bound by the LUN, not OCSFS
 
-With three nodes each writing **their own** files on **one** SSD-backed LUN, the
-aggregate is the device/1 GbE ceiling (~100 MB/s sequential), not a clustering
-tax: steady-state file I/O does **zero** per-operation on-disk locking (single-
-writer ownership), so the second and third node add no coordination cost on
-independent files — they just share the one physical disk. (v1, by contrast,
-collapsed to a few hundred IOPS under cluster load because every 4 KiB I/O did
-synchronous on-disk lock work.) Real scaling needs multiple LUNs / a faster pool.
+Three nodes, each writing **its own** files on **one** 4 KiB-`volblocksize` LUN,
+`-o cluster` (aggregate = sum of 3):
+
+| Workload (O_DIRECT) | no `-C` | with `-C` |
+|---|--:|--:|
+| Sequential write 1 MiB | 98.7 MB/s | 92.9 MB/s |
+| Sequential read 1 MiB  | 81.8 MB/s | 91.2 MB/s |
+| Random write 4 KiB     | 20 570 IOPS | 6 339 IOPS |
+
+Two things to read here. **(1)** The 3-node aggregate ≈ a *single* node's number
+(seq ~the 1 GbE/SSD ceiling; random-write 4 KiB 20.5k ≈ the 21k one node already
+extracts): steady-state file I/O does **zero** per-operation on-disk locking
+(single-writer ownership), so peers add no coordination tax — but a *single shared
+LUN/target is the ceiling*. **Scale aggregate I/O by spreading VMs across multiple
+LUNs**, not by adding nodes to one LUN. (v1 instead *collapsed* under cluster load,
+doing synchronous on-disk lock work per 4 KiB I/O.) **(2)** `-C` is ≈free on cluster
+sequential read/write too (the async read verify + batched CAW write); the cluster
+4 KiB-random-write cost is the per-write coherence CAW (the `csum_async` relaxation
+is single-node only, since in cluster the checksum *is* that CAW).
 
 ---
 
@@ -294,29 +301,32 @@ synchronous on-disk lock work.) Real scaling needs multiple LUNs / a faster pool
 
 | File | Responsibility |
 |---|---|
-| `super.c` | Mount/unmount, `-o cluster` option, AG headers (pre-sized for autogrow), statfs, sync |
+| `super.c` | Mount/unmount, `-o cluster` / `-o csum_async` options, AG headers (pre-sized for autogrow), statfs, sync |
 | `inode.c` | Inode read/write/alloc/free (CAW in cluster), extent map (inline ↔ B+tree), coherent re-read |
 | `dir.c` · `rename.c` | Namespace ops under the metadata lease; directory blocks read fresh via bio |
-| `iomap.c` | Buffered + O_DIRECT data path; block-granular CoW via bios |
+| `iomap.c` | Buffered + O_DIRECT data path; block-granular CoW via bios; **async inline data-checksum read verify** |
+| `csum.c` | Per-data-block CRC32c (`mkfs -C`): batched store + batched coherent read; clear-on-free |
 | `file.c` | `fallocate` (preallocate/punch/zero), `fiemap`, `SEEK_HOLE/DATA`; lease on open/release |
 | `extent_btree.c` | Per-inode extent B+tree (spill past 16 inline extents) |
-| `bitmap.c` | Per-AG allocation; cluster alloc/free + **FITRIM** via CAW |
+| `bitmap.c` | Per-AG allocation; cluster alloc/free + **FITRIM** via CAW; drops freed blocks' checksums |
 | `journal.c` | Per-node WAL: redo log, replay on mount, **replay a dead peer's slot** (L5) |
 | `refcount.c` | Per-AG refcount B+tree for reflink/snapshot/dedup sharing |
-| `reflink.c` | `FICLONE`/`copy_file_range`, `FIDEDUPERANGE` dedup, snapshot ioctl, `FITRIM`/`GROWFS`/`SCRUB` dispatch |
+| `reflink.c` | `FICLONE`/`copy_file_range`, `FIDEDUPERANGE` dedup, snapshot ioctl, `FITRIM`/`GROWFS`/`SCRUB`/`DEFRAG` dispatch |
+| `defrag.c` | Online extent compaction (`OCSFS_IOC_DEFRAG`) |
 | `xattr.c` | xattr (user/trusted/security) + POSIX ACL in one block |
 | `cluster.c` | L3: node-slot claim, heartbeat kthread, coherent bio + CAW helpers, fencing |
 | `lease.c` | L4 ownership leases + L4b metadata lease + L5 recovery (leader, reclaim) |
-| `grow.c` | L2: autonomous online autogrow (watcher + `OCSFS_IOC_GROWFS`) |
-| `scrub.c` | Online metadata scrub (`OCSFS_IOC_SCRUB`) |
+| `grow.c` | L2: autonomous online autogrow (watcher + `OCSFS_IOC_GROWFS`); checksums new AGs |
+| `scrub.c` | Online scrub: every metadata checksum **+ every data block** (`OCSFS_IOC_SCRUB`) |
 | `transport/scsi_pr.c` | SCSI-3 PR + Compare-And-Write (the only file carried over from v1) |
 
 ### Userspace tools (`tools2/`)
 
 | Tool | Description |
 |---|---|
-| `mkfs.ocsfs2` | Volume formatter; uniform autogrow-ready AGs; `-N` max nodes, `-s` format-a-prefix (testing) |
+| `mkfs.ocsfs2` | Volume formatter; uniform autogrow-ready AGs; `-N` max nodes (default 32), `-C` data checksums, `-s` format-a-prefix (testing) |
 | `fsck.ocsfs2` | Offline structural + checksum + refcount-tree check |
+| `ocsfs2-scrub` · `ocsfs2-defrag` · `ocsfs2-tool` | Online scrub / defrag / growfs+snapshot CLIs (also driven by the systemd timers) |
 
 ---
 
