@@ -296,7 +296,10 @@ fail:
 	ocsfs2_txn_abort(txn);
 fail_committed:
 	inode_dec_link_count(inode);
-	discard_new_inode(inode);
+	iput(inode);   /* nlink already 0 above -> evict frees the inode + its ino.
+			* (the inode is from new_inode(), never I_NEW, so the kernel's
+			* discard_new_inode() would WARN; a legitimately failed create
+			* — e.g. ENOSPC — must clean up without noise.) */
 out:
 	ocsfs2_meta_unlock(dir->i_sb);
 	return ret;
@@ -359,7 +362,10 @@ fail:
 	ocsfs2_txn_abort(txn);
 fail_committed:
 	inode_dec_link_count(inode);
-	discard_new_inode(inode);
+	iput(inode);   /* nlink already 0 above -> evict frees the inode + its ino.
+			* (the inode is from new_inode(), never I_NEW, so the kernel's
+			* discard_new_inode() would WARN; a legitimately failed create
+			* — e.g. ENOSPC — must clean up without noise.) */
 out:
 	ocsfs2_meta_unlock(dir->i_sb);
 	return ret;
@@ -454,7 +460,10 @@ fail:
 	ocsfs2_txn_abort(txn);
 fail_committed:
 	clear_nlink(inode);
-	discard_new_inode(inode);
+	iput(inode);   /* nlink already 0 above -> evict frees the inode + its ino.
+			* (the inode is from new_inode(), never I_NEW, so the kernel's
+			* discard_new_inode() would WARN; a legitimately failed create
+			* — e.g. ENOSPC — must clean up without noise.) */
 out:
 	ocsfs2_meta_unlock(dir->i_sb);
 	return ret ? ERR_PTR(ret) : NULL;
