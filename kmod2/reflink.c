@@ -185,8 +185,10 @@ loff_t ocsfs2_remap_file_range(struct file *src_file, loff_t src_off,
 		return -EINVAL;
 
 	lock_two_nondirectories(src, dst);
-	ret = ocsfs2_reflink_range(src_file, src_off, dst_file, dst_off, len,
-				   remap_flags);
+	ret = ocsfs2_inode_ensure_writable(dst);   /* dst is mutated (CoW share) */
+	if (!ret)
+		ret = ocsfs2_reflink_range(src_file, src_off, dst_file, dst_off, len,
+					   remap_flags);
 	unlock_two_nondirectories(src, dst);
 	return ret;
 }
@@ -283,8 +285,15 @@ unlock_dir:
 long ocsfs2_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	switch (cmd) {
-	case OCSFS_IOC_SNAP_CREATE:
+	case OCSFS_IOC_SNAP_CREATE: {
+		/* snapshot flips the source's extents to SHARED in the refcount tree
+		 * (a mutation), so take the EX lease on the source first */
+		int ret = ocsfs2_inode_ensure_writable(file_inode(file));
+
+		if (ret)
+			return ret;
 		return ocsfs2_ioc_snap_create(file, (void __user *)arg);
+	}
 	case OCSFS_IOC_GROWFS:              /* D2: force an autogrow check now */
 		if (!capable(CAP_SYS_ADMIN))
 			return -EPERM;
@@ -311,6 +320,11 @@ long ocsfs2_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		ret = mnt_want_write_file(file);
 		if (ret)
 			return ret;
+		ret = ocsfs2_inode_ensure_writable(file_inode(file)); /* rewrites extents */
+		if (ret) {
+			mnt_drop_write_file(file);
+			return ret;
+		}
 		ret = ocsfs2_defrag_file(file_inode(file), &res);
 		mnt_drop_write_file(file);
 		if (ret)

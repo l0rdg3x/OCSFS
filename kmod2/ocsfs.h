@@ -997,6 +997,7 @@ void ocsfs2_recover_node(struct super_block *sb, u16 slot, u32 gen);
 /* per-inode lease management driven by open()/release() (cluster only). */
 int  ocsfs2_inode_open_lease(struct inode *inode, bool want_ex);
 void ocsfs2_inode_close_lease(struct inode *inode);
+int  ocsfs2_inode_ensure_writable(struct inode *inode);  /* acquire EX before a write */
 /* global metadata lease around cross-node namespace ops: serialises + makes
  * shared metadata (dirs, inode table, bitmap) coherent. No-op single-node.
  * meta_lock refreshes @dir coherently if non-NULL. */

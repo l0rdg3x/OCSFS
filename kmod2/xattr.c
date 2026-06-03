@@ -98,6 +98,15 @@ int ocsfs2_xattr_set(struct inode *inode, const char *name, const void *value,
 	u8 *nb;
 	int ret = 0;
 
+	/* A standalone xattr/ACL write mutates an existing file -> EX lease first.
+	 * When called inside a create txn (own_txn==false) the inode is brand-new and
+	 * owned by this node already, so skip it (and avoid leaking a lease). */
+	if (own_txn) {
+		ret = ocsfs2_inode_ensure_writable(inode);
+		if (ret)
+			return ret;
+	}
+
 	if (namelen == 0 || namelen > OCSFS2_MAX_NAME)
 		return -EINVAL;
 	if (size > OCSFS2_XATTR_SPACE)

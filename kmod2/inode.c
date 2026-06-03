@@ -1122,6 +1122,11 @@ int ocsfs2_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	if (ret)
 		return ret;
 
+	/* truncate / chmod / chown / utimes all mutate the inode -> EX lease first */
+	ret = ocsfs2_inode_ensure_writable(inode);
+	if (ret)
+		return ret;
+
 	if ((attr->ia_valid & ATTR_SIZE) && attr->ia_size != inode->i_size) {
 		loff_t oldsize = inode->i_size;
 		u32 bs = inode->i_sb->s_blocksize;

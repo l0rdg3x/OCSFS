@@ -203,33 +203,85 @@ void ocsfs2_lease_release(struct super_block *sb, u64 resource, int mode)
 int ocsfs2_inode_open_lease(struct inode *inode, bool want_ex)
 {
 	struct ocsfs2_inode_info *oi = OCSFS2_I(inode);
-	int want = want_ex ? OCSFS2_LEASE_EX : OCSFS2_LEASE_SH;
 	int ret = 0;
 
 	if (!OCSFS2_SB(inode->i_sb)->s_cluster)
 		return 0;
 
+	/* A WRITE open DEFERS the EX lease to the first actual write
+	 * (ocsfs2_inode_ensure_writable). This is what makes online live migration
+	 * work: the destination QEMU must open(O_RDWR) the disk during -incoming
+	 * while the SOURCE still owns it. Taking EX here would either deny the open
+	 * (-EBUSY) or, if it blocked, deadlock the migration (the source only
+	 * releases at switchover, which needs the destination already set up). The
+	 * single-writer invariant is preserved because the EX is still exclusive —
+	 * it's just acquired at first write, by which point the source has released.
+	 * Only one node ever holds EX at an instant. */
+	if (want_ex) {
+		mutex_lock(&oi->i_meta_lock);
+		oi->i_lease_count++;
+		mutex_unlock(&oi->i_meta_lock);
+		return 0;
+	}
+
+	/* READ open: take SH so reads are coherent. */
 	mutex_lock(&oi->i_meta_lock);
-	if (oi->i_lease_count > 0 && oi->i_lease_mode >= want) {
+	if (oi->i_lease_count > 0 && oi->i_lease_mode >= OCSFS2_LEASE_SH) {
 		oi->i_lease_count++;       /* already hold a sufficient lease */
 		mutex_unlock(&oi->i_meta_lock);
 		return 0;
 	}
 	mutex_unlock(&oi->i_meta_lock);
 
-	ret = ocsfs2_lease_acquire(inode->i_sb, oi->i_disk_ino, want);
+	ret = ocsfs2_lease_acquire(inode->i_sb, oi->i_disk_ino, OCSFS2_LEASE_SH);
+	if (ret)
+		return ret;
+	ocsfs2_inode_refresh_coherent(inode);   /* re-read fresh after a peer */
+	mutex_lock(&oi->i_meta_lock);
+	if (oi->i_lease_mode == OCSFS2_LEASE_NONE)
+		oi->i_lease_mode = OCSFS2_LEASE_SH;
+	oi->i_lease_count++;
+	mutex_unlock(&oi->i_meta_lock);
+	return 0;
+}
+
+/* Acquire the EX (write-owner) lease before a write, if not already held — the
+ * deferred half of ocsfs2_inode_open_lease. BLOCKS until the lease is free: at a
+ * live-migration switchover the source keeps EX until its QEMU closes the disk,
+ * so the destination's first write waits for that hand-off (a few ms once the
+ * source QEMU exits) rather than failing. ~30 s cap so a wedged peer surfaces.
+ * MUST be called by every path that writes a file's data or metadata, or two
+ * nodes could write the same file. */
+int ocsfs2_inode_ensure_writable(struct inode *inode)
+{
+	struct ocsfs2_inode_info *oi = OCSFS2_I(inode);
+	int ret = 0, tries;
+
+	if (!OCSFS2_SB(inode->i_sb)->s_cluster)
+		return 0;
+
+	mutex_lock(&oi->i_meta_lock);
+	if (oi->i_lease_mode == OCSFS2_LEASE_EX) {
+		mutex_unlock(&oi->i_meta_lock);
+		return 0;                  /* already the write owner */
+	}
+	mutex_unlock(&oi->i_meta_lock);
+
+	for (tries = 0; tries < 6000; tries++) {     /* 6000 * 5 ms = 30 s */
+		ret = ocsfs2_lease_acquire(inode->i_sb, oi->i_disk_ino,
+					   OCSFS2_LEASE_EX);
+		if (ret != -EBUSY)
+			break;
+		msleep(5);
+	}
 	if (ret)
 		return ret;
 
-	/* Fresh acquire (EX or SH): another node may have owned and modified this
-	 * file since we last touched it, so coherently re-read the inode + drop
-	 * stale caches before any I/O. (Re-opens while we already hold the lease
-	 * skip this — no other writer can have run.) */
+	/* Fresh EX: a peer (the migration source) may have written since, so drop
+	 * stale caches + re-read the inode before this write lands. */
 	ocsfs2_inode_refresh_coherent(inode);
-
 	mutex_lock(&oi->i_meta_lock);
-	oi->i_lease_mode = want;
-	oi->i_lease_count++;
+	oi->i_lease_mode = OCSFS2_LEASE_EX;
 	mutex_unlock(&oi->i_meta_lock);
 	return 0;
 }

@@ -697,6 +697,12 @@ ssize_t ocsfs2_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	if (ret <= 0)
 		goto out;
 
+	/* take (or wait for) the EX write-owner lease — deferred from open so a
+	 * live-migration destination could open the disk; the first write claims it */
+	ret = ocsfs2_inode_ensure_writable(inode);
+	if (ret)
+		goto out;
+
 	if (iocb->ki_flags & IOCB_DIRECT) {
 		ret = iomap_dio_rw(iocb, from, &ocsfs2_iomap_ops, &ocsfs2_dio_ops,
 				   0, NULL, 0);

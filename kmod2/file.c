@@ -165,6 +165,11 @@ long ocsfs2_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 		return -EINVAL;
 
 	inode_lock(inode);
+	ret = ocsfs2_inode_ensure_writable(inode);   /* EX lease before mutating */
+	if (ret) {
+		inode_unlock(inode);
+		return ret;
+	}
 	if (mode & FALLOC_FL_PUNCH_HOLE)
 		ret = ocsfs2_punch_hole(inode, offset, len);
 	else if (mode & FALLOC_FL_ZERO_RANGE)
