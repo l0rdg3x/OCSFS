@@ -82,6 +82,24 @@ The detailed analysis below is kept for reference.
 
 ## Part A — Open functional / correctness items
 
+### A9. [MAYBE · P3] Extend Plan 5 journal deferral to cluster volumes (perf)
+Plan 5 (`50d2370`) makes the journal **batched + deferred** only on volumes that
+can never join a cluster (`s_max_nodes <= 1`): `qemu-img convert` there went
+52.4s → 12.7s (4.1×, at the data floor), crash-safe. **Cluster-capable volumes
+(`-N>1`, i.e. the PVE storage) keep the synchronous per-op checkpoint** — correct
+(peers read current home blocks coherently; dead-peer `replay_slot` sees the one
+in-flight txn it expects) but `convert`/import/restore stay slow there. The
+common cluster op (clone) is already instant via reflink (~0.08s), so this is a
+*rare-op* optimization.
+*To do it safely:* (1) allow the deferred path for cluster; (2) **checkpoint on
+metadata-lease release** (`ocsfs2_lease_release`, lease.c — every EX-release site)
+so a peer never reads a lagging home block — **a single missed site = stale
+cross-node read = corruption**; (3) make `ocsfs2_journal_replay_slot` **loop**
+(deferral means a dead node can leave many uncheckpointed txns, not one); (4) full
+3-node crash + coherence validation. High risk for a rare-op gain → its own
+focused session, not a tail-end change. (Single-node + cluster-synchronous paths
+are both validated: see `docs/plans/2026-06-03-ocsfs-v2-plan5-journal-perf.md`.)
+
 ### A1. [FIX · P1] Per-AG refcount B+tree is not cluster-coherent
 `kmod2/refcount.c` reads/writes the refcount tree with `sb_bread` +
 `mark_buffer_dirty`/`sync_dirty_buffer` — the **single-node** path. It uses
