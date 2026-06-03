@@ -433,6 +433,12 @@ struct inode *ocsfs2_iget(struct super_block *sb, u64 ino)
 		inode->i_op = &ocsfs2_file_iops;
 		inode->i_fop = &ocsfs2_file_fops;
 		inode->i_mapping->a_ops = &ocsfs2_file_aops;
+		/* Large folios: the page cache coalesces buffered writes into multi-block
+		 * folios, so writeback maps + checksums a big contiguous range per folio
+		 * instead of one 4K block. On a cluster volume this collapses the data-csum
+		 * cost from one CAW per block to ~one CAW per 64 blocks (csum_set_range
+		 * batches the contiguous slots). iomap drives all the buffered paths. */
+		mapping_set_large_folios(inode->i_mapping);
 	} else if (S_ISDIR(inode->i_mode)) {
 		inode->i_op = &ocsfs2_dir_iops;
 		inode->i_fop = &ocsfs2_dir_fops;
@@ -686,6 +692,12 @@ struct inode *ocsfs2_new_inode(struct mnt_idmap *idmap, struct inode *dir,
 		inode->i_op = &ocsfs2_file_iops;
 		inode->i_fop = &ocsfs2_file_fops;
 		inode->i_mapping->a_ops = &ocsfs2_file_aops;
+		/* Large folios: the page cache coalesces buffered writes into multi-block
+		 * folios, so writeback maps + checksums a big contiguous range per folio
+		 * instead of one 4K block. On a cluster volume this collapses the data-csum
+		 * cost from one CAW per block to ~one CAW per 64 blocks (csum_set_range
+		 * batches the contiguous slots). iomap drives all the buffered paths. */
+		mapping_set_large_folios(inode->i_mapping);
 	} else if (S_ISDIR(mode)) {
 		inode->i_op = &ocsfs2_dir_iops;
 		inode->i_fop = &ocsfs2_dir_fops;
