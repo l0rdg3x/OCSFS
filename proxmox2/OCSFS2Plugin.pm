@@ -34,7 +34,8 @@ use base qw(PVE::Storage::Plugin);
 my $MODULE = 'ocsfs2';
 
 # ── registration ──
-sub api { return 11; }            # PVE storage plugin API (>= 9); adjust if older
+sub api { return 14; }            # PVE 9.x storage API (APIVER 14); base provides
+                                  # defaults for the newer methods we don't override
 sub type { return 'ocsfs2'; }
 
 sub plugindata {
