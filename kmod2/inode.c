@@ -90,6 +90,8 @@ struct inode *ocsfs2_alloc_inode(struct super_block *sb)
 	oi->i_dir_btree_root = 0;
 	oi->i_xattr_block = 0;
 	oi->i_dirent_count = 0;
+	oi->i_prealloc_phys = 0;
+	oi->i_prealloc_left = 0;
 	return &oi->vfs_inode;
 }
 
@@ -463,6 +465,26 @@ struct inode *ocsfs2_iget(struct super_block *sb, u64 ino)
 
 /* ── evict ── */
 
+/* Return the per-inode allocation reservation (cluster speculative prealloc) to
+ * the bitmap. The reserved tail was claimed in one CAW but never written into an
+ * extent, so a plain bitmap free is correct (never shared/refcounted). Safe to
+ * call when no write can be in flight (last close / evict). */
+void ocsfs2_drop_prealloc(struct inode *inode)
+{
+	struct ocsfs2_inode_info *oi = OCSFS2_I(inode);
+	u64 phys;
+	u32 n;
+
+	mutex_lock(&oi->i_meta_lock);
+	phys = oi->i_prealloc_phys;
+	n = oi->i_prealloc_left;
+	oi->i_prealloc_phys = 0;
+	oi->i_prealloc_left = 0;
+	mutex_unlock(&oi->i_meta_lock);
+	if (n)
+		ocsfs2_free_blocks(inode->i_sb, phys, n);
+}
+
 void ocsfs2_evict_inode(struct inode *inode)
 {
 	struct ocsfs2_inode_info *oi = OCSFS2_I(inode);
@@ -470,6 +492,7 @@ void ocsfs2_evict_inode(struct inode *inode)
 	u16 i;
 
 	truncate_inode_pages_final(&inode->i_data);
+	ocsfs2_drop_prealloc(inode);     /* return any unwritten reservation */
 
 	if (freeing && !is_bad_inode(inode)) {
 		/* free data blocks (refcount-aware: a shared reflink/snapshot block

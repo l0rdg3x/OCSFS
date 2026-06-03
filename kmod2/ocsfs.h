@@ -624,6 +624,8 @@ struct ocsfs2_inode_info {
 	u64   i_dir_btree_root;
 	u64   i_xattr_block;             /* xattr/ACL block, 0 = none */
 	u32   i_dirent_count;
+	u64   i_prealloc_phys;           /* cluster: next free block of the reservation */
+	u32   i_prealloc_left;           /* cluster: blocks left in the reservation, 0=none */
 	u8    i_lease_mode;              /* OCSFS2_LEASE_* currently held (cluster) */
 	u32   i_lease_count;            /* opens needing the lease */
 	struct mutex i_meta_lock;        /* protects extent map + dir metadata */
@@ -743,6 +745,7 @@ struct inode *ocsfs2_iget(struct super_block *sb, u64 ino);
 int  ocsfs2_write_inode_block(struct inode *inode);
 int  ocsfs2_write_inode(struct inode *inode, struct writeback_control *wbc);
 void ocsfs2_evict_inode(struct inode *inode);
+void ocsfs2_drop_prealloc(struct inode *inode);  /* return cluster reservation */
 struct inode *ocsfs2_new_inode(struct mnt_idmap *idmap, struct inode *dir,
 			       umode_t mode, dev_t rdev);
 int  ocsfs2_alloc_inode_num(struct super_block *sb, u32 ag_hint, u64 *ino_out);

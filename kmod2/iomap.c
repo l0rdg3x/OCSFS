@@ -247,17 +247,56 @@ static int ocsfs2_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 		if (want == 0)
 			want = 1;
 
-		ret = ocsfs2_alloc_blocks(inode->i_sb, oi->i_ag, (u32)want, &phys);
-		if (ret == -ENOSPC && want > 1) {
-			want = 1;
-			ret = ocsfs2_alloc_blocks(inode->i_sb, oi->i_ag, 1, &phys);
+		/* Cluster speculative-prealloc: each ocsfs2_alloc_blocks is a synchronous
+		 * SCSI CAW (bitmap claim) round-trip. A scattered small-write workload (a
+		 * qemu-img / vma restore writing 64K qcow2 clusters) pays one per cluster
+		 * -> ~6 MB/s. Instead claim a physically-contiguous run ONCE and carve
+		 * WRITTEN extents out of it without further CAWs. The reservation is sized
+		 * by the file size (XFS-style: small files don't over-reserve), and its
+		 * unwritten tail is returned on close/evict (and leaked->fsck-reclaimed on
+		 * crash — the integrity trade for speed). */
+		if (sbi->s_cluster && oi->i_prealloc_left >= want) {
+			phys = oi->i_prealloc_phys;
+			oi->i_prealloc_phys += want;
+			oi->i_prealloc_left -= (u32)want;
+			alloc = (u32)want;
+		} else {
+			u32 chunk = (u32)want;
+
+			if (sbi->s_cluster) {
+				u64 isz = (i_size_read(inode) + bs - 1) / bs;
+				u64 res = min_t(u64, isz, OCSFS2_ALLOC_CAP_BLOCKS);
+
+				if (res > chunk)
+					chunk = (u32)res;
+				if (oi->i_prealloc_left) {   /* drop the too-small remnant */
+					ocsfs2_free_blocks(inode->i_sb, oi->i_prealloc_phys,
+							   oi->i_prealloc_left);
+					oi->i_prealloc_phys = 0;
+					oi->i_prealloc_left = 0;
+				}
+			}
+			ret = ocsfs2_alloc_blocks(inode->i_sb, oi->i_ag, chunk, &phys);
+			if (ret == -ENOSPC && chunk > (u32)want) {   /* no big contiguous run */
+				chunk = (u32)want;
+				ret = ocsfs2_alloc_blocks(inode->i_sb, oi->i_ag, chunk, &phys);
+			}
+			if (ret == -ENOSPC && want > 1) {
+				want = 1;
+				chunk = 1;
+				ret = ocsfs2_alloc_blocks(inode->i_sb, oi->i_ag, 1, &phys);
+			}
+			if (ret) {
+				if (batched)
+					ocsfs2_run_end(inode->i_sb);
+				goto out;
+			}
+			alloc = (u32)want;
+			if (chunk > alloc) {            /* stash the surplus for next writes */
+				oi->i_prealloc_phys = phys + alloc;
+				oi->i_prealloc_left = chunk - alloc;
+			}
 		}
-		if (ret) {
-			if (batched)
-				ocsfs2_run_end(inode->i_sb);
-			goto out;
-		}
-		alloc = (u32)want;
 
 		ret = ocsfs2_extent_insert(inode, lblk, phys, alloc, OCSFS2_EXT_WRITTEN);
 		if (ret) {
