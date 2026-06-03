@@ -128,6 +128,11 @@ mount -t ocsfs2 -o cluster /dev/disk/by-id/scsi-XXXX /mnt/vmstore
 `-o cluster` enables membership (heartbeat slot), SCSI-PR fencing, the ownership
 / metadata leases and crash recovery. Without it the volume is single-node only.
 
+| Mount option | Effect |
+|---|---|
+| `cluster` | opt into multinode mode (required on every node sharing the LUN). |
+| `csum_async` | (data-checksum volumes, single-node) defer the per-write checksum `sync` to writeback — ~3.6× faster sustained 4 KiB-random-write, at the cost of a wider post-crash false-positive window (a rewrite/scrub clears it). Default off (crash-safe). Ignored in cluster mode (the checksum is the coherence CAW). |
+
 On mount each node claims a heartbeat slot and starts its liveness epoch; a node
 that stops heartbeating is fenced (its PR key is preempted) and its files are
 recovered by a survivor (journal replay + lease reclaim).
@@ -224,10 +229,13 @@ instead of corrupt data) and logs `DATA checksum mismatch on read at block N` �
 restore the affected file from backup. The online scrub does the same check in
 bulk (`ocsfs2-scrub` / the weekly timer). Checksums follow the physical block, so
 reflink/snapshot/CoW stay correct, and a freed block's CRC is dropped so reuse
-never false-positives. Opt-in; existing volumes are unaffected. The cost is
-deliberately small — see §10. Caveats: a crash mid-writeback can leave a block
-whose stored CRC doesn't match the not-yet-written data (a benign false-positive
-that a rewrite/scrub clears); AGs added by online autogrow are not yet checksummed.
+never false-positives. AGs added by **online autogrow are checksummed** too (the
+new AGs carry a CRC region identical to the original ones). Both the inline verify
+and the scrub read DATA via raw bios (coherent with how data is written), not the
+buffer cache. Opt-in; existing volumes are unaffected. The cost is deliberately
+small — see §10. Caveat: a crash mid-writeback can leave a block whose stored CRC
+doesn't match the not-yet-written data (a benign false-positive a rewrite/scrub
+clears); `-o csum_async` (§5) widens that window in exchange for speed.
 
 ### Defragment (periodic + on-demand)
 
@@ -418,11 +426,13 @@ large-sequential / backup volumes. This is a TrueNAS/ZFS setting, set at zvol
 creation (it cannot be changed later).
 
 **2. Keep data checksums (`-C`) on — they are nearly free where it matters.**
-Inline read verification and large/sequential writes cost ≈0–5 %; the *only*
-measurable cost is **sustained pure 4 KiB-random-write**, capped at ~3.5k IOPS by
-the crash-safe per-write checksum `sync` (independent of LUN speed). For typical
-VM workloads (mixed, buffered, larger I/O) this is invisible; for a benchmark that
-does nothing but 4 KiB O_DIRECT random writes, expect that ceiling.
+Inline read verification (O_DIRECT **and** buffered, both async/pipelined) and
+large/sequential writes cost ≈0–5 %; the *only* measurable cost is **sustained
+pure 4 KiB-random-write**, capped at ~3.5k IOPS by the crash-safe per-write
+checksum `sync` (independent of LUN speed). For typical VM workloads (mixed,
+buffered, larger I/O) this is invisible. If a workload genuinely needs sustained
+small-random-write throughput *with* checksums, mount **`-o csum_async`** (§5):
+~3.6× faster (≈ no-`-C`), trading a wider post-crash false-positive window.
 
 | Workload (O_DIRECT, single node) | `-C` cost |
 |---|---|

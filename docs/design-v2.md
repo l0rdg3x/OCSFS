@@ -123,9 +123,13 @@ testing on a cluster stack.
   block** — one sync/CAW (`csum_set_range`) and one coherent read (`csum_read_range`)
   per ~1024 contiguous data blocks, not per block. A freed block's CRC is dropped
   (`csum_clear_range`) so reuse never false-positives; `copy_blocks` carries the CRC
-  so defrag/CoW stay verifiable. The residual cost is pure 4 KiB-random-write,
-  capped by the crash-safe per-write checksum `sync` (an async-`-C` mount option is
-  a possible future relaxation).
+  so defrag/CoW stay verifiable; online-autogrow-added AGs get an identical CRC
+  region (`grow.c`). The inline verify is async on both paths (pre-read the CRCs,
+  verify in the bio completion) so reads stay pipelined; the scrub reads DATA via
+  raw bios (coherent with the iomap data path), not the buffer cache. The residual
+  cost is pure 4 KiB-random-write, capped by the crash-safe per-write checksum
+  `sync`; **`-o csum_async`** defers it to writeback (~3.6×) for a wider post-crash
+  false-positive window.
 - **Per-node WAL (redo) journal.** A transaction journals *after-images* of metadata
   blocks; COMMIT is the durability point; replay re-applies committed txns.
 - **Ordered durability.** Data blocks referenced by a new/changed extent are flushed

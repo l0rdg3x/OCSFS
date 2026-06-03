@@ -567,6 +567,7 @@ struct ocsfs2_sb_info {
 	u32   s_ag_capacity;             /* slots in s_ags (autogrow headroom) */
 	bool  s_growable;                /* COMPAT_AUTOGROW: uniform AGs, online-grow ok */
 	bool  s_datacsum;                /* A8: RO_COMPAT_DATACSUM — per-data-block CRC */
+	bool  s_csum_async;              /* P3b: -o csum_async — skip per-write csum sync */
 	struct task_struct *s_grow_thread;
 	struct mutex s_grow_lock;        /* serialises online grow + geometry refresh */
 

@@ -27,6 +27,7 @@
 
 struct ag_geom {
 	u64 start, bitmap_off, bitmap_blocks, itable_off, itable_blocks;
+	u64 csum_off, csum_blocks;
 	u64 meta_blocks, data_off, data_blocks;
 };
 
@@ -38,9 +39,16 @@ static void compute_ag_geom(struct ocsfs2_sb_info *sbi, u32 bs, u32 idx,
 	g->start         = region + (u64)idx * sbi->s_ag_blocks;
 	g->bitmap_blocks = DIV_ROUND_UP(DIV_ROUND_UP(sbi->s_ag_blocks, 8), bs);
 	g->itable_blocks = (sbi->s_inodes_per_ag * OCSFS2_INODE_SIZE) / bs;
-	g->meta_blocks   = 1 + g->bitmap_blocks + g->itable_blocks;
+	/* A8/P3a: a checksummed volume reserves a per-AG CRC region (one __le32 per
+	 * block of the AG), laid out exactly like mkfs (header|bitmap|itable|csum|data)
+	 * so an autogrow-added AG is checksummed identically to the original AGs. */
+	g->csum_blocks   = sbi->s_datacsum ?
+			   DIV_ROUND_UP(sbi->s_ag_blocks * sizeof(__le32), bs) : 0;
+	g->meta_blocks   = 1 + g->bitmap_blocks + g->itable_blocks + g->csum_blocks;
 	g->bitmap_off    = (g->start + 1) * bs;
 	g->itable_off    = (g->start + 1 + g->bitmap_blocks) * bs;
+	g->csum_off      = g->csum_blocks ?
+			   (g->start + 1 + g->bitmap_blocks + g->itable_blocks) * bs : 0;
 	g->data_off      = (g->start + g->meta_blocks) * bs;
 	g->data_blocks   = sbi->s_ag_blocks - g->meta_blocks;
 }
@@ -80,6 +88,15 @@ static int write_new_ag(struct super_block *sb, u32 idx, struct ag_geom *g)
 	if (ret)
 		return ret;
 
+	/* P3a: zero the per-AG checksum region (0 = "unset", so data blocks read as
+	 * unverified until first written, never false-positive) */
+	if (g->csum_blocks) {
+		ret = blkdev_issue_zeroout(sb->s_bdev, (g->csum_off / 512),
+					   g->csum_blocks * (bs / 512), GFP_NOFS, 0);
+		if (ret)
+			return ret;
+	}
+
 	blk = kzalloc(bs, GFP_NOFS);
 	ag  = kzalloc(bs, GFP_NOFS);
 	if (!blk || !ag) { kfree(blk); kfree(ag); return -ENOMEM; }
@@ -110,6 +127,8 @@ static int write_new_ag(struct super_block *sb, u32 idx, struct ag_geom *g)
 	ag->ag_inodes_per_ag = cpu_to_le64(OCSFS2_SB(sb)->s_inodes_per_ag);
 	ag->ag_data_off = cpu_to_le64(g->data_off);
 	ag->ag_data_blocks = cpu_to_le64(g->data_blocks);
+	ag->ag_csum_off = cpu_to_le64(g->csum_off);        /* P3a: 0 unless -C */
+	ag->ag_csum_blocks = cpu_to_le64(g->csum_blocks);
 	ag->ag_rc_btree_root = cpu_to_le64(0);
 	ag->ag_checksum = cpu_to_le32(ocsfs2_crc32c(~0U, ag,
 			  offsetof(struct ocsfs2_disk_ag, ag_checksum)));
@@ -138,6 +157,8 @@ static void install_ag_incore(struct ocsfs2_sb_info *sbi, u32 idx,
 	ai->bitmap_blocks = g->bitmap_blocks;
 	ai->inode_table_off = g->itable_off;
 	ai->inodes_per_ag = sbi->s_inodes_per_ag;
+	ai->csum_off = g->csum_off;             /* P3a: 0 unless s_datacsum */
+	ai->csum_blocks = g->csum_blocks;
 	ai->data_off = g->data_off;
 	ai->data_blocks = g->data_blocks;
 	ai->rc_btree_root = 0;

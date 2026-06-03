@@ -283,82 +283,96 @@ const struct iomap_ops ocsfs2_iomap_ops = {
 /* ── address_space operations ── */
 
 /* ── A8 inline read verification (buffered) ──
- * When data checksums are enabled we replace iomap's default async bio read ops
- * with a synchronous read_folio_range that, after reading each MAPPED range,
- * recomputes the per-block CRC and compares it to the stored value. A mismatch
- * is reported via iomap_finish_folio_read(..., -EIO): the folio is left
- * not-uptodate so the read syscall returns -EIO instead of serving corruption.
- * iomap only calls read_folio_range for real IOMAP_MAPPED data within i_size
- * (holes / unwritten / post-EOF blocks are zeroed without a read), so every
- * range we see here has a backing physical block to verify. Synchronous and
- * opt-in: non-checksummed volumes keep iomap's fast async path untouched. */
+ * Verify every data block's CRC on read and return -EIO on mismatch instead of
+ * serving corruption. To keep readahead PIPELINED (a synchronous bio-per-folio
+ * is QD1 and throttles sequential reads to the link's per-op latency), this
+ * mirrors the O_DIRECT path: at submit time (process context) pre-read the
+ * expected CRCs into a per-bio context, submit the read bio ASYNC, and verify in
+ * the completion (crc32c + kmap_local — no sleeping) before iomap_finish_folio_read.
+ * iomap only calls this for real IOMAP_MAPPED data within i_size (holes /
+ * unwritten / post-EOF are zeroed without a read). Opt-in: non-checksummed
+ * volumes keep iomap's default fast async path untouched. */
+struct ocsfs2_rdv {
+	struct folio	*folio;
+	struct super_block *sb;
+	size_t		poff;
+	size_t		plen;
+	u64		phys0;
+	u32		nblk;
+	u32		expected[];	/* pre-read stored CRC per block (0 = skip) */
+};
+
+static void ocsfs2_csum_read_end(struct bio *bio)
+{
+	struct ocsfs2_rdv *rv = bio->bi_private;
+	struct super_block *sb = rv->sb;
+	u32 bs = sb->s_blocksize;
+	int err = blk_status_to_errno(bio->bi_status);
+	u32 i;
+
+	for (i = 0; !err && i < rv->nblk; i++) {
+		void *k;
+		u32 got;
+
+		if (!rv->expected[i])
+			continue;          /* unset -> skip */
+		k = kmap_local_folio(rv->folio, rv->poff + (size_t)i * bs);
+		got = ocsfs2_data_crc(sb, k);
+		kunmap_local(k);
+		if (got != rv->expected[i]) {
+			pr_err_ratelimited("ocsfs2: DATA checksum mismatch on read at block %llu (have 0x%08x want 0x%08x)\n",
+				(unsigned long long)(rv->phys0 + i), got,
+				rv->expected[i]);
+			err = -EIO;
+		}
+	}
+	iomap_finish_folio_read(rv->folio, rv->poff, rv->plen, err);
+	bio_put(bio);
+	kfree(rv);
+}
+
 static int ocsfs2_csum_read_folio_range(const struct iomap_iter *iter,
 					struct iomap_read_folio_ctx *ctx,
 					size_t plen)
 {
 	struct folio *folio = ctx->cur_folio;
-	struct inode *inode = iter->inode;
-	struct super_block *sb = inode->i_sb;
+	struct super_block *sb = iter->inode->i_sb;
 	const struct iomap *iomap = &iter->iomap;
 	loff_t pos = iter->pos;
 	size_t poff = offset_in_folio(folio, pos);
-	u32 bs = sb->s_blocksize;
-	u64 phys0 = (iomap->addr + (pos - iomap->offset)) >> sb->s_blocksize_bits;
-	struct bio bio;
-	struct bio_vec bvec;
-	u32 nb = plen >> sb->s_blocksize_bits;
-	u32 *want;
-	int err;
-	size_t b;
+	u32 nblk = plen >> sb->s_blocksize_bits;
+	struct ocsfs2_rdv *rv;
+	struct bio *bio;
 
-	/* one synchronous read of the whole range — folio memory is contiguous */
-	bio_init(&bio, sb->s_bdev, &bvec, 1, REQ_OP_READ);
-	bio.bi_iter.bi_sector = iomap_sector(iomap, pos);
-	bio_add_folio_nofail(&bio, folio, plen, poff);
-	err = submit_bio_wait(&bio);
-	bio_uninit(&bio);
+	rv = kmalloc(struct_size(rv, expected, nblk), GFP_NOFS);
+	if (!rv)
+		return -ENOMEM;        /* setup failure: core cleans up (no finish) */
+	rv->folio = folio;
+	rv->sb    = sb;
+	rv->poff  = poff;
+	rv->plen  = plen;
+	rv->phys0 = (iomap->addr + (pos - iomap->offset)) >> sb->s_blocksize_bits;
+	rv->nblk  = nblk;
+	/* pre-read the stored CRCs now (process context, may sleep); the bio
+	 * completion only recomputes + compares (no sleeping) */
+	ocsfs2_csum_read_range(sb, rv->phys0, rv->expected, nblk);
 
-	/* batch the stored CRCs (one read per checksum block, not per data block) */
-	want = err ? NULL : kmalloc_array(nb, sizeof(u32), GFP_NOFS);
-	if (want) {
-		ocsfs2_csum_read_range(sb, phys0, want, nb);
-		for (b = 0; !err && b < plen; b += bs) {
-			u32 w = want[b >> sb->s_blocksize_bits];
-			void *k;
-			u32 got;
-
-			if (!w)
-				continue;          /* unset -> skip */
-			k = kmap_local_folio(folio, poff + b);
-			got = ocsfs2_data_crc(sb, k);
-			kunmap_local(k);
-			if (got != w) {
-				pr_err_ratelimited("ocsfs2: DATA checksum mismatch on read at block %llu (have 0x%08x want 0x%08x)\n",
-					(unsigned long long)(phys0 + (b >> sb->s_blocksize_bits)),
-					got, w);
-				err = -EIO;
-			}
-		}
-		kfree(want);
-	} else if (!err) {
-		/* allocation failed: fall back to the per-block coherent check */
-		for (b = 0; !err && b < plen; b += bs) {
-			void *k = kmap_local_folio(folio, poff + b);
-
-			err = ocsfs2_csum_check(sb,
-					phys0 + (b >> sb->s_blocksize_bits), k);
-			kunmap_local(k);
-		}
+	bio = bio_alloc(sb->s_bdev, 1, REQ_OP_READ, GFP_NOFS);
+	if (!bio) {
+		kfree(rv);
+		return -ENOMEM;
 	}
-	/* contract: we took ownership of this range — always finish it, conveying
-	 * success/failure via @err; return 0 so the core does not double-clean. */
-	iomap_finish_folio_read(folio, poff, plen, err);
-	return 0;
+	bio->bi_iter.bi_sector = iomap_sector(iomap, pos);
+	bio_add_folio_nofail(bio, folio, plen, poff);
+	bio->bi_private = rv;
+	bio->bi_end_io = ocsfs2_csum_read_end;
+	submit_bio(bio);               /* async — pipelines across the readahead window */
+	return 0;                      /* queued; finish happens in the completion */
 }
 
 static const struct iomap_read_ops ocsfs2_csum_read_ops = {
 	.read_folio_range = ocsfs2_csum_read_folio_range,
-	/* .submit_read = NULL: reads complete synchronously in read_folio_range */
+	/* .submit_read = NULL: each range's bio is submitted immediately (async) */
 };
 
 static int ocsfs2_read_folio(struct file *file, struct folio *folio)

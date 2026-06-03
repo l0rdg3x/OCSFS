@@ -109,31 +109,55 @@ static void scrub_xattr(struct super_block *sb, u64 blk,
 	brelse(bh);
 }
 
-/* A8: verify the stored CRC of every data block in an extent (skip unset=0) */
+/* A8: verify the stored CRC of every data block in an extent (skip unset=0).
+ * File DATA lives on disk via the iomap bio path, NOT the buffer cache, so it
+ * must be read with a raw bio (ocsfs2_cl_bio) — exactly like the inline read
+ * verify. Reading data with sb_bread/meta_bread is incoherent (it returned the
+ * wrong bytes for blocks in autogrow-added regions → spurious mismatches). Read
+ * in chunks and batch the stored-CRC lookup (one read per checksum block) for
+ * speed. */
+#define OCSFS2_SCRUB_CHUNK 64          /* blocks per bio (256 KiB at 4 KiB bs) */
 static void scrub_data_extent(struct super_block *sb, u64 phys, u32 len,
 			      struct ocsfs2_scrub_result *res)
 {
-	u32 i;
+	u32 bs = sb->s_blocksize;
+	u32 ch = OCSFS2_SCRUB_CHUNK;
+	void *buf;
+	u32 *want;
+	u32 done;
 
-	for (i = 0; i < len; i++) {
-		u32 stored = ocsfs2_csum_read(sb, phys + i);
-		struct buffer_head *bh;
-		u32 crc;
+	buf = kmalloc((size_t)ch * bs, GFP_NOFS);
+	if (!buf) { ch = 1; buf = kmalloc(bs, GFP_NOFS); }
+	want = kmalloc_array(ch, sizeof(u32), GFP_NOFS);
+	if (!buf || !want) { kfree(buf); kfree(want); res->errors++; return; }
 
-		if (!stored)
+	for (done = 0; done < len; done += ch) {
+		u32 n = min(len - done, ch), i;
+
+		if (ocsfs2_cl_bio(sb, (u64)(phys + done) * bs, buf,
+				  n * bs, REQ_OP_READ)) {
+			res->errors += n;          /* couldn't read the data */
 			continue;
-		bh = ocsfs2_meta_bread(sb, phys + i);
-		if (!bh) { res->errors++; continue; }
-		crc = ocsfs2_data_crc(sb, bh->b_data);
-		res->checked++;
-		if (crc != stored) {
-			pr_warn("ocsfs2: scrub: DATA checksum mismatch at block %llu (have 0x%08x want 0x%08x)\n",
-				(unsigned long long)(phys + i), crc, stored);
-			res->errors++;
 		}
-		brelse(bh);
+		ocsfs2_csum_read_range(sb, phys + done, want, n);
+		for (i = 0; i < n; i++) {
+			u32 crc;
+
+			if (!want[i])
+				continue;          /* unset -> skip */
+			crc = ocsfs2_data_crc(sb, (u8 *)buf + (size_t)i * bs);
+			res->checked++;
+			if (crc != want[i]) {
+				pr_warn("ocsfs2: scrub: DATA checksum mismatch at block %llu (have 0x%08x want 0x%08x)\n",
+					(unsigned long long)(phys + done + i),
+					crc, want[i]);
+				res->errors++;
+			}
+		}
 		cond_resched();
 	}
+	kfree(buf);
+	kfree(want);
 }
 
 /* walk an extent tree (or one leaf), verifying each record's data checksums */

@@ -16,10 +16,19 @@
 #include <linux/blkdev.h>
 #include <linux/unaligned.h>
 
-/* mount options: the only one is "cluster" (opt-in multinode). Without it a
- * volume — even one formatted with mkfs -N >1 — mounts single-node. */
+/* mount options:
+ *  - "cluster"    opt-in multinode. Without it a volume — even one formatted with
+ *                 mkfs -N >1 — mounts single-node.
+ *  - "csum_async" (data-checksum volumes only) make the checksum write async:
+ *                 don't fsync the checksum block per write, let normal writeback
+ *                 flush it. Lifts the pure-4 KiB-random-write ceiling at the cost
+ *                 of a wider post-crash false-positive window (data may reach disk
+ *                 before its checksum; a rewrite/scrub clears it). Default off
+ *                 (crash-safe). Single-node only — in cluster the checksum is the
+ *                 coherence CAW and is always synchronous. */
 struct ocsfs2_fc {
 	bool cluster;
+	bool csum_async;
 };
 
 /* ── inode slab lifecycle ── */
@@ -397,6 +406,9 @@ static int ocsfs2_fill_super(struct super_block *sb, struct fs_context *fc)
 		struct ocsfs2_fc *ctx = fc->fs_private;
 
 		sbi->s_clustered = ctx && ctx->cluster && sbi->s_max_nodes > 1;
+		/* async checksum is a single-node optimisation: in cluster the csum is
+		 * the coherence CAW (always synchronous), so ignore it there. */
+		sbi->s_csum_async = ctx && ctx->csum_async && !sbi->s_clustered;
 	}
 
 	/* L3: join the cluster (claim our node slot) BEFORE the journal, so the
@@ -484,9 +496,10 @@ fail:
 
 /* ── mount glue ── */
 
-enum { Opt_cluster };
+enum { Opt_cluster, Opt_csum_async };
 static const struct fs_parameter_spec ocsfs2_param_specs[] = {
 	fsparam_flag("cluster", Opt_cluster),
+	fsparam_flag("csum_async", Opt_csum_async),
 	{}
 };
 
@@ -501,6 +514,9 @@ static int ocsfs2_parse_param(struct fs_context *fc, struct fs_parameter *param)
 	switch (opt) {
 	case Opt_cluster:
 		ctx->cluster = true;
+		break;
+	case Opt_csum_async:
+		ctx->csum_async = true;
 		break;
 	}
 	return 0;

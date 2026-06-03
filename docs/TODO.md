@@ -47,10 +47,31 @@ per instruction — a few loose v1 test files: `test_ocsfs.c`, `ocsfs_fsx.c`,
   (−2% vs no-`-C`); and the cluster read verify batches the coherent CRC read
   (`csum_read_range`) — cluster seqread `-C` 12→32.5 MB/s/node (≈ no-`-C`).
   Validated single-node + 3-node `-o cluster` (cross-node `dd`-corrupt → n2 detects
-  on both paths), fsx `-C` differential vs XFS clean, fsck clean. Remaining
-  follow-ups (minor): checksum the AGs added by online autogrow; the benign
-  crash-mid-writeback window (a rewrite/scrub clears it); a `sync` vs async-`-C`
-  mount tunable for pure-4K-random-write workloads (today −~30%, the crash-safe cost).
+  on both paths), fsx `-C` differential vs XFS clean, fsck clean.
+- **P3a** checksum autogrow-added AGs — **DONE** (2026-06-03): `grow.c`
+  `compute_ag_geom` now reserves the per-AG CRC region (identical layout to mkfs),
+  `write_new_ag` zeroes it + writes `ag_csum_off/blocks`, `install_ag_incore`
+  populates the in-core fields. Validated via dm-linear grow (3→23 AGs): a data
+  block in an autogrow-added AG is verified inline (corrupt → `-EIO`) and the scrub
+  finds exactly the corruption. **Also fixed a pre-existing scrub bug it exposed:**
+  the scrub read DATA via `sb_bread` (buffer cache), incoherent with the iomap bio
+  data path — it returned wrong bytes for grown regions → thousands of spurious
+  "mismatches". `scrub.c` now reads data via a raw bio (`ocsfs2_cl_bio`, like the
+  inline verify), batched 256 KiB/read (correct + much faster). grown clean scrub:
+  2454→0 errors; 1 real corruption → exactly 1.
+- **P3b** async checksum write (`-o csum_async`) — **DONE** (2026-06-03): skips the
+  per-write checksum `sync` (deferred to writeback), lifting the pure-4 KiB-random-
+  write ceiling: 3 356 → 12 192 IOPS (3.6×, ≈ no-`-C`), detection intact. Tradeoff:
+  wider post-crash false-positive window (data may reach disk before its checksum;
+  a rewrite/scrub clears it). Single-node only (in cluster the csum is the coherence
+  CAW, always synchronous). Default off (crash-safe).
+- **Buffered inline read perf** — **DONE** (2026-06-03): the inline read verify was
+  a synchronous bio-per-folio (QD1) → buffered sequential read with `-C` was
+  ~18 MB/s. Now async (pre-read CRCs, submit the bio without waiting, verify in the
+  completion — like O_DIRECT) → pipelined: **117 MB/s** (line rate, 6.5×), detection
+  intact. O_DIRECT read was already fast (~95 MB/s).
+  Remaining (minor): the benign crash-mid-writeback false-positive window (a
+  rewrite/scrub clears it).
 - **S5** shared-disk single-trust-domain — **DISCARDED** (won't fix in the FS):
   inherent to shared-disk FSes; handled operationally — the LUN is exposed only
   to authenticated initiators (iSCSI CHAP / FC zoning + LUN masking).

@@ -198,6 +198,16 @@ restored full speed:
 | Random write 16 KiB (single node) | 14.7 MB/s | 40.8 MB/s | 2.8× |
 | **Cluster** sequential read /node | 12.2 MB/s | **32.5 MB/s** | 2.7× (≈ no-`-C`) |
 | Cluster random read 16 KiB /node | 13.5 MB/s | 27.0 MB/s | 2.0× |
+| **Buffered** sequential read (single node) | 18 MB/s | **117 MB/s** | **6.5×** (line rate) |
+
+The inline read verify is async on both paths (O_DIRECT and buffered) — pre-read
+the stored CRCs, then verify in the bio completion — so reads stay pipelined; the
+online scrub reads data the same way (raw bio, batched 256 KiB), not via the
+buffer cache. For the one remaining write cost — sustained pure 4 KiB-random-write
+(~3.5k IOPS, the crash-safe per-write checksum `sync`) — mount **`-o csum_async`**
+to defer the checksum durability to writeback: **3 356 → 12 192 IOPS (3.6×, ≈
+no-`-C`)**, at the cost of a wider post-crash false-positive window (a rewrite or
+scrub clears it). Single-node only (in cluster the checksum *is* the coherence CAW).
 
 ### The biggest lever is on the SAN, not the FS — match `volblocksize`
 
