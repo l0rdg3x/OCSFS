@@ -90,19 +90,22 @@ per instruction — a few loose v1 test files: `test_ocsfs.c`, `ocsfs_fsx.c`,
   reflink branch called `find_free_diskname` without `$add_fmt_suffix` → bad
   extensionless volname. Now `qm clone` of a template = 1.3s reflink, boots.
 
-### LIVEMIG. [FIX · P1] Online (live) migration blocked by single-writer lease
-`qm migrate --online` fails: the **target** qemu opens the disk read-write while
-the **source** still holds the EX lease → `ocsfs2_inode_open_lease` returns
-`-EBUSY` → `Could not open …: Device or resource busy` → qemu exits. The lease
-(`lease_modify`) has **no revocation** — the holder keeps EX until it closes the
-file, but live migration needs the target open *before* the source releases.
-Offline migration (sequential open/close) is unaffected. Fix options: **(A)** defer
-the open-EX, acquire EX lazily+blocking on first write (simpler; relies on the
-source closing promptly post-switchover, which PVE does); **(B)** add a revoke
-protocol (acquirer sets a revoke bit, holder flushes like `close_lease` and
-releases). Both are core single-writer changes → need careful 3-node validation.
-The plugin comment already *claims* live migration works (lease handoff) — it was
-never exercised online; this is the gap.
+### LIVEMIG. [DONE · 2026-06-03] Online (live) migration — deferred write lease
+`qm migrate --online` used to fail: the **target** qemu opens the disk RW during
+`-incoming` while the **source** still holds the EX lease → `inode_open_lease`
+returned `-EBUSY` → qemu exits. Taking EX at open couldn't block instead (the
+source only releases at switchover, which needs the target already set up →
+deadlock). **Fix (option A):** a WRITE open now **defers** the EX lease;
+`ocsfs2_inode_ensure_writable` takes it (BLOCKING, ~30 s cap) at the **first
+write** — so the target open succeeds, and at switchover the source's qemu closes
+(releasing + flushing data/csums/journal) and the target's first write claims EX +
+refreshes. The single-writer invariant holds (EX still exclusive, one holder per
+instant). `ensure_writable` guards every file-write path: `write_iter`,
+`fallocate`, `setattr`, xattr/ACL set, `remap_file_range` (FICLONE/dedup), and the
+snapshot/defrag ioctls (`copy_file_range` routes through `write_iter`); READ opens
+still take SH; no-op single-node. **Validated 3-node** (`5FD4B5AB`): fsx 20000,
+cross-node hand-off, and a real **online migration of a running VM both ways**
+(n1↔n2, n1↔n3, ~6 s, 55 ms downtime, VM stays up, `fsck` clean).
 
 The detailed analysis below is kept for reference.
 

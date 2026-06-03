@@ -19,11 +19,11 @@ package PVE::Storage::Custom::OCSFS2Plugin;
 #       cluster 1                                  # mount -o cluster (multinode)
 #       shared 1
 #
-# Offline migration works with no data copy — the write-ownership lease passes
-# from source to destination on close/open. ONLINE migration (qm migrate
-# --online) is NOT yet supported: it needs the destination QEMU to open the disk
-# while the source still holds the EX lease, and the lease currently has no
-# revocation (the destination open returns -EBUSY). Tracked in docs/TODO.md.
+# Live migration (online and offline) works with no data copy — it IS the
+# write-ownership lease handing off from source to destination. The destination
+# QEMU opens the disk during -incoming via a deferred write lease (EX is acquired
+# at the first write, not at open), so it does not collide with the still-running
+# source; it claims the lease at the switchover's first write.
 
 use strict;
 use warnings;

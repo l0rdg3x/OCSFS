@@ -71,7 +71,7 @@ It is also exactly the Proxmox workload, which is why VMFS works the same way.
 | 🩺 **Online metadata + data scrub** | Verify every on-disk checksum on a live volume (`OCSFS_IOC_SCRUB`) to catch silent bitrot |
 | 🔐 **End-to-end data checksums** | Opt-in `mkfs -C`: per-physical-block CRC32c, **verified inline on every read** (buffered + O_DIRECT, cross-node) → `-EIO` not corruption, on **any** SAN; **deferred + batched so it is near-free even for cluster random writes**, CoW/reflink-safe |
 | 🏎️ **Near-raw VM-disk I/O** | O_DIRECT (`cache=none`); **zero per-I/O clustering tax** (single-writer); the FS software ceiling is ~250k IOPS/node (RAM-measured) — a node is bound by the LUN/fabric, not by OCSFS |
-| 🧱 **Proxmox-native** | `mount -t ocsfs2 -o cluster`; storage plugin with reflink clones; full clone/snapshot/backup/restore/resize validated on a 3-node cluster |
+| 🧱 **Proxmox-native** | `mount -t ocsfs2 -o cluster`; storage plugin with reflink clones; clone/snapshot/backup/restore/resize **and online live migration** validated on a 3-node cluster |
 
 ---
 
@@ -102,13 +102,12 @@ The OCSFS storage plugin drives the real PVE CLI (`qm` / `pvesm` / `vzdump` /
 - ✅ **Crash recovery under PVE** — a node power-loss (`sysrq-b`) is detected by a
   survivor, which replays the dead node's journal; data + checksums intact
 
-> [!NOTE]
-> **Live migration: offline works; *online* (`qm migrate --online`) is a known
-> limitation.** Online migration needs the destination QEMU to open the disk while
-> the source still holds the write-ownership lease, and the lease currently has no
-> *revocation* protocol — the destination open returns `-EBUSY`. Offline migration
-> (sequential lease hand-off via close → open) is fine. Adding lease revocation (or
-> a lazy/blocking first-write lease) is the tracked follow-up; see `docs/TODO.md`.
+- ✅ **Online live migration** (`qm migrate --online`) — validated **bidirectionally
+  across all 3 nodes** (n1↔n2, n1↔n3), a running VM, ~6–7 s, ~55 ms downtime, VM
+  stays up, `fsck` clean. The destination opens the disk during `-incoming` via a
+  **deferred write lease** (the EX lease is taken at the first write, not at open),
+  so it never collides with the source — the lease hand-off *is* the migration,
+  with no data copy.
 
 ### Single node — the integrity gate (`fsck` clean, zero kernel warnings)
 
@@ -374,8 +373,10 @@ ocsfs2: vmstore
 The plugin owns the clustered mount/unmount, prefers **reflink** for fast VM
 clones, and supports every PVE content type. Clone, snapshot, backup/restore and
 disk resize are validated end-to-end on a 3-node cluster (see Status). **Online
-live migration is a known limitation** (see the note above) — offline migration
-works today.
+live migration works** with no data copy — it *is* the OCSFS write-ownership lease
+handing off from source to destination (deferred write lease; the destination
+opens the disk while the source still runs, and claims the lease at the
+switchover's first write).
 
 ---
 
@@ -384,7 +385,6 @@ works today.
 | Area | Status |
 |---|---|
 | **Maturity** | Alpha / research — not production-ready, AI-generated, unreviewed |
-| **Online live migration** | **Not yet supported.** `qm migrate --online` fails: the destination opens the disk while the source holds the EX lease and the lease has no revocation (→ `-EBUSY`). **Offline migration works.** Fix (lease revocation / lazy first-write lease) tracked in `docs/TODO.md`. |
 | **Inline compression** | **Out of scope — not planned.** Breaks the iomap 1:1 mapping and O_DIRECT (`cache=none`). Space savings come from dedup + thin + discard. |
 | **`-C` random read** | Each read fetches its stored checksum (one coherent read per checksum block) — near-free for sequential/cached, but uncached random-read pays it. The write side is now near-free (deferred + batched). |
 | **Cluster size (max nodes)** | Fixed at format time by `mkfs -N` (default **32**), like OCFS2 node slots — each node reserves a private journal (~16 MiB) + slot + heartbeat. Format headroom, not a runtime cap; raising it needs a reformat. |
@@ -425,7 +425,7 @@ ocsfs/
 6. ✅ ~~per-data-block checksums (`mkfs -C`) with inline read verification + DKMS~~
 7. ✅ ~~Proxmox storage battery (clone/snapshot/backup/restore/resize), 3-node~~
 8. ✅ ~~cluster perf: deferred+batched checksums, allocation reservation, large folios, node-owned-AG affinity (random-write checksum cost removed)~~
-9. **Online live migration** (lease revocation / lazy first-write lease)
+9. ✅ ~~online live migration (deferred write lease + lazy EX on first write), validated bidirectional 3-node~~
 10. Corosync membership provider (the L3 interface is already pluggable); parallel multi-node recovery; out-of-band STONITH
 
 ---

@@ -155,13 +155,14 @@ ocsfs2: vmstore
 The plugin owns mount/unmount of the LUN and presents it like a directory
 datastore, so VM and CT image management, ISOs and backups all work. It prefers
 **reflink** for clones (`cp --reflink=always`), so a linked clone or a template
-deploy is near-instant and space-efficient. Clone, snapshot, backup/restore and
-disk resize are validated on a 3-node cluster. **Offline** migration works with no
-data copy (the write-ownership lease passes from source to destination on
-close/open). **Online** migration (`qm migrate --online`) is **not yet supported**:
-the destination QEMU must open the disk while the source still holds the EX lease,
-and the lease has no revocation yet (the open returns `-EBUSY`); tracked in the
-TODO.
+deploy is near-instant and space-efficient. Clone, snapshot, backup/restore, disk
+resize and **online live migration** are validated on a 3-node cluster. Live
+migration needs no data copy — it *is* the write-ownership lease handing off from
+source to destination: the destination opens the disk during `-incoming` via a
+**deferred write lease** (EX is taken at the first write, not at open), so it
+never collides with the still-running source, and claims the lease at the
+switchover's first write (validated bidirectional across 3 nodes, ~6 s, ~55 ms
+downtime).
 
 - **VM disks**: store as `raw` (reflink/snapshot/discard all work) or `qcow2`.
 - **CT (LXC)**: stored as `raw` images on a loop device (`subvol=0`), so the
