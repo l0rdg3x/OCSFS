@@ -724,6 +724,11 @@ int  ocsfs2_getattr(struct mnt_idmap *idmap, const struct path *path,
 		    struct kstat *stat, u32 request_mask, unsigned int flags);
 int  ocsfs2_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		    struct iattr *attr);
+struct file_kattr;
+void ocsfs2_set_inode_flags(struct inode *inode);                /* chattr flags */
+int  ocsfs2_fileattr_get(struct dentry *dentry, struct file_kattr *fa);
+int  ocsfs2_fileattr_set(struct mnt_idmap *idmap, struct dentry *dentry,
+			 struct file_kattr *fa);
 /* extent map (Plan 1/2: inline extents only — caller holds i_meta_lock) */
 int  ocsfs2_bmap(struct inode *inode, u64 logical_block, u64 *phys_out);
 int  ocsfs2_inode_append_block(struct inode *inode, u64 *phys_out);

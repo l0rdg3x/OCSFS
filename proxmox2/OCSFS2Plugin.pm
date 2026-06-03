@@ -123,14 +123,17 @@ sub deactivate_storage {
     }
 }
 
-# ── fast clone via reflink (raw images); fall back to the base behaviour ──
+# ── fast clone via reflink — for ANY format (raw or qcow2). `cp --reflink` of a
+# qcow2 file shares its blocks (CoW on write) just like raw, so the clone is
+# instant and space-efficient instead of a full qemu-img copy. Fall back to the
+# base behaviour only for snapshot-based (linked) clones. ──
 sub clone_image {
     my ($class, $scfg, $storeid, $volname, $vmid, $snap) = @_;
 
     my ($vtype, $name, $ownervm, undef, undef, undef, $fmt) =
         $class->parse_volname($volname);
 
-    if (!$snap && $fmt eq 'raw') {
+    if (!$snap) {
         my $src = $class->filesystem_path($scfg, $volname);
         my $newname = $class->find_free_diskname($storeid, $scfg, $vmid, $fmt);
         my $dstvol = "$vmid/$newname";

@@ -569,6 +569,8 @@ const struct inode_operations ocsfs2_dir_iops = {
 	.setattr = ocsfs2_setattr,
 	.getattr = ocsfs2_getattr,
 	.listxattr = ocsfs2_listxattr,
+	.fileattr_get = ocsfs2_fileattr_get,
+	.fileattr_set = ocsfs2_fileattr_set,
 #ifdef CONFIG_FS_POSIX_ACL
 	.get_inode_acl = ocsfs2_get_acl,
 	.set_acl       = ocsfs2_set_acl,

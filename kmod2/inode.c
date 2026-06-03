@@ -11,6 +11,63 @@
 #include <linux/mpage.h>
 #include <linux/iomap.h>
 #include <linux/time.h>
+#include <linux/fileattr.h>
+
+/* chattr / lsattr (FS_IOC_GETFLAGS/SETFLAGS): the user-settable inode flags we
+ * support, stored verbatim in the on-disk i_flags. IMMUTABLE/APPEND are the ones
+ * Proxmox needs (it `chattr +i`s template base disks); the rest are honoured by
+ * the VFS via inode->i_flags. */
+#define OCSFS2_FL_USER_MODIFIABLE (FS_IMMUTABLE_FL | FS_APPEND_FL | \
+				   FS_NOATIME_FL | FS_NODUMP_FL | \
+				   FS_SYNC_FL | FS_DIRSYNC_FL)
+#define OCSFS2_FL_USER_VISIBLE    OCSFS2_FL_USER_MODIFIABLE
+
+/* Map the persisted FS_*_FL bits onto the VFS inode flags the kernel enforces. */
+void ocsfs2_set_inode_flags(struct inode *inode)
+{
+	u32 fl = OCSFS2_I(inode)->i_flags;
+	unsigned int v = 0;
+
+	if (fl & FS_IMMUTABLE_FL)
+		v |= S_IMMUTABLE;
+	if (fl & FS_APPEND_FL)
+		v |= S_APPEND;
+	if (fl & FS_NOATIME_FL)
+		v |= S_NOATIME;
+	if (fl & FS_SYNC_FL)
+		v |= S_SYNC;
+	if (fl & FS_DIRSYNC_FL)
+		v |= S_DIRSYNC;
+	inode_set_flags(inode, v,
+			S_IMMUTABLE | S_APPEND | S_NOATIME | S_SYNC | S_DIRSYNC);
+}
+
+int ocsfs2_fileattr_get(struct dentry *dentry, struct file_kattr *fa)
+{
+	struct inode *inode = d_inode(dentry);
+
+	fileattr_fill_flags(fa, OCSFS2_I(inode)->i_flags & OCSFS2_FL_USER_VISIBLE);
+	return 0;
+}
+
+int ocsfs2_fileattr_set(struct mnt_idmap *idmap, struct dentry *dentry,
+			struct file_kattr *fa)
+{
+	struct inode *inode = d_inode(dentry);
+	struct ocsfs2_inode_info *oi = OCSFS2_I(inode);
+
+	/* only the legacy FS_IOC_SETFLAGS set; no project/fsx attributes. The VFS
+	 * (fileattr_set_prepare) already enforced CAP_LINUX_IMMUTABLE etc. */
+	if (fileattr_has_fsx(fa))
+		return -EOPNOTSUPP;
+	if (fa->flags & ~OCSFS2_FL_USER_MODIFIABLE)
+		return -EOPNOTSUPP;
+	oi->i_flags = (oi->i_flags & ~OCSFS2_FL_USER_MODIFIABLE) | fa->flags;
+	ocsfs2_set_inode_flags(inode);
+	inode_set_ctime_current(inode);
+	mark_inode_dirty(inode);
+	return 0;
+}
 
 struct kmem_cache *ocsfs2_inode_cachep;
 
@@ -329,6 +386,7 @@ struct inode *ocsfs2_iget(struct super_block *sb, u64 ino)
 	inode_set_mtime_to_ts(inode, ns_to_timespec64(le64_to_cpu(di.i_mtime)));
 	inode_set_ctime_to_ts(inode, ns_to_timespec64(le64_to_cpu(di.i_ctime)));
 	oi->i_flags = le32_to_cpu(di.i_flags);
+	ocsfs2_set_inode_flags(inode);          /* honour IMMUTABLE/APPEND/... */
 	oi->i_generation = le32_to_cpu(di.i_generation);
 	oi->i_ag = ocsfs2_ino_to_ag(sbi, ino);
 	oi->i_extent_tree_root = le64_to_cpu(di.i_extent_tree_root);
@@ -1023,6 +1081,8 @@ const struct inode_operations ocsfs2_file_iops = {
 	.getattr   = ocsfs2_getattr,
 	.fiemap    = ocsfs2_fiemap,
 	.listxattr = ocsfs2_listxattr,
+	.fileattr_get = ocsfs2_fileattr_get,
+	.fileattr_set = ocsfs2_fileattr_set,
 #ifdef CONFIG_FS_POSIX_ACL
 	.get_inode_acl = ocsfs2_get_acl,
 	.set_acl       = ocsfs2_set_acl,
@@ -1033,6 +1093,8 @@ const struct inode_operations ocsfs2_special_iops = {
 	.setattr   = ocsfs2_setattr,
 	.getattr   = ocsfs2_getattr,
 	.listxattr = ocsfs2_listxattr,
+	.fileattr_get = ocsfs2_fileattr_get,
+	.fileattr_set = ocsfs2_fileattr_set,
 #ifdef CONFIG_FS_POSIX_ACL
 	.get_inode_acl = ocsfs2_get_acl,
 	.set_acl       = ocsfs2_set_acl,
