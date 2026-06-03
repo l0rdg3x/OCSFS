@@ -445,6 +445,7 @@ struct ocsfs2_dio_rv {
 	unsigned int	nblk;		/* number of blocks covered */
 	void		*orig_private;	/* the iomap_dio */
 	bio_end_io_t	*orig_end_io;	/* iomap_dio_bio_end_io */
+	struct bvec_iter saved_iter;	/* bi_iter snapshot (consumed after I/O) */
 	u32		expected[];	/* stored CRC per block (0 = unset/skip) */
 };
 
@@ -455,36 +456,40 @@ static void ocsfs2_dio_read_end(struct bio *bio)
 	u32 bs = sb->s_blocksize;
 
 	if (!bio->bi_status) {			/* device read ok — verify data */
-		struct bvec_iter_all iter_all;
-		struct bio_vec *bvl;
-		unsigned int blk = 0;
+		struct bvec_iter it;
+		struct bio_vec bv;
+		u32 blk = 0, filled = 0, crc = ~0U;
 
-		bio_for_each_segment_all(bvl, bio, iter_all) {
-			unsigned int off = 0;
+		/* accumulate each block's CRC over the byte stream (incremental
+		 * crc32c) so a 4 KiB block split across segments — O_DIRECT buffers
+		 * are only 512 B-aligned — is verified against the right slot */
+		__bio_for_each_segment(bv, bio, it, rv->saved_iter) {
+			void *base = kmap_local_page(bv.bv_page);
+			u8 *p = (u8 *)base + bv.bv_offset;
+			u32 left = bv.bv_len;
 
-			while (off + bs <= bvl->bv_len && blk < rv->nblk) {
-				u32 want = rv->expected[blk];
+			while (left && blk < rv->nblk) {
+				u32 take = min(bs - filled, left);
 
-				if (want) {
-					unsigned int abs = bvl->bv_offset + off;
-					struct page *pg = bvl->bv_page +
-							(abs >> PAGE_SHIFT);
-					void *k = kmap_local_page(pg);
-					u32 got = ocsfs2_data_crc(sb,
-							k + (abs & ~PAGE_MASK));
+				crc = ocsfs2_crc32c(crc, p, take);
+				filled += take;
+				p += take;
+				left -= take;
+				if (filled == bs) {
+					u32 want = rv->expected[blk];
 
-					kunmap_local(k);
-					if (got != want) {
+					if (want && crc != want) {
 						pr_err_ratelimited("ocsfs2: DATA checksum mismatch on O_DIRECT read at block %llu (have 0x%08x want 0x%08x)\n",
 							(unsigned long long)(rv->phys0 + blk),
-							got, want);
+							crc, want);
 						bio->bi_status = BLK_STS_IOERR;
-						break;
 					}
+					blk++;
+					crc = ~0U;
+					filled = 0;
 				}
-				off += bs;
-				blk++;
 			}
+			kunmap_local(base);
 			if (bio->bi_status)
 				break;
 		}
@@ -506,7 +511,9 @@ static int ocsfs2_dio_read_arm(struct super_block *sb, struct bio *bio)
 	unsigned int i;
 	bool any = false;
 
-	if (!nblk)
+	/* only verify whole blocks starting on a block boundary; a sub-block /
+	 * unaligned-start O_DIRECT read can't be mapped to per-block CRC slots */
+	if (!nblk || (bio->bi_iter.bi_sector & ((bs >> SECTOR_SHIFT) - 1)))
 		return -EINVAL;
 	rv = kmalloc(struct_size(rv, expected, nblk), GFP_NOFS);
 	if (!rv)
@@ -527,6 +534,7 @@ static int ocsfs2_dio_read_arm(struct super_block *sb, struct bio *bio)
 	rv->nblk	 = nblk;
 	rv->orig_private = bio->bi_private;
 	rv->orig_end_io	 = bio->bi_end_io;
+	rv->saved_iter	 = bio->bi_iter;   /* the block layer consumes bi_iter on I/O */
 	bio->bi_private	 = rv;
 	bio->bi_end_io	 = ocsfs2_dio_read_end;
 	return 0;

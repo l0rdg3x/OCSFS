@@ -392,40 +392,79 @@ void ocsfs2_csum_folio_range(struct super_block *sb, struct folio *folio,
 	kfree(crcs);
 }
 
-/* Store CRCs for the blocks of a write bio (O_DIRECT submit path). The user data
- * is in the bio (block-aligned for O_DIRECT) and final before submission. The bio
- * covers a contiguous physical run; collect the CRCs and store them in one batch. */
+/* Store CRCs for the blocks of a write bio (the O_DIRECT submit hook).
+ *
+ * The bio covers the device byte range [start, end). O_DIRECT buffers need only
+ * be aligned to the device LOGICAL sector (512 B), and qemu/qcow2 issues
+ * SUB-block writes (e.g. 8-byte qcow2 L1/L2 entries) — so the bio may start
+ * mid-block and/or be smaller than one FS block. Handle that exactly:
+ *   - a block FULLY inside [start,end): compute its CRC (crc32c accumulated over
+ *     the byte stream, so a block split across bio segments is still correct);
+ *   - a block only PARTIALLY written (head/tail): we don't have its other bytes
+ *     here, so CLEAR its checksum (unset) rather than leave a stale one — the
+ *     read verify then skips it (no false positive) until a full-block rewrite
+ *     or the scrub.
+ * (A naive per-segment, whole-block-assuming loop stored WRONG CRCs and failed
+ * reads of a perfectly good image — found via `qemu-img convert -t none` onto a
+ * -C volume, where a sub-block O_DIRECT write left the block's stale CRC of the
+ * zero-init done earlier through the page cache.) */
 void ocsfs2_csum_bio(struct super_block *sb, struct bio *bio)
 {
 	u32 bs = sb->s_blocksize;
-	u64 phys0 = bio->bi_iter.bi_sector >> (sb->s_blocksize_bits - 9);
-	u32 nblk = bio->bi_iter.bi_size / bs;
+	u64 start = (u64)bio->bi_iter.bi_sector << SECTOR_SHIFT;
+	u32 size = bio->bi_iter.bi_size;
+	u64 end = start + size;
+	u64 ff = round_up(start, bs) / bs;        /* first fully-covered block */
+	u64 fl = end / bs;                        /* one past last fully-covered */
+	u32 nfull = (fl > ff) ? (u32)(fl - ff) : 0;
 	struct bvec_iter iter;
 	struct bio_vec bv;
 	u32 *crcs;
-	u32 n = 0;
+	u32 n = 0, filled = 0, crc = ~0U;
+	u64 skip;
 
-	if (!OCSFS2_SB(sb)->s_datacsum || !nblk)
+	if (!OCSFS2_SB(sb)->s_datacsum || !size)
 		return;
-	crcs = kmalloc_array(nblk, sizeof(u32), GFP_NOFS);
+	/* partial head / tail blocks can't be checksummed from this bio alone */
+	if (start & (bs - 1))
+		ocsfs2_csum_clear_range(sb, start / bs, 1);
+	if (end & (bs - 1))
+		ocsfs2_csum_clear_range(sb, (end - 1) / bs, 1);
+	if (!nfull)
+		return;
+	crcs = kmalloc_array(nfull, sizeof(u32), GFP_NOFS);
+	if (!crcs) {
+		ocsfs2_csum_clear_range(sb, ff, nfull);   /* can't csum -> unset (safe) */
+		return;
+	}
+	skip = (u64)ff * bs - start;              /* bytes before the first full block */
 	bio_for_each_segment(bv, bio, iter) {
-		unsigned int off = 0;
+		void *base = kmap_local_page(bv.bv_page);
+		u8 *p = (u8 *)base + bv.bv_offset;
+		u32 left = bv.bv_len;
 
-		while (off + bs <= bv.bv_len && n < nblk) {
-			void *base = kmap_local_page(bv.bv_page);
-			u32 crc = ocsfs2_data_crc(sb, base + bv.bv_offset + off);
+		if (skip) {
+			u32 s = min_t(u64, skip, left);
 
-			kunmap_local(base);
-			if (crcs)
-				crcs[n] = crc;
-			else
-				ocsfs2_csum_set(sb, phys0 + n, crc);
-			n++;
-			off += bs;
+			p += s;
+			left -= s;
+			skip -= s;
 		}
+		while (left && n < nfull) {
+			u32 take = min(bs - filled, left);
+
+			crc = ocsfs2_crc32c(crc, p, take);   /* incremental */
+			filled += take;
+			p += take;
+			left -= take;
+			if (filled == bs) {
+				crcs[n++] = crc;
+				crc = ~0U;
+				filled = 0;
+			}
+		}
+		kunmap_local(base);
 	}
-	if (crcs) {
-		ocsfs2_csum_set_range(sb, phys0, crcs, n);
-		kfree(crcs);
-	}
+	ocsfs2_csum_set_range(sb, ff, crcs, n);
+	kfree(crcs);
 }

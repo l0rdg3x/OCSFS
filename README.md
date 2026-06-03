@@ -83,6 +83,14 @@ It is also exactly the Proxmox workload, which is why VMFS works the same way.
 > validated on a **real 2–3 node iSCSI cluster**. **Not production-ready — do not
 > use with data that matters.**
 
+> [!NOTE]
+> **Proxmox VE integration testing is in progress** (2026-06): a real 3-node PVE
+> cluster with the OCSFS storage plugin — cloud-init Debian VMs on a shared OCSFS
+> LUN, live migration, snapshots, clones (reflink), backup/restore and under-load
+> operation. This is already finding real bugs (e.g. a checksum false-positive on
+> O_DIRECT writes from `qemu-img`, under fix) — exactly its purpose. Results will
+> land here as the matrix completes.
+
 All testing runs on **Proxmox VE 9 nodes (kernel 7.0.x-pve)** against **real
 iSCSI LUNs from TrueNAS SCALE** with **SCSI Persistent Reservations +
 Compare-And-Write** — full cluster mode with hardware CAS, never a degraded
