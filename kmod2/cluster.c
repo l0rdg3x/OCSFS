@@ -62,6 +62,14 @@ struct buffer_head *ocsfs2_meta_bread(struct super_block *sb, u64 blk)
 	bh = sb_getblk(sb, blk);
 	if (!bh)
 		return NULL;
+	/* If this block is enrolled in the current transaction, its cached buffer
+	 * holds uncommitted modifications not yet on disk; a coherent re-read would
+	 * clobber them (rename: del_dirent must see add_dirent's new entry written
+	 * into the same dir block earlier in the same txn). We hold the metadata
+	 * lease for the whole txn, so no peer can have changed the block meanwhile —
+	 * trust the cache. */
+	if (buffer_uptodate(bh) && ocsfs2_txn_has_block(sb, blk))
+		return bh;
 	lock_buffer(bh);
 	if (ocsfs2_cl_bio(sb, blk * (u64)sb->s_blocksize, bh->b_data,
 			  sb->s_blocksize, REQ_OP_READ)) {

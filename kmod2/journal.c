@@ -266,6 +266,25 @@ int ocsfs2_txn_get(struct ocsfs2_txn *txn, struct buffer_head *bh)
 	return 0;
 }
 
+/* True if @blk is already enrolled in the calling task's current transaction.
+ * Used by ocsfs2_meta_bread to avoid re-reading a block from disk when this
+ * txn has modified it but not yet committed/checkpointed: the cached buffer is
+ * authoritative (e.g. rename's del_dirent must see add_dirent's new entry in
+ * the same dir block; a coherent re-read would clobber it). The current txn is
+ * task-local (txn_begin) so the t_bufs walk needs no extra locking. */
+bool ocsfs2_txn_has_block(struct super_block *sb, u64 blk)
+{
+	struct ocsfs2_txn *txn = current->journal_info;
+	struct ocsfs2_txn_buf *tb;
+
+	if (!txn || txn->t_sb != sb)
+		return false;
+	list_for_each_entry(tb, &txn->t_bufs, link)
+		if (tb->home_block == blk)
+			return true;
+	return false;
+}
+
 /* Revoke blocks being freed: a just-freed metadata block (B+tree / refcount
  * node) may still be enrolled in the live transaction (modified before it was
  * freed) and/or carry a dirty buffer-cache buffer. If that physical block is
