@@ -62,6 +62,155 @@ static int csum_slot(struct super_block *sb, u64 phys, u64 *byte_off)
 	return 0;
 }
 
+/* ── cluster deferred checksums ──
+ * One synchronous SCSI CAW per data block is the cluster -C random-write
+ * bottleneck (each is a fabric round-trip that does NOT scale with bandwidth).
+ * Instead pending (phys -> crc) updates accumulate in an in-memory tree and
+ * flush in batched CAWs at fsync / lease-release / sync_fs. Reads consult the
+ * tree so a not-yet-flushed block still verifies; a crash drops the pending
+ * csums (data can reach disk before its csum -> a benign read false-positive,
+ * cleared by a later rewrite or the scrub — the speed/integrity trade the
+ * operator opted into). The write path no longer blocks on the CAW, so
+ * concurrent writers stop serialising on it. */
+#define OCSFS2_CSUM_DEFER_MAX  65536u   /* pending-entry cap before a forced flush */
+
+struct ocsfs2_csum_pend {
+	struct rb_node node;
+	u64 phys;
+	u32 crc;
+};
+
+static void csum_write_range_sync(struct super_block *sb, u64 phys0,
+				  const u32 *crcs, u32 n);
+
+static inline bool csum_defer_on(struct ocsfs2_sb_info *sbi)
+{
+	return sbi->s_cluster && sbi->s_datacsum;
+}
+
+/* Write every pending csum to disk (batched CAWs: contiguous physical runs go
+ * out in one csum_write_range_sync, which itself groups by csum block). Splice
+ * the whole tree out under the lock so concurrent writers keep accumulating
+ * into a fresh tree while we do I/O. */
+void ocsfs2_csum_flush(struct super_block *sb)
+{
+	struct ocsfs2_sb_info *sbi = OCSFS2_SB(sb);
+	struct rb_root batch;
+	struct rb_node *n;
+	u32 *crcs;
+	u64 run0 = 0;
+	u32 runn = 0;
+	const u32 cap = 1024;
+
+	if (!csum_defer_on(sbi) || !READ_ONCE(sbi->s_csum_pending))
+		return;
+	spin_lock(&sbi->s_csum_lock);
+	batch = sbi->s_csum_tree;
+	sbi->s_csum_tree = RB_ROOT;
+	sbi->s_csum_pending = 0;
+	spin_unlock(&sbi->s_csum_lock);
+
+	crcs = kmalloc_array(cap, sizeof(*crcs), GFP_NOFS);
+	while ((n = rb_first(&batch))) {
+		struct ocsfs2_csum_pend *e =
+			rb_entry(n, struct ocsfs2_csum_pend, node);
+
+		if (!crcs) {                          /* OOM: one CAW per slot */
+			csum_write_range_sync(sb, e->phys, &e->crc, 1);
+		} else {
+			if (runn && (e->phys != run0 + runn || runn == cap)) {
+				csum_write_range_sync(sb, run0, crcs, runn);
+				runn = 0;
+			}
+			if (!runn)
+				run0 = e->phys;
+			crcs[runn++] = e->crc;
+		}
+		rb_erase(n, &batch);
+		kfree(e);
+	}
+	if (crcs && runn)
+		csum_write_range_sync(sb, run0, crcs, runn);
+	kfree(crcs);
+}
+
+/* Record one pending (phys -> crc); overwrites a prior pending value so the
+ * tree always holds the latest CRC for a block (a later write or a clear-to-0
+ * supersedes an earlier one). */
+static void csum_defer_set(struct super_block *sb, u64 phys, u32 crc)
+{
+	struct ocsfs2_sb_info *sbi = OCSFS2_SB(sb);
+	struct rb_node **p, *parent = NULL;
+	struct ocsfs2_csum_pend *ne;
+
+	ne = kmalloc(sizeof(*ne), GFP_NOFS);
+	if (!ne) {                              /* OOM: write it synchronously */
+		csum_write_range_sync(sb, phys, &crc, 1);
+		return;
+	}
+	ne->phys = phys;
+	ne->crc = crc;
+
+	spin_lock(&sbi->s_csum_lock);
+	p = &sbi->s_csum_tree.rb_node;
+	while (*p) {
+		struct ocsfs2_csum_pend *e =
+			rb_entry(*p, struct ocsfs2_csum_pend, node);
+		parent = *p;
+		if (phys < e->phys)
+			p = &(*p)->rb_left;
+		else if (phys > e->phys)
+			p = &(*p)->rb_right;
+		else {                          /* newer crc for the same block */
+			e->crc = crc;
+			spin_unlock(&sbi->s_csum_lock);
+			kfree(ne);
+			return;
+		}
+	}
+	rb_link_node(&ne->node, parent, p);
+	rb_insert_color(&ne->node, &sbi->s_csum_tree);
+	sbi->s_csum_pending++;
+	spin_unlock(&sbi->s_csum_lock);
+
+	if (READ_ONCE(sbi->s_csum_pending) > OCSFS2_CSUM_DEFER_MAX)
+		ocsfs2_csum_flush(sb);
+}
+
+/* If @phys has a pending (not-yet-flushed) csum, return it. Lock-free fast path
+ * when nothing is pending (the common read-only case). */
+static bool csum_defer_lookup(struct super_block *sb, u64 phys, u32 *crc)
+{
+	struct ocsfs2_sb_info *sbi = OCSFS2_SB(sb);
+	struct rb_node *n;
+	bool found = false;
+
+	if (!csum_defer_on(sbi) || !READ_ONCE(sbi->s_csum_pending))
+		return false;
+	spin_lock(&sbi->s_csum_lock);
+	n = sbi->s_csum_tree.rb_node;
+	while (n) {
+		struct ocsfs2_csum_pend *e =
+			rb_entry(n, struct ocsfs2_csum_pend, node);
+		if (phys < e->phys)
+			n = n->rb_left;
+		else if (phys > e->phys)
+			n = n->rb_right;
+		else { *crc = e->crc; found = true; break; }
+	}
+	spin_unlock(&sbi->s_csum_lock);
+	return found;
+}
+
+void ocsfs2_csum_defer_init(struct super_block *sb)
+{
+	struct ocsfs2_sb_info *sbi = OCSFS2_SB(sb);
+
+	sbi->s_csum_tree = RB_ROOT;
+	spin_lock_init(&sbi->s_csum_lock);
+	sbi->s_csum_pending = 0;
+}
+
 void ocsfs2_csum_set(struct super_block *sb, u64 phys, u32 crc)
 {
 	struct ocsfs2_sb_info *sbi = OCSFS2_SB(sb);
@@ -70,6 +219,10 @@ void ocsfs2_csum_set(struct super_block *sb, u64 phys, u32 crc)
 
 	if (!sbi->s_datacsum || csum_slot(sb, phys, &byte))
 		return;
+	if (csum_defer_on(sbi)) {       /* accumulate; flushed at fsync/lease/sync */
+		csum_defer_set(sb, phys, crc);
+		return;
+	}
 	v = cpu_to_le32(crc);
 
 	if (sbi->s_cluster) {
@@ -196,6 +349,8 @@ u32 ocsfs2_csum_read(struct super_block *sb, u64 phys)
 
 	if (!sbi->s_datacsum || csum_slot(sb, phys, &byte))
 		return 0;
+	if (csum_defer_lookup(sb, phys, &crc))   /* a pending write wins over disk */
+		return crc;
 	blk = byte / sb->s_blocksize;
 	off = byte % sb->s_blocksize;
 	bh = ocsfs2_meta_bread(sb, blk);   /* coherent in cluster */
@@ -262,6 +417,14 @@ void ocsfs2_csum_read_range(struct super_block *sb, u64 phys0, u32 *out, u32 n)
 		}
 		i += cnt;
 	}
+	/* a pending (not-yet-flushed) write wins over the on-disk slot */
+	if (csum_defer_on(sbi) && READ_ONCE(sbi->s_csum_pending))
+		for (i = 0; i < n; i++) {
+			u32 c;
+
+			if (csum_defer_lookup(sb, phys0 + i, &c))
+				out[i] = c;
+		}
 }
 
 /* Batched store of CRCs for a contiguous run of physical blocks [phys0, phys0+n);
@@ -272,6 +435,22 @@ void ocsfs2_csum_read_range(struct super_block *sb, u64 phys0, u32 *out, u32 n)
  * instead of 256). Equivalent on-disk result to calling ocsfs2_csum_set per block. */
 void ocsfs2_csum_set_range(struct super_block *sb, u64 phys0, const u32 *crcs,
 			   u32 n)
+{
+	struct ocsfs2_sb_info *sbi = OCSFS2_SB(sb);
+	u32 i;
+
+	if (!sbi->s_datacsum || !n)
+		return;
+	if (csum_defer_on(sbi)) {       /* accumulate; flushed at fsync/lease/sync */
+		for (i = 0; i < n; i++)
+			csum_defer_set(sb, phys0 + i, crcs[i]);
+		return;
+	}
+	csum_write_range_sync(sb, phys0, crcs, n);
+}
+
+static void csum_write_range_sync(struct super_block *sb, u64 phys0,
+				  const u32 *crcs, u32 n)
 {
 	struct ocsfs2_sb_info *sbi = OCSFS2_SB(sb);
 	u32 i = 0;

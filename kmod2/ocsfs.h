@@ -28,6 +28,7 @@
 #include <linux/uuid.h>
 #include <linux/time64.h>
 #include <linux/dma-direction.h>
+#include <linux/rbtree.h>
 #include <linux/sched.h>
 
 /* ═══════════════════════ on-disk constants ═══════════════════════ */
@@ -597,6 +598,15 @@ struct ocsfs2_sb_info {
 	bool  s_growable;                /* COMPAT_AUTOGROW: uniform AGs, online-grow ok */
 	bool  s_datacsum;                /* A8: RO_COMPAT_DATACSUM — per-data-block CRC */
 	bool  s_csum_async;              /* P3b: -o csum_async — skip per-write csum sync */
+
+	/* cluster deferred-csum map: instead of one synchronous SCSI CAW per data
+	 * block, pending (phys -> crc) updates accumulate here and flush in batched
+	 * CAWs at fsync / lease-release / sync_fs. Reads consult it so a not-yet-
+	 * flushed block still verifies. Lets concurrent writes skip the CAW round-trip
+	 * (the cluster -C random-write bottleneck). */
+	struct rb_root s_csum_tree;
+	spinlock_t  s_csum_lock;
+	u32   s_csum_pending;
 	struct task_struct *s_grow_thread;
 	struct mutex s_grow_lock;        /* serialises online grow + geometry refresh */
 
@@ -830,6 +840,8 @@ void ocsfs2_csum_clear_range(struct super_block *sb, u64 phys,    /* on free */
 			     u32 count);                          /* drop stale CRCs */
 void ocsfs2_csum_set_range(struct super_block *sb, u64 phys0,     /* batched store */
 			   const u32 *crcs, u32 n);              /* 1 sync/CAW per blk */
+void ocsfs2_csum_flush(struct super_block *sb);       /* write pending cluster csums */
+void ocsfs2_csum_defer_init(struct super_block *sb);  /* init the pending-csum tree */
 void ocsfs2_csum_read_range(struct super_block *sb, u64 phys0,    /* batched read */
 			    u32 *out, u32 n);                    /* 1 read per csum blk */
 struct folio;

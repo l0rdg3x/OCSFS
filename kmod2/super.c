@@ -284,6 +284,7 @@ static int ocsfs2_sync_fs(struct super_block *sb, int wait)
 	int ret = ocsfs2_journal_checkpoint(sb);  /* flush deferred home blocks */
 	int ret2 = write_back_meta(sb);
 
+	ocsfs2_csum_flush(sb);                     /* flush deferred cluster csums */
 	return ret ? ret : ret2;
 }
 
@@ -294,6 +295,7 @@ static void ocsfs2_put_super(struct super_block *sb)
 	if (!sbi)
 		return;
 	ocsfs2_grow_stop(sb);      /* stop the autogrow watcher before tearing down */
+	ocsfs2_csum_flush(sb);     /* drain pending csums while the CAW path is up */
 	if (sbi->s_clustered)      /* A4: persist a true free count (coherent read) */
 		ocsfs2_recompute_free(sb);
 	ocsfs2_cluster_exit(sb);   /* stop heartbeat + release node slot first */
@@ -340,6 +342,7 @@ static int ocsfs2_fill_super(struct super_block *sb, struct fs_context *fc)
 	spin_lock_init(&sbi->s_free_lock);
 	mutex_init(&sbi->s_super_lock);
 	mutex_init(&sbi->s_grow_lock);
+	ocsfs2_csum_defer_init(sb);   /* deferred-csum tree (used in cluster -C) */
 
 	bh = sb_bread(sb, 0);
 	if (!bh) {

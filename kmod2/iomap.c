@@ -740,6 +740,7 @@ static int ocsfs2_fsync(struct file *file, loff_t start, loff_t end, int datasyn
 		if (r)
 			ret = r;
 	}
+	ocsfs2_csum_flush(inode->i_sb);   /* make this data's deferred csums durable */
 	if (!ret)
 		blkdev_issue_flush(inode->i_sb->s_bdev);
 	return ret;

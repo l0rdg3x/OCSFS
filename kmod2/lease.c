@@ -256,6 +256,8 @@ void ocsfs2_inode_close_lease(struct inode *inode)
 	/* flush our data + metadata before handing off so the next owner sees it */
 	if (mode == OCSFS2_LEASE_EX) {
 		filemap_write_and_wait(inode->i_mapping);
+		ocsfs2_csum_flush(inode->i_sb);   /* deferred data csums -> disk before
+						   * a peer reads + inline-verifies them */
 		ocsfs2_write_inode_block(inode);
 		/* A9: write the DEFERRED journal metadata (extent btree etc.) to its home
 		 * blocks now — it is journal-owned, not on the dirty list, so the
