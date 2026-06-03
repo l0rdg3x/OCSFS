@@ -99,10 +99,20 @@ static int clustered_alloc(struct super_block *sb, u32 ag_hint, u32 count,
 	for (tried = 0; tried < sbi->s_ag_count && ret == -ENOSPC; tried++) {
 		u32 ag = (ag_hint + tried) % sbi->s_ag_count;
 		struct ocsfs2_ag_info *ai = &sbi->s_ags[ag];
-		u64 b;
+		/* number of bitmap blocks covering this AG */
+		u64 nbm = ((u64)ai->block_count + bpb - 1) / bpb;
+		/* Start scanning at the bitmap block of next_blk_hint (the allocation
+		 * frontier) and wrap, instead of always from block 0. Without this a
+		 * sequential fill re-reads every already-full bitmap block coherently on
+		 * each allocation — O(filled) cl_bio per alloc, the dominant cluster
+		 * convert cost. The CAW still guarantees correctness if the hint is
+		 * stale (a peer's allocation just causes a miscompare + retry). */
+		u64 startk = nbm ? (ai->next_blk_hint / bpb) % nbm : 0;
+		u64 kk;
 
 		mutex_lock(&ai->ag_lock);
-		for (b = 0; (u64)b * bpb < ai->block_count; b++) {
+		for (kk = 0; kk < nbm; kk++) {
+			u64 b = (startk + kk) % nbm;
 			u64 base = (u64)b * bpb;
 			u32 blk_bits = (u32)min_t(u64, bpb, ai->block_count - base);
 			u64 bbyte = ai->bitmap_off + (u64)b * bs;
@@ -128,6 +138,7 @@ static int clustered_alloc(struct super_block *sb, u32 ag_hint, u32 count,
 					set_bit_le8(new, run_start + i);
 				if (ocsfs2_scsi_caw(sb, bbyte / bs, old, new, bs) == 0) {
 					ai->free_blocks -= count;   /* per-node hint */
+					ai->next_blk_hint = base + run_start + count;
 					*block_out = ai->block_start + base + run_start;
 					ret = 0;
 					goto unlock;
