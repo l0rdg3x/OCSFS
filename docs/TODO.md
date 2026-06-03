@@ -75,6 +75,34 @@ per instruction — a few loose v1 test files: `test_ocsfs.c`, `ocsfs_fsx.c`,
 - **S5** shared-disk single-trust-domain — **DISCARDED** (won't fix in the FS):
   inherent to shared-disk FSes; handled operationally — the LUN is exposed only
   to authenticated initiators (iSCSI CHAP / FC zoning + LUN masking).
+- **RENAME data-loss on cluster** — **FIXED** (2026-06-03, `e16a301`): `meta_bread`
+  re-read a block from disk on every call, clobbering an uncommitted modification
+  made earlier in the same txn. rename() (add_dirent + del_dirent on one dir block)
+  committed a dir block with NEITHER name → file vanished; this silently destroyed
+  **every vzdump archive** (PVE renames the `.vma.zst` into place). Fix:
+  `ocsfs2_txn_has_block` guard skips the re-read for in-txn blocks. 3-node clean.
+- **Buffered WRITE perf on cluster (`-C`)** — **FIXED** (2026-06-03, `ea7308e`):
+  was ~7 MB/s (restore 3GB = 265s) because the data-csum did one CAW per 4K block
+  in writeback. `mapping_set_large_folios` → writeback batches a multi-block folio
+  → csum_set_range collapses to ~1 CAW / 64 blocks. 8→44 MB/s (5.3×, ≈ O_DIRECT),
+  checksums kept. fsx 30k + cross-node + fsck clean.
+- **Proxmox linked-clone** — **FIXED** (2026-06-03, `e261bb4`): plugin `clone_image`
+  reflink branch called `find_free_diskname` without `$add_fmt_suffix` → bad
+  extensionless volname. Now `qm clone` of a template = 1.3s reflink, boots.
+
+### LIVEMIG. [FIX · P1] Online (live) migration blocked by single-writer lease
+`qm migrate --online` fails: the **target** qemu opens the disk read-write while
+the **source** still holds the EX lease → `ocsfs2_inode_open_lease` returns
+`-EBUSY` → `Could not open …: Device or resource busy` → qemu exits. The lease
+(`lease_modify`) has **no revocation** — the holder keeps EX until it closes the
+file, but live migration needs the target open *before* the source releases.
+Offline migration (sequential open/close) is unaffected. Fix options: **(A)** defer
+the open-EX, acquire EX lazily+blocking on first write (simpler; relies on the
+source closing promptly post-switchover, which PVE does); **(B)** add a revoke
+protocol (acquirer sets a revoke bit, holder flushes like `close_lease` and
+releases). Both are core single-writer changes → need careful 3-node validation.
+The plugin comment already *claims* live migration works (lease handoff) — it was
+never exercised online; this is the gap.
 
 The detailed analysis below is kept for reference.
 
