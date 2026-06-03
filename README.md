@@ -20,10 +20,10 @@
 > matters.**
 
 > [!NOTE]
-> **This is OCSFS v2 — a from-scratch rearchitecture** (kernel module `ocsfs2`,
-> sources in `kmod2/`, tools in `tools2/`). It replaces the v1 design (still on
-> `main` under `kmod/`) whose per-operation distributed lock manager could not
-> scale metadata under cross-node contention and fought a never-ending stream of
+> **OCSFS v2 is a from-scratch rearchitecture** (kernel module `ocsfs2`, sources in
+> `kmod2/`, tools in `tools2/`). It replaces the v1 design (preserved on the
+> `v1-legacy` branch) whose per-operation distributed lock manager could not scale
+> metadata under cross-node contention and fought a never-ending stream of
 > cross-node buffered-cache coherence bugs. v2's organizing principle —
 > **single-writer ownership** — removes *both* problem classes by construction.
 
@@ -64,14 +64,14 @@ It is also exactly the Proxmox workload, which is why VMFS works the same way.
 | 🧩 **No external dependencies** | No DLM daemon, no corosync, no cluster LAN — coordination is on the LUN |
 | 🛡️ **Hardware fencing** | SCSI-3 Persistent Reservations evict a failed node at the fabric |
 | 💓 **Storage-path heartbeat** | Liveness proven by writes to the LUN (liveness-epoch), immune to LAN partitions |
-| 📓 **Crash-safe journaling** | Per-node WAL with redo; replay on mount + replay of a *dead peer's* journal during recovery |
-| 🌳 **Modern data path** | iomap, inline extents + per-inode extent B+tree, O_DIRECT, sparse, `FIEMAP`, `SEEK_HOLE/DATA` |
+| 📓 **Crash-safe journaling** | Per-node WAL with redo; log-scan replay on mount + replay of a *dead peer's* journal during recovery |
+| 🌳 **Modern data path** | iomap, inline extents + per-inode extent B+tree, O_DIRECT, **large folios**, sparse, `FIEMAP`, `SEEK_HOLE/DATA` |
 | 🪞 **Space efficiency** | Reflink (`FICLONE`), CoW snapshots, **cross-file dedup** (`FIDEDUPERANGE`), thin/sparse, **discard/TRIM** |
 | 📈 **Autonomous online autogrow** | Grow the LUN any number of times — each node detects it and grows into the new space hot, **repeatedly** |
-| 🩺 **Online metadata scrub** | Verify every on-disk checksum on a live volume (`OCSFS_IOC_SCRUB`) to catch silent bitrot |
-| 🔐 **End-to-end data checksums** | Opt-in `mkfs -C`: per-physical-block CRC32c, **verified inline on every read** (buffered + O_DIRECT, cross-node) → `-EIO` not corruption, on **any** SAN; cheap (batched), CoW/reflink-safe |
-| 🏎️ **Near-raw VM-disk I/O** | O_DIRECT (`cache=none`); **zero per-I/O clustering tax** (single-writer) — a node hits the raw LUN; aggregate is bound by the shared LUN (scale with more LUNs) |
-| 🧱 **Proxmox-native** | `mount -t ocsfs2 -o cluster`; live migration *is* the lease hand-off |
+| 🩺 **Online metadata + data scrub** | Verify every on-disk checksum on a live volume (`OCSFS_IOC_SCRUB`) to catch silent bitrot |
+| 🔐 **End-to-end data checksums** | Opt-in `mkfs -C`: per-physical-block CRC32c, **verified inline on every read** (buffered + O_DIRECT, cross-node) → `-EIO` not corruption, on **any** SAN; **deferred + batched so it is near-free even for cluster random writes**, CoW/reflink-safe |
+| 🏎️ **Near-raw VM-disk I/O** | O_DIRECT (`cache=none`); **zero per-I/O clustering tax** (single-writer); the FS software ceiling is ~250k IOPS/node (RAM-measured) — a node is bound by the LUN/fabric, not by OCSFS |
+| 🧱 **Proxmox-native** | `mount -t ocsfs2 -o cluster`; storage plugin with reflink clones; full clone/snapshot/backup/restore/resize validated on a 3-node cluster |
 
 ---
 
@@ -79,182 +79,149 @@ It is also exactly the Proxmox workload, which is why VMFS works the same way.
 
 > [!WARNING]
 > **Alpha / Research.** The single-node data path is `fsx`-validated; the cluster
-> (membership, single-writer ownership, directory coherence, crash recovery) is
-> validated on a **real 2–3 node iSCSI cluster**. **Not production-ready — do not
-> use with data that matters.**
+> (membership, single-writer ownership, directory coherence, crash recovery, the
+> Proxmox storage battery) is validated on a **real 3-node iSCSI cluster**.
+> **Not production-ready — do not use with data that matters.**
+
+All testing runs on **Proxmox VE 9 nodes (kernel 7.0.x-pve)** against **real iSCSI
+LUNs from TrueNAS SCALE** with **SCSI Persistent Reservations + Compare-And-Write**
+— full cluster mode with hardware CAS, never a degraded fallback. **No loopback
+devices.** The module is always built on the Proxmox nodes (matching kernel) and
+installed via **DKMS** (auto-rebuilds on kernel upgrade).
+
+### Proxmox VE storage battery (3-node, validated)
+
+The OCSFS storage plugin drives the real PVE CLI (`qm` / `pvesm` / `vzdump` /
+`qmrestore`) against a shared LUN, end-to-end:
+
+- ✅ **Linked/template clone** via reflink — `qm clone` of a Debian 13 cloud-init
+  template = **~1.3 s** (copy-on-write, instant), the cloned VM boots a real kernel
+- ✅ **Snapshot** create / rollback / delete (`qm snapshot` / `rollback` / `delsnapshot`)
+- ✅ **Backup → restore** (`vzdump` → `qmrestore`) to a new VMID, the restored VM boots
+- ✅ **Disk resize** (`qm resize`, grow), guest sees the new size, `fsck` clean
+- ✅ **Crash recovery under PVE** — a node power-loss (`sysrq-b`) is detected by a
+  survivor, which replays the dead node's journal; data + checksums intact
 
 > [!NOTE]
-> **Proxmox VE integration testing is in progress** (2026-06): a real 3-node PVE
-> cluster with the OCSFS storage plugin — cloud-init Debian VMs on a shared OCSFS
-> LUN, live migration, snapshots, clones (reflink), backup/restore and under-load
-> operation. This is already finding real bugs (e.g. a checksum false-positive on
-> O_DIRECT writes from `qemu-img`, under fix) — exactly its purpose. Results will
-> land here as the matrix completes.
-
-All testing runs on **Proxmox VE 9 nodes (kernel 7.0.x-pve)** against **real
-iSCSI LUNs from TrueNAS SCALE** with **SCSI Persistent Reservations +
-Compare-And-Write** — full cluster mode with hardware CAS, never a degraded
-fallback. **No loopback devices.**
+> **Live migration: offline works; *online* (`qm migrate --online`) is a known
+> limitation.** Online migration needs the destination QEMU to open the disk while
+> the source still holds the write-ownership lease, and the lease currently has no
+> *revocation* protocol — the destination open returns `-EBUSY`. Offline migration
+> (sequential lease hand-off via close → open) is fine. Adding lease revocation (or
+> a lazy/blocking first-write lease) is the tracked follow-up; see `docs/TODO.md`.
 
 ### Single node — the integrity gate (`fsck` clean, zero kernel warnings)
 
 - ✅ buffered + **O_DIRECT** write/read with sha256 round-trip across `drop_caches`
 - ✅ **inline extents → per-inode extent B+tree** spill, validated with `fsx`
-  (buffered 3×30 000 ops + O_DIRECT) against an in-memory mirror, cross-checked
-  vs XFS with identical seeds
+  (30 000+ ops) against an in-memory mirror, cross-checked vs XFS with identical seeds
 - ✅ **reflink** (`FICLONE`) + **CoW snapshots** with copy-on-write isolation
-- ✅ **cross-file dedup** (`FIDEDUPERANGE`): identical files share storage, a
-  write diverges via CoW, differing files dedupe nothing
-- ✅ xattr, POSIX ACLs, sym/hardlinks, `mknod`, nested directories
+- ✅ **cross-file dedup** (`FIDEDUPERANGE`), xattr, POSIX ACLs, sym/hardlinks, `mknod`
 - ✅ `fallocate` preallocate / **punch-hole** / **zero-range**, sparse, truncate
 - ✅ **discard/TRIM** (`fstrim`) reclaims free space on the thin LUN (SCSI UNMAP)
 - ✅ **autonomous online autogrow**, including **repeated** grows in one mount
-  (via dm-linear over the real LUN; data intact each step). Autogrow-added AGs are
-  **data-checksummed** like the original AGs (validated 3→23 AGs: inline + scrub
-  catch corruption in a grown AG)
-- ✅ **online scrub** verifies every metadata checksum **and every data block**
-  (`mkfs -C`); detects injected inode-checksum *and* data-block corruption
-- ✅ **crash recovery**: journal replay on mount reconstructs a committed-but-
-  uncheckpointed transaction (validated by `sysrq` power-loss)
+- ✅ **online scrub** verifies every metadata checksum **and every data block** (`-C`)
+- ✅ **rename is crash- and cluster-safe** — a regression where a coherent metadata
+  re-read could clobber an in-transaction directory block (silently destroying a
+  renamed file, e.g. every `vzdump` archive) was found and fixed; validated 3-node
 
 ### Two / three nodes — the real validation target (`fsck` clean)
 
-- ✅ **L3 membership + fencing** — nodes see each other alive via the storage
-  heartbeat; a paused node is DECLARED DEAD past the window and SCSI-PR fenced
+- ✅ **L3 membership + fencing** — storage heartbeat; a paused node is DECLARED
+  DEAD past the window and SCSI-PR fenced
 - ✅ **L4 single-writer ownership** — an EX owner blocks a peer's open-for-write;
-  after release the peer takes it and reads coherent data; concurrent writes to
-  *different* files both land
-- ✅ **L4b directory coherence** — two nodes creating files/dirs in the **same**
-  directory both converge with no lost entries and a consistent on-disk `i_size`
-- ✅ **L5 recovery** — a dead node's owner-leases are eagerly reclaimed and its
-  per-node journal is replayed by the survivor (off the heartbeat path), so its
-  files become usable again with content intact
-- ✅ **multinode performance** (see below) — 3-node aggregate on one LUN ≈ a
-  single node's (the shared LUN is the ceiling, **no per-I/O clustering tax**); no
-  metadata collapse under concurrent load (v1 collapsed here)
-- ✅ **differential data-path testing** (`tests/v2/fsx_diff.sh`) — identical
-  `fsx` seeds/params on OCSFS vs **XFS** (a bug counts only when OCSFS diverges
-  from XFS, filtering fuzzer/golden-output artifacts): **buffered**, **O_DIRECT**
-  (the Proxmox `cache=none` path) and **clone/reflink** all match XFS with **zero
-  divergence** over 8 seeds × 3 flag matrices (24/24 runs), `fsck` clean. mmap is
-  disabled in the matrix because OCSFS v2 does not implement it (unused by the
-  Proxmox workload)
-
-### Testing method (lesson learned)
-
-Raw `xfstests ./check` pass/fail is **unreliable for a custom FS**: its golden
-output flags benign stdout (e.g. "filesystem does not support fallocate mode …")
-as failure, and `fsx` itself emits ops that **even XFS rejects** (unaligned
-O_DIRECT writes → `write: Invalid argument`). Both look like FS bugs and are not.
-The reliable method is **differential**: run the *same* `fsx` seed+params on
-OCSFS and on XFS (reflink=1) and treat a result as a bug **only when OCSFS
-diverges from XFS** (`tests/v2/fsx_diff.sh`). Use aligned params to avoid the
-O_DIRECT artifact. This is how the real reflink data-loss bug above was confirmed
-(minimal deterministic repro; XFS correct, OCSFS not) and how the O_DIRECT path
-was cleared.
-
-### Data integrity — end-to-end checksums (opt-in `mkfs -C`)
-
-- ✅ per-**data-block** CRC32c in a per-AG region; stored on every write (buffered
-  + O_DIRECT, cluster-coherent via CAW), **verified inline on every read** on both
-  paths — a mismatch returns `-EIO` instead of corruption — plus the online scrub
-  for bulk verification. Validated single-node **and** 3-node `-o cluster`: a raw
-  `dd` corruption of a block on the LUN is caught on a *peer's* buffered and
-  O_DIRECT read; CoW/reflink-safe (the CRC follows the physical block); fsx `-C`
-  differential vs XFS clean (no false positives), `fsck` clean.
-
-> **Inline compression is out of scope** (not a TODO): it breaks the iomap 1:1
-> logical↔physical mapping and O_DIRECT (`cache=none`, the Proxmox default), so it
-> cannot be added without sacrificing the hot-path integrity/performance OCSFS
-> targets. Space savings come from dedup + thin + discard instead.
+  after release the peer takes it and reads coherent data
+- ✅ **L4b directory coherence** — concurrent create/rename in the **same**
+  directory across nodes converge with no lost entries; **90-way concurrent create
+  (3×30) = 90/90, 0 errors**, `fsck` clean
+- ✅ **L5 recovery** — a dead node's leases are reclaimed and its per-node journal
+  is **log-scan replayed** by a survivor (off the heartbeat path), content intact
+  — validated by real power-loss with files held open (uncheckpointed) at crash
+- ✅ **data checksums cross-node** — a raw `dd` corruption of a block on the LUN is
+  caught on a *peer's* O_DIRECT and buffered read (`-EIO`), deferred csums durable
+  across a crash (flushed at `fsync` / lease release)
 
 ---
 
 ## ⚡ Performance
 
 Measured on the real testbed: **Proxmox VE 9 (kernel 7.0.x-pve)**, a **TrueNAS
-SCALE iSCSI LUN** over **1 GbE**, **100 GiB zvol, `volblocksize=4K`, `sync=disabled`**,
-single SSD, SCSI PR + CAW. fio O_DIRECT (`--direct=1 --ioengine=libaio`, the Proxmox
-`cache=none` path), QD32 random / QD1 sequential (1 MiB). The 1 GbE link and the
-single shared SSD are the ceilings — treat absolutes as *this rig* and read the
-**ratios**.
+SCALE iSCSI LUN over 1 GbE**, single SSD, SCSI PR + CAW; fio O_DIRECT
+(`--direct=1 --ioengine=libaio`, the Proxmox `cache=none` path). The 1 GbE link
+and the single shared SSD are the ceilings — treat absolutes as *this rig* and
+read the **ratios**.
 
-### Single node — checksums (`-C`) are near-free except pure random write
+### The headline: checksums are no longer the cluster random-write cost
 
-`-C` = per-data-block CRC32c, stored on write + **verified inline on every read**
-(both O_DIRECT and buffered, async/pipelined).
+The hard problem on a clustered FS is small random writes: each one used to pay a
+synchronous **SCSI Compare-And-Write** to store its data checksum — a *fabric
+round-trip* whose latency does **not** scale with bandwidth, so it stays the
+ceiling even on faster fabrics. Three changes removed it:
 
-| Workload (O_DIRECT) | no `-C` | with `-C` | Δ |
-|---|--:|--:|---|
-| Sequential write 1 MiB | 89.1 MB/s | 83.3 MB/s | −6% |
-| Sequential read 1 MiB  | 88.1 MB/s | 86.7 MB/s | −2% |
-| Random **read** 4 KiB  | 26 539 IOPS | 26 735 IOPS | **≈0%** (verify ≈ free) |
-| Random read 16 KiB     | 7 103 IOPS | 7 105 IOPS | ≈0% |
-| Random write 16 KiB    | 5 390 IOPS | 2 713 IOPS | −50% |
-| Random **write** 4 KiB | **20 988 IOPS** | 3 656 IOPS | −83% ← the one real cost |
-| Random write 4 KiB **`-o csum_async`** | 20 988 IOPS | **12 192 IOPS** | **−4%** |
+| Cluster `-C` random-4 KiB write (O_DIRECT) | IOPS | |
+|---|--:|---|
+| synchronous per-block checksum CAW (before) | ~2 050 | baseline |
+| **deferred + batched checksums (now)** | **~15 000–20 000** | **~8–10×** |
 
-Reads, sequential and large/aligned writes pay almost nothing. The only real cost
-is **sustained pure 4 KiB-random-write**, capped at ~3.5k IOPS by the crash-safe
-per-write checksum `sync` (independent of LUN speed). Mounting **`-o csum_async`**
-defers that `sync` to writeback and restores ~3.6× (≈ no-`-C`), trading a wider
-post-crash false-positive window (a rewrite/scrub clears it; single-node only).
+The checksum now accumulates in memory and flushes in **batched** CAWs (one per
+checksum block) at coherence points (`fsync`, lease hand-off, `sync`), so the hot
+write path no longer round-trips the fabric. `-C` cluster random write now sits at
+the **no-checksum** rate — the integrity feature is effectively free — while
+corruption is still caught on read and the only trade is a narrow post-crash
+window where a not-yet-flushed checksum yields a benign read false-positive that a
+rewrite or the scrub clears.
 
-### Making `-C` cheap — the engineering
+### Backup / restore / clone (real Proxmox ops, 3-node)
 
-Three changes took the checksum cost from crippling to near-free (gains, *this rig*):
+| Operation | Time | Note |
+|---|--:|---|
+| `qm clone` (template → VM, reflink) | **~1.3 s** | copy-on-write, instant |
+| `vzdump` backup (3 GB VM) | **~17 s** | |
+| `qmrestore` (5 GB image) | **~25 s** | was ~280 s before the allocation reservation |
 
-| `-C` change | workload | before | after |
-|---|---|--:|--:|
-| Batch the write (`csum_set_range`: 1 `sync`/CAW per checksum block, not per block) | seq write | 14.5 MB/s | **94.7 MB/s** (6.5×) |
-| Async inline read verify (pre-read CRCs, verify in the bio completion — not a sync bio-per-folio) | buffered seq read | 18 MB/s | **117 MB/s** (6.5×, line rate) |
-| Batch the cluster read (`csum_read_range`: 1 coherent read per checksum block) | cluster seq read /node | 12 MB/s | **32 MB/s** (≈ no-`-C`) |
+The restore (a scattered small-write import) went from **~280 s to ~25–40 s** via a
+per-inode **allocation reservation**: a node claims a contiguous block run in one
+CAW and carves writes out of it, instead of one CAW per 64 KiB qcow2 cluster.
 
-The online scrub reads DATA the same way (raw bio, batched 256 KiB) — *not* via the
-buffer cache, which is incoherent with the iomap data path (a bug that surfaced as
-spurious mismatches on autogrow-grown regions; fixed). Autogrow-added AGs are
-checksummed identically to the original ones.
+### Why the FS isn't the bottleneck — RAM-measured ceiling
 
-### The biggest lever is on the SAN, not the FS — match `volblocksize`
+To separate the filesystem software from the fabric, OCSFS single-node was
+measured on a RAM block device (no SAN, no CAW):
+
+| random-4 KiB write | IOPS |
+|---|--:|
+| raw RAM device (1 thread QD32) | 280 000 |
+| **OCSFS single-node (1 thread QD32)** | **252 000** (90 % of raw) |
+| OCSFS, 4 threads on the **same** file | **495 000** (scales — no lock serialisation) |
+
+The FS software adds ~10 % over raw and **scales with concurrent writers on one
+inode** — there is no per-inode lock serialising the I/O path. So the entire
+single-node→cluster gap is the SAN/CAW round-trip, not OCSFS: **the lever for
+faster fabrics (FC 32 G, iSCSI 40 G) is fewer CAW round-trips**, which is exactly
+what the deferred checksums, the allocation reservation, and the **node-owned-AG
+allocation affinity** (nodes allocate from disjoint AGs → no cross-node CAW
+contention) target.
+
+### Sequential & read
+
+Sequential write/read run at the 1 GbE line rate (~50–90 MB/s on this rig);
+**buffered** sequential write went from ~7 MB/s to ~50–70 MB/s once the page cache
+was given **large folios** (writeback maps + checksums a multi-block folio at once
+instead of one 4 KiB block). Random-4 KiB **read** on `-C` pays the inline checksum
+verify (one stored-CRC fetch per block) — that is the one remaining `-C` read cost
+and is most visible on uncached random reads.
+
+### The biggest lever is on the SAN — match `volblocksize`
 
 A 4 KiB random write to a **16 KiB-`volblocksize`** zvol forces a 16 KiB ZFS
-read-modify-write (4× amplification). Single-node, no `-C`:
+read-modify-write (4× amplification). **Match the zvol `volblocksize` to the
+guest** (4 KiB for random-heavy disks) for ~4× random-write, entirely SAN-side.
+**Scale aggregate I/O by spreading VMs across multiple LUNs**, not by adding nodes
+to one LUN — a single shared target is the ceiling.
 
-| Random write, O_DIRECT | 16 KiB-`volblocksize` | 4 KiB-`volblocksize` | gain |
-|---|--:|--:|---|
-| 4 KiB QD32  | 5 369 IOPS | **20 988 IOPS** | **3.9×** |
-| 16 KiB QD32 | 2 858 IOPS | 5 390 IOPS | 1.9× |
-
-> **Most performant *and* safe combination:**
-> 1. **Match the zvol `volblocksize` to the guest** (4 KiB for random-heavy VM
->    disks) — the single biggest win (~4× random write), entirely on the SAN side.
-> 2. **Keep `-C` on** — ≈free for reads, sequential and large writes (the dominant
->    Proxmox patterns); silent-corruption protection on any SAN.
-> 3. For sustained small-random-write *with* checksums, add **`-o csum_async`** (3.6×).
-> 4. On the SAN: `sync=standard` (+ SLOG) for power-loss durability, or
->    `sync=disabled` for speed if the SAN cache is battery/UPS-backed.
-
-### Cluster (3 nodes, one shared LUN) — bound by the LUN, not OCSFS
-
-Three nodes, each writing **its own** files on **one** 4 KiB-`volblocksize` LUN,
-`-o cluster` (aggregate = sum of 3):
-
-| Workload (O_DIRECT) | no `-C` | with `-C` |
-|---|--:|--:|
-| Sequential write 1 MiB | 98.7 MB/s | 92.9 MB/s |
-| Sequential read 1 MiB  | 81.8 MB/s | 91.2 MB/s |
-| Random write 4 KiB     | 20 570 IOPS | 6 339 IOPS |
-
-Two things to read here. **(1)** The 3-node aggregate ≈ a *single* node's number
-(seq ~the 1 GbE/SSD ceiling; random-write 4 KiB 20.5k ≈ the 21k one node already
-extracts): steady-state file I/O does **zero** per-operation on-disk locking
-(single-writer ownership), so peers add no coordination tax — but a *single shared
-LUN/target is the ceiling*. **Scale aggregate I/O by spreading VMs across multiple
-LUNs**, not by adding nodes to one LUN. (v1 instead *collapsed* under cluster load,
-doing synchronous on-disk lock work per 4 KiB I/O.) **(2)** `-C` is ≈free on cluster
-sequential read/write too (the async read verify + batched CAW write); the cluster
-4 KiB-random-write cost is the per-write coherence CAW (the `csum_async` relaxation
-is single-node only, since in cluster the checksum *is* that CAW).
+> **Inline compression is out of scope** (not a TODO): it breaks the iomap 1:1
+> logical↔physical mapping and O_DIRECT (`cache=none`, the Proxmox default). Space
+> savings come from dedup + thin + discard instead.
 
 ---
 
@@ -266,7 +233,7 @@ is single-node only, since in cluster the checksum *is* that CAW).
         │                 iSCSI / Fibre Channel SAN                     │
         │                                                               │
         │  SB │ node table │ heartbeat │ lease table │ recovery         │
-        │     │ journal[per node] │ AG[0..N): bitmap·inodes·refcount·data│
+        │     │ journal[per node] │ AG[0..N): bitmap·inodes·refcount·csum·data│
         └───────┬───────────────────────────────────────────┬──────────┘
                 │   SCSI-3 PR (fencing)                       │
                 │   SCSI CAW (atomic on-disk state)           │
@@ -283,10 +250,10 @@ is single-node only, since in cluster the checksum *is* that CAW).
 |---|---|---|
 | **L0** transport | SCSI-3 PR (register/preempt-abort) + Compare-And-Write via BSG-direct | `transport/scsi_pr.c` |
 | **L1** on-disk format | XFS-like AGs, lease table, per-node journals; CRC32c on every metadata block | `ocsfs.h`, `tools2/` |
-| **L2** local engine | iomap data path, extents (inline + B+tree), allocation, namespace, journal, reflink/CoW/dedup — **validated single-node before any cluster code** | `iomap.c` `inode.c` `dir.c` `bitmap.c` `journal.c` `refcount.c` `reflink.c` `extent_btree.c` `file.c` `xattr.c` |
+| **L2** local engine | iomap data path, extents (inline + B+tree), allocation, namespace, journal, reflink/CoW/dedup — **validated single-node before any cluster code** | `iomap.c` `inode.c` `dir.c` `bitmap.c` `journal.c` `refcount.c` `reflink.c` `extent_btree.c` `file.c` `xattr.c` `csum.c` |
 | **L3** membership | On-disk heartbeat (liveness-epoch / observer clock) + SCSI-PR fencing, behind `ocsfs2_cluster_ops` (pluggable for corosync) | `cluster.c` |
 | **L4** ownership | Per-file lease table, **true optimistic CAS over CAW** (read → check → CAW); L4b coarse metadata lease for namespace/allocation | `lease.c` |
-| **L5** recovery | Leader election → replay dead peer's journal → reclaim its leases, off the heartbeat path | `lease.c` + `journal.c` |
+| **L5** recovery | Leader election → log-scan replay of dead peer's journal → reclaim its leases, off the heartbeat path | `lease.c` + `journal.c` |
 
 ### Key design choices
 
@@ -294,14 +261,16 @@ is single-node only, since in cluster the checksum *is* that CAW).
 - **Coordination on the LUN.** No DLM daemon, no cluster LAN: lease/membership
   state are versioned on-disk records mutated by **Compare-And-Write**.
 - **Coherence by construction + CAW.** File data is single-writer; the small
-  shared metadata (bitmap, inode table) is mutated by **per-block CAW** and read
-  fresh via direct bios (the per-node buffer cache is bypassed for those), so a
-  node never acts on a stale peer view.
-- **Liveness-epoch leases.** A lease is honoured only while its owner is ALIVE at
-  a matching generation — so there is **no per-lease renewal**, just one heartbeat
-  per node.
-- **Per-node WAL.** Each node journals to its own region; recovery replays a dead
-  peer's journal.
+  shared metadata (bitmap, inode table, checksums) is mutated by **CAW** and read
+  fresh via direct bios, so a node never acts on a stale peer view. An
+  in-transaction block is never re-read from disk (it would clobber the
+  uncommitted change — the rename fix).
+- **Deferred journal + checkpoint-on-lease-release.** The per-node WAL batches
+  commits (jbd2-lite); a node flushes its deferred metadata to home blocks when it
+  releases an EX lease, so the next owner reads current state — coherence at lease
+  boundaries, crash recovery by log-scan replay.
+- **Liveness-epoch leases.** A lease is honoured only while its owner is ALIVE at a
+  matching generation — no per-lease renewal, just one heartbeat per node.
 
 ---
 
@@ -310,20 +279,20 @@ is single-node only, since in cluster the checksum *is* that CAW).
 | File | Responsibility |
 |---|---|
 | `super.c` | Mount/unmount, `-o cluster` / `-o csum_async` options, AG headers (pre-sized for autogrow), statfs, sync |
-| `inode.c` | Inode read/write/alloc/free (CAW in cluster), extent map (inline ↔ B+tree), coherent re-read |
-| `dir.c` · `rename.c` | Namespace ops under the metadata lease; directory blocks read fresh via bio |
-| `iomap.c` | Buffered + O_DIRECT data path; block-granular CoW via bios; **async inline data-checksum read verify** |
-| `csum.c` | Per-data-block CRC32c (`mkfs -C`): batched store + batched coherent read; clear-on-free |
+| `inode.c` | Inode read/write/alloc/free (CAW in cluster), extent map (inline ↔ B+tree), node-owned-AG inode affinity, coherent re-read |
+| `dir.c` · `rename.c` | Namespace ops under the metadata lease; dir blocks read fresh; in-txn block protected from re-read clobber |
+| `iomap.c` | Buffered + O_DIRECT data path; large folios; block-granular CoW; per-inode **allocation reservation**; async inline data-checksum read verify |
+| `csum.c` | Per-data-block CRC32c (`mkfs -C`): **deferred + per-checksum-block batched** store in cluster, batched coherent read, inline verify, clear-on-free |
 | `file.c` | `fallocate` (preallocate/punch/zero), `fiemap`, `SEEK_HOLE/DATA`; lease on open/release |
 | `extent_btree.c` | Per-inode extent B+tree (spill past 16 inline extents) |
-| `bitmap.c` | Per-AG allocation; cluster alloc/free + **FITRIM** via CAW; drops freed blocks' checksums |
-| `journal.c` | Per-node WAL: redo log, replay on mount, **replay a dead peer's slot** (L5) |
+| `bitmap.c` | Per-AG allocation; **node-owned-AG affinity**; cluster alloc/free + **FITRIM** via CAW; drops freed blocks' checksums |
+| `journal.c` | Per-node WAL: deferred/batched redo log, log-scan replay on mount, **log-scan replay of a dead peer's slot** (L5) |
 | `refcount.c` | Per-AG refcount B+tree for reflink/snapshot/dedup sharing |
 | `reflink.c` | `FICLONE`/`copy_file_range`, `FIDEDUPERANGE` dedup, snapshot ioctl, `FITRIM`/`GROWFS`/`SCRUB`/`DEFRAG` dispatch |
 | `defrag.c` | Online extent compaction (`OCSFS_IOC_DEFRAG`) |
 | `xattr.c` | xattr (user/trusted/security) + POSIX ACL in one block |
-| `cluster.c` | L3: node-slot claim, heartbeat kthread, coherent bio + CAW helpers, fencing |
-| `lease.c` | L4 ownership leases + L4b metadata lease + L5 recovery (leader, reclaim) |
+| `cluster.c` | L3: node-slot claim, heartbeat kthread, coherent bio + CAW helpers (incl. multi-slot CAW), fencing |
+| `lease.c` | L4 ownership leases + L4b metadata lease + L5 recovery (leader, reclaim); checkpoint + csum flush on EX release |
 | `grow.c` | L2: autonomous online autogrow (watcher + `OCSFS_IOC_GROWFS`); checksums new AGs |
 | `scrub.c` | Online scrub: every metadata checksum **+ every data block** (`OCSFS_IOC_SCRUB`) |
 | `transport/scsi_pr.c` | SCSI-3 PR + Compare-And-Write (the only file carried over from v1) |
@@ -340,16 +309,13 @@ is single-node only, since in cluster the checksum *is* that CAW).
 
 ## 🔨 Building
 
-The one-step installer (below) is the supported path — it installs the module
-via **DKMS**, so it is **rebuilt automatically on every kernel upgrade**. To build
-by hand:
+The one-step installer (below) is the supported path — it installs the module via
+**DKMS**, so it is **rebuilt automatically on every kernel upgrade**. To build by
+hand (on the node whose kernel will run it):
 
 ```bash
-# Kernel module (build on the node whose kernel will run it)
-make -C /lib/modules/$(uname -r)/build M=$PWD/kmod2 modules
-
-# Tools
-cc -O2 -std=gnu11 tools2/mkfs.c -o mkfs.ocsfs2
+make -C /lib/modules/$(uname -r)/build M=$PWD/kmod2 modules    # kernel module
+cc -O2 -std=gnu11 tools2/mkfs.c -o mkfs.ocsfs2                 # tools
 cc -O2 -std=gnu11 tools2/fsck.c -o fsck.ocsfs2
 ```
 
@@ -360,7 +326,7 @@ cc -O2 -std=gnu11 tools2/fsck.c -o fsck.ocsfs2
 #   -N = max cluster nodes baked into the layout (default 32; 1 = single-node).
 #        Format headroom, not a runtime cap — raising it later needs a reformat.
 #   -C = enable per-data-block checksums (recommended on any SAN without its own
-#        end-to-end integrity; cheap on writes, detects silent corruption on read).
+#        end-to-end integrity; near-free now, detects silent corruption on read).
 sudo ./mkfs.ocsfs2 -L vmstore -N 32 -C -f /dev/sdb
 
 sudo modprobe ocsfs2                  # on every node (DKMS-installed; see below)
@@ -374,21 +340,9 @@ sudo mount -t ocsfs2 -o cluster /dev/sdb /mnt/ocsfs
 
 `-o cluster` opts into multinode mode (claims a node slot, registers an SCSI PR
 key, starts the heartbeat). Without it the volume is single-node even if formatted
-with `-N > 1` — so there is zero clustering overhead for a lone host. **All nodes
-sharing a LUN must mount with `-o cluster`** (mounting the same LUN on two nodes
-*without* it is two independent single-node mounts = corruption).
-
-### Growing, trimming, scrubbing
-
-```bash
-# Autogrow: enlarge the LUN on the SAN; each node grows into it within ~30 s.
-# Force it now from any node:  ioctl OCSFS_IOC_GROWFS on the mountpoint.
-fstrim -v /mnt/ocsfs                 # reclaim free space on the thin LUN (UNMAP)
-# Scrub:  ioctl OCSFS_IOC_SCRUB — verify every metadata checksum online
-```
-
-See [`tests/v2/`](tests/v2/) for `growfs_tool.c`, `scrub_tool.c`, `dedup_tool.c`
-and the full validation scripts.
+with `-N > 1`. **All nodes sharing a LUN must mount with `-o cluster`** (mounting
+the same LUN on two nodes *without* it is two independent single-node mounts =
+corruption).
 
 ---
 
@@ -402,16 +356,9 @@ and the weekly scrub/defrag timers:
 sudo ./proxmox2/install.sh        # run ONCE on EACH node — no re-run after a kernel upgrade
 ```
 
-It installs the prerequisites (`dkms`, `build-essential`, the matching kernel
-headers), registers + builds `ocsfs2` through **DKMS** (so the module is rebuilt
-**automatically on every future kernel upgrade** — no manual step), installs
-`/usr/sbin/{mkfs,fsck}.ocsfs2`, `ocsfs2-{scrub,defrag,tool}` and
-`/sbin/mount.ocsfs2`, enables the periodic online maintenance timers, and — on a
-PVE node — the `PVE::Storage::Custom::OCSFS2Plugin` storage plugin. The debug
-tools (bpftrace, xfsprogs, …) are **not** prerequisites — they are dev-only. Then:
+Then format the shared LUN once and declare the storage:
 
 ```bash
-# format the shared LUN once, from a single node (-C = data checksums, recommended):
 mkfs.ocsfs2 -L vmstore -N 32 -C -f /dev/disk/by-id/<your-lun>
 ```
 ```ini
@@ -425,9 +372,10 @@ ocsfs2: vmstore
 ```
 
 The plugin owns the clustered mount/unmount, prefers **reflink** for fast VM
-clones, and supports every PVE content type. **Live migration** needs no data
-copy — it *is* the OCSFS write-ownership lease handing off from source to
-destination node.
+clones, and supports every PVE content type. Clone, snapshot, backup/restore and
+disk resize are validated end-to-end on a 3-node cluster (see Status). **Online
+live migration is a known limitation** (see the note above) — offline migration
+works today.
 
 ---
 
@@ -436,14 +384,14 @@ destination node.
 | Area | Status |
 |---|---|
 | **Maturity** | Alpha / research — not production-ready, AI-generated, unreviewed |
-| **Inline compression** | **Out of scope — not planned.** Transparent compression breaks the iomap 1:1 logical↔physical mapping and O_DIRECT (`cache=none`, the Proxmox default), and would require a parallel non-iomap data path that sacrifices hot-path integrity/performance — explicitly avoided. Space savings come from dedup + thin + discard instead. |
-| **Per-data-block checksums** | Available **opt-in** (`mkfs -C`): per-physical-block CRC32c in a per-AG region, stored on every write and **verified inline on every read** (buffered + O_DIRECT) — a mismatch returns `-EIO` instead of serving corruption, on any SAN/cache mode, cross-node — plus the online scrub for bulk verification. Cheap by design (batched 1 sync/CAW + 1 coherent read per checksum block); the only measurable cost is pure 4 KiB-random-write (~30%, the crash-safe checksum-`sync`). Follow-up: checksum the AGs added by online autogrow. |
-| **Cluster size (max nodes)** | Fixed at format time by `mkfs -N` (default **32**), like OCFS2 node slots / GFS2 journals — each node reserves a private journal (~16 MiB) + slot + heartbeat. It is **format headroom, not a runtime cap** (on-disk addressing supports far more); raising it later needs a reformat, so pick the cluster's eventual max up front. 32 covers any realistic Proxmox cluster at ~512 MiB reserved. |
-| **Maturity of cluster paths** | The single-node data path is differentially validated (`fsx_diff.sh` vs XFS, 24/24 clean incl. clone/reflink) and `fsck`-clean. The multi-node coherence/recovery paths are validated on 2–3 nodes but have had less soak time than a production FS. |
-| **Metadata-op throughput under cross-node contention** | Namespace ops on a *shared* directory serialise on one metadata lease; fine for the VM-disk workload (rare namespace churn), not tuned for many nodes hammering one directory. The **data path is unaffected** (single-writer, no per-I/O CAW). |
+| **Online live migration** | **Not yet supported.** `qm migrate --online` fails: the destination opens the disk while the source holds the EX lease and the lease has no revocation (→ `-EBUSY`). **Offline migration works.** Fix (lease revocation / lazy first-write lease) tracked in `docs/TODO.md`. |
+| **Inline compression** | **Out of scope — not planned.** Breaks the iomap 1:1 mapping and O_DIRECT (`cache=none`). Space savings come from dedup + thin + discard. |
+| **`-C` random read** | Each read fetches its stored checksum (one coherent read per checksum block) — near-free for sequential/cached, but uncached random-read pays it. The write side is now near-free (deferred + batched). |
+| **Cluster size (max nodes)** | Fixed at format time by `mkfs -N` (default **32**), like OCFS2 node slots — each node reserves a private journal (~16 MiB) + slot + heartbeat. Format headroom, not a runtime cap; raising it needs a reformat. |
 | **Concurrent evict-time free under cluster** | Concurrent delete+alloc across nodes is not yet fully coordinated at evict time (known follow-up). |
-| **`df` free-count in cluster mode** | The on-disk **block bitmap is authoritative and always correct** (`fsck` recomputes it; allocation never returns a false ENOSPC), but the superblock's *cached* free-block counter drifts in cluster mode (each node updates its bitmap via CAW; the shared counter is not kept in sync), so `df` can over-report free space until a remount. Cosmetic — not a data/integrity issue; recomputing the cached counter is a known follow-up. |
-| **Encryption** | Out of scope by design — encrypt at the SAN/LUN (LUKS on the zvol) or in the guest (qcow2/LUKS); per-file fscrypt would disable O_DIRECT and block reflink/snapshot. |
+| **`df` free-count in cluster mode** | The on-disk **block bitmap is authoritative and always correct** (`fsck` recomputes it; allocation never returns a false ENOSPC), but the superblock's *cached* free-block counter drifts in cluster mode until a remount. Cosmetic — not a data/integrity issue. |
+| **Extreme concurrent metadata churn** | Hundreds of simultaneous cross-node `create()`s can saturate the SAN's CAW path and fail some ops with `-EIO` (cleanly — the create rolls back, `fsck` clean); use moderate metadata concurrency. The **data path is unaffected**. |
+| **Encryption** | Out of scope by design — encrypt at the SAN/LUN (LUKS on the zvol) or in the guest. |
 | **Fencing** | SCSI-3 Persistent Reservations only; out-of-band STONITH not wired. |
 
 ---
@@ -472,11 +420,13 @@ ocsfs/
 1. ✅ ~~L2 single-node data path, fsx-validated~~
 2. ✅ ~~reflink + CoW snapshots; cross-file dedup~~
 3. ✅ ~~L3 membership + L4 single-writer ownership + L4b directory coherence~~
-4. ✅ ~~L5 recovery (peer journal replay + eager lease reclaim)~~
-5. ✅ ~~discard/TRIM, autonomous repeatable autogrow, online metadata scrub~~
-6. ✅ ~~multinode performance + curated xfstests~~
-7. ✅ ~~per-data-block checksums (opt-in `mkfs -C`) with inline read verification + DKMS packaging~~ — *(inline compression stays **out of scope**: incompatible with O_DIRECT + the iomap 1:1 mapping)*
-8. Corosync membership provider (the L3 interface is already pluggable); parallel multi-node recovery; out-of-band STONITH
+4. ✅ ~~L5 recovery (peer journal log-scan replay + eager lease reclaim)~~
+5. ✅ ~~discard/TRIM, autonomous repeatable autogrow, online metadata + data scrub~~
+6. ✅ ~~per-data-block checksums (`mkfs -C`) with inline read verification + DKMS~~
+7. ✅ ~~Proxmox storage battery (clone/snapshot/backup/restore/resize), 3-node~~
+8. ✅ ~~cluster perf: deferred+batched checksums, allocation reservation, large folios, node-owned-AG affinity (random-write checksum cost removed)~~
+9. **Online live migration** (lease revocation / lazy first-write lease)
+10. Corosync membership provider (the L3 interface is already pluggable); parallel multi-node recovery; out-of-band STONITH
 
 ---
 

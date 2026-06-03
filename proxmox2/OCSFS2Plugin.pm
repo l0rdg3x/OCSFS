@@ -19,8 +19,11 @@ package PVE::Storage::Custom::OCSFS2Plugin;
 #       cluster 1                                  # mount -o cluster (multinode)
 #       shared 1
 #
-# Live migration works because OCSFS hands the file's write-ownership lease from
-# the source node to the destination on open/close — no data copy.
+# Offline migration works with no data copy — the write-ownership lease passes
+# from source to destination on close/open. ONLINE migration (qm migrate
+# --online) is NOT yet supported: it needs the destination QEMU to open the disk
+# while the source still holds the EX lease, and the lease currently has no
+# revocation (the destination open returns -EBUSY). Tracked in docs/TODO.md.
 
 use strict;
 use warnings;

@@ -155,9 +155,13 @@ ocsfs2: vmstore
 The plugin owns mount/unmount of the LUN and presents it like a directory
 datastore, so VM and CT image management, ISOs and backups all work. It prefers
 **reflink** for clones (`cp --reflink=always`), so a linked clone or a template
-deploy is near-instant and space-efficient. Live migration works because the
-file's write-ownership lease is handed from source to destination on open/close —
-no data copy.
+deploy is near-instant and space-efficient. Clone, snapshot, backup/restore and
+disk resize are validated on a 3-node cluster. **Offline** migration works with no
+data copy (the write-ownership lease passes from source to destination on
+close/open). **Online** migration (`qm migrate --online`) is **not yet supported**:
+the destination QEMU must open the disk while the source still holds the EX lease,
+and the lease has no revocation yet (the open returns `-EBUSY`); tracked in the
+TODO.
 
 - **VM disks**: store as `raw` (reflink/snapshot/discard all work) or `qcow2`.
 - **CT (LXC)**: stored as `raw` images on a loop device (`subvol=0`), so the
@@ -427,19 +431,24 @@ creation (it cannot be changed later).
 
 **2. Keep data checksums (`-C`) on — they are nearly free where it matters.**
 Inline read verification (O_DIRECT **and** buffered, both async/pipelined) and
-large/sequential writes cost ≈0–5 %; the *only* measurable cost is **sustained
-pure 4 KiB-random-write**, capped at ~3.5k IOPS by the crash-safe per-write
-checksum `sync` (independent of LUN speed). For typical VM workloads (mixed,
-buffered, larger I/O) this is invisible. If a workload genuinely needs sustained
-small-random-write throughput *with* checksums, mount **`-o csum_async`** (§5):
-~3.6× faster (≈ no-`-C`), trading a wider post-crash false-positive window.
+large/sequential writes cost ≈0–5 %. **On cluster volumes the checksum is now
+deferred and batched** (accumulated in memory, flushed in one CAW per checksum
+block at `fsync` / lease hand-off / `sync`), so even **4 KiB-random-write runs at
+the no-`-C` rate** (~2k → ~15–20k IOPS on the 1 GbE rig) — the per-write CAW is off
+the hot path; the trade is a narrow post-crash window where a not-yet-flushed
+checksum yields a benign read false-positive that a rewrite or the scrub clears.
+On **single-node** volumes the per-write checksum `sync` still caps sustained pure
+4 KiB-random-write (~3.5k IOPS); mount **`-o csum_async`** (§5) there for ~3.6×
+(≈ no-`-C`). The one remaining `-C` cost on cluster is uncached **random reads**
+(each fetches its stored checksum).
 
-| Workload (O_DIRECT, single node) | `-C` cost |
+| Workload (O_DIRECT) | `-C` cost |
 |---|---|
-| reads (seq + random, any size) | ≈0 % |
 | sequential / large-aligned writes | ≈2–5 % |
-| 16 KiB random write | ≈10 % |
-| pure 4 KiB random write | capped ~3.5k IOPS (integrity price) |
+| **4 KiB random write, cluster (deferred+batched)** | **≈0 % (no-`-C` rate)** |
+| 4 KiB random write, single-node (sync) | capped ~3.5k IOPS — use `-o csum_async` |
+| sequential / cached reads | ≈0 % |
+| uncached random read | pays one stored-checksum fetch per block |
 
 **3. SAN durability vs speed.** `sync=disabled` on the zvol is fastest but loses
 recent writes on a SAN power failure; use `sync=standard` (optionally with a SLOG)
