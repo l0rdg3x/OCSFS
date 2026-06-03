@@ -40,7 +40,8 @@ static int repoint_dotdot(struct inode *dir, u64 new_parent_ino)
 					break;
 				de->de_ino = cpu_to_le64(new_parent_ino);
 				ocsfs2_dirent_set_csum(de);
-				mark_buffer_dirty(bh);
+				if (!ocsfs2_current_txn())   /* in a txn the journal owns writeback */
+					mark_buffer_dirty(bh);
 				break;
 			}
 		}

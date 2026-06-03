@@ -182,9 +182,10 @@ int ocsfs2_xattr_set(struct inode *inode, const char *name, const void *value,
 		if (!bh) { ret = -EIO; goto out; }
 		ocsfs2_jbuf(bh);
 		memcpy(bh->b_data, nb, bs);
-		mark_buffer_dirty(bh);
-		if (!ocsfs2_current_txn())
+		if (!ocsfs2_current_txn()) {   /* in a txn the journal owns writeback */
+			mark_buffer_dirty(bh);
 			sync_dirty_buffer(bh);
+		}
 		brelse(bh);
 	}
 	ret = ocsfs2_write_inode_block(inode);

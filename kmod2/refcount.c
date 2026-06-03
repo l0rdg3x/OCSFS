@@ -180,9 +180,10 @@ static int rc_set_root(struct super_block *sb, struct ocsfs2_ag_info *ai, u64 ro
 	dag->ag_checksum = cpu_to_le32(ocsfs2_crc32c(~0U, dag,
 			   offsetof(struct ocsfs2_disk_ag, ag_checksum)));
 	mutex_unlock(&ai->ag_lock);
-	mark_buffer_dirty(bh);
-	if (!in_txn)
+	if (!in_txn) {                      /* in a txn the journal owns writeback */
+		mark_buffer_dirty(bh);
 		sync_dirty_buffer(bh);
+	}
 	brelse(bh);
 	ai->rc_btree_root = root;
 	return 0;
@@ -248,9 +249,10 @@ static int rc_store(struct super_block *sb, struct ocsfs2_ag_info *ai,
 	}
 	node->rn_checksum = cpu_to_le32(ocsfs2_crc32c(~0U, node,
 			    offsetof(struct ocsfs2_disk_rc_node, rn_checksum)));
-	mark_buffer_dirty(bh);
-	if (!in_txn)
+	if (!in_txn) {                      /* in a txn the journal owns writeback */
+		mark_buffer_dirty(bh);
 		sync_dirty_buffer(bh);
+	}
 	brelse(bh);
 	return 0;
 }

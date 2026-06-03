@@ -241,20 +241,48 @@ int ocsfs2_write_inode_block(struct inode *inode)
 	blk = byte_off / sb->s_blocksize;
 	off_in_blk = byte_off % sb->s_blocksize;
 
-	bh = sb_bread(sb, blk);
-	if (!bh)
-		return -EIO;
-	ret = ocsfs2_jbuf(bh);   /* enrol in current txn (snapshot) before modifying */
-	if (ret) {
+	/* Deferred-journal (single-node): every inode-block write must be journaled
+	 * so the ring's after-image for this block is always the freshest. The inode
+	 * block is otherwise mixed-modified — a create journals an empty inode while
+	 * fsync/writeback persists the full inode non-journaled — and a crash would
+	 * replay the stale create-time after-image over the newer write. When called
+	 * outside a transaction (writeback), JOIN the running batch (J5-D) so the
+	 * inode is journaled and batched with the data writes. */
+	{
+		bool batched = !ocsfs2_current_txn() && sbi->s_journal.j_active &&
+			       sbi->s_max_nodes <= 1;
+
+		if (batched) {
+			ret = ocsfs2_run_begin(sb);
+			if (ret)
+				return ret;
+		}
+
+		bh = sb_bread(sb, blk);
+		if (!bh) {
+			if (batched)
+				ocsfs2_run_end(sb);
+			return -EIO;
+		}
+		ret = ocsfs2_jbuf(bh);   /* enrol (snapshot) before modifying */
+		if (ret) {
+			brelse(bh);
+			if (batched)
+				ocsfs2_run_end(sb);
+			return ret;
+		}
+		fill_disk_inode(inode,
+				(struct ocsfs2_disk_inode *)(bh->b_data + off_in_blk));
+		if (!ocsfs2_current_txn()) {   /* not journaled: persist now */
+			mark_buffer_dirty(bh);
+			if (sb->s_flags & SB_SYNCHRONOUS ||
+			    (inode_state_read(inode) & I_DIRTY_SYNC))
+				sync_dirty_buffer(bh);
+		}
 		brelse(bh);
-		return ret;
+		if (batched)
+			ocsfs2_run_end(sb);
 	}
-	fill_disk_inode(inode, (struct ocsfs2_disk_inode *)(bh->b_data + off_in_blk));
-	mark_buffer_dirty(bh);
-	if (!ocsfs2_current_txn() &&
-	    (sb->s_flags & SB_SYNCHRONOUS || (inode_state_read(inode) & I_DIRTY_SYNC)))
-		sync_dirty_buffer(bh);
-	brelse(bh);
 	return 0;
 }
 
@@ -502,7 +530,8 @@ static int reserve_inode_slot(struct super_block *sb, u32 ag, u64 local)
 	di->i_ino = cpu_to_le64((u64)ag * sbi->s_ag_size + local);
 	di->i_checksum = cpu_to_le32(ocsfs2_crc32c(~0U, di,
 				offsetof(struct ocsfs2_disk_inode, i_checksum)));
-	mark_buffer_dirty(bh);
+	if (!ocsfs2_current_txn())          /* in a txn the journal owns writeback */
+		mark_buffer_dirty(bh);
 	brelse(bh);
 	return 0;
 }
@@ -601,9 +630,10 @@ void ocsfs2_free_inode_num(struct super_block *sb, u64 ino)
 		if (bh) {
 			ocsfs2_jbuf(bh);   /* enrol if within a txn (else writeback) */
 			memset(bh->b_data + off, 0, OCSFS2_INODE_SIZE);
-			mark_buffer_dirty(bh);
-			if (!ocsfs2_current_txn())
+			if (!ocsfs2_current_txn()) {   /* in a txn the journal owns writeback */
+				mark_buffer_dirty(bh);
 				sync_dirty_buffer(bh);
+			}
 			brelse(bh);
 		}
 	}

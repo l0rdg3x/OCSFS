@@ -110,7 +110,8 @@ int ocsfs2_add_dirent(struct inode *dir, const struct qstr *name,
 			ret = ocsfs2_jbuf(bh);
 			if (ret) { brelse(bh); goto out; }
 			write_dirent(de, name, ino, ft);
-			mark_buffer_dirty(bh);
+			if (!ocsfs2_current_txn())   /* in a txn the journal owns writeback */
+				mark_buffer_dirty(bh);
 			brelse(bh);
 			goto added;
 		}
@@ -128,7 +129,8 @@ int ocsfs2_add_dirent(struct inode *dir, const struct qstr *name,
 	if (ret) { brelse(bh); goto out; }
 	memset(bh->b_data, 0, OCSFS2_BLOCK_SIZE);
 	write_dirent(slot_ptr(bh, 0), name, ino, ft);
-	mark_buffer_dirty(bh);
+	if (!ocsfs2_current_txn())           /* in a txn the journal owns writeback */
+		mark_buffer_dirty(bh);
 	brelse(bh);
 
 added:
@@ -168,7 +170,8 @@ int ocsfs2_del_dirent(struct inode *dir, const struct qstr *name)
 				continue;
 			if (ocsfs2_jbuf(bh)) { brelse(bh); ret = -ENOMEM; goto out; }
 			memset(de, 0, OCSFS2_DIRENT_SIZE);
-			mark_buffer_dirty(bh);
+			if (!ocsfs2_current_txn())   /* in a txn the journal owns writeback */
+				mark_buffer_dirty(bh);
 			brelse(bh);
 			if (oi->i_dirent_count)
 				oi->i_dirent_count--;

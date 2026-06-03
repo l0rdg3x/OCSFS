@@ -63,9 +63,10 @@ static void flush_bitmap_range(struct super_block *sb, struct ocsfs2_ag_info *ai
 		if (txn)
 			ocsfs2_txn_get(txn, bhs[i]);  /* snapshot before overwrite */
 		memcpy(bhs[i]->b_data, buf + i * sb->s_blocksize, sb->s_blocksize);
-		mark_buffer_dirty(bhs[i]);
-		if (!txn)
-			sync_dirty_buffer(bhs[i]);    /* data path: bitmap durable ahead of inode */
+		if (!txn) {                           /* in a txn the journal owns writeback */
+			mark_buffer_dirty(bhs[i]);
+			sync_dirty_buffer(bhs[i]);    /* no txn: bitmap durable now */
+		}
 	}
 }
 

@@ -281,7 +281,10 @@ int ocsfs2_statfs(struct dentry *dentry, struct kstatfs *buf)
 
 static int ocsfs2_sync_fs(struct super_block *sb, int wait)
 {
-	return write_back_meta(sb);
+	int ret = ocsfs2_journal_checkpoint(sb);  /* flush deferred home blocks */
+	int ret2 = write_back_meta(sb);
+
+	return ret ? ret : ret2;
 }
 
 static void ocsfs2_put_super(struct super_block *sb)
@@ -294,6 +297,7 @@ static void ocsfs2_put_super(struct super_block *sb)
 	if (sbi->s_clustered)      /* A4: persist a true free count (coherent read) */
 		ocsfs2_recompute_free(sb);
 	ocsfs2_cluster_exit(sb);   /* stop heartbeat + release node slot first */
+	ocsfs2_journal_checkpoint(sb);  /* flush deferred home blocks -> clean ring */
 	write_back_meta(sb);
 	ocsfs2_journal_exit(sb);
 	kvfree(sbi->s_ags);

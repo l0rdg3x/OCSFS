@@ -87,9 +87,11 @@ void ocsfs2_csum_set(struct super_block *sb, u64 phys, u32 crc)
 		if (ocsfs2_current_txn())
 			ocsfs2_jbuf(bh);
 		memcpy(bh->b_data + off, &v, sizeof(v));
-		mark_buffer_dirty(bh);
-		if (!ocsfs2_current_txn() && !sbi->s_csum_async)
-			sync_dirty_buffer(bh);
+		if (!ocsfs2_current_txn()) {   /* in a txn the journal owns writeback */
+			mark_buffer_dirty(bh);
+			if (!sbi->s_csum_async)
+				sync_dirty_buffer(bh);
+		}
 		brelse(bh);
 	}
 }
@@ -176,9 +178,10 @@ void ocsfs2_csum_clear_range(struct super_block *sb, u64 phys, u32 count)
 		if (ocsfs2_current_txn())
 			ocsfs2_jbuf(bh);
 		memset(bh->b_data + off, 0, (size_t)n * sizeof(__le32));
-		mark_buffer_dirty(bh);
-		if (!ocsfs2_current_txn())
+		if (!ocsfs2_current_txn()) {   /* in a txn the journal owns writeback */
+			mark_buffer_dirty(bh);
 			sync_dirty_buffer(bh);
+		}
 		brelse(bh);
 		i += n;
 	}
@@ -340,10 +343,13 @@ void ocsfs2_csum_set_range(struct super_block *sb, u64 phys0, const u32 *crcs,
 					ocsfs2_jbuf(bh);
 				for (k = 0; k < cnt; k++)
 					slot[k] = cpu_to_le32(crcs[i + k]);
-				mark_buffer_dirty(bh);
-				/* sync once per block, unless -o csum_async defers it */
-				if (!ocsfs2_current_txn() && !sbi->s_csum_async)
-					sync_dirty_buffer(bh);
+				/* in a txn the journal owns writeback; else sync once per
+				 * block, unless -o csum_async defers it */
+				if (!ocsfs2_current_txn()) {
+					mark_buffer_dirty(bh);
+					if (!sbi->s_csum_async)
+						sync_dirty_buffer(bh);
+				}
 				brelse(bh);
 			}
 		}

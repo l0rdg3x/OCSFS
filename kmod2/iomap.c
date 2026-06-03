@@ -223,9 +223,22 @@ static int ocsfs2_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 	}
 
 	if (flags & IOMAP_WRITE) {
+		bool batched = !ocsfs2_current_txn() && sbi->s_max_nodes <= 1;
 		u64 want = end_blk - lblk;
 		u64 phys;
 		u32 alloc;
+
+		/* J5-D (deferred single-node): JOIN the running batch so the bitmap
+		 * allocation + extent insert share one commit with neighbouring writes
+		 * (a repeatedly-appended leaf / bitmap is journaled once per batch). The
+		 * extent insert only ever fails at node_alloc (ENOSPC), BEFORE it touches
+		 * the btree, so on failure the op undoes its own partial work with a
+		 * normal free — it never aborts the shared running txn. */
+		if (batched) {
+			ret = ocsfs2_run_begin(inode->i_sb);
+			if (ret)
+				goto out;
+		}
 
 		if (next_logical != U64_MAX && next_logical - lblk < want)
 			want = next_logical - lblk;     /* don't overlap the next extent */
@@ -239,16 +252,24 @@ static int ocsfs2_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 			want = 1;
 			ret = ocsfs2_alloc_blocks(inode->i_sb, oi->i_ag, 1, &phys);
 		}
-		if (ret)
+		if (ret) {
+			if (batched)
+				ocsfs2_run_end(inode->i_sb);
 			goto out;
+		}
 		alloc = (u32)want;
 
 		ret = ocsfs2_extent_insert(inode, lblk, phys, alloc, OCSFS2_EXT_WRITTEN);
 		if (ret) {
-			ocsfs2_free_blocks(inode->i_sb, phys, alloc);
+			ocsfs2_free_blocks(inode->i_sb, phys, alloc); /* undo the alloc */
+			if (batched)
+				ocsfs2_run_end(inode->i_sb);
 			goto out;
 		}
 		inode->i_blocks += (u64)alloc * (bs / 512);
+
+		if (batched)
+			ocsfs2_run_end(inode->i_sb);   /* leave; the batch commits later */
 
 		iomap->addr = phys * (u64)bs;
 		iomap->length = (u64)alloc * bs;
@@ -419,8 +440,20 @@ static ssize_t ocsfs2_writeback_range(struct iomap_writepage_ctx *wpc,
 		return ret;
 	/* a dirty folio always has blocks allocated from the write path; a HOLE
 	 * here would just be skipped by iomap (Plan 2 has no punch/truncate race) */
-	/* A8: record per-block CRCs for the data hitting disk (no-op unless enabled) */
-	ocsfs2_csum_folio_range(wpc->inode->i_sb, folio, pos, len, &wpc->iomap);
+	/* A8: record per-block CRCs for the data hitting disk (no-op unless enabled).
+	 * J5-D: enrol the csum blocks in the running batch (journaled + coalesced). */
+	{
+		struct super_block *sb = wpc->inode->i_sb;
+		bool batched = !ocsfs2_current_txn() &&
+			       OCSFS2_SB(sb)->s_datacsum &&
+			       OCSFS2_SB(sb)->s_max_nodes <= 1;
+
+		if (batched && ocsfs2_run_begin(sb))
+			batched = false;
+		ocsfs2_csum_folio_range(sb, folio, pos, len, &wpc->iomap);
+		if (batched)
+			ocsfs2_run_end(sb);
+	}
 	return iomap_add_to_ioend(wpc, folio, pos, end_pos, len);
 }
 
@@ -549,9 +582,19 @@ static void ocsfs2_dio_submit(const struct iomap_iter *iter, struct bio *bio,
 	struct super_block *sb = iter->inode->i_sb;
 
 	(void)file_offset;
-	if (op_is_write(bio_op(bio)))
+	if (op_is_write(bio_op(bio))) {
+		/* J5-D: enrol the csum blocks in the running batch (journaled + coalesced
+		 * with the data-write metadata) instead of a separate per-write sync. */
+		bool batched = !ocsfs2_current_txn() &&
+			       OCSFS2_SB(sb)->s_datacsum &&
+			       OCSFS2_SB(sb)->s_max_nodes <= 1;
+
+		if (batched && ocsfs2_run_begin(sb))
+			batched = false;
 		ocsfs2_csum_bio(sb, bio);
-	else if (OCSFS2_SB(sb)->s_datacsum)
+		if (batched)
+			ocsfs2_run_end(sb);
+	} else if (OCSFS2_SB(sb)->s_datacsum)
 		ocsfs2_dio_read_arm(sb, bio);	/* best-effort; unverified on failure */
 	submit_bio(bio);
 }
@@ -649,6 +692,17 @@ static int ocsfs2_fsync(struct file *file, loff_t start, loff_t end, int datasyn
 		return ret;
 	if (!datasync || (inode_state_read(inode) & I_DIRTY_DATASYNC))
 		ret = sync_inode_metadata(inode, 1);
+	/* The deferred journal batches commits and no longer flushes per commit;
+	 * fsync is a durability barrier, so force the running batch out to the ring
+	 * and flush the device cache to make this inode's metadata + data durable. */
+	if (!ret) {
+		int r = ocsfs2_run_flush(inode->i_sb);
+
+		if (r)
+			ret = r;
+	}
+	if (!ret)
+		blkdev_issue_flush(inode->i_sb->s_bdev);
 	return ret;
 }
 

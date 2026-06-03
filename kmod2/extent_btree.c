@@ -68,9 +68,10 @@ static void node_finish(struct super_block *sb, struct buffer_head *bh)
 	struct ocsfs2_disk_ext_node *n = (struct ocsfs2_disk_ext_node *)bh->b_data;
 
 	n->en_checksum = cpu_to_le32(node_crc(n));
-	mark_buffer_dirty(bh);
-	if (!ocsfs2_current_txn())
+	if (!ocsfs2_current_txn()) {       /* in a txn the journal owns writeback */
+		mark_buffer_dirty(bh);
 		sync_dirty_buffer(bh);
+	}
 }
 
 /* Allocate a fresh node block; returns a held, enrolled bh (caller fills). */

@@ -477,7 +477,31 @@ struct ocsfs2_journal {
 	struct buffer_head *j_hdr_bh;
 	struct super_block *j_sb;
 	bool   j_active;
+	/* Plan 5 (single-node only): deferred checkpoint. Committed txns awaiting
+	 * checkpoint are kept on j_ckpt (in commit order), pinning their metadata
+	 * buffers (so a reader sees the new content before the home block is
+	 * rewritten) and recording where their after-images live in the ring (so the
+	 * checkpoint sources home content from the immutable ring, never the live
+	 * buffer). In cluster mode this list stays empty — checkpoint is synchronous
+	 * per commit so peers reading home blocks coherently always see current
+	 * metadata. */
+	struct list_head j_ckpt;
+	/* J5-D (single-node only): running transaction. Data-path ops (block alloc +
+	 * extent insert, and inode writeback) JOIN j_running instead of each opening
+	 * its own txn, so many ops share one desc+commit and a repeatedly-touched
+	 * btree leaf / inode is journaled once per batch. j_run_handles counts ops
+	 * currently building j_running; the running txn is committed only when
+	 * handles==0 (no op is mid-modify, so its after-images are consistent), on a
+	 * buffer threshold, on ->fsync / sync / checkpoint / unmount, or when an
+	 * explicit (non-data) op needs to run. */
+	struct ocsfs2_txn *j_running;
+	unsigned int j_run_handles;
+	wait_queue_head_t j_run_wait;
 };
+
+/* commit j_running when it reaches this many distinct metadata buffers (bounds
+ * the per-commit size well under OCSFS2_JTXN_MAX_BLOCKS and the ring) */
+#define OCSFS2_RUN_MAX_BUFS  192
 
 /* A metadata buffer enrolled in a transaction (with its before-image). */
 struct ocsfs2_txn_buf {
@@ -493,6 +517,11 @@ struct ocsfs2_txn {
 	struct list_head t_bufs;
 	unsigned int t_nr;
 	bool   t_failed;
+	/* Plan 5 deferred checkpoint: set at commit, links the committed txn on
+	 * j_ckpt until its home blocks are checkpointed. t_ring_start is the ring
+	 * record index of this txn's descriptor (after-images follow at +1..+t_nr). */
+	struct list_head t_ckpt;
+	u64    t_ring_start;
 };
 
 /* ═══════════════════════ cluster (L3-L5) ═══════════════════════ */
@@ -866,6 +895,12 @@ int  ocsfs2_init_empty_dir(struct inode *dir, struct inode *parent);
 int  ocsfs2_journal_init(struct super_block *sb);
 void ocsfs2_journal_exit(struct super_block *sb);
 int  ocsfs2_journal_replay(struct super_block *sb);
+int  ocsfs2_journal_checkpoint(struct super_block *sb); /* Plan 5: flush deferred home blocks */
+/* J5-D running transaction (single-node data path): join/leave the shared batch,
+ * and force it out (commit) at a durability/serialisation barrier. */
+int  ocsfs2_run_begin(struct super_block *sb);
+void ocsfs2_run_end(struct super_block *sb);
+int  ocsfs2_run_flush(struct super_block *sb);
 struct ocsfs2_txn *ocsfs2_txn_begin(struct super_block *sb);
 int  ocsfs2_txn_get(struct ocsfs2_txn *txn, struct buffer_head *bh);
 int  ocsfs2_txn_commit(struct ocsfs2_txn *txn);
@@ -888,6 +923,20 @@ static inline int ocsfs2_jbuf(struct buffer_head *bh)
 
 	return txn ? ocsfs2_txn_get(txn, bh) : 0;
 }
+
+/*
+ * J5-A — journal owns metadata writeback. After modifying a journaled metadata
+ * buffer that was enrolled with ocsfs2_jbuf(), the dirty/sync of its home block
+ * is gated on being OUTSIDE a transaction:
+ *
+ *     if (!ocsfs2_current_txn()) { mark_buffer_dirty(bh); ... sync ... }
+ *
+ * Inside a transaction the buffer must NOT be left on the kernel dirty list:
+ * its home block is written only by checkpoint/replay, sourced from the journal
+ * ring, so the kernel can never write uncommitted (or post-commit, concurrently
+ * re-modified) content to the home block. This keeps the deferred single-node
+ * checkpoint race-free.
+ */
 
 /* xattr.c — extended attributes + POSIX ACL */
 extern const struct xattr_handler * const ocsfs2_xattr_handlers[];
