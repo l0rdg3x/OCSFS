@@ -257,6 +257,11 @@ void ocsfs2_inode_close_lease(struct inode *inode)
 	if (mode == OCSFS2_LEASE_EX) {
 		filemap_write_and_wait(inode->i_mapping);
 		ocsfs2_write_inode_block(inode);
+		/* A9: write the DEFERRED journal metadata (extent btree etc.) to its home
+		 * blocks now — it is journal-owned, not on the dirty list, so the
+		 * sync_blockdev below would miss it. The next owner then reads current
+		 * home blocks coherently. */
+		ocsfs2_journal_checkpoint(inode->i_sb);
 		sync_blockdev(inode->i_sb->s_bdev);
 	}
 	ocsfs2_lease_release(inode->i_sb, oi->i_disk_ino, mode);
@@ -297,10 +302,12 @@ void ocsfs2_meta_unlock(struct super_block *sb)
 {
 	if (!OCSFS2_SB(sb)->s_cluster)
 		return;
-	/* No sync_blockdev here: the op's journal commit already checkpointed +
-	 * flushed its metadata durably. A full device sync per namespace op would
-	 * starve the heartbeat under load (the v1 cascade). A barrier suffices. */
-	blkdev_issue_flush(sb->s_bdev);
+	/* A9: the op's journal commit is now DEFERRED (no per-op checkpoint), so
+	 * write the deferred metadata (dir / extent btree / xattr) to its home blocks
+	 * before releasing the lease — the next holder reads home coherently. The
+	 * checkpoint already issues a flush; no extra sync_blockdev (a full device
+	 * sync per namespace op would starve the heartbeat, the v1 cascade). */
+	ocsfs2_journal_checkpoint(sb);
 	ocsfs2_lease_release(sb, OCSFS2_META_RESOURCE, OCSFS2_LEASE_EX);
 }
 

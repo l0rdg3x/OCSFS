@@ -89,34 +89,30 @@ coherently re-reading every full block — O(filled) cl_bio per alloc. A cluster
 (`3190d2e`): scan from `next_blk_hint` + wrap; cl_bio 68k→17k (4×), convert
 ~60s→47s; fsx + churn clean. This was masking the journal cost (below).
 
-### A9. [FIX · P2] Extend Plan 5 journal deferral to cluster volumes (perf)
-After A10, a cluster convert (47s) is dominated by the **synchronous journal**:
-44k `sync_dirty_buffer` + 59k `blkdev_issue_flush` (per-op commit + checkpoint).
-The single-node deferred path does 21/122/63 of those. So journal deferral would
-take a cluster convert ~47s → ~17s (near single-node). **But it's the high-risk
-cross-node change**: (1) the deferred path can't simply replace the synchronous
-one — peers read home blocks coherently, and crash recovery (`replay_slot`)
-needs the records ordered before the header, so naively dropping the per-op
-flush/checkpoint risks torn cross-node metadata; (2) needs **checkpoint on every
-metadata-lease release/downgrade** (`ocsfs2_lease_release`, lease.c — a single
-missed site = stale cross-node read = corruption); (3) `replay_slot` must loop;
-(4) full 3-node crash + coherence validation. Its own focused session.
-Plan 5 (`50d2370`) makes the journal **batched + deferred** only on volumes that
-can never join a cluster (`s_max_nodes <= 1`): `qemu-img convert` there went
-52.4s → 12.7s (4.1×, at the data floor), crash-safe. **Cluster-capable volumes
-(`-N>1`, i.e. the PVE storage) keep the synchronous per-op checkpoint** — correct
-(peers read current home blocks coherently; dead-peer `replay_slot` sees the one
-in-flight txn it expects) but `convert`/import/restore stay slow there. The
-common cluster op (clone) is already instant via reflink (~0.08s), so this is a
-*rare-op* optimization.
-*To do it safely:* (1) allow the deferred path for cluster; (2) **checkpoint on
-metadata-lease release** (`ocsfs2_lease_release`, lease.c — every EX-release site)
-so a peer never reads a lagging home block — **a single missed site = stale
-cross-node read = corruption**; (3) make `ocsfs2_journal_replay_slot` **loop**
-(deferral means a dead node can leave many uncheckpointed txns, not one); (4) full
-3-node crash + coherence validation. High risk for a rare-op gain → its own
-focused session, not a tail-end change. (Single-node + cluster-synchronous paths
-are both validated: see `docs/plans/2026-06-03-ocsfs-v2-plan5-journal-perf.md`.)
+### A9. [DONE · 2026-06-03] Extend Plan 5 journal deferral to cluster volumes (perf)
+Cluster volumes now use the **same deferred + batched journal** as single-node
+(the `s_max_nodes <= 1` gate in `ocsfs2_txn_commit` / `ocsfs2_journal_replay`
+became unconditional). Result: cluster `qemu-img convert` **60s → 47s (A10) →
+28.7s (A9)**; `sync_dirty_buffer` 44k → 33, `blkdev_issue_flush` 59k → 57. The
+remaining cluster cost vs single-node (12.7s) is the CAW coherence path (bitmap
+alloc `cl_bio` reads + `scsi_caw` claims + inode CAW), which stays immediate.
+*Correctness — how deferral stays cross-node-safe:* bitmap / inode / refcount /
+csum keep the **immediate CAW** path (peers read them coherently); only journaled
+metadata (extent btree / dir / xattr) defers. A peer never reads a lagging home
+block because **every EX metadata-lease release checkpoints first**:
+`ocsfs2_inode_close_lease` (file btree+inode) and `ocsfs2_meta_unlock` (dir/xattr)
+both call `ocsfs2_journal_checkpoint(sb)` before `ocsfs2_lease_release`. Crash of
+a deferred peer can leave **many** uncheckpointed txns, so
+`ocsfs2_journal_replay_slot` is now a **log-scan loop** (validates seq continuity
++ every after-image CRC, applies each txn atomically, stops at the first torn /
+seq-break record) instead of the old single-txn replay.
+*Validated 3-node (`944323AD`):* coherence (n1 writes 40 files incl. 10 multi-
+extent/btree + dir ops; n2 **and** n3 read all 40, 0 mismatch); crash recovery
+(n1 crashed via sysrq-b holding 10 fsync'd-but-uncheckpointed files open → n2
+detects dead slot 0, log-scan `replay_slot` recovers all 10 byte-for-byte, 0
+mismatch); fsck clean. **All 3 nodes must run the A9 module before mounting** (the
+deferred ring now accumulates; an old synchronous-replay node would misread it —
+a cleanly-unmounted old volume is fine, the journal is empty at mount).
 
 ### A1. [FIX · P1] Per-AG refcount B+tree is not cluster-coherent
 `kmod2/refcount.c` reads/writes the refcount tree with `sb_bread` +
